@@ -10,8 +10,11 @@ export class RateLimiter {
     constructor(
         private readonly limit: number,
         private readonly windowMs: number,
-        private readonly now: () => number = Date.now,
-    ) {}
+        private readonly now: () => number = () => performance.now(),
+    ) {
+        if (!(limit >= 1)) throw new RangeError(`rate limit must be at least 1, got ${limit}`);
+        if (!(windowMs > 0)) throw new RangeError(`rate window must be positive, got ${windowMs}`);
+    }
 
     take(key: string): { ok: true } | { ok: false; retryAfterSeconds: number } {
         const t = this.now();
@@ -22,6 +25,8 @@ export class RateLimiter {
             this.windows.set(key, { start: t, count: 1 });
             return { ok: true };
         }
+        // A clock that stepped back would otherwise stretch the window past windowMs
+        if (w.start > t) w.start = t;
         if (w.count >= this.limit) {
             return {
                 ok: false,
