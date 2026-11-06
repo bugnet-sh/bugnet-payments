@@ -1,14 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import {
-    create,
-    now,
-    post,
-    terms,
-    testApp,
-    type TestApp,
-    until,
-    withHints,
-} from "../testing/app.ts";
+import { create, post, terms, testApp, type TestApp, until, withHints } from "../testing/app.ts";
 import { seedOrder, seedPayment } from "../testing/orders.ts";
 import { signedPayment } from "../testing/payment.ts";
 import { claimHash, newClaim, sealClaim } from "./claim.ts";
@@ -34,16 +25,20 @@ beforeEach(() => {
 });
 
 function after(ms: number): Date {
-    return new Date(now().getTime() + ms);
+    return new Date(app.now.get().getTime() + ms);
 }
 
 // seedOrder's own times follow the wall clock, which is years before the frozen app clock
 function seed(over: Partial<OrderRow> = {}): Promise<{ order: OrderRow; claim: string }> {
-    return seedOrder(app.pool, { createdAt: now(), expiresAt: after(15 * 60_000), ...over });
+    return seedOrder(app.pool, {
+        createdAt: app.now.get(),
+        expiresAt: after(15 * 60_000),
+        ...over,
+    });
 }
 
 function seedPaid(over: Partial<OrderRow> = {}): Promise<{ order: OrderRow; claim: string }> {
-    return seed({ state: "paid", paidAt: now(), payer: "P", ...over });
+    return seed({ state: "paid", paidAt: app.now.get(), payer: "P", ...over });
 }
 
 async function stateOf(id: string) {
@@ -278,11 +273,11 @@ describe("redeem", () => {
             kind: "start",
             package_id: "pkg-test",
             amount_micros: 10_000,
-            expires_at: new Date(now().getTime() + 600_000).toISOString(),
+            expires_at: new Date(app.now.get().getTime() + 600_000).toISOString(),
         });
         expect(await findOrder(app.pool, order.id)).toMatchObject({
             state: "redeemed",
-            redeemedAt: now(),
+            redeemedAt: app.now.get(),
             tokenExpiresAt: after(600_000),
         });
         app.now.set(after(60_000));
@@ -390,7 +385,9 @@ describe("redeem", () => {
     it("never answers payment_required for a paid order", async () => {
         const a = await post(app, "/v1/orders", create({ idempotencyKey: KEY + "g" }));
         await setOrderState(app.pool, a.body.orderId, "unpaid", "settling", { payer: "P" });
-        await setOrderState(app.pool, a.body.orderId, "settling", "paid", { paidAt: now() });
+        await setOrderState(app.pool, a.body.orderId, "settling", "paid", {
+            paidAt: app.now.get(),
+        });
         const replay = await post(app, "/v1/orders", create({ idempotencyKey: KEY + "g" }));
         expect(replay.body).toEqual({
             status: "refused",
@@ -417,7 +414,7 @@ describe("redeem", () => {
     });
 
     it("refuses a redeem when the payment was recorded after expiry", async () => {
-        const t0 = new Date(now().getTime() - 60_000);
+        const t0 = new Date(app.now.get().getTime() - 60_000);
         const { order, claim } = await seedPaid({
             expiresAt: t0,
             paidAt: new Date(t0.getTime() + 1_000),
@@ -428,7 +425,7 @@ describe("redeem", () => {
     });
 
     it("redeems a payment recorded exactly at expiry", async () => {
-        const t0 = new Date(now().getTime() - 60_000);
+        const t0 = new Date(app.now.get().getTime() - 60_000);
         const { order, claim } = await seedPaid({ expiresAt: t0, paidAt: t0 });
         const r = await post(app, "/v1/orders", { orderId: order.id, claim });
         expect(r.body.status).toBe("paid");
@@ -437,8 +434,8 @@ describe("redeem", () => {
     it("refuses a redeem after the token expired", async () => {
         const { order, claim } = await seedPaid({
             state: "redeemed",
-            redeemedAt: new Date(now().getTime() - 600_000),
-            tokenExpiresAt: new Date(now().getTime() - 1_000),
+            redeemedAt: new Date(app.now.get().getTime() - 600_000),
+            tokenExpiresAt: new Date(app.now.get().getTime() - 1_000),
         });
         const r = await post(app, "/v1/orders", { orderId: order.id, claim });
         expect(r.body).toEqual({ status: "refused", orderId: order.id, reason: "token_expired" });
@@ -519,16 +516,16 @@ describe("x402 payment from _meta", () => {
 describe("abandonOrder", () => {
     it("records the hint without changing state", async () => {
         const { order } = await seedPaid({ state: "redeemed" });
-        expect(await abandonOrder(app.pool, order.id, "denied", now())).toBe("recorded");
+        expect(await abandonOrder(app.pool, order.id, "denied", app.now.get())).toBe("recorded");
         expect(await findOrder(app.pool, order.id)).toMatchObject({
             state: "redeemed",
             abandonReason: "denied",
-            abandonAt: now(),
+            abandonAt: app.now.get(),
         });
     });
 
     it("answers unknown for a missing or malformed id", async () => {
-        expect(await abandonOrder(app.pool, newOrderId(), "denied", now())).toBe("unknown");
-        expect(await abandonOrder(app.pool, "ord_X", "denied", now())).toBe("unknown");
+        expect(await abandonOrder(app.pool, newOrderId(), "denied", app.now.get())).toBe("unknown");
+        expect(await abandonOrder(app.pool, "ord_X", "denied", app.now.get())).toBe("unknown");
     });
 });

@@ -12,16 +12,7 @@ import { newOrderId } from "../orders/ids.ts";
 import { findPaymentByOrder } from "../orders/store.ts";
 import type { OrderRow } from "../orders/types.ts";
 import { usdcAta } from "../solana/accounts.ts";
-import {
-    create,
-    get,
-    now,
-    post,
-    testApp,
-    type TestApp,
-    totalCalls,
-    withHints,
-} from "../testing/app.ts";
+import { create, get, post, testApp, type TestApp, totalCalls, withHints } from "../testing/app.ts";
 import { testSigner } from "../testing/keys.ts";
 import { seedOrder } from "../testing/orders.ts";
 import { signedPayment } from "../testing/payment.ts";
@@ -32,7 +23,7 @@ let app: TestApp;
 let order: OrderRow;
 
 function inFuture(ms: number): Date {
-    return new Date(now().getTime() + ms);
+    return new Date(app.now.get().getTime() + ms);
 }
 
 async function unpaid(over: Partial<OrderRow> = {}): Promise<OrderRow> {

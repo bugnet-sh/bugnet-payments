@@ -12,6 +12,9 @@ export class BodyTooLarge extends Error {
     }
 }
 
+// nginx's status for a client that hung up before any answer
+const CLIENT_CLOSED = 499;
+
 function splitListen(listen: string): { host: string; port: number } {
     const at = listen.lastIndexOf(":");
     return {
@@ -27,12 +30,17 @@ export function requestPath(target: string | undefined): string {
     return URL.parse(raw, "http://local")?.pathname ?? raw.split("?", 1)[0]!;
 }
 
-function fail(res: ServerResponse, status: number, body: unknown): void {
+function fail(
+    res: ServerResponse,
+    status: number,
+    body: unknown,
+    headers: Record<string, string> = {},
+): void {
     if (res.headersSent) {
         res.destroy();
         return;
     }
-    sendJson(res, status, body);
+    sendJson(res, status, body, headers);
 }
 
 // The pay path's CheckPayer call stops when the caller hangs up
@@ -55,14 +63,14 @@ export async function startServer(
             log.info("request", {
                 method: req.method,
                 path: requestPath(req.url),
-                status: res.statusCode,
+                status: res.writableFinished ? res.statusCode : CLIENT_CLOSED,
                 ms: Math.round(performance.now() - started),
                 ip: req.socket.remoteAddress,
             });
         });
         handler(req, res).catch((err: unknown) => {
             if (err instanceof BodyTooLarge) {
-                fail(res, 413, { error: "body_too_large" });
+                fail(res, 413, { error: "body_too_large" }, { Connection: "close" });
                 return;
             }
             log.error("handler failed", { err });
@@ -103,6 +111,8 @@ export function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer
             if (size > maxBytes) {
                 over = true;
                 chunks.length = 0;
+                // Stop reading: with Connection: close the socket ends once the 413 is flushed
+                req.pause();
                 reject(new BodyTooLarge());
                 return;
             }

@@ -70,7 +70,7 @@ export function createInternalHandler(d: InternalDeps): Handler {
             body = await readJson(req, d.maxBodyBytes);
         } catch (err) {
             if (!(err instanceof BodyTooLarge)) throw err;
-            sendJson(res, 413, BAD_REQUEST);
+            sendJson(res, 413, BAD_REQUEST, { Connection: "close" });
             return;
         }
         if (abandon !== null) {

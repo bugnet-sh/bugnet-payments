@@ -43,7 +43,7 @@ export interface TestApp {
     feePayer: KeyPairSigner;
     settings: Settings;
     secrets: Secrets;
-    now: { set(d: Date): void };
+    now: { get(): Date; set(d: Date): void };
     close(): Promise<void>;
 }
 
@@ -51,12 +51,6 @@ const DEFAULT_NOW = new Date("2030-01-01T00:00:00Z");
 // Router events in tests are signed with this seed
 const EVENT_SEED = Buffer.alloc(32, 9);
 const FEE_PAYER_SEED = 5;
-
-let clock = DEFAULT_NOW;
-
-export function now(): Date {
-    return new Date(clock.getTime());
-}
 
 function keypairSecret(seed: number, signer: KeyPairSigner): string {
     const bytes = new Uint8Array(64);
@@ -66,10 +60,23 @@ function keypairSecret(seed: number, signer: KeyPairSigner): string {
 }
 
 export async function testApp(over: TestAppOptions = {}): Promise<TestApp> {
-    clock = over.now ?? DEFAULT_NOW;
+    const stops: Array<() => Promise<void>> = [];
+    try {
+        return await buildApp(over, stops);
+    } catch (err) {
+        for (const stop of stops.reverse()) await stop().catch(() => undefined);
+        throw err;
+    }
+}
+
+async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>): Promise<TestApp> {
+    let clock = over.now ?? DEFAULT_NOW;
+    const appNow = () => new Date(clock.getTime());
     const log = memoryLog();
     const db = await testDb();
+    stops.push(() => db.close());
     const router = await startFakeRouter(over.routerImpl ?? {});
+    stops.push(() => router.close());
     const payer = await testSigner(3);
     const feePayer = await testSigner(FEE_PAYER_SEED);
     const recipient = await testSigner(1);
@@ -101,7 +108,6 @@ export async function testApp(over: TestAppOptions = {}): Promise<TestApp> {
         refundKey: "",
         rpcUrl: "",
     };
-    const appNow = () => now();
     const rpc = createFakeRpc();
     const hints = new BlockhashCache(rpc, settings.solana.blockhash_cache_ttl, () =>
         clock.getTime(),
@@ -163,6 +169,7 @@ export async function testApp(over: TestAppOptions = {}): Promise<TestApp> {
         }),
         log,
     );
+    stops.push(() => internal.close());
     const publicServer = await startServer(
         settings.http.public_listen,
         createPublicHandler({
@@ -197,6 +204,7 @@ export async function testApp(over: TestAppOptions = {}): Promise<TestApp> {
         settings,
         secrets,
         now: {
+            get: appNow,
             set(d: Date) {
                 clock = d;
             },

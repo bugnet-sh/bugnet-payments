@@ -10,7 +10,7 @@ import * as esbuild from "esbuild";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { newOrderId } from "../orders/ids.ts";
 import type { OrderRow } from "../orders/types.ts";
-import { get, now, testApp, type TestApp, totalCalls } from "../testing/app.ts";
+import { get, testApp, type TestApp, totalCalls } from "../testing/app.ts";
 import { seedOrder } from "../testing/orders.ts";
 import { payWithWallet, type WalletPort } from "./flow.ts";
 import {
@@ -122,7 +122,7 @@ describe("checkout routes", () => {
         await rm(dir, { recursive: true, force: true });
     });
     beforeEach(async () => {
-        const expiresAt = new Date(now().getTime() + 15 * 60_000);
+        const expiresAt = new Date(app.now.get().getTime() + 15 * 60_000);
         order = (await seedOrder(app.pool, { expiresAt })).order;
         for (const k of Object.keys(app.rpc.calls)) app.rpc.calls[k] = 0;
     });
@@ -162,8 +162,9 @@ describe("checkout routes", () => {
             expect(await unknown.text()).toContain("Order not found");
         }
 
-        const lapsed = (await seedOrder(app.pool, { expiresAt: new Date(now().getTime() - 1_000) }))
-            .order;
+        const lapsed = (
+            await seedOrder(app.pool, { expiresAt: new Date(app.now.get().getTime() - 1_000) })
+        ).order;
         const expired = await get(app, `/o/${lapsed.id}`, html);
         expect(expired.status).toBe(410);
         expect(expired.headers.get("content-type")).toBe("text/html; charset=utf-8");
@@ -172,7 +173,9 @@ describe("checkout routes", () => {
         expect(page).toContain("Expired");
         expect(page).not.toContain("/checkout.js");
 
-        const refunded = (await seedOrder(app.pool, { state: "refunded", expiresAt: now() })).order;
+        const refunded = (
+            await seedOrder(app.pool, { state: "refunded", expiresAt: app.now.get() })
+        ).order;
         const closed = await get(app, `/o/${refunded.id}`, html);
         expect(closed.status).toBe(410);
         expect(await closed.text()).toContain("Refunded");
@@ -180,7 +183,7 @@ describe("checkout routes", () => {
     });
 
     it("shows a paid order as paid", async () => {
-        const paid = (await seedOrder(app.pool, { state: "paid", expiresAt: now() })).order;
+        const paid = (await seedOrder(app.pool, { state: "paid", expiresAt: app.now.get() })).order;
         const r = await get(app, `/o/${paid.id}`, { accept: "text/html" });
         expect(r.status).toBe(200);
         const html = await r.text();

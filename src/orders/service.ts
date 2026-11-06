@@ -12,6 +12,7 @@ import type pg from "pg";
 import { z } from "zod";
 import type { Settings } from "../config.ts";
 import { withTx, type Queryable } from "../db/pool.ts";
+import { isRecord } from "../is-record.ts";
 import type { Log } from "../log.ts";
 import type { BlockhashCache } from "../solana/blockhash.ts";
 import { SOLANA_MAINNET } from "../solana/constants.ts";
@@ -54,7 +55,7 @@ interface Found {
 }
 
 const CONTROL_CHARS = /\p{Cc}/u;
-const TERMS = ["kind", "packageId", "amountMicros", "description"] as const;
+const REQUIRED_CREATE_FIELDS = ["kind", "packageId", "amountMicros", "description"] as const;
 
 export function shortText(max: number) {
     return z
@@ -99,7 +100,7 @@ function requestSchema(maxAmountMicros: number): z.ZodType<OrderRequest> {
 }
 
 function hasTerms(r: OrderRequest): boolean {
-    return TERMS.every((t) => r[t] !== undefined);
+    return REQUIRED_CREATE_FIELDS.every((t) => r[t] !== undefined);
 }
 
 function refused(reason: RefusalReason, orderId?: string, retryAfterSeconds?: number): Refused {
@@ -107,10 +108,6 @@ function refused(reason: RefusalReason, orderId?: string, retryAfterSeconds?: nu
     if (orderId !== undefined) out.orderId = orderId;
     if (retryAfterSeconds !== undefined) out.retryAfterSeconds = retryAfterSeconds;
     return out;
-}
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-    return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
 function memoOf(payment: unknown): string | undefined {
@@ -286,8 +283,10 @@ async function answerAuthorized(
 }
 
 async function redeem(d: OrderServiceDeps, id: string, retryStale: boolean): Promise<OrderResult> {
+    let justRedeemed = false;
     try {
-        return await withTx(d.pool, async (c) => {
+        const result = await withTx(d.pool, async (c) => {
+            justRedeemed = false;
             const o = await lockOrder(c, id);
             if (o === null) return refused("order_unknown", id);
             const now = d.now();
@@ -301,7 +300,7 @@ async function redeem(d: OrderServiceDeps, id: string, retryStale: boolean): Pro
                         redeemedAt: now,
                         tokenExpiresAt,
                     });
-                    d.log.info("order redeemed", { orderId: id });
+                    justRedeemed = true;
                     return paid(d, c, o, tokenExpiresAt);
                 }
                 case "redeemed":
@@ -313,6 +312,8 @@ async function redeem(d: OrderServiceDeps, id: string, retryStale: boolean): Pro
                     return closed(o);
             }
         });
+        if (justRedeemed) d.log.info("order redeemed", { orderId: id });
+        return result;
     } catch (err) {
         if (!(err instanceof StaleStateError) || !retryStale) throw err;
         const fresh = await findOrder(d.pool, id);

@@ -10,6 +10,7 @@ import {
 import { decodePaymentSignatureHeader } from "@x402/core/http";
 import type { PaymentPayload } from "@x402/core/types";
 import { peekWireTransactionVersion, transactionMessageHash } from "@x402/svm";
+import { isRecord } from "../is-record.ts";
 import { isOrderId } from "../orders/ids.ts";
 import { TOKEN_PROGRAM } from "../solana/constants.ts";
 
@@ -62,10 +63,6 @@ export function parsePaymentHeader(value: string): unknown {
 
 function invalid(code: string): PaymentRefusal {
     return new PaymentRefusal("payment_invalid", code);
-}
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-    return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
 // Without this check the payer is whatever address the sender writes, so a stranger could spend

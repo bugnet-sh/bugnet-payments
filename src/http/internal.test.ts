@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { memoryLog } from "../log.ts";
 import { newOrderId } from "../orders/ids.ts";
 import { findOrder } from "../orders/store.ts";
-import { create, now, post, testApp, type TestApp, until } from "../testing/app.ts";
+import { create, post, testApp, type TestApp, until } from "../testing/app.ts";
 import { seedOrder } from "../testing/orders.ts";
 import { bearerOk, startServer } from "./server.ts";
 
@@ -87,13 +87,39 @@ describe("internal API", () => {
         expect(r.body).toEqual({ status: "refused", reason: "bad_request" });
     });
 
+    it("answers 413 and closes the connection when a chunked body passes the limit", async () => {
+        const { port } = new URL(app.internalUrl);
+        const max = app.settings.http.max_body_bytes;
+        const out = await new Promise<string>((resolve, reject) => {
+            let text = "";
+            const sock = connect(Number(port), "127.0.0.1", () => {
+                sock.write(
+                    "POST /v1/orders HTTP/1.1\r\nHost: x\r\n" +
+                        `Authorization: Bearer ${app.secrets.paymentsToken}\r\n` +
+                        "Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+                );
+                const chunk = "x".repeat(max + 1);
+                sock.write(`${chunk.length.toString(16)}\r\n${chunk}\r\n`);
+            });
+            sock.setEncoding("utf8");
+            sock.on("data", (c: string) => (text += c));
+            sock.on("error", (err: NodeJS.ErrnoException) =>
+                err.code === "ECONNRESET" ? resolve(text) : reject(err),
+            );
+            sock.on("close", () => resolve(text));
+        });
+        expect(out.split("\r\n", 1)[0]).toBe("HTTP/1.1 413 Payload Too Large");
+        expect(out.toLowerCase()).toContain("connection: close");
+        expect(out).toContain('"reason":"bad_request"');
+    });
+
     it("records an abandon hint without changing state", async () => {
         const { order } = await seedOrder(app.pool, {
             state: "redeemed",
-            paidAt: now(),
+            paidAt: app.now.get(),
             payer: "P",
-            redeemedAt: now(),
-            tokenExpiresAt: new Date(now().getTime() + 600_000),
+            redeemedAt: app.now.get(),
+            tokenExpiresAt: new Date(app.now.get().getTime() + 600_000),
         });
         const r = await post(app, `/v1/orders/${order.id}/abandon`, { reason: "denied" });
         expect(r.status).toBe(204);
@@ -101,7 +127,7 @@ describe("internal API", () => {
         expect(await findOrder(app.pool, order.id)).toMatchObject({
             state: "redeemed",
             abandonReason: "denied",
-            abandonAt: now(),
+            abandonAt: app.now.get(),
         });
         const unknown = await post(app, `/v1/orders/${newOrderId()}/abandon`, { reason: "denied" });
         expect(unknown.status).toBe(404);
@@ -164,7 +190,26 @@ describe("internal API", () => {
     it("never logs a claim", async () => {
         const r = await post(app, "/v1/orders", create());
         expect(r.body.claim).toMatch(/^[A-Za-z0-9_-]{43}$/);
-        expect(JSON.stringify(app.log.lines)).not.toContain(r.body.claim);
+        const key = "toolu_01NEVERLOGCLAIMREPLAY0001";
+        const first = await post(app, "/v1/orders", create({ idempotencyKey: key }));
+        const replay = await post(app, "/v1/orders", create({ idempotencyKey: key }));
+        expect(replay.body.claim).toBe(first.body.claim);
+        const paid = await seedOrder(app.pool, {
+            state: "paid",
+            createdAt: app.now.get(),
+            expiresAt: new Date(app.now.get().getTime() + 900_000),
+            paidAt: app.now.get(),
+            payer: "P",
+        });
+        const redeemed = await post(app, "/v1/orders", {
+            orderId: paid.order.id,
+            claim: paid.claim,
+        });
+        expect(redeemed.body.status).toBe("paid");
+        const text = JSON.stringify(app.log.lines);
+        for (const claim of [r.body.claim, first.body.claim, paid.claim]) {
+            expect(text).not.toContain(claim);
+        }
     });
 
     it("writes an access log line with method, path, status, ms and IP only", async () => {
@@ -180,6 +225,30 @@ describe("internal API", () => {
 });
 
 describe("server", () => {
+    it("logs 499 when the client hangs up before any answer", async () => {
+        const log = memoryLog();
+        let release!: () => void;
+        const gate = new Promise<void>((r) => (release = r));
+        const s = await startServer(
+            "127.0.0.1:0",
+            async () => {
+                await gate;
+            },
+            log,
+        );
+        try {
+            const sock = connect(s.port, "127.0.0.1", () => {
+                sock.write("GET /slow HTTP/1.1\r\nHost: x\r\n\r\n");
+                setTimeout(() => sock.destroy(), 50);
+            });
+            await until(async () => log.lines.some((l) => l.msg === "request"), 2_000);
+            expect(log.lines.find((l) => l.msg === "request")).toMatchObject({ status: 499 });
+        } finally {
+            release();
+            await s.close();
+        }
+    });
+
     it("answers 500 internal when a handler throws", async () => {
         const log = memoryLog();
         const s = await startServer(
