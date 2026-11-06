@@ -8,14 +8,15 @@ import {
     getTransactionDecoder,
 } from "@solana/kit";
 import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
+import pg from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { PayerVerdict } from "../gen/bugnet/router/v1/payments_pb.ts";
-import { silentLog } from "../log.ts";
+import { memoryLog, silentLog } from "../log.ts";
 import { RateLimiter } from "../ratelimit.ts";
 import { createRouterClient, type RouterClient } from "../router/client.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { BlockhashCache } from "../solana/blockhash.ts";
-import { LIGHTHOUSE_PROGRAM, TOKEN_PROGRAM } from "../solana/constants.ts";
+import { LIGHTHOUSE_PROGRAM, SOLANA_MAINNET, TOKEN_PROGRAM } from "../solana/constants.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
 import { createFakeRpc, type FakeRpc, TEST_BLOCKHASH, TEST_LVBH } from "../testing/fake-rpc.ts";
 import { type FakeRouter, startFakeRouter } from "../testing/fake-router.ts";
@@ -25,8 +26,14 @@ import { signedPayment } from "../testing/payment.ts";
 import { type ChallengeContext, requirementsFor } from "../x402/challenge.ts";
 import { decodePayment } from "../x402/decode.ts";
 import { createSettler, type Settler } from "../x402/settler.ts";
-import { type PayDeps, payOrder } from "./pay.ts";
-import { confirmPayment, findOrder, findPaymentByOrder, setOrderState } from "./store.ts";
+import { createPayDeps, type PayDeps, payOrder } from "./pay.ts";
+import {
+    archivePayment,
+    confirmPayment,
+    findOrder,
+    findPaymentByOrder,
+    setOrderState,
+} from "./store.ts";
 import type { OrderRow } from "./types.ts";
 
 const payer = await testSigner(3);
@@ -132,6 +139,44 @@ function quietConsole() {
     return vi.spyOn(console, "error").mockImplementation(() => {});
 }
 
+const CONFIRMED = {
+    value: [{ confirmationStatus: "confirmed", err: null, slot: 1n, confirmations: 1n }],
+};
+
+// Runs fn inside the settler's first confirmation poll, after the settling commit
+function confirmingAfter(fn: () => Promise<void>): FakeRpc {
+    let first = true;
+    return createFakeRpc({
+        getSignatureStatuses: async () => {
+            if (first) {
+                first = false;
+                await fn();
+            }
+            return CONFIRMED;
+        },
+    });
+}
+
+function sentSignature(r: FakeRpc): string {
+    return getSignatureFromTransaction(
+        getTransactionDecoder().decode(getBase64Encoder().encode(r.sent[0]!)),
+    );
+}
+
+async function markPaidByReconciler(id: string): Promise<void> {
+    const payment = (await findPaymentByOrder(db.pool, id))!;
+    await confirmPayment(db.pool, id, NOW);
+    await setOrderState(db.pool, id, "settling", "paid", { paidAt: payment.createdAt });
+}
+
+function within<T>(ms: number, p: Promise<T>): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`no answer within ${ms} ms`)), ms);
+    });
+    return Promise.race([p, late]).finally(() => clearTimeout(timer));
+}
+
 beforeAll(async () => {
     db = await testDb();
 });
@@ -145,7 +190,7 @@ beforeEach(async () => {
     req = withHints(requirementsFor(order, challenge));
     p = await signedPayment(req, payer);
     router = await startRouter(PayerVerdict.OK);
-    d = {
+    d = createPayDeps({
         pool: db.pool,
         settler: settlerOn(rpc),
         router: clientFor(router),
@@ -153,7 +198,7 @@ beforeEach(async () => {
         challenge,
         log: silentLog,
         now: () => NOW,
-    };
+    });
 });
 afterEach(async () => {
     vi.restoreAllMocks();
@@ -434,7 +479,7 @@ describe("payOrder", () => {
         const { order: other } = await seedOrder(db.pool, { state: "paid", expiresAt: EXPIRES });
         await seedPayment(db.pool, other.id, {
             status: "confirmed",
-            messageHash: decodePayment(p, d.settler).messageHash,
+            messageHash: decodePayment(p, challenge).messageHash,
         });
         expect(await payOrder(d, order.id, p, sig())).toEqual({
             kind: "refused",
@@ -490,35 +535,162 @@ describe("payOrder", () => {
     });
 
     it("answers paid when another worker marked the order paid during the confirmation wait", async () => {
-        let first = true;
-        const racing = createFakeRpc({
-            getSignatureStatuses: async () => {
-                if (first) {
-                    first = false;
-                    const payment = (await findPaymentByOrder(db.pool, order.id))!;
-                    await confirmPayment(db.pool, order.id, NOW);
-                    await setOrderState(db.pool, order.id, "settling", "paid", {
-                        paidAt: payment.createdAt,
-                    });
-                }
-                return {
-                    value: [
-                        { confirmationStatus: "confirmed", err: null, slot: 1n, confirmations: 1n },
-                    ],
-                };
-            },
-        });
+        const racing = confirmingAfter(() => markPaidByReconciler(order.id));
         const out = await payOrder({ ...d, settler: settlerOn(racing) }, order.id, p, sig());
-        const payment = (await findPaymentByOrder(db.pool, order.id))!;
         expect(out).toEqual({
             kind: "paid",
             orderId: order.id,
             payer: payer.address,
-            signature: payment.txSignature,
+            signature: sentSignature(racing),
         });
-        expect(first).toBe(false);
         expect(racing.calls.sendTransaction).toBe(1);
         expect(await stateOf(order.id)).toBe("paid");
+        expect(await findPaymentByOrder(db.pool, order.id)).toMatchObject({
+            status: "confirmed",
+            confirmedAt: NOW,
+        });
+    });
+
+    it("answers paid when the order was marked paid while its payment was still settling", async () => {
+        const racing = confirmingAfter(() =>
+            setOrderState(db.pool, order.id, "settling", "paid", { paidAt: NOW }),
+        );
+        const out = await payOrder({ ...d, settler: settlerOn(racing) }, order.id, p, sig());
+        expect(out).toEqual({
+            kind: "paid",
+            orderId: order.id,
+            payer: payer.address,
+            signature: sentSignature(racing),
+        });
+        expect(await findPaymentByOrder(db.pool, order.id)).toMatchObject({ status: "settling" });
+    });
+
+    it("answers settling when the order left settling for another state during the wait", async () => {
+        const racing = confirmingAfter(() =>
+            setOrderState(db.pool, order.id, "settling", "expired"),
+        );
+        const out = await payOrder({ ...d, settler: settlerOn(racing) }, order.id, p, sig());
+        expect(out).toEqual({ kind: "settling", orderId: order.id });
+        expect(await stateOf(order.id)).toBe("expired");
+        expect(await findPaymentByOrder(db.pool, order.id)).toMatchObject({
+            status: "settling",
+            confirmedAt: null,
+        });
+    });
+
+    it("answers settling and leaves the order settling when the payment left settling", async () => {
+        const log = memoryLog();
+        const racing = confirmingAfter(async () => {
+            await archivePayment(db.pool, order.id, "blockhash_expired");
+        });
+        const out = await payOrder({ ...d, settler: settlerOn(racing), log }, order.id, p, sig());
+        expect(out).toEqual({ kind: "settling", orderId: order.id });
+        expect(await findOrder(db.pool, order.id)).toMatchObject({
+            state: "settling",
+            paidAt: null,
+        });
+        expect(await findPaymentByOrder(db.pool, order.id)).toBeNull();
+        expect(log.lines).toContainEqual(
+            expect.objectContaining({
+                level: "error",
+                orderId: order.id,
+                signature: sentSignature(racing),
+            }),
+        );
+    });
+
+    it("answers settling when writing paid fails after the settling commit", async () => {
+        const log = memoryLog();
+        let connects = 0;
+        const pool = {
+            connect: () =>
+                ++connects === 1 ? db.pool.connect() : Promise.reject(new Error("db down")),
+            query: db.pool.query.bind(db.pool),
+        } as unknown as pg.Pool;
+        const out = await payOrder({ ...d, pool, log }, order.id, p, sig());
+        expect(out).toEqual({ kind: "settling", orderId: order.id });
+        expect(connects).toBe(2);
+        expect(rpc.calls.sendTransaction).toBe(1);
+        expect(await stateOf(order.id)).toBe("settling");
+        expect(await findPaymentByOrder(db.pool, order.id)).toMatchObject({ status: "settling" });
+        expect(log.lines).toContainEqual(
+            expect.objectContaining({ level: "error", msg: "marking the order paid failed" }),
+        );
+    });
+
+    it("answers settling when the re-read after a lost race fails", async () => {
+        const log = memoryLog();
+        const pool = {
+            connect: db.pool.connect.bind(db.pool),
+            query: () => Promise.reject(new Error("db down")),
+        } as unknown as pg.Pool;
+        const racing = confirmingAfter(() => markPaidByReconciler(order.id));
+        const out = await payOrder(
+            { ...d, pool, settler: settlerOn(racing), log },
+            order.id,
+            p,
+            sig(),
+        );
+        expect(out).toEqual({ kind: "settling", orderId: order.id });
+        expect(await stateOf(order.id)).toBe("paid");
+        expect(log.lines).toContainEqual(
+            expect.objectContaining({ level: "error", msg: "re-reading the order failed" }),
+        );
+    });
+
+    it("stamps confirmed_at when confirmation returns and paid_at with the record time", async () => {
+        const LATER = new Date("2030-01-01T00:05:20Z");
+        let clock = NOW;
+        const slow = confirmingAfter(async () => {
+            clock = LATER;
+        });
+        const out = await payOrder(
+            { ...d, settler: settlerOn(slow), now: () => clock },
+            order.id,
+            p,
+            sig(),
+        );
+        expect(out.kind).toBe("paid");
+        expect(await findPaymentByOrder(db.pool, order.id)).toMatchObject({
+            status: "confirmed",
+            createdAt: NOW,
+            confirmedAt: LATER,
+        });
+        expect((await findOrder(db.pool, order.id))!.paidAt).toEqual(NOW);
+    });
+
+    it("frees its pool client while waiting for confirmation", async () => {
+        const small = new pg.Pool({ connectionString: db.url, max: 2 });
+        let release = () => {};
+        const held = new Promise<void>((r) => (release = r));
+        let waiting = 0;
+        let bothWaiting = () => {};
+        const both = new Promise<void>((r) => (bothWaiting = r));
+        const slow = createFakeRpc({
+            getSignatureStatuses: async () => {
+                if (++waiting === 2) bothWaiting();
+                await held;
+                return CONFIRMED;
+            },
+        });
+        const { order: second } = await seedOrder(db.pool, { expiresAt: EXPIRES });
+        const pd = { ...d, pool: small, settler: settlerOn(slow) };
+        try {
+            const payments = Promise.all([
+                payOrder(pd, order.id, p, sig()),
+                payOrder(pd, second.id, await paymentFor(second, payer2), sig()),
+            ]);
+            await within(5_000, both);
+            expect(await within(1_000, small.query("select 1 as one"))).toMatchObject({
+                rows: [{ one: 1 }],
+            });
+            release();
+            expect((await payments).map((o) => o.kind)).toEqual(["paid", "paid"]);
+            expect(await stateOf(second.id)).toBe("paid");
+        } finally {
+            release();
+            await small.end();
+        }
     });
 
     it("refuses with 503 and sends nothing when block height is unavailable at record time", async () => {
@@ -623,5 +795,56 @@ describe("payOrder", () => {
         expect(await stateOf(order.id)).toBe("unpaid");
         expect(await findPaymentByOrder(db.pool, order.id)).toBeNull();
         expect(await payOrder(d, order.id, p, sig())).toMatchObject({ kind: "paid" });
+    });
+
+    it("refuses a settlement the facilitator already saw with 409", async () => {
+        const dup: Settler = {
+            feePayer: FEE_PAYER,
+            transactionVersions: [0],
+            async settle() {
+                return {
+                    success: false,
+                    errorReason: "duplicate_settlement",
+                    transaction: "",
+                    network: SOLANA_MAINNET,
+                };
+            },
+        };
+        expect(await payOrder({ ...d, settler: dup }, order.id, p, sig())).toEqual({
+            kind: "refused",
+            orderId: order.id,
+            httpStatus: 409,
+            reason: "payment_replayed",
+        });
+        expect(await stateOf(order.id)).toBe("unpaid");
+        expect(await findPaymentByOrder(db.pool, order.id)).toBeNull();
+    });
+});
+
+describe("createPayDeps", () => {
+    const deps = (over: Partial<ChallengeContext>): PayDeps => ({
+        pool: db.pool,
+        settler: settlerOn(createFakeRpc()),
+        router: clientFor(router),
+        attempts: new RateLimiter(5, 60_000, () => 0),
+        challenge: { ...challenge, ...over },
+        log: silentLog,
+        now: () => NOW,
+    });
+
+    it("accepts a settler and challenge that agree", () => {
+        const ok = deps({});
+        expect(createPayDeps(ok)).toBe(ok);
+    });
+
+    it("refuses a challenge fee payer the settler does not sign for", async () => {
+        const other = (await testSigner(6)).address;
+        expect(() => createPayDeps(deps({ feePayer: other }))).toThrow(/fee payer/);
+    });
+
+    it("refuses transaction versions that differ from the settler's", () => {
+        expect(() => createPayDeps(deps({ transactionVersions: [0, 1] }))).toThrow(
+            /transaction versions/,
+        );
     });
 });

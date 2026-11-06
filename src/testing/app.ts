@@ -10,7 +10,7 @@ import { createPublicHandler } from "../http/public.ts";
 import { startServer } from "../http/server.ts";
 import type { PaymentsService } from "../gen/bugnet/router/v1/payments_pb.ts";
 import { memoryLog } from "../log.ts";
-import { type PayDeps, payOrder } from "../orders/pay.ts";
+import { createPayDeps, payOrder } from "../orders/pay.ts";
 import type { OrderServiceDeps } from "../orders/service.ts";
 import { orderKey, orderPublicKeyBase64 } from "../orders/token.ts";
 import type { OrderRequest, OrderRow } from "../orders/types.ts";
@@ -124,7 +124,7 @@ export async function testApp(over: TestAppOptions = {}): Promise<TestApp> {
         transactionVersions: settings.solana.transaction_versions,
         log,
     });
-    const pay: PayDeps = {
+    const pay = createPayDeps({
         pool: db.pool,
         settler,
         router: createRouterClient({
@@ -141,7 +141,7 @@ export async function testApp(over: TestAppOptions = {}): Promise<TestApp> {
         challenge,
         log,
         now: appNow,
-    };
+    });
     const service: OrderServiceDeps = {
         pool: db.pool,
         settings,

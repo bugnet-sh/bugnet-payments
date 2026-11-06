@@ -1,6 +1,7 @@
 import { bindX402ExactCredential, InvalidProofError } from "@solana/pay-kit";
 import type { PaymentRequirements, SettleResponse } from "@x402/core/types";
 import type pg from "pg";
+import { withTx } from "../db/pool.ts";
 import type { Log } from "../log.ts";
 import type { RateLimiter } from "../ratelimit.ts";
 import type { PayerCheck, RouterClient } from "../router/client.ts";
@@ -53,6 +54,23 @@ export interface PayDeps {
     now: () => Date;
 }
 
+// The settler signs as fee payer for exactly the terms the challenge advertises
+export function createPayDeps(d: PayDeps): PayDeps {
+    if (d.settler.feePayer !== d.challenge.feePayer) {
+        throw new Error(
+            `settler fee payer ${d.settler.feePayer} differs from the challenge's ${d.challenge.feePayer}`,
+        );
+    }
+    const ours = d.settler.transactionVersions.join(",");
+    const theirs = d.challenge.transactionVersions.join(",");
+    if (ours !== theirs) {
+        throw new Error(
+            `settler transaction versions [${ours}] differ from the challenge's [${theirs}]`,
+        );
+    }
+    return d;
+}
+
 type Refused = Extract<PayOutcome, { kind: "refused" }>;
 
 interface Checked {
@@ -62,7 +80,8 @@ interface Checked {
 
 class Tx {
     private open = false;
-    broken = false;
+    private broken = false;
+    private released = false;
 
     constructor(private readonly c: pg.PoolClient) {}
 
@@ -89,6 +108,12 @@ class Tx {
         } catch {
             this.broken = true;
         }
+    }
+
+    release(): void {
+        if (this.released) return;
+        this.released = true;
+        this.c.release(this.broken);
     }
 }
 
@@ -129,7 +154,7 @@ export async function payOrder(
         return await settle(d, c, tx, order, checked, t);
     } finally {
         await tx.rollback();
-        c.release(tx.broken);
+        tx.release();
     }
 }
 
@@ -169,7 +194,7 @@ async function alreadyPaid(
     const payment = await findPaymentByOrder(c, orderId);
     let hash: string | undefined;
     try {
-        hash = decodePayment(raw, d.settler).messageHash;
+        hash = decodePayment(raw, d.challenge).messageHash;
     } catch (err) {
         if (!(err instanceof PaymentRefusal)) throw err;
     }
@@ -193,7 +218,7 @@ async function checkPayment(
 ): Promise<Checked | Refused> {
     let dec: DecodedPayment;
     try {
-        dec = decodePayment(raw, d.settler);
+        dec = decodePayment(raw, d.challenge);
     } catch (err) {
         if (!(err instanceof PaymentRefusal)) throw err;
         const status = err.reason === "payment_malformed" ? 400 : 422;
@@ -217,7 +242,7 @@ async function checkPayment(
     const check = await d.router.checkPayer(
         {
             payer: dec.payer,
-            feePayer: d.settler.feePayer,
+            feePayer: d.challenge.feePayer,
             packageId: order.packageId,
             kind: order.kind,
         },
@@ -274,6 +299,8 @@ async function settle(
             });
             await setOrderState(c, order.id, "unpaid", "settling", { payer: dec.payer });
             await tx.commit();
+            // The confirmation wait can take 30 s and must not hold a pool client
+            tx.release();
         },
     };
     let res: SettleResponse;
@@ -285,7 +312,7 @@ async function settle(
             ? settling(order.id)
             : refused(order.id, 503, "settlement_unavailable");
     }
-    if (res.success) return markPaid(d, c, tx, order.id, dec.payer, res.transaction, t);
+    if (res.success) return markPaid(d, order.id, dec.payer, res.transaction, t);
     if (attempt.committed) return settling(order.id);
     switch (attempt.failure) {
         case "commit_conflict":
@@ -303,39 +330,35 @@ async function settle(
 
 async function markPaid(
     d: PayDeps,
-    c: pg.PoolClient,
-    tx: Tx,
     orderId: string,
     payer: string,
     signature: string,
-    t: Date,
+    paidAt: Date,
 ): Promise<PayOutcome> {
     const paid: PayOutcome = { kind: "paid", orderId, payer, signature };
+    let confirmed: boolean;
     try {
-        await tx.begin();
-        await confirmPayment(c, orderId, t);
-        await setOrderState(c, orderId, "settling", "paid", { paidAt: t });
-        await tx.commit();
-        return paid;
+        confirmed = await withTx(d.pool, async (c) => {
+            if (!(await confirmPayment(c, orderId, d.now()))) return false;
+            await setOrderState(c, orderId, "settling", "paid", { paidAt });
+            return true;
+        });
     } catch (err) {
-        await tx.rollback();
         if (!(err instanceof StaleStateError)) {
             d.log.error("marking the order paid failed", { orderId, err });
             return settling(orderId);
         }
-        return (await paidElsewhere(d, c, orderId, signature)) ? paid : settling(orderId);
+        return (await paidElsewhere(d, orderId, signature)) ? paid : settling(orderId);
     }
+    if (confirmed || (await paidElsewhere(d, orderId, signature))) return paid;
+    d.log.error("payment was not settling at confirmation", { orderId, signature });
+    return settling(orderId);
 }
 
-async function paidElsewhere(
-    d: PayDeps,
-    c: pg.PoolClient,
-    orderId: string,
-    signature: string,
-): Promise<boolean> {
+async function paidElsewhere(d: PayDeps, orderId: string, signature: string): Promise<boolean> {
     try {
-        const order = await findOrder(c, orderId);
-        const payment = await findPaymentByOrder(c, orderId);
+        const order = await findOrder(d.pool, orderId);
+        const payment = await findPaymentByOrder(d.pool, orderId);
         return (
             (order?.state === "paid" || order?.state === "redeemed") &&
             payment?.txSignature === signature
