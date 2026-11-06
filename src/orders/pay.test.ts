@@ -778,6 +778,33 @@ describe("payOrder", () => {
         });
     });
 
+    it("throws on a second commit and writes nothing the second time", async () => {
+        let second: unknown;
+        const twice: Settler = {
+            feePayer: FEE_PAYER,
+            transactionVersions: [0],
+            async settle(attempt) {
+                const r = {
+                    messageHash: attempt.messageHash,
+                    signature: "signature-twice",
+                    blockhash: TEST_BLOCKHASH,
+                    lastValidBlockHeight: TEST_LVBH,
+                };
+                await attempt.commit(r);
+                attempt.committed = true;
+                second = await attempt
+                    .commit({ ...r, signature: "signature-twice-2" })
+                    .catch((e) => e);
+                throw new Error("stop");
+            },
+        };
+        await payOrder({ ...d, settler: twice }, order.id, p, sig());
+        expect(second).toEqual(new Error("attempt already committed"));
+        expect(await findPaymentByOrder(db.pool, order.id)).toMatchObject({
+            txSignature: "signature-twice",
+        });
+    });
+
     it("refuses with 503 and records nothing when the settler throws before the commit", async () => {
         const throwing: Settler = {
             feePayer: FEE_PAYER,

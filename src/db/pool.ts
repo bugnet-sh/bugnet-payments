@@ -10,17 +10,28 @@ export function createPool(url: string, log: Log = jsonLog("payments")): pg.Pool
     return pool;
 }
 
-export async function withTx<T>(pool: pg.Pool, fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
+export async function withTx<T>(
+    pool: pg.Pool,
+    fn: (c: pg.PoolClient) => Promise<T>,
+    log: Log = jsonLog("payments"),
+): Promise<T> {
     const client = await pool.connect();
+    let broken: Error | undefined;
     try {
         await client.query("begin");
         const result = await fn(client);
         await client.query("commit");
         return result;
     } catch (err) {
-        await client.query("rollback").catch(() => undefined);
+        try {
+            await client.query("rollback");
+        } catch (rollbackErr) {
+            // A connection that cannot roll back is in an unknown state and must not be reused
+            broken = rollbackErr instanceof Error ? rollbackErr : new Error(String(rollbackErr));
+            log.warn("rollback failed, destroying client", { err: rollbackErr });
+        }
         throw err;
     } finally {
-        client.release();
+        client.release(broken);
     }
 }

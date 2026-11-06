@@ -287,6 +287,7 @@ async function settle(
         committed: false,
         // The settling row must be durable before the settler broadcasts
         async commit(r) {
+            if (attempt.committed) throw new Error("attempt already committed");
             await insertPayment(c, {
                 orderId: order.id,
                 txSignature: r.signature,
