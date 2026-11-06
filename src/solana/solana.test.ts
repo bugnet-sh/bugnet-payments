@@ -43,6 +43,11 @@ describe("loadKeypair", () => {
         expect((err as Error).message).toMatch(/BUGNET_FEE_PAYER_KEY/);
         expect((err as Error).message).not.toMatch(/abc/);
     });
+    it("refuses a 32-byte value such as a pasted address", async () => {
+        await expect(
+            loadKeypair("Bhhc3XNdjtCNr3pj2aZwhCt8pHwsU8wRL7dqJNDZEExw", "BUGNET_FEE_PAYER_KEY"),
+        ).rejects.toThrow("BUGNET_FEE_PAYER_KEY: expected 64 bytes, got 32");
+    });
     it("refuses a 64-byte key whose public half is another key's", async () => {
         const a = await generateExportableKeypair();
         const b = await generateExportableKeypair();

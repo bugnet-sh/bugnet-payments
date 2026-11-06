@@ -25,11 +25,8 @@ export async function loadKeypair(secret: string, name: string): Promise<KeyPair
     } catch {
         throw new Error(`${name}: not a base58 string or JSON byte array`);
     }
-    if (bytes.length === 32) {
-        return createKeyPairSignerFromPrivateKeyBytes(bytes);
-    }
     if (bytes.length !== 64) {
-        throw new Error(`${name}: expected 32 or 64 bytes, got ${bytes.length}`);
+        throw new Error(`${name}: expected 64 bytes, got ${bytes.length}`);
     }
     const signer = await createKeyPairSignerFromPrivateKeyBytes(bytes.slice(0, 32));
     if (signer.address !== getBase58Decoder().decode(bytes.slice(32))) {
