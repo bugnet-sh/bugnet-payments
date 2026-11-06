@@ -28,6 +28,7 @@ export interface TestAppOptions {
     routerImpl?: Partial<ServiceImpl<typeof PaymentsService>>;
     checkPayer?: boolean;
     trustedProxies?: string[];
+    checkoutJsPath?: string;
 }
 
 export interface TestApp {
@@ -177,7 +178,7 @@ export async function testApp(over: TestAppOptions = {}): Promise<TestApp> {
             ),
             trustedProxies: settings.http.trusted_proxies,
             maxBodyBytes: settings.http.max_body_bytes,
-            checkoutJsPath: "dist/checkout.js",
+            checkoutJsPath: over.checkoutJsPath ?? "dist/checkout.js",
             log,
             now: appNow,
         }),

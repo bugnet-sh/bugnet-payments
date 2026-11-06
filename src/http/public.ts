@@ -1,6 +1,8 @@
-import type { IncomingMessage } from "node:http";
+import { readFile } from "node:fs/promises";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { encodePaymentResponseHeader } from "@x402/core/http";
 import type pg from "pg";
+import { CHECKOUT_CSP, renderCheckout, renderNotFound } from "../checkout/page.ts";
 import type { Log } from "../log.ts";
 import { isOrderId } from "../orders/ids.ts";
 import { type PayDeps, type PayOutcome, payOrder } from "../orders/pay.ts";
@@ -9,7 +11,12 @@ import type { OrderRow } from "../orders/types.ts";
 import type { RateLimiter } from "../ratelimit.ts";
 import type { BlockhashCache } from "../solana/blockhash.ts";
 import { SOLANA_MAINNET } from "../solana/constants.ts";
-import { type ChallengeContext, challengeFor, paymentRequiredHeaders } from "../x402/challenge.ts";
+import {
+    type ChallengeContext,
+    challengeFor,
+    paymentRequiredHeaders,
+    payUrlFor,
+} from "../x402/challenge.ts";
 import { parsePaymentHeader } from "../x402/decode.ts";
 import { type Handler, hangupSignal, requestPath, sendJson } from "./server.ts";
 
@@ -81,6 +88,52 @@ function paymentFrom(header: string): unknown {
     } catch {
         return { x402Version: 2 };
     }
+}
+
+function wantsHtml(req: IncomingMessage): boolean {
+    return /\btext\/html\b/i.test(req.headers.accept ?? "");
+}
+
+function sendHtml(res: ServerResponse, status: number, html: string): void {
+    res.writeHead(status, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Content-Length": String(Buffer.byteLength(html)),
+        "Content-Security-Policy": CHECKOUT_CSP,
+        "Cache-Control": "no-store",
+    });
+    res.end(html);
+}
+
+async function sendCheckout(
+    res: ServerResponse,
+    d: PublicDeps,
+    order: OrderRow | null,
+): Promise<void> {
+    if (order === null) {
+        sendHtml(res, 404, renderNotFound());
+        return;
+    }
+    const state = publicState(order, d.now());
+    const html = await renderCheckout({
+        orderId: order.id,
+        description: order.description,
+        amountMicros: order.amountMicros,
+        state,
+        pageUrl: payUrlFor(d.challenge.publicUrl, order.id),
+        origin: new URL(d.challenge.publicUrl).origin,
+    });
+    const closed = state === "expired" || state === "refunded" || state === "review";
+    sendHtml(res, closed ? 410 : 200, html);
+}
+
+async function sendScript(res: ServerResponse, file: string): Promise<void> {
+    const body = await readFile(file);
+    res.writeHead(200, {
+        "Content-Type": "text/javascript; charset=utf-8",
+        "Content-Length": String(body.length),
+        "Cache-Control": "no-store",
+    });
+    res.end(body);
 }
 
 function settlementHeaders(transaction: string, payer: string): Record<string, string> {
@@ -156,6 +209,11 @@ export function createPublicHandler(d: PublicDeps): Handler {
             );
             return;
         }
+        if (path === "/checkout.js") {
+            if (req.method === "GET") await sendScript(res, d.checkoutJsPath);
+            else sendJson(res, 405, { error: "method_not_allowed" });
+            return;
+        }
         if (route === null) {
             sendJson(res, 404, { error: "not_found" });
             return;
@@ -180,6 +238,10 @@ export function createPublicHandler(d: PublicDeps): Handler {
             return;
         }
         const order = isOrderId(id) ? await findOrder(d.pool, id) : null;
+        if (!isStatus && wantsHtml(req)) {
+            await sendCheckout(res, d, order);
+            return;
+        }
         if (order === null) {
             sendJson(res, 404, { error: "order_unknown" });
             return;
