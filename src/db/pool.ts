@@ -1,9 +1,13 @@
 import pg from "pg";
+import { jsonLog, type Log } from "../log.ts";
 
 export type Queryable = pg.Pool | pg.PoolClient;
 
-export function createPool(url: string): pg.Pool {
-    return new pg.Pool({ connectionString: url });
+export function createPool(url: string, log: Log = jsonLog("payments")): pg.Pool {
+    const pool = new pg.Pool({ connectionString: url });
+    // An idle client erroring (server restart, dropped connection) would otherwise crash the process.
+    pool.on("error", (err) => log.error("postgres idle client error", { err }));
+    return pool;
 }
 
 export async function withTx<T>(pool: pg.Pool, fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {

@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { testDb, type TestDb } from "../testing/db.ts";
+import { memoryLog } from "../log.ts";
 import { migrate } from "./migrate.ts";
+import { createPool } from "./pool.ts";
 
 let db: TestDb;
 beforeAll(async () => {
@@ -95,5 +97,16 @@ describe("schema", () => {
         const base = "ord_dddddddddddddddddddddddddd";
         expect(await codeOf(insertOrder(base, "start", null, "paid_twice"))).toBe("23514");
         expect(await codeOf(insertOrder(base, "extend", null))).toBe("23514");
+    });
+});
+
+describe("createPool", () => {
+    it("logs idle client errors instead of throwing", async () => {
+        const log = memoryLog();
+        const pool = createPool("postgres://localhost:5432/postgres?sslmode=disable", log);
+        expect(() => pool.emit("error", new Error("terminated"))).not.toThrow();
+        expect(log.lines).toHaveLength(1);
+        expect(log.lines[0]).toMatchObject({ level: "error", msg: "postgres idle client error" });
+        await pool.end();
     });
 });
