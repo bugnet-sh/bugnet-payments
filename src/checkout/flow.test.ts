@@ -270,6 +270,34 @@ describe("payWithWallet", () => {
         expect(calls).not.toContain("signTransaction");
     });
 
+    type Option = Record<string, unknown> & { extra: Record<string, unknown> };
+    it.each<[string, (o: Option) => void]>([
+        ["no payTo", (o) => delete o.payTo],
+        ["no amount", (o) => delete o.amount],
+        ["no asset", (o) => delete o.asset],
+        ["no network", (o) => delete o.network],
+        ["no feePayer", (o) => delete o.extra.feePayer],
+        ["a numeric payTo", (o) => (o.payTo = 1)],
+        ["a numeric amount", (o) => (o.amount = 10_000)],
+        ["a null asset", (o) => (o.asset = null)],
+        ["a numeric network", (o) => (o.network = 101)],
+        ["a feePayer list", (o) => (o.extra.feePayer = [o.extra.feePayer])],
+        ["a payTo that is not an address", (o) => (o.payTo = "not-an-address")],
+        ["a feePayer that is not an address", (o) => (o.extra.feePayer = "0x1234")],
+        ["a fractional amount", (o) => (o.amount = "0.01")],
+    ])("fails without signing when the hinted option has %s", async (_, change) => {
+        const option: Option = { ...accepts, extra: { ...accepts.extra } };
+        change(option);
+        const header = b64(JSON.stringify(challenge(option as unknown as PaymentRequirements)));
+        const { calls, w, f, sleep } = harness({
+            order: () => json(402, {}, { "PAYMENT-REQUIRED": header }),
+        });
+        await expect(payWithWallet({ fetch: f, wallet: w, orderUrl, sleep })).rejects.toThrow(
+            new Error("the order answered an unreadable payment challenge"),
+        );
+        expect(calls).not.toContain("signTransaction");
+    });
+
     it("answers a 5xx as unavailable with its Retry-After, never as a refusal", async () => {
         const rpcDown = harness({
             submit: () =>
@@ -313,6 +341,56 @@ describe("payWithWallet", () => {
             "signTransaction",
             "GET payment-signature",
         ]);
+    });
+
+    it.each(["too_many_attempts", "payer_busy", "payer_rate_limited", "too_many_requests"])(
+        "answers a 429 %s as unavailable with its Retry-After, never as a refusal",
+        async (reason) => {
+            const { w, f, sleep } = harness({
+                submit: () =>
+                    json(
+                        429,
+                        { refused: reason, orderId: id, retryAfterSeconds: 5 },
+                        { "Retry-After": "5" },
+                    ),
+            });
+            const result = await payWithWallet({ fetch: f, wallet: w, orderUrl, sleep });
+            expect(result).toEqual({ unavailable: reason, retryAfterSeconds: 5 });
+            expect(pageStep(result)).toEqual({
+                message: "busy, try again in 5 s",
+                payAfterMs: 5_000,
+            });
+        },
+    );
+
+    it("offers Pay at once after a 429 that asks for no wait", async () => {
+        const zero = harness({
+            submit: () =>
+                json(
+                    429,
+                    { refused: "payer_busy", orderId: id, retryAfterSeconds: 0 },
+                    { "Retry-After": "0" },
+                ),
+        });
+        const result = await payWithWallet({
+            fetch: zero.f,
+            wallet: zero.w,
+            orderUrl,
+            sleep: zero.sleep,
+        });
+        expect(result).toEqual({ unavailable: "payer_busy", retryAfterSeconds: 0 });
+        expect(pageStep(result)).toEqual({ message: "busy, try again now", payAfterMs: 0 });
+
+        const absent = harness({ order: () => json(429, { error: "too_many_requests" }) });
+        const refetched = await payWithWallet({
+            fetch: absent.f,
+            wallet: absent.w,
+            orderUrl,
+            sleep: absent.sleep,
+        });
+        expect(refetched).toEqual({ unavailable: "too_many_requests", retryAfterSeconds: 0 });
+        expect(pageStep(refetched)).toEqual({ message: "busy, try again now", payAfterMs: 0 });
+        expect(absent.calls).not.toContain("signTransaction");
     });
 
     it("refuses with the most specific reason a 4xx gives", async () => {
@@ -371,11 +449,84 @@ describe("payWithWallet", () => {
 describe("watchOrder", () => {
     const settling = () => json(200, { orderId: id, state: "settling" });
 
-    it("checks status every 2 s for at most 60 s, then answers the last state", async () => {
+    const unpaid = () => json(200, { orderId: id, state: "unpaid" });
+
+    it("checks status every 2 s for at most 120 s, then answers the last state", async () => {
         const { calls, sleeps, f, sleep } = harness();
         expect(await watchOrder({ fetch: f, orderUrl, sleep })).toBe("settling");
-        expect(sleeps).toEqual(new Array(30).fill(2000));
-        expect(calls).toEqual(new Array(30).fill("GET status"));
+        expect(sleeps).toEqual(new Array(60).fill(2000));
+        expect(calls).toEqual(new Array(60).fill("GET status"));
+    });
+
+    it("keeps watching an unconfirmed payment through unpaid until it settles", async () => {
+        const { sleeps, w, f, sleep } = harness({
+            submit: () => {
+                throw new TypeError("network error");
+            },
+            statuses: [unpaid, unpaid, settling, () => json(200, { orderId: id, state: "paid" })],
+        });
+        const step = pageStep(await payWithWallet({ fetch: f, wallet: w, orderUrl, sleep }));
+        expect(step.watch).toEqual({ unpaidForMs: 20_000 });
+        const state = await watchOrder({ fetch: f, orderUrl, sleep }, step.watch);
+        expect(state).toBe("paid");
+        expect(sleeps).toEqual([2000, 2000, 2000, 2000]);
+        expect(stateStep(state)).toEqual({ message: "paid", state: "paid" });
+    });
+
+    it("answers unpaid for an unconfirmed payment only after 20 s of unpaid", async () => {
+        const watch = pageStep("unconfirmed").watch;
+        const failing = () => json(503, { error: "too_busy" });
+        const { sleeps, f, sleep } = harness({
+            statuses: [
+                ...new Array<() => Response>(10).fill(unpaid),
+                failing,
+                ...new Array<() => Response>(10).fill(unpaid),
+            ],
+        });
+        expect(await watchOrder({ fetch: f, orderUrl, sleep }, watch)).toBe("unpaid");
+        expect(sleeps).toEqual(new Array(12).fill(2000));
+
+        const steady = harness({ statuses: new Array<() => Response>(20).fill(unpaid) });
+        expect(await watchOrder({ fetch: steady.f, orderUrl, sleep: steady.sleep }, watch)).toBe(
+            "unpaid",
+        );
+        expect(steady.sleeps).toEqual(new Array(11).fill(2000));
+    });
+
+    it("ends an unconfirmed watch at once on a state other than unpaid", async () => {
+        const watch = pageStep("unconfirmed").watch;
+        const expired = harness({
+            statuses: [unpaid, unpaid, () => json(200, { orderId: id, state: "expired" })],
+        });
+        expect(await watchOrder({ fetch: expired.f, orderUrl, sleep: expired.sleep }, watch)).toBe(
+            "expired",
+        );
+        expect(expired.sleeps).toHaveLength(3);
+
+        const fellBack = harness({ statuses: [unpaid, settling, unpaid] });
+        expect(
+            await watchOrder({ fetch: fellBack.f, orderUrl, sleep: fellBack.sleep }, watch),
+        ).toBe("unpaid");
+        expect(fellBack.sleeps).toHaveLength(3);
+    });
+
+    it("never answers unpaid for an unconfirmed payment that read unpaid under 20 s", async () => {
+        const failing = () => json(503, { error: "too_busy" });
+        const { sleeps, f, sleep } = harness({
+            statuses: [
+                ...new Array<() => Response>(55).fill(failing),
+                ...new Array<() => Response>(5).fill(unpaid),
+            ],
+        });
+        const watch = pageStep("unconfirmed").watch;
+        expect(await watchOrder({ fetch: f, orderUrl, sleep }, watch)).toBeUndefined();
+        expect(sleeps).toHaveLength(60);
+    });
+
+    it("answers unpaid at once when no unpaid wait is asked", async () => {
+        const { sleeps, f, sleep } = harness({ statuses: [unpaid] });
+        expect(await watchOrder({ fetch: f, orderUrl, sleep })).toBe("unpaid");
+        expect(sleeps).toEqual([2000]);
     });
 
     it("stops as soon as the order is paid or closed", async () => {
@@ -398,15 +549,15 @@ describe("watchOrder", () => {
         const failing = () => json(503, { error: "too_busy" });
         const unknown = () => json(200, { orderId: id, state: "weird" });
         const seen = harness({
-            statuses: [settling, ...new Array<() => Response>(29).fill(failing)],
+            statuses: [settling, ...new Array<() => Response>(59).fill(failing)],
         });
         expect(await watchOrder({ fetch: seen.f, orderUrl, sleep: seen.sleep })).toBe("settling");
 
         const never = harness({
-            statuses: [unknown, ...new Array<() => Response>(29).fill(failing)],
+            statuses: [unknown, ...new Array<() => Response>(59).fill(failing)],
         });
         expect(await watchOrder({ fetch: never.f, orderUrl, sleep: never.sleep })).toBeUndefined();
-        expect(never.sleeps).toHaveLength(30);
+        expect(never.sleeps).toHaveLength(60);
     });
 });
 
@@ -461,11 +612,11 @@ describe("pageStep", () => {
     it("checks the order's status when the result leaves it unknown", () => {
         expect(pageStep("unconfirmed")).toEqual({
             message: "could not confirm the payment; checking status…",
-            watch: true,
+            watch: { unpaidForMs: 20_000 },
         });
         expect(pageStep({ refused: "order_closed" })).toEqual({
             message: "this order is closed",
-            watch: true,
+            watch: {},
         });
     });
 
@@ -476,6 +627,10 @@ describe("pageStep", () => {
         });
         expect(pageStep({ unavailable: "http_502" })).toEqual({
             message: "busy, try again",
+            payAfterMs: 0,
+        });
+        expect(pageStep({ unavailable: "http_503", retryAfterSeconds: 0 })).toEqual({
+            message: "busy, try again now",
             payAfterMs: 0,
         });
     });

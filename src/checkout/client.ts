@@ -68,8 +68,8 @@ function element<T extends HTMLElement>(root: HTMLElement, selector: string): T 
 async function show(v: View, step: PageStep): Promise<number | undefined> {
     v.message.textContent = step.message;
     if (step.state !== undefined) v.stateLabel.textContent = STATE_LABELS[step.state];
-    if (!step.watch) return step.payAfterMs;
-    return show(v, stateStep(await watchOrder(v.status)));
+    if (step.watch === undefined) return step.payAfterMs;
+    return show(v, stateStep(await watchOrder(v.status, step.watch)));
 }
 
 function startPayment(root: HTMLElement, v: View): void {

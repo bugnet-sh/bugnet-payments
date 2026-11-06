@@ -1,4 +1,4 @@
-import { address, getBase64Decoder, getTransactionEncoder } from "@solana/kit";
+import { address, getBase64Decoder, getTransactionEncoder, isAddress } from "@solana/kit";
 import type { PaymentPayload, PaymentRequired } from "@x402/core/types";
 import { safeBase64Decode, safeBase64Encode } from "@x402/core/utils";
 import type { PublicState } from "../http/public.ts";
@@ -31,12 +31,17 @@ export interface PayFlowDeps extends StatusDeps {
     wallet: WalletPort;
 }
 
+export interface WatchOptions {
+    // Until the order is seen settling, unpaid counts only once it has lasted this long
+    unpaidForMs?: number;
+}
+
 // What the page shows after a result, and whether and when it offers Pay again
 export interface PageStep {
     message: string;
     state?: PublicState;
     payAfterMs?: number;
-    watch?: boolean;
+    watch?: WatchOptions;
 }
 
 export const STATE_LABELS: Record<PublicState, string> = {
@@ -49,8 +54,9 @@ export const STATE_LABELS: Record<PublicState, string> = {
 };
 
 const POLL_EVERY_MS = 2_000;
-const SETTLE_FOR_MS = 120_000;
-const WATCH_FOR_MS = 60_000;
+const WATCH_FOR_MS = 120_000;
+// The server reads unpaid until the settler's checks commit settling, a few seconds after submit
+const UNCONFIRMED_UNPAID_FOR_MS = 20_000;
 const SIMULATION_FAILED = "invalid_exact_svm_transaction_simulation_failed";
 const UNREADABLE_CHALLENGE = "the order answered an unreadable payment challenge";
 const JSON_ACCEPT = { Accept: "application/json" };
@@ -63,13 +69,28 @@ function isRecord(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+function isOption(a: unknown): boolean {
+    return (
+        isRecord(a) &&
+        typeof a.payTo === "string" &&
+        isAddress(a.payTo) &&
+        typeof a.amount === "string" &&
+        /^\d+$/.test(a.amount) &&
+        typeof a.asset === "string" &&
+        typeof a.network === "string" &&
+        isRecord(a.extra) &&
+        typeof a.extra.feePayer === "string" &&
+        isAddress(a.extra.feePayer)
+    );
+}
+
 function isChallenge(v: unknown): v is PaymentRequired {
     return (
         isRecord(v) &&
         isRecord(v.resource) &&
         typeof v.resource.url === "string" &&
         Array.isArray(v.accepts) &&
-        v.accepts.every((a) => isRecord(a) && isRecord(a.extra))
+        v.accepts.every(isOption)
     );
 }
 
@@ -95,7 +116,8 @@ async function reasonOf(res: Response): Promise<string> {
 }
 
 async function unavailable(res: Response): Promise<PayFlowResult> {
-    const retryAfter = res.headers.get("Retry-After")?.trim() ?? "";
+    // A 429 without a wait means its limit has already reset
+    const retryAfter = res.headers.get("Retry-After")?.trim() || (res.status === 429 ? "0" : "");
     const reason = await reasonOf(res);
     if (!/^\d+$/.test(retryAfter)) return { unavailable: reason };
     return { unavailable: reason, retryAfterSeconds: Number(retryAfter) };
@@ -119,20 +141,27 @@ async function currentState(d: StatusDeps): Promise<PublicState | undefined> {
 // Polls until the order leaves settling or time runs out, and answers the last state it saw
 export async function watchOrder(
     d: StatusDeps,
-    forMs: number = WATCH_FOR_MS,
+    opts: WatchOptions = {},
 ): Promise<PublicState | undefined> {
     const sleep = d.sleep ?? wait;
+    let unpaidForMs = opts.unpaidForMs ?? 0;
+    let unpaidSince: number | undefined;
     let state: PublicState | undefined;
-    for (let waited = 0; waited < forMs; waited += POLL_EVERY_MS) {
+    for (let waited = POLL_EVERY_MS; waited <= WATCH_FOR_MS; waited += POLL_EVERY_MS) {
         await sleep(POLL_EVERY_MS);
-        state = (await currentState(d)) ?? state;
-        if (state !== undefined && state !== "settling") return state;
+        const seen = await currentState(d);
+        if (seen === undefined) continue;
+        state = seen;
+        if (state === "settling") unpaidForMs = 0;
+        else if (state !== "unpaid") return state;
+        else if (waited - (unpaidSince ??= waited) >= unpaidForMs) return state;
     }
-    return state;
+    // Unpaid for less than asked is no answer yet
+    return state === "unpaid" ? undefined : state;
 }
 
 async function untilSettled(d: StatusDeps): Promise<PayFlowResult> {
-    const state = await watchOrder(d, SETTLE_FOR_MS);
+    const state = await watchOrder(d);
     if (state === "paid") return "paid";
     if (state === undefined || state === "settling") return "settling_timeout";
     return { refused: `order_${state}` };
@@ -141,7 +170,7 @@ async function untilSettled(d: StatusDeps): Promise<PayFlowResult> {
 async function outcome(d: StatusDeps, res: Response): Promise<PayFlowResult> {
     if (res.status === 200) return "paid";
     if (res.status === 202) return untilSettled(d);
-    if (res.status >= 500) return unavailable(res);
+    if (res.status === 429 || res.status >= 500) return unavailable(res);
     return { refused: await reasonOf(res) };
 }
 
@@ -213,11 +242,15 @@ export function pageStep(r: PayFlowResult): PageStep {
         case "network_busy":
             return { message: "network busy, try again", payAfterMs: 0 };
         case "unconfirmed":
-            return { message: "could not confirm the payment; checking status…", watch: true };
+            return {
+                message: "could not confirm the payment; checking status…",
+                watch: { unpaidForMs: UNCONFIRMED_UNPAID_FOR_MS },
+            };
     }
     if ("unavailable" in r) {
         const seconds = r.retryAfterSeconds;
         if (seconds === undefined) return { message: "busy, try again", payAfterMs: 0 };
+        if (seconds === 0) return { message: "busy, try again now", payAfterMs: 0 };
         return { message: `busy, try again in ${seconds} s`, payAfterMs: seconds * 1_000 };
     }
     switch (r.refused) {
@@ -235,7 +268,7 @@ export function pageStep(r: PayFlowResult): PageStep {
         case "order_review":
             return stateStep("review");
         case "order_closed":
-            return { message: "this order is closed", watch: true };
+            return { message: "this order is closed", watch: {} };
         case "order_unknown":
             return { message: "this order does not exist" };
         default:
