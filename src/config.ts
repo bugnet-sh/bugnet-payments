@@ -42,7 +42,20 @@ const settingsSchema = z
                     .refine(httpsOrLoopback, "must be https unless the host is loopback")
                     .default("https://pay.bugnet.sh"),
                 trusted_proxies: z
-                    .array(z.string().refine((s) => isIP(s) !== 0, "an IP address"))
+                    .array(
+                        z.string().transform((s, ctx) => {
+                            const ip = s.replace(/^::ffff:/i, "");
+                            if (isIP(ip) === 0) {
+                                ctx.issues.push({
+                                    code: "custom",
+                                    message: `${JSON.stringify(s)} is not an IP address`,
+                                    input: s,
+                                });
+                                return z.NEVER;
+                            }
+                            return ip;
+                        }),
+                    )
                     .default(["127.0.0.1", "::1"]),
                 max_body_bytes: count.default(65536),
             })

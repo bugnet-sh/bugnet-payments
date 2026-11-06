@@ -17,6 +17,7 @@ import { testSigner } from "../testing/keys.ts";
 import { seedOrder } from "../testing/orders.ts";
 import { signedPayment } from "../testing/payment.ts";
 import { requirementsFor } from "../x402/challenge.ts";
+import { parseSettings } from "../config.ts";
 import { clientIp, publicState } from "./public.ts";
 
 let app: TestApp;
@@ -43,6 +44,19 @@ function requirementsOf(o: OrderRow): PaymentRequirements {
 
 async function headerFor(o: OrderRow, who = app.payer): Promise<string> {
     return encodePaymentSignatureHeader(await signedPayment(requirementsOf(o), who));
+}
+
+let ipSeq = 0;
+
+// Each call gets its own client address behind the trusted proxy, so the per-IP limiters never
+// depend on test order
+function freshIp(): string {
+    ipSeq += 1;
+    return `10.200.${Math.floor(ipSeq / 250)}.${ipSeq % 250}`;
+}
+
+function pub(path: string, headers: Record<string, string> = {}): Promise<Response> {
+    return get(app, path, { "x-forwarded-for": freshIp(), ...headers });
 }
 
 beforeAll(async () => {
@@ -95,18 +109,36 @@ describe("clientIp", () => {
         expect(clientIp(fake("9.9.9.9", "1.2.3.4"), ["127.0.0.1"])).toBe("9.9.9.9");
         expect(clientIp(fake("127.0.0.1"), ["127.0.0.1"])).toBe("127.0.0.1");
     });
+
+    it("matches an IPv4-mapped trusted entry against the plain socket address", () => {
+        const { trusted_proxies } = parseSettings(
+            `[http]\ntrusted_proxies = ["::ffff:127.0.0.1"]\n[solana]\nrecipient = "${app.settings.solana.recipient}"\n`,
+            "t",
+        ).http;
+        expect(trusted_proxies).toEqual(["127.0.0.1"]);
+        expect(clientIp(fake("127.0.0.1", "1.2.3.4"), trusted_proxies)).toBe("1.2.3.4");
+    });
+
+    it("refuses an invalid trusted proxy entry at config load", () => {
+        expect(() =>
+            parseSettings(
+                `[http]\ntrusted_proxies = ["127.0.0.1", "proxy.local"]\n[solana]\nrecipient = "${app.settings.solana.recipient}"\n`,
+                "t",
+            ),
+        ).toThrow(/proxy\.local/);
+    });
 });
 
 describe("public order routes", () => {
     it("answers unknown 404 and expired 410 without RPC", async () => {
         const expired = await unpaid({ expiresAt: inFuture(-1_000) });
         const marked = await unpaid({ state: "expired" });
-        expect((await get(app, `/o/${newOrderId()}`)).status).toBe(404);
-        expect((await get(app, "/o/not-an-id")).status).toBe(404);
-        const r = await get(app, `/o/${expired.id}`);
+        expect((await pub(`/o/${newOrderId()}`)).status).toBe(404);
+        expect((await pub("/o/not-an-id")).status).toBe(404);
+        const r = await pub(`/o/${expired.id}`);
         expect(r.status).toBe(410);
         expect(await r.json()).toEqual({ error: "order_expired", orderId: expired.id });
-        expect((await get(app, `/o/${marked.id}`)).status).toBe(410);
+        expect((await pub(`/o/${marked.id}`)).status).toBe(410);
         expect(totalCalls(app.rpc)).toBe(0);
     });
 
@@ -117,7 +149,7 @@ describe("public order routes", () => {
             ["manual", "review"],
         ] as const) {
             const o = await unpaid({ state });
-            const r = await get(app, `/o/${o.id}`);
+            const r = await pub(`/o/${o.id}`);
             expect(r.status).toBe(410);
             expect(await r.json()).toEqual({ error: "order_closed", orderId: o.id, state: shown });
         }
@@ -125,7 +157,7 @@ describe("public order routes", () => {
     });
 
     it("challenges an unpaid order with the public URL", async () => {
-        const r = await get(app, `/o/${order.id}`, { accept: "application/json" });
+        const r = await pub(`/o/${order.id}`, { accept: "application/json" });
         expect(r.status).toBe(402);
         const pr = decodePaymentRequiredHeader(r.headers.get("payment-required")!);
         expect(pr.resource.url).toBe(`${app.settings.http.public_url}/o/${order.id}`);
@@ -137,18 +169,18 @@ describe("public order routes", () => {
     it("answers paid 200 and settling 202", async () => {
         for (const state of ["paid", "redeemed"] as const) {
             const o = await unpaid({ state });
-            const r = await get(app, `/o/${o.id}`);
+            const r = await pub(`/o/${o.id}`);
             expect(r.status).toBe(200);
             expect(await r.json()).toEqual({ paid: true, orderId: o.id });
         }
         const s = await unpaid({ state: "settling" });
-        const r = await get(app, `/o/${s.id}`);
+        const r = await pub(`/o/${s.id}`);
         expect(r.status).toBe(202);
         expect(await r.json()).toEqual({ state: "settling", orderId: s.id });
     });
 
     it("settles a payment and returns the settlement headers", async () => {
-        const r = await get(app, `/o/${order.id}`, {
+        const r = await pub(`/o/${order.id}`, {
             "payment-signature": await headerFor(order),
         });
         expect(r.status).toBe(200);
@@ -165,7 +197,7 @@ describe("public order routes", () => {
     it("accepts the X-PAYMENT header name and POST", async () => {
         const r = await fetch(`${app.publicOrigin}/o/${order.id}`, {
             method: "POST",
-            headers: { "x-payment": await headerFor(order) },
+            headers: { "x-payment": await headerFor(order), "x-forwarded-for": freshIp() },
             body: "ignored",
         });
         expect(r.status).toBe(200);
@@ -175,11 +207,11 @@ describe("public order routes", () => {
 
     it("repeats the settlement headers for the same payment and omits them for another", async () => {
         const h = await headerFor(order);
-        const first = await get(app, `/o/${order.id}`, { "payment-signature": h });
-        const again = await get(app, `/o/${order.id}`, { "payment-signature": h });
+        const first = await pub(`/o/${order.id}`, { "payment-signature": h });
+        const again = await pub(`/o/${order.id}`, { "payment-signature": h });
         expect(again.status).toBe(200);
         expect(again.headers.get("payment-response")).toBe(first.headers.get("payment-response"));
-        const other = await get(app, `/o/${order.id}`, {
+        const other = await pub(`/o/${order.id}`, {
             "payment-signature": await headerFor(order, await testSigner(4)),
         });
         expect(other.status).toBe(200);
@@ -188,7 +220,7 @@ describe("public order routes", () => {
     });
 
     it("takes the payment path when a payment comes with Accept: text/html", async () => {
-        const r = await get(app, `/o/${order.id}`, {
+        const r = await pub(`/o/${order.id}`, {
             accept: "text/html",
             "payment-signature": await headerFor(order),
         });
@@ -199,8 +231,8 @@ describe("public order routes", () => {
 
     it("broadcasts once for two concurrent payments to /o/{id}", async () => {
         const [a, b] = await Promise.all([
-            get(app, `/o/${order.id}`, { "payment-signature": await headerFor(order) }),
-            get(app, `/o/${order.id}`, {
+            pub(`/o/${order.id}`, { "payment-signature": await headerFor(order) }),
+            pub(`/o/${order.id}`, {
                 "payment-signature": await headerFor(order, await testSigner(4)),
             }),
         ]);
@@ -214,7 +246,7 @@ describe("public order routes", () => {
         const created = (await post(app, "/v1/orders", create())).body;
         const stranger = await testSigner(4);
         const p = await signedPayment(withHints(created.paymentRequired.accepts[0]), stranger);
-        const paid = await get(app, `/o/${created.orderId}`, {
+        const paid = await pub(`/o/${created.orderId}`, {
             "payment-signature": encodePaymentSignatureHeader(p),
         });
         expect(paid.status).toBe(200);
@@ -225,20 +257,88 @@ describe("public order routes", () => {
         );
     });
 
+    it("answers 202 with the settling body for a payment on a settling order", async () => {
+        const o = await unpaid({ state: "settling" });
+        const r = await pub(`/o/${o.id}`, { "payment-signature": await headerFor(o) });
+        expect(r.status).toBe(202);
+        expect(await r.json()).toEqual({ state: "settling", orderId: o.id });
+    });
+
+    it("defaults Retry-After to 5 on a 503 refusal without retryAfterSeconds", async () => {
+        const down = await testApp({
+            checkPayer: true,
+            routerImpl: {
+                checkPayer: () => {
+                    throw new Error("router down");
+                },
+            },
+        });
+        try {
+            const o = (await seedOrder(down.pool, { expiresAt: inFuture(15 * 60_000) })).order;
+            const h = encodePaymentSignatureHeader(
+                await signedPayment(requirementsOf(o), down.payer),
+            );
+            const r = await get(down, `/o/${o.id}`, { "payment-signature": h });
+            expect(r.status).toBe(503);
+            expect(r.headers.get("retry-after")).toBe("5");
+        } finally {
+            await down.close();
+        }
+    });
+
+    it("prefers PAYMENT-SIGNATURE over X-PAYMENT when both are sent", async () => {
+        const good = await headerFor(order);
+        const r = await pub(`/o/${order.id}`, {
+            "payment-signature": good,
+            "x-payment": "%%% not base64 json",
+        });
+        expect(r.status).toBe(200);
+        expect(await r.json()).toEqual({ paid: true, orderId: order.id });
+    });
+
+    it("limits status polling to 240 a minute per client IP", async () => {
+        const ip = freshIp();
+        const poll = () => get(app, `/o/${order.id}/status`, { "x-forwarded-for": ip });
+        for (let i = 0; i < 240; i++) expect((await poll()).status).toBe(200);
+        expect((await poll()).status).toBe(429);
+    });
+
+    it("answers 413 with Connection: close for a body over the limit", async () => {
+        const r = await fetch(`${app.publicOrigin}/o/${order.id}`, {
+            method: "POST",
+            headers: { "x-forwarded-for": freshIp() },
+            body: "x".repeat(app.settings.http.max_body_bytes + 1),
+        });
+        expect(r.status).toBe(413);
+        expect(await r.json()).toEqual({ error: "body_too_large" });
+    });
+
+    it("answers a malformed id on the payment path with the refusal shape", async () => {
+        const r = await pub("/o/not-an-id", { "payment-signature": await headerFor(order) });
+        expect(r.status).toBe(404);
+        expect(await r.json()).toEqual({ refused: "order_unknown" });
+        const plain = await pub("/o/not-an-id");
+        expect(await plain.json()).toEqual({ error: "order_unknown" });
+    });
+
+    it("answers an undecodable payment header 400 payment_malformed", async () => {
+        const r = await pub(`/o/${order.id}`, { "payment-signature": "%%% not base64 json" });
+        expect(r.status).toBe(400);
+        expect(await r.json()).toEqual({ refused: "payment_malformed", orderId: order.id });
+    });
+
     it("answers healthz without counting it against the per-IP limit", async () => {
         for (let i = 0; i < 70; i++) {
-            const r = await get(app, "/healthz", { "x-forwarded-for": "10.1.1.1" });
+            const r = await pub("/healthz", { "x-forwarded-for": "10.1.1.1" });
             expect(r.status).toBe(200);
             expect(await r.json()).toEqual({ ok: true });
         }
-        expect((await get(app, "/o/not-an-id", { "x-forwarded-for": "10.1.1.1" })).status).toBe(
-            404,
-        );
+        expect((await pub("/o/not-an-id", { "x-forwarded-for": "10.1.1.1" })).status).toBe(404);
     });
 
     it("never limits checkout status polling at 100 calls a minute from one IP", async () => {
         for (let i = 0; i < 100; i++) {
-            const r = await get(app, `/o/${order.id}/status`, { "x-forwarded-for": "10.2.2.2" });
+            const r = await pub(`/o/${order.id}/status`, { "x-forwarded-for": "10.2.2.2" });
             expect(r.status).toBe(200);
         }
     });
@@ -253,7 +353,7 @@ describe("public order routes", () => {
             [newOrderId(), await headerFor(order), 404, "order_unknown"],
         ];
         for (const [id, h, status, refused] of cases) {
-            const r = await get(app, `/o/${id}`, { "payment-signature": h });
+            const r = await pub(`/o/${id}`, { "payment-signature": h });
             expect(r.status).toBe(status);
             expect(await r.json()).toMatchObject({ refused, orderId: id });
         }
@@ -268,17 +368,9 @@ describe("public order routes", () => {
             },
         });
         try {
-            const o = (
-                await seedOrder(blocked.pool, { expiresAt: new Date("2030-01-01T00:15:00Z") })
-            ).order;
-            const ctx = {
-                publicUrl: blocked.settings.http.public_url,
-                recipient: blocked.settings.solana.recipient,
-                feePayer: blocked.feePayer.address,
-                transactionVersions: blocked.settings.solana.transaction_versions,
-            };
+            const o = (await seedOrder(blocked.pool, { expiresAt: inFuture(15 * 60_000) })).order;
             const h = encodePaymentSignatureHeader(
-                await signedPayment(withHints(requirementsFor(o, ctx)), blocked.payer),
+                await signedPayment(requirementsOf(o), blocked.payer),
             );
             for (let i = 0; i < 5; i++) {
                 const r = await get(blocked, `/o/${o.id}`, {
@@ -299,7 +391,7 @@ describe("public order routes", () => {
     });
 
     it("serves a status without RPC", async () => {
-        const r = await get(app, `/o/${order.id}/status`);
+        const r = await pub(`/o/${order.id}/status`);
         expect(r.status).toBe(200);
         expect(await r.json()).toEqual({
             orderId: order.id,
@@ -308,14 +400,14 @@ describe("public order routes", () => {
         });
         const lapsed = await unpaid({ expiresAt: inFuture(-1_000) });
         expect(
-            ((await (await get(app, `/o/${lapsed.id}/status`)).json()) as { state: string }).state,
+            ((await (await pub(`/o/${lapsed.id}/status`)).json()) as { state: string }).state,
         ).toBe("expired");
-        expect((await get(app, `/o/${newOrderId()}/status`)).status).toBe(404);
+        expect((await pub(`/o/${newOrderId()}/status`)).status).toBe(404);
         expect(totalCalls(app.rpc)).toBe(0);
     });
 
     it("limits requests per client IP, trusting X-Forwarded-For only from proxies", async () => {
-        const probe = (ip: string) => get(app, `/o/${newOrderId()}`, { "x-forwarded-for": ip });
+        const probe = (ip: string) => pub(`/o/${newOrderId()}`, { "x-forwarded-for": ip });
         for (let i = 0; i < 60; i++) expect((await probe("10.4.4.4")).status).toBe(404);
         const limited = await probe("10.4.4.4");
         expect(limited.status).toBe(429);
@@ -339,17 +431,17 @@ describe("public order routes", () => {
     });
 
     it("answers unknown paths 404 and wrong methods 405", async () => {
-        expect((await get(app, "/nope", { "x-forwarded-for": "10.7.7.7" })).status).toBe(404);
+        expect((await pub("/nope", { "x-forwarded-for": "10.7.7.7" })).status).toBe(404);
         const r = await fetch(`${app.publicOrigin}/o/${order.id}/status`, {
             method: "POST",
-            headers: { "x-forwarded-for": "10.7.7.7" },
+            headers: { "x-forwarded-for": freshIp() },
         });
         expect(r.status).toBe(405);
     });
 
     it("never logs a payment header", async () => {
         const h = await headerFor(order);
-        await get(app, `/o/${order.id}`, { "payment-signature": h });
+        await pub(`/o/${order.id}`, { "payment-signature": h });
         expect(app.log.lines.length).toBeGreaterThan(0);
         expect(JSON.stringify(app.log.lines)).not.toContain(h.slice(0, 40));
     });

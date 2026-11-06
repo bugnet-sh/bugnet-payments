@@ -17,8 +17,8 @@ import {
     paymentRequiredHeaders,
     payUrlFor,
 } from "../x402/challenge.ts";
-import { parsePaymentHeader } from "../x402/decode.ts";
-import { type Handler, hangupSignal, requestPath, sendJson } from "./server.ts";
+import { PaymentRefusal, parsePaymentHeader } from "../x402/decode.ts";
+import { type Handler, hangupSignal, readBody, requestPath, sendJson } from "./server.ts";
 
 export type PublicState = "unpaid" | "settling" | "paid" | "expired" | "refunded" | "review";
 
@@ -57,6 +57,10 @@ export function publicState(o: OrderRow, now: Date): PublicState {
     }
 }
 
+function closedStatus(state: PublicState): 410 | undefined {
+    return state === "expired" || state === "refunded" || state === "review" ? 410 : undefined;
+}
+
 function unmapped(address: string | undefined): string {
     return (address ?? "").replace(/^::ffff:/i, "");
 }
@@ -78,16 +82,6 @@ function paymentHeader(req: IncomingMessage): string | undefined {
         if (typeof v === "string" && v !== "") return v;
     }
     return undefined;
-}
-
-// A header that does not decode still takes the payment path: it must come back as a refusal,
-// never as a fresh 402. An object with no payload decodes to payment_malformed there.
-function paymentFrom(header: string): unknown {
-    try {
-        return parsePaymentHeader(header);
-    } catch {
-        return { x402Version: 2 };
-    }
 }
 
 function wantsHtml(req: IncomingMessage): boolean {
@@ -122,8 +116,7 @@ async function sendCheckout(
         pageUrl: payUrlFor(d.challenge.publicUrl, order.id),
         origin: new URL(d.challenge.publicUrl).origin,
     });
-    const closed = state === "expired" || state === "refunded" || state === "review";
-    sendHtml(res, closed ? 410 : 200, html);
+    sendHtml(res, closedStatus(state) ?? 200, html);
 }
 
 async function sendScript(res: ServerResponse, file: string): Promise<void> {
@@ -146,7 +139,7 @@ function settlementHeaders(transaction: string, payer: string): Record<string, s
     return { "PAYMENT-RESPONSE": value, "X-PAYMENT-RESPONSE": value };
 }
 
-function sendOutcome(res: Parameters<Handler>[1], out: PayOutcome): void {
+function sendOutcome(res: ServerResponse, out: PayOutcome): void {
     switch (out.kind) {
         case "paid":
             sendJson(
@@ -161,7 +154,9 @@ function sendOutcome(res: Parameters<Handler>[1], out: PayOutcome): void {
                 res,
                 200,
                 { paid: true, orderId: out.orderId },
-                out.samePayment ? settlementHeaders(out.signature!, out.payer!) : {},
+                out.samePayment && out.signature !== undefined && out.payer !== undefined
+                    ? settlementHeaders(out.signature, out.payer)
+                    : {},
             );
             return;
         case "settling":
@@ -190,6 +185,8 @@ function sendOutcome(res: Parameters<Handler>[1], out: PayOutcome): void {
 
 export function createPublicHandler(d: PublicDeps): Handler {
     return async (req, res) => {
+        // No public route takes a body; reading it under the cap also ends the request cleanly
+        await readBody(req, d.maxBodyBytes);
         const path = requestPath(req.url);
         if (req.method === "GET" && path === "/healthz") {
             sendJson(res, 200, { ok: true });
@@ -225,16 +222,22 @@ export function createPublicHandler(d: PublicDeps): Handler {
             sendJson(res, 405, { error: "method_not_allowed" });
             return;
         }
-        // Bodies are never used, and an unread one would hold the connection open
-        req.resume();
         const id = route[1]!;
         const header = isStatus ? undefined : paymentHeader(req);
         if (header !== undefined) {
             if (!isOrderId(id)) {
-                sendJson(res, 404, { error: "order_unknown" });
+                sendJson(res, 404, { refused: "order_unknown" });
                 return;
             }
-            sendOutcome(res, await payOrder(d.pay, id, paymentFrom(header), hangupSignal(res)));
+            let payment: unknown;
+            try {
+                payment = parsePaymentHeader(header);
+            } catch (err) {
+                if (!(err instanceof PaymentRefusal)) throw err;
+                sendJson(res, 400, { refused: err.reason, orderId: id });
+                return;
+            }
+            sendOutcome(res, await payOrder(d.pay, id, payment, hangupSignal(res)));
             return;
         }
         const order = isOrderId(id) ? await findOrder(d.pool, id) : null;
@@ -255,14 +258,17 @@ export function createPublicHandler(d: PublicDeps): Handler {
             });
             return;
         }
+        if (closedStatus(state) !== undefined) {
+            sendJson(
+                res,
+                410,
+                state === "expired"
+                    ? { error: "order_expired", orderId: order.id }
+                    : { error: "order_closed", orderId: order.id, state },
+            );
+            return;
+        }
         switch (state) {
-            case "expired":
-                sendJson(res, 410, { error: "order_expired", orderId: order.id });
-                return;
-            case "refunded":
-            case "review":
-                sendJson(res, 410, { error: "order_closed", orderId: order.id, state });
-                return;
             case "paid":
                 sendJson(res, 200, { paid: true, orderId: order.id });
                 return;
