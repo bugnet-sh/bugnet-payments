@@ -26,7 +26,7 @@ export interface RefundRow {
     confirmedAt: Date | null;
 }
 
-interface RefundDbRow extends pg.QueryResultRow {
+export interface RefundDbRow extends pg.QueryResultRow {
     id: string | number;
     order_id: string;
     kind: RefundRow["kind"];
@@ -47,7 +47,7 @@ interface RefundDbRow extends pg.QueryResultRow {
     confirmed_at: Date | null;
 }
 
-function toRefund(r: RefundDbRow): RefundRow {
+export function toRefund(r: RefundDbRow): RefundRow {
     return {
         id: Number(r.id),
         orderId: r.order_id,
