@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { isIP } from "node:net";
 import { encodePaymentResponseHeader } from "@x402/core/http";
 import type pg from "pg";
 import { CHECKOUT_CSP, renderCheckout, renderNotFound } from "../checkout/page.ts";
@@ -7,7 +8,7 @@ import type { Log } from "../log.ts";
 import { isOrderId } from "../orders/ids.ts";
 import { type PayDeps, type PayOutcome, payOrder } from "../orders/pay.ts";
 import { findOrder } from "../orders/store.ts";
-import type { OrderRow } from "../orders/types.ts";
+import type { OrderRow, OrderState } from "../orders/types.ts";
 import type { RateLimiter } from "../ratelimit.ts";
 import type { BlockhashCache } from "../solana/blockhash.ts";
 import { SOLANA_MAINNET } from "../solana/constants.ts";
@@ -18,7 +19,14 @@ import {
     payUrlFor,
 } from "../x402/challenge.ts";
 import { PaymentRefusal, parsePaymentHeader } from "../x402/decode.ts";
-import { type Handler, hangupSignal, readBody, requestPath, sendJson } from "./server.ts";
+import {
+    BodyTooLarge,
+    type Handler,
+    drainBody,
+    hangupSignal,
+    requestPath,
+    sendJson,
+} from "./server.ts";
 
 export type PublicState = "unpaid" | "settling" | "paid" | "expired" | "refunded" | "review";
 
@@ -38,8 +46,13 @@ export interface PublicDeps {
 
 const ORDER_PATH = /^\/o\/([^/]+)(\/status)?$/;
 
+function unreachable(state: never): never {
+    throw new Error(`unhandled order state ${String(state)}`);
+}
+
 export function publicState(o: OrderRow, now: Date): PublicState {
-    switch (o.state) {
+    const state: OrderState = o.state;
+    switch (state) {
         case "unpaid":
             return now.getTime() >= o.expiresAt.getTime() ? "expired" : "unpaid";
         case "settling":
@@ -54,6 +67,8 @@ export function publicState(o: OrderRow, now: Date): PublicState {
             return "refunded";
         case "manual":
             return "review";
+        default:
+            return unreachable(state);
     }
 }
 
@@ -67,13 +82,18 @@ function closedAnswer(
         case "refunded":
         case "review":
             return { status: 410, body: { error: "order_closed", orderId: order.id, state } };
-        default:
+        case "unpaid":
+        case "settling":
+        case "paid":
             return undefined;
+        default:
+            return unreachable(state);
     }
 }
 
 function unmapped(address: string | undefined): string {
-    return (address ?? "").replace(/^::ffff:/i, "");
+    const rest = (address ?? "").replace(/^::ffff:/i, "");
+    return isIP(rest) === 4 ? rest : (address ?? "");
 }
 
 export function clientIp(req: IncomingMessage, trusted: readonly string[]): string {
@@ -194,8 +214,6 @@ function sendOutcome(res: ServerResponse, out: PayOutcome): void {
 
 export function createPublicHandler(d: PublicDeps): Handler {
     return async (req, res) => {
-        // No public route takes a body; reading it under the cap also ends the request cleanly
-        await readBody(req, d.maxBodyBytes);
         const path = requestPath(req.url);
         if (req.method === "GET" && path === "/healthz") {
             sendJson(res, 200, { ok: true });
@@ -203,21 +221,30 @@ export function createPublicHandler(d: PublicDeps): Handler {
         }
         const route = ORDER_PATH.exec(path);
         const isStatus = route?.[2] !== undefined;
+        const header = route === null || isStatus ? undefined : paymentHeader(req);
+        const refuse = (status: number, reason: string, headers: Record<string, string> = {}) =>
+            sendJson(res, status, header === undefined ? { error: reason } : { refused: reason }, {
+                ...headers,
+            });
         const limit = (isStatus ? d.statusPerIp : d.perIp).take(clientIp(req, d.trustedProxies));
+        // No public route takes a body; it is counted against the cap and discarded
+        try {
+            if (!(await drainBody(req, d.maxBodyBytes))) {
+                d.log.info("client hung up mid-body", { path });
+                return;
+            }
+        } catch (err) {
+            if (!(err instanceof BodyTooLarge)) throw err;
+            refuse(413, "body_too_large", { Connection: "close" });
+            return;
+        }
         if (!limit.ok) {
-            sendJson(
-                res,
-                429,
-                { error: "too_many_requests" },
-                {
-                    "Retry-After": String(limit.retryAfterSeconds),
-                },
-            );
+            refuse(429, "too_many_requests", { "Retry-After": String(limit.retryAfterSeconds) });
             return;
         }
         if (path === "/checkout.js") {
             if (req.method === "GET") await sendScript(res, d.checkoutJsPath);
-            else sendJson(res, 405, { error: "method_not_allowed" });
+            else refuse(405, "method_not_allowed");
             return;
         }
         if (route === null) {
@@ -228,11 +255,10 @@ export function createPublicHandler(d: PublicDeps): Handler {
             ? req.method === "GET"
             : req.method === "GET" || req.method === "POST";
         if (!allowed) {
-            sendJson(res, 405, { error: "method_not_allowed" });
+            refuse(405, "method_not_allowed");
             return;
         }
         const id = route[1] ?? "";
-        const header = isStatus ? undefined : paymentHeader(req);
         if (header !== undefined) {
             if (!isOrderId(id)) {
                 sendJson(res, 404, { refused: "order_unknown" });
@@ -284,6 +310,14 @@ export function createPublicHandler(d: PublicDeps): Handler {
                 sendJson(res, 402, pr, paymentRequiredHeaders(pr));
                 return;
             }
+            case "expired":
+            case "refunded":
+            case "review":
+                break;
+            default:
+                unreachable(state);
         }
+        d.log.error("order state left without an answer", { orderId: order.id, state });
+        sendJson(res, 500, { error: "internal" });
     };
 }

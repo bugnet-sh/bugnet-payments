@@ -124,6 +124,35 @@ export function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer
     });
 }
 
+// Counts the body without buffering it; false means the client hung up before the body ended
+export function drainBody(req: IncomingMessage, maxBytes: number): Promise<boolean> {
+    return new Promise((resolve, reject) => {
+        if (Number(req.headers["content-length"]) > maxBytes) {
+            req.resume();
+            reject(new BodyTooLarge());
+            return;
+        }
+        let size = 0;
+        let settled = false;
+        const finish = (done: () => void) => {
+            if (settled) return;
+            settled = true;
+            done();
+        };
+        req.on("data", (chunk: Buffer) => {
+            size += chunk.length;
+            if (size > maxBytes) {
+                // Stop reading: with Connection: close the socket ends once the 413 is flushed
+                req.pause();
+                finish(() => reject(new BodyTooLarge()));
+            }
+        });
+        req.on("end", () => finish(() => resolve(true)));
+        req.on("error", () => finish(() => resolve(false)));
+        req.on("close", () => finish(() => resolve(false)));
+    });
+}
+
 export function sendJson(
     res: ServerResponse,
     status: number,

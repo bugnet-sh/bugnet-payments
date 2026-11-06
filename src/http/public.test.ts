@@ -1,4 +1,5 @@
 import type { IncomingMessage } from "node:http";
+import { connect } from "node:net";
 import { create as protoCreate } from "@bufbuild/protobuf";
 import {
     decodePaymentRequiredHeader,
@@ -6,7 +7,7 @@ import {
     encodePaymentSignatureHeader,
 } from "@x402/core/http";
 import type { PaymentRequirements } from "@x402/core/types";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseSettings } from "../config.ts";
 import { CheckPayerResponseSchema, PayerVerdict } from "../gen/bugnet/router/v1/payments_pb.ts";
 import { newOrderId } from "../orders/ids.ts";
@@ -117,6 +118,20 @@ describe("clientIp", () => {
         ).http;
         expect(trusted_proxies).toEqual(["127.0.0.1"]);
         expect(clientIp(fake("127.0.0.1", "1.2.3.4"), trusted_proxies)).toBe("1.2.3.4");
+    });
+
+    it("keeps a valid IPv6 trusted entry that merely starts with ::ffff:", () => {
+        const { trusted_proxies } = parseSettings(
+            `[http]\ntrusted_proxies = ["::ffff:7f00:1"]\n[solana]\nrecipient = "${app.settings.solana.recipient}"\n`,
+            "t",
+        ).http;
+        expect(trusted_proxies).toEqual(["::ffff:7f00:1"]);
+    });
+
+    it("puts a mapped and a plain forwarded address in one bucket", () => {
+        const trusted = ["127.0.0.1"];
+        expect(clientIp(fake("127.0.0.1", "::ffff:1.2.3.4"), trusted)).toBe("1.2.3.4");
+        expect(clientIp(fake("127.0.0.1", "1.2.3.4"), trusted)).toBe("1.2.3.4");
     });
 
     it("refuses an invalid trusted proxy entry at config load", () => {
@@ -327,7 +342,70 @@ describe("public order routes", () => {
             body: "x".repeat(app.settings.http.max_body_bytes + 1),
         });
         expect(r.status).toBe(413);
+        expect(r.headers.get("connection")).toBe("close");
         expect(await r.json()).toEqual({ error: "body_too_large" });
+    });
+
+    it("counts a request with an oversized body on the per-IP limiter", async () => {
+        const ip = freshIp();
+        const big = await fetch(`${app.publicOrigin}/o/${order.id}`, {
+            method: "POST",
+            headers: { "x-forwarded-for": ip },
+            body: "x".repeat(app.settings.http.max_body_bytes + 1),
+        });
+        expect(big.status).toBe(413);
+        const limit = app.settings.limits.public_per_ip_per_minute;
+        for (let i = 0; i < limit - 1; i++) {
+            expect((await get(app, `/o/${order.id}`, { "x-forwarded-for": ip })).status).toBe(402);
+        }
+        expect((await get(app, `/o/${order.id}`, { "x-forwarded-for": ip })).status).toBe(429);
+    });
+
+    it("ends quietly when the client hangs up mid-body", async () => {
+        const port = new URL(app.publicOrigin).port;
+        const sock = connect(Number(port), "127.0.0.1");
+        await new Promise((resolve) => sock.once("connect", resolve));
+        sock.write(
+            `POST /o/${order.id} HTTP/1.1\r\nHost: x\r\nx-forwarded-for: ${freshIp()}\r\n` +
+                "Content-Length: 100\r\n\r\nabc",
+        );
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        sock.destroy();
+        await vi.waitFor(() => {
+            expect(app.log.lines.some((l) => l["msg"] === "client hung up mid-body")).toBe(true);
+        });
+        expect(app.log.lines.filter((l) => l["level"] === "error")).toEqual([]);
+    });
+
+    it("answers the refusal shape for 413, 405 and 429 on the payment path", async () => {
+        const h = await headerFor(order);
+        const big = await fetch(`${app.publicOrigin}/o/${order.id}`, {
+            method: "POST",
+            headers: { "x-forwarded-for": freshIp(), "payment-signature": h },
+            body: "x".repeat(app.settings.http.max_body_bytes + 1),
+        });
+        expect(big.status).toBe(413);
+        expect(await big.json()).toEqual({ refused: "body_too_large" });
+
+        const put = await fetch(`${app.publicOrigin}/o/${order.id}`, {
+            method: "PUT",
+            headers: { "x-forwarded-for": freshIp(), "payment-signature": h },
+        });
+        expect(put.status).toBe(405);
+        expect(await put.json()).toEqual({ refused: "method_not_allowed" });
+
+        const ip = freshIp();
+        const limit = app.settings.limits.public_per_ip_per_minute;
+        for (let i = 0; i < limit; i++) {
+            await get(app, "/o/not-an-id", { "x-forwarded-for": ip, "payment-signature": h });
+        }
+        const limited = await get(app, "/o/not-an-id", {
+            "x-forwarded-for": ip,
+            "payment-signature": h,
+        });
+        expect(limited.status).toBe(429);
+        expect(limited.headers.get("retry-after")).toMatch(/^\d+$/);
+        expect(await limited.json()).toEqual({ refused: "too_many_requests" });
     });
 
     it("answers a malformed id on the payment path with the refusal shape", async () => {

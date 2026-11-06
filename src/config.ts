@@ -44,7 +44,8 @@ const settingsSchema = z
                 trusted_proxies: z
                     .array(
                         z.string().transform((s, ctx) => {
-                            const ip = s.replace(/^::ffff:/i, "");
+                            const rest = s.replace(/^::ffff:/i, "");
+                            const ip = isIP(rest) === 4 ? rest : s;
                             if (isIP(ip) === 0) {
                                 ctx.issues.push({
                                     code: "custom",
