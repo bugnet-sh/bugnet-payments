@@ -123,11 +123,47 @@ describe("flags", () => {
         expect(await c.getOrder("ord_a", signal())).toEqual({ kind: "disabled" });
         expect(r.headers).toHaveLength(0);
     });
+});
 
-    it("answers disabled for getOrder even when its flag is on, as the router has no GetOrder", async () => {
-        const r = await router({});
+describe("getOrder", () => {
+    it.each([
+        [{ redeemed: false }, { kind: "absent" }],
+        [
+            { redeemed: true, kind: "start", placementState: "ready", refundable: false },
+            { kind: "found", orderKind: "start", placementState: "ready", refundable: false },
+        ],
+        [
+            { redeemed: true, kind: "extend", placementState: "terminated", refundable: true },
+            { kind: "found", orderKind: "extend", placementState: "terminated", refundable: true },
+        ],
+    ])("maps %o", async (answer, want) => {
+        let seen = "";
+        const r = await router({
+            getOrder: (m) => {
+                seen = m.orderId;
+                return answer;
+            },
+        });
         const c = createRouterClient(opts(r.url, { getOrder: true }));
-        expect(await c.getOrder("ord_a", signal())).toEqual({ kind: "disabled" });
-        expect(r.headers).toHaveLength(0);
+        expect(await c.getOrder("ord_a", signal())).toEqual(want);
+        expect(seen).toBe("ord_a");
+        expect(r.headers[0]!.get("authorization")).toBe("Bearer rt");
+    });
+
+    it("answers unavailable on an error, a dead router and an abort", async () => {
+        const failing = await router({
+            getOrder: () => {
+                throw new ConnectError("boom", Code.Internal);
+            },
+        });
+        const c = createRouterClient(opts(failing.url, { getOrder: true }));
+        expect(await c.getOrder("ord_a", signal())).toEqual({ kind: "unavailable" });
+        expect(await c.getOrder("ord_a", AbortSignal.abort())).toEqual({ kind: "unavailable" });
+
+        const dead = await router({});
+        const deadUrl = dead.url;
+        await dead.close();
+        const d = createRouterClient(opts(deadUrl, { getOrder: true }));
+        expect(await d.getOrder("ord_a", signal())).toEqual({ kind: "unavailable" });
     });
 });

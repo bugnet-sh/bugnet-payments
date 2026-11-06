@@ -14,7 +14,7 @@ export type PayerCheck =
     | { verdict: "unavailable" };
 
 export type RouterOrder =
-    | { kind: "found"; placementId: string; state: string }
+    | { kind: "found"; orderKind: string; placementState: string; refundable: boolean }
     | { kind: "absent" }
     | { kind: "disabled" }
     | { kind: "unavailable" };
@@ -91,9 +91,21 @@ export function createRouterClient(o: RouterClientOptions): RouterClient {
             }
         },
 
-        // The router's proto has no GetOrder rpc, so the flag cannot turn anything on
-        async getOrder() {
-            return { kind: "disabled" };
+        async getOrder(orderId, signal) {
+            if (!o.getOrder) return { kind: "disabled" };
+            try {
+                const res = await client.getOrder({ orderId }, { signal });
+                if (!res.redeemed) return { kind: "absent" };
+                return {
+                    kind: "found",
+                    orderKind: res.kind,
+                    placementState: res.placementState,
+                    refundable: res.refundable,
+                };
+            } catch (err) {
+                o.log.warn("router get_order failed", { error: ConnectError.from(err).message });
+                return { kind: "unavailable" };
+            }
         },
     };
 }
