@@ -43,7 +43,7 @@ import { LIGHTHOUSE_PROGRAM, MEMO_PROGRAM, TOKEN_PROGRAM, USDC_MINT } from "../s
 import { TEST_BLOCKHASH, TEST_LVBH } from "../testing/fake-rpc.ts";
 import { testSigner } from "../testing/keys.ts";
 import { signedPayment } from "../testing/payment.ts";
-import { buildPaymentTransaction } from "./build.ts";
+import { buildPaymentTransaction, hasBlockhashHints } from "./build.ts";
 import { type ChallengeContext, requirementsFor } from "./challenge.ts";
 import { decodePayment, parsePaymentHeader } from "./decode.ts";
 
@@ -279,6 +279,23 @@ describe("buildPaymentTransaction", () => {
         await expect(buildPaymentTransaction(noHeight, payer)).rejects.toThrow(
             "challenge has no blockhash",
         );
+    });
+
+    it("tells whether a challenge carries both blockhash hints", () => {
+        expect(hasBlockhashHints(reqWithHints)).toBe(true);
+        expect(hasBlockhashHints(bare)).toBe(false);
+        expect(
+            hasBlockhashHints({
+                ...bare,
+                extra: { ...bare.extra, recentBlockhash: TEST_BLOCKHASH },
+            }),
+        ).toBe(false);
+        expect(
+            hasBlockhashHints({
+                ...reqWithHints,
+                extra: { ...reqWithHints.extra, lastValidBlockHeight: Number(TEST_LVBH) },
+            }),
+        ).toBe(false);
     });
 });
 

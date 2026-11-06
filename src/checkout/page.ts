@@ -1,5 +1,6 @@
 import QRCode from "qrcode";
 import type { PublicState } from "../http/public.ts";
+import { STATE_LABELS } from "./flow.ts";
 
 export const CHECKOUT_CSP =
     "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
@@ -14,15 +15,6 @@ export interface CheckoutView {
     pageUrl: string;
     origin: string;
 }
-
-const STATE_LABELS: Record<PublicState, string> = {
-    unpaid: "Awaiting payment",
-    settling: "Settling",
-    paid: "Paid",
-    expired: "Expired",
-    refunded: "Refunded",
-    review: "Under review",
-};
 
 const ESCAPES: Record<string, string> = {
     "&": "&amp;",
@@ -154,13 +146,16 @@ ${body}
 `;
 }
 
+const MESSAGE = '<p id="message" role="status" aria-live="polite"></p>';
+const SCRIPT = '<script type="module" src="/checkout.js"></script>';
+
 async function paySection(v: CheckoutView, amount: string): Promise<string> {
     const links = walletLinks(v.pageUrl, v.origin);
     return `<section>
 <h2>Pay with a browser wallet</h2>
 <ul id="wallets"><li>Looking for wallets</li></ul>
 <button id="pay-button" class="button" type="button" disabled>Pay ${amount}</button>
-<p id="message" role="status" aria-live="polite"></p>
+${MESSAGE}
 </section>
 <section>
 <h2>Pay with a phone wallet</h2>
@@ -173,13 +168,15 @@ ${await qrSvg(links.phantom)}
 <figcaption>Scan with your phone to open this page in Phantom</figcaption>
 </figure>
 </section>
-<script type="module" src="/checkout.js"></script>`;
+${SCRIPT}`;
 }
 
 export async function renderCheckout(v: CheckoutView): Promise<string> {
     const amount = amountLabel(v.amountMicros);
     const id = escapeHtml(v.orderId);
-    const pay = v.state === "unpaid" ? await paySection(v, amount) : "";
+    let tail = "";
+    if (v.state === "unpaid") tail = await paySection(v, amount);
+    else if (v.state === "settling") tail = `${MESSAGE}\n${SCRIPT}`;
     return page(
         `Pay ${amount} · Bugnet`,
         `<main id="checkout" data-order-id="${id}" data-state="${v.state}">
@@ -190,7 +187,7 @@ export async function renderCheckout(v: CheckoutView): Promise<string> {
 <dt>Order</dt><dd><code>${id}</code></dd>
 <dt>Status</dt><dd id="state">${STATE_LABELS[v.state]}</dd>
 </dl>
-${pay}
+${tail}
 </main>`,
     );
 }

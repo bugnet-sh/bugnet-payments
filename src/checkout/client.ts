@@ -3,7 +3,16 @@ import {
     type SolanaSignTransactionFeature,
 } from "@solana/wallet-standard-features";
 import { getWallets } from "@wallet-standard/app";
-import { describeResult, type PayFlowResult, payWithWallet, type WalletPort } from "./flow.ts";
+import {
+    type PageStep,
+    pageStep,
+    payWithWallet,
+    STATE_LABELS,
+    type StatusDeps,
+    stateStep,
+    type WalletPort,
+    watchOrder,
+} from "./flow.ts";
 
 type Wallet = ReturnType<ReturnType<typeof getWallets>["get"]>[number];
 type WalletAccount = Wallet["accounts"][number];
@@ -13,11 +22,21 @@ interface ConnectFeature {
     connect(): Promise<{ accounts: readonly WalletAccount[] }>;
 }
 
+interface View {
+    message: HTMLElement;
+    stateLabel: HTMLElement;
+    status: StatusDeps;
+}
+
 const STANDARD_CONNECT = "standard:connect";
 const MAINNET = "solana:mainnet";
 
 function usable(w: Wallet): boolean {
-    return STANDARD_CONNECT in w.features && SolanaSignTransaction in w.features;
+    return (
+        w.chains.includes(MAINNET) &&
+        STANDARD_CONNECT in w.features &&
+        SolanaSignTransaction in w.features
+    );
 }
 
 function portFor(w: Wallet): WalletPort {
@@ -45,19 +64,33 @@ function element<T extends HTMLElement>(root: HTMLElement, selector: string): T 
     return el;
 }
 
-function start(root: HTMLElement): void {
+// Shows a step, follows the order's status when the step leaves it unknown, and answers payAfterMs
+async function show(v: View, step: PageStep): Promise<number | undefined> {
+    v.message.textContent = step.message;
+    if (step.state !== undefined) v.stateLabel.textContent = STATE_LABELS[step.state];
+    if (!step.watch) return step.payAfterMs;
+    return show(v, stateStep(await watchOrder(v.status)));
+}
+
+function startPayment(root: HTMLElement, v: View): void {
     const list = element<HTMLUListElement>(root, "#wallets");
     const button = element<HTMLButtonElement>(root, "#pay-button");
-    const message = element<HTMLElement>(root, "#message");
-    const stateLabel = element<HTMLElement>(root, "#state");
-    const orderUrl = `${location.origin}/o/${root.dataset.orderId}`;
     const wallets = getWallets();
     let chosen: Wallet | undefined;
     let busy = false;
-    let done = false;
+    let payable = true;
 
     const refresh = () => {
-        button.disabled = busy || done || chosen === undefined;
+        button.disabled = busy || !payable || chosen === undefined;
+    };
+
+    const offerPayAfter = (ms: number | undefined) => {
+        payable = ms === 0;
+        if (ms === undefined || ms === 0) return;
+        setTimeout(() => {
+            payable = true;
+            refresh();
+        }, ms);
     };
 
     const render = () => {
@@ -93,41 +126,48 @@ function start(root: HTMLElement): void {
         refresh();
     };
 
-    const show = (result: PayFlowResult) => {
-        message.textContent = describeResult(result);
-        if (result === "paid") {
-            done = true;
-            stateLabel.textContent = "Paid";
-        }
-    };
-
     const pay = async (wallet: Wallet) => {
         busy = true;
         refresh();
-        message.textContent = "waiting for the wallet";
+        v.message.textContent = "waiting for the wallet";
+        let step: PageStep;
         try {
-            show(
-                await payWithWallet({
-                    fetch: (input, init) => fetch(input, init),
-                    wallet: portFor(wallet),
-                    orderUrl,
-                }),
-            );
+            step = pageStep(await payWithWallet({ ...v.status, wallet: portFor(wallet) }));
         } catch (err) {
             const reason = err instanceof Error ? err.message : String(err);
-            message.textContent = `the payment did not go through: ${reason}`;
+            step = { message: `the payment did not go through: ${reason}`, payAfterMs: 0 };
         }
+        offerPayAfter(await show(v, step));
         busy = false;
         refresh();
     };
 
     button.addEventListener("click", () => {
-        if (chosen !== undefined && !busy) void pay(chosen);
+        if (chosen !== undefined && !busy && payable) void pay(chosen);
     });
     wallets.on("register", render);
     wallets.on("unregister", render);
     render();
 }
 
+async function followSettling(v: View): Promise<void> {
+    v.message.textContent = "the payment is settling; checking status…";
+    const state = await watchOrder(v.status);
+    // Only the unpaid page carries the wallet list and the QR
+    if (state === "unpaid") location.reload();
+    else await show(v, stateStep(state));
+}
+
 const root = document.getElementById("checkout");
-if (root !== null && root.dataset.state === "unpaid") start(root);
+if (root !== null) {
+    const v: View = {
+        message: element<HTMLElement>(root, "#message"),
+        stateLabel: element<HTMLElement>(root, "#state"),
+        status: {
+            fetch: (input, init) => fetch(input, init),
+            orderUrl: `${location.origin}/o/${root.dataset.orderId}`,
+        },
+    };
+    if (root.dataset.state === "unpaid") startPayment(root, v);
+    else if (root.dataset.state === "settling") void followSettling(v);
+}

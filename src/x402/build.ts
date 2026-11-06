@@ -28,15 +28,22 @@ export interface BuildOptions {
     extraInstructions?: readonly Instruction[];
 }
 
+export type HintedRequirements = PaymentRequirements & {
+    extra: { recentBlockhash: string; lastValidBlockHeight: string };
+};
+
+export function hasBlockhashHints(req: PaymentRequirements): req is HintedRequirements {
+    const { recentBlockhash, lastValidBlockHeight } = req.extra;
+    return typeof recentBlockhash === "string" && typeof lastValidBlockHeight === "string";
+}
+
 export async function buildPaymentTransaction(
     req: PaymentRequirements,
     payer: Address,
     opts: BuildOptions = {},
 ): Promise<Transaction> {
+    if (!hasBlockhashHints(req)) throw new Error("challenge has no blockhash");
     const { feePayer, memo, recentBlockhash, lastValidBlockHeight } = req.extra;
-    if (typeof recentBlockhash !== "string" || typeof lastValidBlockHeight !== "string") {
-        throw new Error("challenge has no blockhash");
-    }
     const transfer = getTransferCheckedInstruction({
         source: await usdcAta(payer),
         mint: USDC_MINT,

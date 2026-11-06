@@ -75,7 +75,6 @@ describe("checkout page", () => {
     it("shows a closed order's state without a way to pay", async () => {
         for (const [state, label] of [
             ["paid", "Paid"],
-            ["settling", "Settling"],
             ["expired", "Expired"],
             ["refunded", "Refunded"],
             ["review", "Under review"],
@@ -89,15 +88,28 @@ describe("checkout page", () => {
         }
     });
 
+    it("follows a settling order with the client but offers no way to pay", async () => {
+        const html = await renderCheckout({ ...view, state: "settling" });
+        expect(html).toContain('<dd id="state">Settling</dd>');
+        expect(html).toContain('<p id="message" role="status" aria-live="polite"></p>');
+        expect(html).toContain('<script type="module" src="/checkout.js"></script>');
+        expect(html).not.toContain('id="pay-button"');
+        expect(html).not.toContain('id="wallets"');
+        expect(html).not.toContain("<svg");
+    });
+
     it("bundles the browser client", async () => {
         const out = await esbuild.build({
             entryPoints: ["src/checkout/client.ts"],
             bundle: true,
             platform: "browser",
             format: "esm",
+            target: "es2022",
             write: false,
-            logLevel: "silent",
+            logLevel: "warning",
         });
+        expect(out.errors).toEqual([]);
+        expect(out.warnings).toEqual([]);
         const text = out.outputFiles[0]!.text;
         expect(text).toContain("solana:signTransaction");
         expect(text).toContain("standard:connect");
@@ -189,6 +201,19 @@ describe("checkout routes", () => {
         const html = await r.text();
         expect(html).toContain("Paid");
         expect(html).not.toContain('id="pay-button"');
+    });
+
+    it("serves a settling order's page with the client that follows it", async () => {
+        const settling = (
+            await seedOrder(app.pool, { state: "settling", expiresAt: app.now.get() })
+        ).order;
+        const r = await get(app, `/o/${settling.id}`, { accept: "text/html" });
+        expect(r.status).toBe(200);
+        const html = await r.text();
+        expect(html).toContain("Settling");
+        expect(html).toContain('<script type="module" src="/checkout.js"></script>');
+        expect(html).not.toContain('id="pay-button"');
+        expect(totalCalls(app.rpc)).toBe(0);
     });
 
     it("keeps answering x402 clients with JSON", async () => {
