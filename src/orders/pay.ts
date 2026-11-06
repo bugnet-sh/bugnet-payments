@@ -1,0 +1,347 @@
+import { bindX402ExactCredential, InvalidProofError } from "@solana/pay-kit";
+import type { PaymentRequirements, SettleResponse } from "@x402/core/types";
+import type pg from "pg";
+import type { Log } from "../log.ts";
+import type { RateLimiter } from "../ratelimit.ts";
+import type { PayerCheck, RouterClient } from "../router/client.ts";
+import { type ChallengeContext, requirementsFor } from "../x402/challenge.ts";
+import {
+    type DecodedPayment,
+    decodePayment,
+    PaymentRefusal,
+    type PayRefusal,
+} from "../x402/decode.ts";
+import type { SettleAttempt, Settler } from "../x402/settler.ts";
+import {
+    confirmPayment,
+    findOrder,
+    findPaymentByOrder,
+    insertPayment,
+    lockOrder,
+    setOrderState,
+    StaleStateError,
+} from "./store.ts";
+import type { OrderRow } from "./types.ts";
+
+export type PayOutcome =
+    | { kind: "paid"; orderId: string; payer: string; signature: string }
+    | {
+          kind: "already_paid";
+          orderId: string;
+          samePayment: boolean;
+          signature?: string;
+          payer?: string;
+      }
+    | { kind: "settling"; orderId: string }
+    | {
+          kind: "refused";
+          orderId: string;
+          httpStatus: 400 | 403 | 404 | 409 | 410 | 422 | 429 | 503;
+          reason: PayRefusal;
+          code?: string;
+          retryAfterSeconds?: number;
+          blockedUntil?: string;
+      };
+
+export interface PayDeps {
+    pool: pg.Pool;
+    settler: Settler;
+    router: RouterClient;
+    attempts: RateLimiter;
+    challenge: ChallengeContext;
+    log: Log;
+    now: () => Date;
+}
+
+type Refused = Extract<PayOutcome, { kind: "refused" }>;
+
+interface Checked {
+    dec: DecodedPayment;
+    req: PaymentRequirements;
+}
+
+class Tx {
+    private open = false;
+    broken = false;
+
+    constructor(private readonly c: pg.PoolClient) {}
+
+    async begin(): Promise<void> {
+        await this.c.query("begin");
+        this.open = true;
+    }
+
+    async commit(): Promise<void> {
+        this.open = false;
+        try {
+            await this.c.query("commit");
+        } catch (err) {
+            this.broken = true;
+            throw err;
+        }
+    }
+
+    async rollback(): Promise<void> {
+        if (!this.open) return;
+        this.open = false;
+        try {
+            await this.c.query("rollback");
+        } catch {
+            this.broken = true;
+        }
+    }
+}
+
+function refused(
+    orderId: string,
+    httpStatus: Refused["httpStatus"],
+    reason: PayRefusal,
+    more: Pick<Refused, "code" | "retryAfterSeconds" | "blockedUntil"> = {},
+): Refused {
+    const out: Refused = { kind: "refused", orderId, httpStatus, reason };
+    if (more.code !== undefined) out.code = more.code;
+    if (more.retryAfterSeconds !== undefined) out.retryAfterSeconds = more.retryAfterSeconds;
+    if (more.blockedUntil !== undefined) out.blockedUntil = more.blockedUntil;
+    return out;
+}
+
+function settling(orderId: string): PayOutcome {
+    return { kind: "settling", orderId };
+}
+
+export async function payOrder(
+    d: PayDeps,
+    orderId: string,
+    raw: unknown,
+    signal: AbortSignal,
+): Promise<PayOutcome> {
+    const c = await d.pool.connect();
+    const tx = new Tx(c);
+    try {
+        await tx.begin();
+        const order = await lockOrder(c, orderId);
+        if (order === null) return refused(orderId, 404, "order_unknown");
+        const t = d.now();
+        const answer = await answerForState(d, c, order, raw, t);
+        if (answer !== undefined) return answer;
+        const checked = await checkPayment(d, order, raw, signal);
+        if ("kind" in checked) return checked;
+        return await settle(d, c, tx, order, checked, t);
+    } finally {
+        await tx.rollback();
+        c.release(tx.broken);
+    }
+}
+
+async function answerForState(
+    d: PayDeps,
+    c: pg.PoolClient,
+    order: OrderRow,
+    raw: unknown,
+    t: Date,
+): Promise<PayOutcome | undefined> {
+    switch (order.state) {
+        case "paid":
+        case "redeemed":
+            return alreadyPaid(d, c, order.id, raw);
+        case "settling":
+            return settling(order.id);
+        case "expired":
+            return refused(order.id, 410, "order_expired");
+        case "refunding":
+        case "refunded":
+        case "manual":
+            return refused(order.id, 410, "order_closed");
+        case "unpaid":
+            if (t.getTime() >= order.expiresAt.getTime()) {
+                return refused(order.id, 410, "order_expired");
+            }
+            return undefined;
+    }
+}
+
+async function alreadyPaid(
+    d: PayDeps,
+    c: pg.PoolClient,
+    orderId: string,
+    raw: unknown,
+): Promise<PayOutcome> {
+    const payment = await findPaymentByOrder(c, orderId);
+    let hash: string | undefined;
+    try {
+        hash = decodePayment(raw, d.settler).messageHash;
+    } catch (err) {
+        if (!(err instanceof PaymentRefusal)) throw err;
+    }
+    if (payment === null || hash !== payment.messageHash) {
+        return { kind: "already_paid", orderId, samePayment: false };
+    }
+    return {
+        kind: "already_paid",
+        orderId,
+        samePayment: true,
+        signature: payment.txSignature,
+        payer: payment.payer,
+    };
+}
+
+async function checkPayment(
+    d: PayDeps,
+    order: OrderRow,
+    raw: unknown,
+    signal: AbortSignal,
+): Promise<Checked | Refused> {
+    let dec: DecodedPayment;
+    try {
+        dec = decodePayment(raw, d.settler);
+    } catch (err) {
+        if (!(err instanceof PaymentRefusal)) throw err;
+        const status = err.reason === "payment_malformed" ? 400 : 422;
+        return refused(order.id, status, err.reason, { code: err.code });
+    }
+    if (dec.memoOrderId !== order.id) return refused(order.id, 422, "payment_order_mismatch");
+    // Counted only once the payment names this order, so junk never uses up the payer's attempts
+    const taken = d.attempts.take(`order:${order.id}:${dec.payer}`);
+    if (!taken.ok) {
+        return refused(order.id, 429, "too_many_attempts", {
+            retryAfterSeconds: taken.retryAfterSeconds,
+        });
+    }
+    const req = requirementsFor(order, d.challenge);
+    try {
+        bindX402ExactCredential(dec.payload, req);
+    } catch (err) {
+        if (!(err instanceof InvalidProofError)) throw err;
+        return refused(order.id, 422, "payment_invalid", { code: err.code });
+    }
+    const check = await d.router.checkPayer(
+        {
+            payer: dec.payer,
+            feePayer: d.settler.feePayer,
+            packageId: order.packageId,
+            kind: order.kind,
+        },
+        signal,
+    );
+    return payerRefusal(order.id, check) ?? { dec, req };
+}
+
+function payerRefusal(orderId: string, check: PayerCheck): Refused | undefined {
+    switch (check.verdict) {
+        case "ok":
+        case "skipped":
+            return undefined;
+        case "blocked":
+            return refused(orderId, 403, "payer_blocked", { blockedUntil: check.blockedUntil });
+        case "busy":
+            return refused(orderId, 429, "payer_busy", {
+                retryAfterSeconds: check.retryAfterSeconds,
+            });
+        case "rate_limited":
+            return refused(orderId, 429, "payer_rate_limited", {
+                retryAfterSeconds: check.retryAfterSeconds,
+            });
+        case "invalid":
+            return refused(orderId, 422, "payer_invalid");
+        case "unavailable":
+            return refused(orderId, 503, "router_unavailable");
+    }
+}
+
+async function settle(
+    d: PayDeps,
+    c: pg.PoolClient,
+    tx: Tx,
+    order: OrderRow,
+    { dec, req }: Checked,
+    t: Date,
+): Promise<PayOutcome> {
+    const attempt: SettleAttempt = {
+        messageHash: dec.messageHash,
+        committed: false,
+        // The settling row must be durable before the settler broadcasts
+        async commit(r) {
+            await insertPayment(c, {
+                orderId: order.id,
+                txSignature: r.signature,
+                messageHash: r.messageHash,
+                payer: dec.payer,
+                sourceTokenAccount: dec.sourceTokenAccount,
+                amountMicros: order.amountMicros,
+                blockhash: r.blockhash,
+                lastValidBlockHeight: r.lastValidBlockHeight,
+                createdAt: t,
+            });
+            await setOrderState(c, order.id, "unpaid", "settling", { payer: dec.payer });
+            await tx.commit();
+        },
+    };
+    let res: SettleResponse;
+    try {
+        res = await d.settler.settle(attempt, dec.payload, req);
+    } catch (err) {
+        d.log.error("settle threw", { orderId: order.id, committed: attempt.committed, err });
+        return attempt.committed
+            ? settling(order.id)
+            : refused(order.id, 503, "settlement_unavailable");
+    }
+    if (res.success) return markPaid(d, c, tx, order.id, dec.payer, res.transaction, t);
+    if (attempt.committed) return settling(order.id);
+    switch (attempt.failure) {
+        case "commit_conflict":
+            return refused(order.id, 409, "payment_replayed");
+        case "block_height_unavailable":
+            return refused(order.id, 503, "rpc_unavailable");
+        case "commit_failed":
+            return refused(order.id, 503, "settlement_unavailable");
+    }
+    if (res.errorReason === "duplicate_settlement") {
+        return refused(order.id, 409, "payment_replayed");
+    }
+    return refused(order.id, 422, "payment_invalid", { code: res.errorReason });
+}
+
+async function markPaid(
+    d: PayDeps,
+    c: pg.PoolClient,
+    tx: Tx,
+    orderId: string,
+    payer: string,
+    signature: string,
+    t: Date,
+): Promise<PayOutcome> {
+    const paid: PayOutcome = { kind: "paid", orderId, payer, signature };
+    try {
+        await tx.begin();
+        await confirmPayment(c, orderId, t);
+        await setOrderState(c, orderId, "settling", "paid", { paidAt: t });
+        await tx.commit();
+        return paid;
+    } catch (err) {
+        await tx.rollback();
+        if (!(err instanceof StaleStateError)) {
+            d.log.error("marking the order paid failed", { orderId, err });
+            return settling(orderId);
+        }
+        return (await paidElsewhere(d, c, orderId, signature)) ? paid : settling(orderId);
+    }
+}
+
+async function paidElsewhere(
+    d: PayDeps,
+    c: pg.PoolClient,
+    orderId: string,
+    signature: string,
+): Promise<boolean> {
+    try {
+        const order = await findOrder(c, orderId);
+        const payment = await findPaymentByOrder(c, orderId);
+        return (
+            (order?.state === "paid" || order?.state === "redeemed") &&
+            payment?.txSignature === signature
+        );
+    } catch (err) {
+        d.log.error("re-reading the order failed", { orderId, err });
+        return false;
+    }
+}
