@@ -1,5 +1,6 @@
 import type pg from "pg";
 import { type Queryable, withTx } from "../db/pool.ts";
+import type { OrderRow } from "../orders/types.ts";
 import { findPaymentByOrder, lockOrder, setOrderState } from "../orders/store.ts";
 
 export type RefundReason =
@@ -84,15 +85,18 @@ export type RefundRequest = "created" | "exists" | "not_refundable" | "unknown" 
 // The order lock makes the state check and the insert one step, so two triggers (an event and
 // the sweeper) can never both create a refund, and a full and a partial refund never coexist.
 // Without an amount the refund is full; with one it is partial and must not exceed the payment.
+// A caller that chose the order before taking the lock passes `eligible` to re-check it under it.
 export async function requestRefund(
     pool: pg.Pool,
     orderId: string,
     reason: RefundReason,
     amountMicros?: number,
+    eligible?: (order: OrderRow) => boolean,
 ): Promise<RefundRequest> {
     return withTx(pool, async (c) => {
         const order = await lockOrder(c, orderId);
         if (order === null) return "unknown";
+        if (eligible !== undefined && !eligible(order)) return "not_refundable";
         if (order.state === "refunding" || order.state === "refunded") return "exists";
         if (order.state === "manual") {
             if ((await findRefund(c, orderId)) !== null) return "exists";

@@ -178,3 +178,19 @@ describe("returnManualToRedeemed", () => {
         expect(await returnManualToRedeemed(db.pool, order.id, at)).toBe(false);
     });
 });
+
+describe("requestRefund eligibility check", () => {
+    it("refuses and creates nothing when the check fails under the lock", async () => {
+        const { order } = await paidOrder("redeemed");
+        const result = await requestRefund(
+            db.pool,
+            order.id,
+            "unredeemed",
+            undefined,
+            (o) => o.state === "paid",
+        );
+        expect(result).toBe("not_refundable");
+        expect(await countRefunds(order.id)).toBe(0);
+        expect((await findOrder(db.pool, order.id))!.state).toBe("redeemed");
+    });
+});
