@@ -118,10 +118,7 @@ const settingsSchema = z
                 url: z.url().default("http://127.0.0.1:8080"),
                 timeout: duration.prefault("3s"),
                 check_payer: z.boolean().default(false),
-                get_order: z
-                    .boolean()
-                    .refine((on) => !on, "the router has no GetOrder RPC yet")
-                    .default(false),
+                get_order: z.boolean().default(false),
                 event_public_key: key32.default(""),
             })
             .strict()

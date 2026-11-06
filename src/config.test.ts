@@ -95,10 +95,9 @@ describe("parseSettings", () => {
         ).not.toThrow();
     });
 
-    it("refuses router.get_order until the router serves GetOrder", () => {
-        expect(() =>
-            parseSettings(`[solana]\nrecipient = "${ADDR}"\n[router]\nget_order = true`, "t"),
-        ).toThrow(/router.get_order: the router has no GetOrder RPC yet/);
+    it("accepts router.get_order = true", () => {
+        const s = parseSettings(`[solana]\nrecipient = "${ADDR}"\n[router]\nget_order = true`, "t");
+        expect(s.router.get_order).toBe(true);
     });
 });
 

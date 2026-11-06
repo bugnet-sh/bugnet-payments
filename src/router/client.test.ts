@@ -130,11 +130,34 @@ describe("getOrder", () => {
         [{ redeemed: false }, { kind: "absent" }],
         [
             { redeemed: true, kind: "start", placementState: "ready", refundable: false },
-            { kind: "found", orderKind: "start", placementState: "ready", refundable: false },
+            {
+                kind: "found",
+                orderKind: "start",
+                placementState: "ready",
+                refundable: false,
+                failureReason: "",
+                terminationReason: "",
+            },
         ],
         [
-            { redeemed: true, kind: "extend", placementState: "terminated", refundable: true },
-            { kind: "found", orderKind: "extend", placementState: "terminated", refundable: true },
+            {
+                redeemed: true,
+                kind: "start",
+                placementState: "failed",
+                refundable: true,
+                failureReason: "provider_failed",
+                terminationReason: "provider_failed",
+                endedAt: ts("2026-11-07T00:00:00Z"),
+            },
+            {
+                kind: "found",
+                orderKind: "start",
+                placementState: "failed",
+                refundable: true,
+                failureReason: "provider_failed",
+                terminationReason: "provider_failed",
+                endedAt: new Date("2026-11-07T00:00:00Z"),
+            },
         ],
     ])("maps %o", async (answer, want) => {
         let seen = "";
@@ -148,6 +171,37 @@ describe("getOrder", () => {
         expect(await c.getOrder("ord_a", signal())).toEqual(want);
         expect(seen).toBe("ord_a");
         expect(r.headers[0]!.get("authorization")).toBe("Bearer rt");
+    });
+
+    it("answers disabled on Unimplemented and warns once per process", async () => {
+        const r = await router({
+            getOrder: () => {
+                throw new ConnectError("no", Code.Unimplemented);
+            },
+        });
+        const log = memoryLog();
+        const c = createRouterClient(opts(r.url, { getOrder: true, log }));
+        expect(await c.getOrder("ord_a", signal())).toEqual({ kind: "disabled" });
+        expect(await c.getOrder("ord_b", signal())).toEqual({ kind: "disabled" });
+        expect(log.lines.filter((l) => l.level === "warn")).toHaveLength(1);
+    });
+
+    it("answers unavailable on InvalidArgument", async () => {
+        const r = await router({
+            getOrder: () => {
+                throw new ConnectError("bad", Code.InvalidArgument);
+            },
+        });
+        const c = createRouterClient(opts(r.url, { getOrder: true }));
+        expect(await c.getOrder("", signal())).toEqual({ kind: "unavailable" });
+    });
+
+    it("answers unavailable when the deadline passes", async () => {
+        const r = await router({
+            getOrder: () => new Promise((resolve) => setTimeout(resolve, 1_500)),
+        });
+        const c = createRouterClient(opts(r.url, { getOrder: true, timeoutMs: 100 }));
+        expect(await c.getOrder("ord_a", signal())).toEqual({ kind: "unavailable" });
     });
 
     it("answers unavailable on an error, a dead router and an abort", async () => {

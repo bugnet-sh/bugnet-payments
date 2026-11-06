@@ -136,8 +136,12 @@ export async function sweep(d: SweepDeps): Promise<SweepReport> {
                         }
                     }
                     await confirm(id);
-                    if (abandon)
-                        d.log.info("abandon ignored, router holds the order", { orderId: id });
+                    d.log.info(
+                        abandon
+                            ? "abandon ignored, router holds the order"
+                            : "router holds the order",
+                        { orderId: id, placementState: answer.placementState },
+                    );
                 }
             }
         });

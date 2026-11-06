@@ -14,7 +14,15 @@ export type PayerCheck =
     | { verdict: "unavailable" };
 
 export type RouterOrder =
-    | { kind: "found"; orderKind: string; placementState: string; refundable: boolean }
+    | {
+          kind: "found";
+          orderKind: string;
+          placementState: string;
+          refundable: boolean;
+          failureReason: string;
+          terminationReason: string;
+          endedAt?: Date;
+      }
     | { kind: "absent" }
     | { kind: "disabled" }
     | { kind: "unavailable" };
@@ -53,6 +61,7 @@ export function createRouterClient(o: RouterClientOptions): RouterClient {
         }),
     );
 
+    let warnedUnimplemented = false;
     return {
         async checkPayer(r, signal) {
             if (!o.checkPayer) return { verdict: "skipped" };
@@ -101,9 +110,27 @@ export function createRouterClient(o: RouterClientOptions): RouterClient {
                     orderKind: res.kind,
                     placementState: res.placementState,
                     refundable: res.refundable,
+                    failureReason: res.failureReason,
+                    terminationReason: res.terminationReason,
+                    ...(res.endedAt
+                        ? {
+                              endedAt: new Date(
+                                  Number(res.endedAt.seconds) * 1000 +
+                                      Math.floor(res.endedAt.nanos / 1e6),
+                              ),
+                          }
+                        : {}),
                 };
             } catch (err) {
-                o.log.warn("router get_order failed", { error: ConnectError.from(err).message });
+                const ce = ConnectError.from(err);
+                if (ce.code === Code.Unimplemented) {
+                    if (!warnedUnimplemented) {
+                        warnedUnimplemented = true;
+                        o.log.warn("router does not serve GetOrder", { code: Code[ce.code] });
+                    }
+                    return { kind: "disabled" };
+                }
+                o.log.warn("router get_order failed", { code: Code[ce.code], error: ce.message });
                 return { kind: "unavailable" };
             }
         },
