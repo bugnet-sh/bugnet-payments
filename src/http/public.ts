@@ -233,7 +233,7 @@ export function createPublicHandler(d: PublicDeps): Handler {
             sendJson(res, 405, { error: "method_not_allowed" });
             return;
         }
-        const id = route[1]!;
+        const id = route[1] ?? "";
         const header = isStatus ? undefined : paymentHeader(req);
         if (header !== undefined) {
             if (!isOrderId(id)) {
