@@ -57,8 +57,19 @@ export function publicState(o: OrderRow, now: Date): PublicState {
     }
 }
 
-function closedStatus(state: PublicState): 410 | undefined {
-    return state === "expired" || state === "refunded" || state === "review" ? 410 : undefined;
+function closedAnswer(
+    order: OrderRow,
+    state: PublicState,
+): { status: 410; body: Record<string, string> } | undefined {
+    switch (state) {
+        case "expired":
+            return { status: 410, body: { error: "order_expired", orderId: order.id } };
+        case "refunded":
+        case "review":
+            return { status: 410, body: { error: "order_closed", orderId: order.id, state } };
+        default:
+            return undefined;
+    }
 }
 
 function unmapped(address: string | undefined): string {
@@ -116,7 +127,7 @@ async function sendCheckout(
         pageUrl: payUrlFor(d.challenge.publicUrl, order.id),
         origin: new URL(d.challenge.publicUrl).origin,
     });
-    sendHtml(res, closedStatus(state) ?? 200, html);
+    sendHtml(res, closedAnswer(order, state)?.status ?? 200, html);
 }
 
 async function sendScript(res: ServerResponse, file: string): Promise<void> {
@@ -258,14 +269,9 @@ export function createPublicHandler(d: PublicDeps): Handler {
             });
             return;
         }
-        if (closedStatus(state) !== undefined) {
-            sendJson(
-                res,
-                410,
-                state === "expired"
-                    ? { error: "order_expired", orderId: order.id }
-                    : { error: "order_closed", orderId: order.id, state },
-            );
+        const closed = closedAnswer(order, state);
+        if (closed !== undefined) {
+            sendJson(res, closed.status, closed.body);
             return;
         }
         switch (state) {

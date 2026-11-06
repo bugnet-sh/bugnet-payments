@@ -156,6 +156,23 @@ describe("public order routes", () => {
         expect(totalCalls(app.rpc)).toBe(0);
     });
 
+    it("answers the same 410 in the HTML page and in JSON for every closed state", async () => {
+        const past = inFuture(-1_000);
+        for (const o of [
+            await unpaid({ expiresAt: past }),
+            await unpaid({ state: "expired" }),
+            await unpaid({ state: "refunding" }),
+            await unpaid({ state: "refunded" }),
+            await unpaid({ state: "manual" }),
+        ]) {
+            const json = await pub(`/o/${o.id}`, { accept: "application/json" });
+            const html = await pub(`/o/${o.id}`, { accept: "text/html" });
+            expect(json.status).toBe(410);
+            expect(html.status).toBe(410);
+            expect(html.headers.get("content-type")).toMatch(/text\/html/);
+        }
+    });
+
     it("challenges an unpaid order with the public URL", async () => {
         const r = await pub(`/o/${order.id}`, { accept: "application/json" });
         expect(r.status).toBe(402);
