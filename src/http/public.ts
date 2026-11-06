@@ -165,9 +165,7 @@ function sendOutcome(res: ServerResponse, out: PayOutcome): void {
                 res,
                 200,
                 { paid: true, orderId: out.orderId },
-                out.samePayment && out.signature !== undefined && out.payer !== undefined
-                    ? settlementHeaders(out.signature, out.payer)
-                    : {},
+                out.samePayment ? settlementHeaders(out.signature, out.payer) : {},
             );
             return;
         case "settling":

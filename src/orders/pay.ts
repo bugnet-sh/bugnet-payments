@@ -26,12 +26,13 @@ import type { OrderRow } from "./types.ts";
 
 export type PayOutcome =
     | { kind: "paid"; orderId: string; payer: string; signature: string }
+    | { kind: "already_paid"; orderId: string; samePayment: false }
     | {
           kind: "already_paid";
           orderId: string;
-          samePayment: boolean;
-          signature?: string;
-          payer?: string;
+          samePayment: true;
+          signature: string;
+          payer: string;
       }
     | { kind: "settling"; orderId: string }
     | {

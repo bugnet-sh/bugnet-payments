@@ -1,3 +1,4 @@
+import type { IncomingMessage } from "node:http";
 import { create as protoCreate } from "@bufbuild/protobuf";
 import {
     decodePaymentRequiredHeader,
@@ -5,9 +6,9 @@ import {
     encodePaymentSignatureHeader,
 } from "@x402/core/http";
 import type { PaymentRequirements } from "@x402/core/types";
-import type { IncomingMessage } from "node:http";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { PayerVerdict, CheckPayerResponseSchema } from "../gen/bugnet/router/v1/payments_pb.ts";
+import { parseSettings } from "../config.ts";
+import { CheckPayerResponseSchema, PayerVerdict } from "../gen/bugnet/router/v1/payments_pb.ts";
 import { newOrderId } from "../orders/ids.ts";
 import { findPaymentByOrder } from "../orders/store.ts";
 import type { OrderRow } from "../orders/types.ts";
@@ -17,7 +18,6 @@ import { testSigner } from "../testing/keys.ts";
 import { seedOrder } from "../testing/orders.ts";
 import { signedPayment } from "../testing/payment.ts";
 import { requirementsFor } from "../x402/challenge.ts";
-import { parseSettings } from "../config.ts";
 import { clientIp, publicState } from "./public.ts";
 
 let app: TestApp;
