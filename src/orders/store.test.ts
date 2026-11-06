@@ -149,10 +149,35 @@ describe("order store", () => {
         });
     });
 
+    it("confirmPayment is idempotent and reports whether a row changed", async () => {
+        const { order } = await seedOrder(db.pool, { state: "settling" });
+        await seedPayment(db.pool, order.id);
+        const first = new Date("2026-11-06T12:00:00Z");
+        expect(await confirmPayment(db.pool, order.id, first)).toBe(true);
+        expect(await confirmPayment(db.pool, order.id, new Date("2026-11-06T13:00:00Z"))).toBe(
+            false,
+        );
+        expect((await findPaymentByOrder(db.pool, order.id))?.confirmedAt).toEqual(first);
+        expect(await confirmPayment(db.pool, newOrderId(), first)).toBe(false);
+    });
+
+    it("archivePayment leaves a confirmed payment untouched", async () => {
+        const { order } = await seedOrder(db.pool, { state: "settling" });
+        await seedPayment(db.pool, order.id);
+        await confirmPayment(db.pool, order.id, new Date());
+        expect(await archivePayment(db.pool, order.id, "onchain_failed")).toBe(false);
+        expect(await findPaymentByOrder(db.pool, order.id)).toMatchObject({ status: "confirmed" });
+        expect((await findOrder(db.pool, order.id))?.state).toBe("settling");
+        const failed = await db.pool.query("select 1 from failed_payments where order_id = $1", [
+            order.id,
+        ]);
+        expect(failed.rowCount).toBe(0);
+    });
+
     it("archivePayment frees the order for a new payment", async () => {
         const { order } = await seedOrder(db.pool, { state: "settling" });
         const first = await seedPayment(db.pool, order.id);
-        await archivePayment(db.pool, order.id, "blockhash_expired");
+        expect(await archivePayment(db.pool, order.id, "blockhash_expired")).toBe(true);
         expect(await findPaymentByOrder(db.pool, order.id)).toBeNull();
         const failed = await db.pool.query(
             "select tx_signature, reason from failed_payments where order_id = $1",

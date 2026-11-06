@@ -223,25 +223,30 @@ export async function findPaymentByOrder(
     return res.rows[0] ? toPayment(res.rows[0]) : null;
 }
 
-export async function confirmPayment(db: Queryable, orderId: string, at: Date): Promise<void> {
-    await db.query(
-        "update payments set status = 'confirmed', confirmed_at = $2 where order_id = $1",
+export async function confirmPayment(db: Queryable, orderId: string, at: Date): Promise<boolean> {
+    const res = await db.query(
+        `update payments set status = 'confirmed', confirmed_at = $2
+         where order_id = $1 and status = 'settling'`,
         [orderId, at],
     );
+    return res.rowCount === 1;
 }
 
 export async function archivePayment(
     db: Queryable,
     orderId: string,
     reason: "onchain_failed" | "blockhash_expired",
-): Promise<void> {
-    await db.query(
-        `with moved as (delete from payments where order_id = $1 returning *)
+): Promise<boolean> {
+    const res = await db.query(
+        `with moved as (
+            delete from payments where order_id = $1 and status = 'settling' returning *
+         )
          insert into failed_payments (order_id, tx_signature, message_hash, payer, amount_micros,
             reason)
          select order_id, tx_signature, message_hash, payer, amount_micros, $2 from moved`,
         [orderId, reason],
     );
+    return res.rowCount === 1;
 }
 
 export async function updateOrderFields(
