@@ -74,6 +74,21 @@ describe("BlockhashCache", () => {
         await cache.latest();
         expect(rpc.calls.getLatestBlockhash).toBe(2);
     });
+    it("fails a hung fetch after the timeout and retries on the next call", async () => {
+        let hang = true;
+        const rpc = createFakeRpc({
+            getLatestBlockhash: () =>
+                hang
+                    ? new Promise(() => {})
+                    : { value: { blockhash: TEST_BLOCKHASH, lastValidBlockHeight: TEST_LVBH } },
+        });
+        const cache = new BlockhashCache(rpc, 8_000, Date.now, 20);
+        await expect(Promise.all([cache.latest(), cache.latest()])).rejects.toBeDefined();
+        expect(rpc.calls.getLatestBlockhash).toBe(1);
+        hang = false;
+        await expect(cache.latest()).resolves.toMatchObject({ blockhash: TEST_BLOCKHASH });
+        expect(rpc.calls.getLatestBlockhash).toBe(2);
+    });
     it("remembers the last valid block height of hints it served", async () => {
         const cache = new BlockhashCache(createFakeRpc(), 8_000);
         await cache.latest();

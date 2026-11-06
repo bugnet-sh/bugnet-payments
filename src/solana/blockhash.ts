@@ -6,6 +6,7 @@ export interface BlockhashHint {
 }
 
 const REMEMBER_MS = 300_000;
+const FETCH_TIMEOUT_MS = 3_000;
 
 export class BlockhashCache {
     private current: { hint: BlockhashHint; at: number } | undefined;
@@ -16,6 +17,7 @@ export class BlockhashCache {
         private readonly rpc: SolanaRpc,
         private readonly ttlMs: number,
         private readonly now: () => number = Date.now,
+        private readonly timeoutMs: number = FETCH_TIMEOUT_MS,
     ) {}
 
     async latest(): Promise<BlockhashHint> {
@@ -37,7 +39,9 @@ export class BlockhashCache {
     }
 
     private async fetch(): Promise<BlockhashHint> {
-        const { value } = await this.rpc.getLatestBlockhash().send();
+        const { value } = await this.rpc
+            .getLatestBlockhash()
+            .send({ abortSignal: AbortSignal.timeout(this.timeoutMs) });
         const hint: BlockhashHint = {
             blockhash: value.blockhash,
             lastValidBlockHeight: value.lastValidBlockHeight,

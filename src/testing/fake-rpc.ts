@@ -62,9 +62,24 @@ export function createFakeRpc(script: Partial<FakeRpcScript> = {}): FakeRpc {
     for (const name of Object.keys(handlers) as (keyof FakeRpcScript)[]) {
         calls[name] = 0;
         rpc[name] = (...args: unknown[]) => ({
-            send: async () => {
+            send: async (options?: { abortSignal?: AbortSignal }) => {
                 calls[name]!++;
-                return (handlers[name] as (...a: unknown[]) => unknown)(...args);
+                const result = (handlers[name] as (...a: unknown[]) => unknown)(...args);
+                const signal = options?.abortSignal;
+                if (!signal) {
+                    return result;
+                }
+                return Promise.race([
+                    result,
+                    new Promise<never>((_, reject) => {
+                        const abort = () => reject(signal.reason);
+                        if (signal.aborted) {
+                            abort();
+                        } else {
+                            signal.addEventListener("abort", abort, { once: true });
+                        }
+                    }),
+                ]);
             },
         });
     }
