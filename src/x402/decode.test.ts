@@ -18,6 +18,7 @@ import {
     pipe,
     setTransactionMessageFeePayer,
     setTransactionMessageLifetimeUsingBlockhash,
+    signBytes,
     type Transaction,
     type TransactionVersion,
     type TransactionWithBlockhashLifetime,
@@ -129,6 +130,19 @@ async function variantPayment(variant: string | { x402Version: number }): Promis
         }
         case "unsigned":
             return payloadOf(await buildPaymentTransaction(reqWithHints, payer.address));
+        case "flipped-signature": {
+            const p = await signedPayment(reqWithHints, payer);
+            const wire = Buffer.from((p.payload as { transaction: string }).transaction, "base64");
+            // The payer's signature is the second 64-byte slot after the one-byte count
+            wire[1 + 64 + 10]! ^= 0xff;
+            return wirePayload(wire);
+        }
+        case "other-key-signature": {
+            const tx = await buildPaymentTransaction(reqWithHints, payer.address);
+            const other = await testSigner(6);
+            const forged = await signBytes(other.keyPair.privateKey, tx.messageBytes);
+            return payloadOf({ ...tx, signatures: { ...tx.signatures, [payer.address]: forged } });
+        }
         case "legacy-message":
             return signedBy(payer, compileTransaction(message("legacy", ixs)));
         case "v1-message":
@@ -308,6 +322,8 @@ describe("decodePayment", () => {
         ["fee payer not first", "other-fee-payer", "invalid_exact_svm_fee_payer_mismatch"],
         ["three signers", "third-signer", "invalid_exact_svm_payload_excessive_signers"],
         ["missing payer signature", "unsigned", "payer_signature_missing"],
+        ["flipped payer signature bytes", "flipped-signature", "payer_signature_invalid"],
+        ["a payer signature by another key", "other-key-signature", "payer_signature_invalid"],
         ["version 1 message", "v1-message", "unsupported_transaction_version"],
         ["version 2 message", "v2-message", "unsupported_transaction_version"],
         ["legacy message", "legacy-message", "unsupported_transaction_version"],

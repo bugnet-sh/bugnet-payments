@@ -1,7 +1,11 @@
+import { createPublicKey, verify } from "node:crypto";
 import {
+    type Address,
+    getAddressEncoder,
     getBase64Encoder,
     getCompiledTransactionMessageDecoder,
     getTransactionDecoder,
+    type ReadonlyUint8Array,
 } from "@solana/kit";
 import { decodePaymentSignatureHeader } from "@x402/core/http";
 import type { PaymentPayload } from "@x402/core/types";
@@ -46,6 +50,7 @@ export interface DecodedPayment {
 }
 
 const TRANSFER_CHECKED = 12;
+const spkiEd25519Prefix = Buffer.from("302a300506032b6570032100", "hex");
 
 export function parsePaymentHeader(value: string): unknown {
     try {
@@ -61,6 +66,24 @@ function invalid(code: string): PaymentRefusal {
 
 function isRecord(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+// Without this check the payer is whatever address the sender writes, so a stranger could spend
+// the real payer's per-order attempts
+function signedBy(signer: Address, message: ReadonlyUint8Array, signature: Uint8Array): boolean {
+    try {
+        const key = createPublicKey({
+            key: Buffer.concat([
+                spkiEd25519Prefix,
+                Buffer.from(getAddressEncoder().encode(signer)),
+            ]),
+            format: "der",
+            type: "spki",
+        });
+        return verify(null, Buffer.from(message), key, signature);
+    } catch {
+        return false;
+    }
 }
 
 function decodeWire(wire: string) {
@@ -116,7 +139,9 @@ export function decodePayment(
     if (payer === undefined || payer !== accounts[1] || payer === ctx.feePayer) {
         throw invalid("payer_mismatch");
     }
-    if (tx.signatures[payer]?.length !== 64) throw invalid("payer_signature_missing");
+    const signature = tx.signatures[payer];
+    if (signature?.length !== 64) throw invalid("payer_signature_missing");
+    if (!signedBy(payer, tx.messageBytes, signature)) throw invalid("payer_signature_invalid");
     const memo = isRecord(accepted.extra) ? accepted.extra.memo : undefined;
     return {
         payload: raw as PaymentPayload,
