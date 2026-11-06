@@ -35,6 +35,15 @@ function fail(res: ServerResponse, status: number, body: unknown): void {
     sendJson(res, status, body);
 }
 
+// The pay path's CheckPayer call stops when the caller hangs up
+export function hangupSignal(res: ServerResponse): AbortSignal {
+    const ac = new AbortController();
+    res.once("close", () => {
+        if (!res.writableFinished) ac.abort();
+    });
+    return ac.signal;
+}
+
 export async function startServer(
     listen: string,
     handler: Handler,

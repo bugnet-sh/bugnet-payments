@@ -1,4 +1,4 @@
-import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from "node:http";
+import type { IncomingHttpHeaders, IncomingMessage } from "node:http";
 import { z } from "zod";
 import type { Log } from "../log.ts";
 import {
@@ -7,7 +7,15 @@ import {
     type OrderServiceDeps,
     shortText,
 } from "../orders/service.ts";
-import { BodyTooLarge, bearerOk, type Handler, readBody, requestPath, sendJson } from "./server.ts";
+import {
+    BodyTooLarge,
+    bearerOk,
+    type Handler,
+    hangupSignal,
+    readBody,
+    requestPath,
+    sendJson,
+} from "./server.ts";
 
 export interface InternalDeps {
     service: OrderServiceDeps;
@@ -29,15 +37,6 @@ async function readJson(req: IncomingMessage, maxBytes: number): Promise<unknown
     } catch {
         return undefined;
     }
-}
-
-// The pay path's CheckPayer call stops when the caller hangs up
-function hangupSignal(res: ServerResponse): AbortSignal {
-    const ac = new AbortController();
-    res.once("close", () => {
-        if (!res.writableFinished) ac.abort();
-    });
-    return ac.signal;
 }
 
 export function createInternalHandler(d: InternalDeps): Handler {

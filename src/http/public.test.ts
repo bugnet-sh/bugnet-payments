@@ -1,0 +1,365 @@
+import { create as protoCreate } from "@bufbuild/protobuf";
+import {
+    decodePaymentRequiredHeader,
+    decodePaymentResponseHeader,
+    encodePaymentSignatureHeader,
+} from "@x402/core/http";
+import type { PaymentRequirements } from "@x402/core/types";
+import type { IncomingMessage } from "node:http";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { PayerVerdict, CheckPayerResponseSchema } from "../gen/bugnet/router/v1/payments_pb.ts";
+import { newOrderId } from "../orders/ids.ts";
+import { findPaymentByOrder } from "../orders/store.ts";
+import type { OrderRow } from "../orders/types.ts";
+import { usdcAta } from "../solana/accounts.ts";
+import {
+    create,
+    get,
+    now,
+    post,
+    testApp,
+    type TestApp,
+    totalCalls,
+    withHints,
+} from "../testing/app.ts";
+import { testSigner } from "../testing/keys.ts";
+import { seedOrder } from "../testing/orders.ts";
+import { signedPayment } from "../testing/payment.ts";
+import { requirementsFor } from "../x402/challenge.ts";
+import { clientIp, publicState } from "./public.ts";
+
+let app: TestApp;
+let order: OrderRow;
+
+function inFuture(ms: number): Date {
+    return new Date(now().getTime() + ms);
+}
+
+async function unpaid(over: Partial<OrderRow> = {}): Promise<OrderRow> {
+    return (await seedOrder(app.pool, { expiresAt: inFuture(15 * 60_000), ...over })).order;
+}
+
+function requirementsOf(o: OrderRow): PaymentRequirements {
+    return withHints(
+        requirementsFor(o, {
+            publicUrl: app.settings.http.public_url,
+            recipient: app.settings.solana.recipient,
+            feePayer: app.feePayer.address,
+            transactionVersions: app.settings.solana.transaction_versions,
+        }),
+    );
+}
+
+async function headerFor(o: OrderRow, who = app.payer): Promise<string> {
+    return encodePaymentSignatureHeader(await signedPayment(requirementsOf(o), who));
+}
+
+beforeAll(async () => {
+    app = await testApp();
+});
+afterAll(async () => {
+    await app.close();
+});
+
+beforeEach(async () => {
+    order = await unpaid();
+    for (const k of Object.keys(app.rpc.calls)) app.rpc.calls[k] = 0;
+    app.log.lines.length = 0;
+});
+
+describe("publicState", () => {
+    const at = new Date("2030-01-01T00:00:00Z");
+    const row = (state: OrderRow["state"], expiresAt = new Date(at.getTime() + 1)) =>
+        ({ state, expiresAt }) as OrderRow;
+
+    it.each([
+        ["unpaid", "unpaid"],
+        ["settling", "settling"],
+        ["paid", "paid"],
+        ["redeemed", "paid"],
+        ["expired", "expired"],
+        ["refunding", "refunded"],
+        ["refunded", "refunded"],
+        ["manual", "review"],
+    ] as const)("maps %s to %s", (state, out) => {
+        expect(publicState(row(state), at)).toBe(out);
+    });
+
+    it("maps unpaid at or past expiry to expired but keeps settling", () => {
+        expect(publicState(row("unpaid", at), at)).toBe("expired");
+        expect(publicState(row("settling", at), at)).toBe("settling");
+    });
+});
+
+describe("clientIp", () => {
+    const fake = (remote: string, xff?: string) =>
+        ({
+            socket: { remoteAddress: remote },
+            headers: xff === undefined ? {} : { "x-forwarded-for": xff },
+        }) as unknown as IncomingMessage;
+
+    it("takes the last forwarded entry only from a trusted socket", () => {
+        expect(clientIp(fake("127.0.0.1", "6.6.6.6, 1.2.3.4"), ["127.0.0.1"])).toBe("1.2.3.4");
+        expect(clientIp(fake("::ffff:127.0.0.1", "1.2.3.4"), ["127.0.0.1"])).toBe("1.2.3.4");
+        expect(clientIp(fake("9.9.9.9", "1.2.3.4"), ["127.0.0.1"])).toBe("9.9.9.9");
+        expect(clientIp(fake("127.0.0.1"), ["127.0.0.1"])).toBe("127.0.0.1");
+    });
+});
+
+describe("public order routes", () => {
+    it("answers unknown 404 and expired 410 without RPC", async () => {
+        const expired = await unpaid({ expiresAt: inFuture(-1_000) });
+        const marked = await unpaid({ state: "expired" });
+        expect((await get(app, `/o/${newOrderId()}`)).status).toBe(404);
+        expect((await get(app, "/o/not-an-id")).status).toBe(404);
+        const r = await get(app, `/o/${expired.id}`);
+        expect(r.status).toBe(410);
+        expect(await r.json()).toEqual({ error: "order_expired", orderId: expired.id });
+        expect((await get(app, `/o/${marked.id}`)).status).toBe(410);
+        expect(totalCalls(app.rpc)).toBe(0);
+    });
+
+    it("answers 410 order_closed with the public state for refunding, refunded and manual", async () => {
+        for (const [state, shown] of [
+            ["refunding", "refunded"],
+            ["refunded", "refunded"],
+            ["manual", "review"],
+        ] as const) {
+            const o = await unpaid({ state });
+            const r = await get(app, `/o/${o.id}`);
+            expect(r.status).toBe(410);
+            expect(await r.json()).toEqual({ error: "order_closed", orderId: o.id, state: shown });
+        }
+        expect(totalCalls(app.rpc)).toBe(0);
+    });
+
+    it("challenges an unpaid order with the public URL", async () => {
+        const r = await get(app, `/o/${order.id}`, { accept: "application/json" });
+        expect(r.status).toBe(402);
+        const pr = decodePaymentRequiredHeader(r.headers.get("payment-required")!);
+        expect(pr.resource.url).toBe(`${app.settings.http.public_url}/o/${order.id}`);
+        expect(pr.resource.description).toBe(order.description);
+        expect(r.headers.get("cache-control")).toBe("no-store");
+        expect(await r.json()).toEqual(pr);
+    });
+
+    it("answers paid 200 and settling 202", async () => {
+        for (const state of ["paid", "redeemed"] as const) {
+            const o = await unpaid({ state });
+            const r = await get(app, `/o/${o.id}`);
+            expect(r.status).toBe(200);
+            expect(await r.json()).toEqual({ paid: true, orderId: o.id });
+        }
+        const s = await unpaid({ state: "settling" });
+        const r = await get(app, `/o/${s.id}`);
+        expect(r.status).toBe(202);
+        expect(await r.json()).toEqual({ state: "settling", orderId: s.id });
+    });
+
+    it("settles a payment and returns the settlement headers", async () => {
+        const r = await get(app, `/o/${order.id}`, {
+            "payment-signature": await headerFor(order),
+        });
+        expect(r.status).toBe(200);
+        expect(await r.json()).toEqual({ paid: true, orderId: order.id });
+        const settled = decodePaymentResponseHeader(r.headers.get("payment-response")!);
+        expect(settled).toMatchObject({
+            success: true,
+            payer: app.payer.address,
+            transaction: (await findPaymentByOrder(app.pool, order.id))!.txSignature,
+        });
+        expect(r.headers.get("x-payment-response")).toBe(r.headers.get("payment-response"));
+    });
+
+    it("accepts the X-PAYMENT header name and POST", async () => {
+        const r = await fetch(`${app.publicOrigin}/o/${order.id}`, {
+            method: "POST",
+            headers: { "x-payment": await headerFor(order) },
+            body: "ignored",
+        });
+        expect(r.status).toBe(200);
+        expect(await r.json()).toEqual({ paid: true, orderId: order.id });
+        expect(r.headers.get("payment-response")).not.toBeNull();
+    });
+
+    it("repeats the settlement headers for the same payment and omits them for another", async () => {
+        const h = await headerFor(order);
+        const first = await get(app, `/o/${order.id}`, { "payment-signature": h });
+        const again = await get(app, `/o/${order.id}`, { "payment-signature": h });
+        expect(again.status).toBe(200);
+        expect(again.headers.get("payment-response")).toBe(first.headers.get("payment-response"));
+        const other = await get(app, `/o/${order.id}`, {
+            "payment-signature": await headerFor(order, await testSigner(4)),
+        });
+        expect(other.status).toBe(200);
+        expect(await other.json()).toEqual({ paid: true, orderId: order.id });
+        expect(other.headers.get("payment-response")).toBeNull();
+    });
+
+    it("takes the payment path when a payment comes with Accept: text/html", async () => {
+        const r = await get(app, `/o/${order.id}`, {
+            accept: "text/html",
+            "payment-signature": await headerFor(order),
+        });
+        expect(r.status).toBe(200);
+        expect(r.headers.get("content-type")).toMatch(/application\/json/);
+        expect(await r.json()).toEqual({ paid: true, orderId: order.id });
+    });
+
+    it("broadcasts once for two concurrent payments to /o/{id}", async () => {
+        const [a, b] = await Promise.all([
+            get(app, `/o/${order.id}`, { "payment-signature": await headerFor(order) }),
+            get(app, `/o/${order.id}`, {
+                "payment-signature": await headerFor(order, await testSigner(4)),
+            }),
+        ]);
+        expect([a.status, b.status]).toContain(200);
+        for (const s of [a.status, b.status]) expect([200, 202]).toContain(s);
+        expect([a, b].filter((r) => r.headers.get("payment-response")).length).toBe(1);
+        expect(app.rpc.calls.sendTransaction).toBe(1);
+    });
+
+    it("a stranger pays and the creator redeems", async () => {
+        const created = (await post(app, "/v1/orders", create())).body;
+        const stranger = await testSigner(4);
+        const p = await signedPayment(withHints(created.paymentRequired.accepts[0]), stranger);
+        const paid = await get(app, `/o/${created.orderId}`, {
+            "payment-signature": encodePaymentSignatureHeader(p),
+        });
+        expect(paid.status).toBe(200);
+        const r = await post(app, "/v1/orders", { orderId: created.orderId, claim: created.claim });
+        expect(r.body).toMatchObject({ status: "paid", payer: stranger.address });
+        expect((await findPaymentByOrder(app.pool, created.orderId))!.sourceTokenAccount).toBe(
+            await usdcAta(stranger.address),
+        );
+    });
+
+    it("answers healthz without counting it against the per-IP limit", async () => {
+        for (let i = 0; i < 70; i++) {
+            const r = await get(app, "/healthz", { "x-forwarded-for": "10.1.1.1" });
+            expect(r.status).toBe(200);
+            expect(await r.json()).toEqual({ ok: true });
+        }
+        expect((await get(app, "/o/not-an-id", { "x-forwarded-for": "10.1.1.1" })).status).toBe(
+            404,
+        );
+    });
+
+    it("never limits checkout status polling at 100 calls a minute from one IP", async () => {
+        for (let i = 0; i < 100; i++) {
+            const r = await get(app, `/o/${order.id}/status`, { "x-forwarded-for": "10.2.2.2" });
+            expect(r.status).toBe(200);
+        }
+    });
+
+    it("never answers 402 once a payment is presented", async () => {
+        const wrongMemo = await headerFor(await unpaid());
+        const expired = await unpaid({ expiresAt: inFuture(-1_000) });
+        const cases: [string, string, number, string][] = [
+            [order.id, "%%% not base64 json", 400, "payment_malformed"],
+            [order.id, wrongMemo, 422, "payment_order_mismatch"],
+            [expired.id, await headerFor(expired), 410, "order_expired"],
+            [newOrderId(), await headerFor(order), 404, "order_unknown"],
+        ];
+        for (const [id, h, status, refused] of cases) {
+            const r = await get(app, `/o/${id}`, { "payment-signature": h });
+            expect(r.status).toBe(status);
+            expect(await r.json()).toMatchObject({ refused, orderId: id });
+        }
+    });
+
+    it("refuses a blocked payer, then limits repeated attempts with Retry-After", async () => {
+        const blocked = await testApp({
+            checkPayer: true,
+            routerImpl: {
+                checkPayer: () =>
+                    protoCreate(CheckPayerResponseSchema, { verdict: PayerVerdict.BLOCKED }),
+            },
+        });
+        try {
+            const o = (
+                await seedOrder(blocked.pool, { expiresAt: new Date("2030-01-01T00:15:00Z") })
+            ).order;
+            const ctx = {
+                publicUrl: blocked.settings.http.public_url,
+                recipient: blocked.settings.solana.recipient,
+                feePayer: blocked.feePayer.address,
+                transactionVersions: blocked.settings.solana.transaction_versions,
+            };
+            const h = encodePaymentSignatureHeader(
+                await signedPayment(withHints(requirementsFor(o, ctx)), blocked.payer),
+            );
+            for (let i = 0; i < 5; i++) {
+                const r = await get(blocked, `/o/${o.id}`, {
+                    "payment-signature": h,
+                    "x-forwarded-for": `10.3.3.${i}`,
+                });
+                expect(r.status).toBe(403);
+                expect(await r.json()).toMatchObject({ refused: "payer_blocked", orderId: o.id });
+            }
+            const last = await get(blocked, `/o/${o.id}`, { "payment-signature": h });
+            expect(last.status).toBe(429);
+            expect(await last.json()).toMatchObject({ refused: "too_many_attempts" });
+            expect(last.headers.get("retry-after")).toMatch(/^\d+$/);
+            expect(blocked.rpc.calls.sendTransaction).toBe(0);
+        } finally {
+            await blocked.close();
+        }
+    });
+
+    it("serves a status without RPC", async () => {
+        const r = await get(app, `/o/${order.id}/status`);
+        expect(r.status).toBe(200);
+        expect(await r.json()).toEqual({
+            orderId: order.id,
+            state: "unpaid",
+            expiresAt: order.expiresAt.toISOString(),
+        });
+        const lapsed = await unpaid({ expiresAt: inFuture(-1_000) });
+        expect(
+            ((await (await get(app, `/o/${lapsed.id}/status`)).json()) as { state: string }).state,
+        ).toBe("expired");
+        expect((await get(app, `/o/${newOrderId()}/status`)).status).toBe(404);
+        expect(totalCalls(app.rpc)).toBe(0);
+    });
+
+    it("limits requests per client IP, trusting X-Forwarded-For only from proxies", async () => {
+        const probe = (ip: string) => get(app, `/o/${newOrderId()}`, { "x-forwarded-for": ip });
+        for (let i = 0; i < 60; i++) expect((await probe("10.4.4.4")).status).toBe(404);
+        const limited = await probe("10.4.4.4");
+        expect(limited.status).toBe(429);
+        expect(await limited.json()).toEqual({ error: "too_many_requests" });
+        expect(limited.headers.get("retry-after")).toMatch(/^\d+$/);
+        expect((await probe("10.5.5.5")).status).toBe(404);
+
+        const untrusted = await testApp({ trustedProxies: ["10.0.0.1"] });
+        try {
+            for (let i = 0; i < 60; i++) {
+                const r = await get(untrusted, `/o/${newOrderId()}`, {
+                    "x-forwarded-for": `10.6.6.${i}`,
+                });
+                expect(r.status).toBe(404);
+            }
+            const r = await get(untrusted, `/o/${newOrderId()}`, { "x-forwarded-for": "10.6.7.1" });
+            expect(r.status).toBe(429);
+        } finally {
+            await untrusted.close();
+        }
+    });
+
+    it("answers unknown paths 404 and wrong methods 405", async () => {
+        expect((await get(app, "/nope", { "x-forwarded-for": "10.7.7.7" })).status).toBe(404);
+        const r = await fetch(`${app.publicOrigin}/o/${order.id}/status`, {
+            method: "POST",
+            headers: { "x-forwarded-for": "10.7.7.7" },
+        });
+        expect(r.status).toBe(405);
+    });
+
+    it("never logs a payment header", async () => {
+        const h = await headerFor(order);
+        await get(app, `/o/${order.id}`, { "payment-signature": h });
+        expect(app.log.lines.length).toBeGreaterThan(0);
+        expect(JSON.stringify(app.log.lines)).not.toContain(h.slice(0, 40));
+    });
+});

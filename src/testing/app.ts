@@ -1,11 +1,14 @@
 import { randomBytes } from "node:crypto";
+import type { ServiceImpl } from "@connectrpc/connect";
 import { getAddressEncoder, getBase58Decoder, type KeyPairSigner } from "@solana/kit";
 import type { PaymentRequirements } from "@x402/core/types";
 import type pg from "pg";
 import { stringify } from "smol-toml";
 import { parseSettings, type Secrets, type Settings } from "../config.ts";
 import { createInternalHandler } from "../http/internal.ts";
+import { createPublicHandler } from "../http/public.ts";
 import { startServer } from "../http/server.ts";
+import type { PaymentsService } from "../gen/bugnet/router/v1/payments_pb.ts";
 import { memoryLog } from "../log.ts";
 import { type PayDeps, payOrder } from "../orders/pay.ts";
 import type { OrderServiceDeps } from "../orders/service.ts";
@@ -22,10 +25,14 @@ import { testSigner } from "./keys.ts";
 
 export interface TestAppOptions {
     now?: Date;
+    routerImpl?: Partial<ServiceImpl<typeof PaymentsService>>;
+    checkPayer?: boolean;
+    trustedProxies?: string[];
 }
 
 export interface TestApp {
     internalUrl: string;
+    publicOrigin: string;
     publicUrl: string;
     pool: pg.Pool;
     rpc: FakeRpc;
@@ -61,16 +68,26 @@ export async function testApp(over: TestAppOptions = {}): Promise<TestApp> {
     clock = over.now ?? DEFAULT_NOW;
     const log = memoryLog();
     const db = await testDb();
-    const router = await startFakeRouter({});
+    const router = await startFakeRouter(over.routerImpl ?? {});
     const payer = await testSigner(3);
     const feePayer = await testSigner(FEE_PAYER_SEED);
     const recipient = await testSigner(1);
     const settings = parseSettings(
         stringify({
-            http: { internal_listen: "127.0.0.1:0", public_listen: "127.0.0.1:0" },
+            http: {
+                internal_listen: "127.0.0.1:0",
+                public_listen: "127.0.0.1:0",
+                ...(over.trustedProxies === undefined
+                    ? {}
+                    : { trusted_proxies: over.trustedProxies }),
+            },
             database: { url: db.url },
             solana: { recipient: recipient.address },
-            router: { url: router.url, event_public_key: orderPublicKeyBase64(EVENT_SEED) },
+            router: {
+                url: router.url,
+                event_public_key: orderPublicKeyBase64(EVENT_SEED),
+                check_payer: over.checkPayer ?? false,
+            },
         }),
         "testApp",
     );
@@ -145,7 +162,29 @@ export async function testApp(over: TestAppOptions = {}): Promise<TestApp> {
         }),
         log,
     );
+    const publicServer = await startServer(
+        settings.http.public_listen,
+        createPublicHandler({
+            pool: db.pool,
+            challenge,
+            hints,
+            pay,
+            perIp: new RateLimiter(settings.limits.public_per_ip_per_minute, 60_000, () =>
+                clock.getTime(),
+            ),
+            statusPerIp: new RateLimiter(settings.limits.status_per_ip_per_minute, 60_000, () =>
+                clock.getTime(),
+            ),
+            trustedProxies: settings.http.trusted_proxies,
+            maxBodyBytes: settings.http.max_body_bytes,
+            checkoutJsPath: "dist/checkout.js",
+            log,
+            now: appNow,
+        }),
+        log,
+    );
     return {
+        publicOrigin: `http://127.0.0.1:${publicServer.port}`,
         internalUrl: `http://127.0.0.1:${internal.port}`,
         publicUrl: settings.http.public_url,
         pool: db.pool,
@@ -162,6 +201,7 @@ export async function testApp(over: TestAppOptions = {}): Promise<TestApp> {
             },
         },
         async close() {
+            await publicServer.close();
             await internal.close();
             await router.close();
             await db.close();
@@ -185,6 +225,18 @@ export async function post(
     });
     const text = await res.text();
     return { status: res.status, body: text === "" ? undefined : JSON.parse(text) };
+}
+
+export function get(
+    app: TestApp,
+    path: string,
+    headers: Record<string, string> = {},
+): Promise<Response> {
+    return fetch(`${app.publicOrigin}${path}`, { headers });
+}
+
+export function totalCalls(rpc: FakeRpc): number {
+    return Object.values(rpc.calls).reduce((a, b) => a + b, 0);
 }
 
 export function create(over: Partial<OrderRequest> = {}): OrderRequest {
