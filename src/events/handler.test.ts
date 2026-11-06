@@ -213,6 +213,7 @@ describe("events", () => {
 
     it("stores unknown types and unknown orders without changing state", async () => {
         const redeemed = await seeded("redeemed");
+        const parked = await seeded("manual", { manualReason: "no_event_unverifiable" });
         const id = eid();
         const blocked = raw({
             id,
@@ -222,9 +223,32 @@ describe("events", () => {
         });
         expect((await send(blocked)).status).toBe(200);
         expect(await eventRows(id)).toBe(1);
-        const ghost = failed("ord_aaaaaaaaaaaaaaaaaaaaaaaaaa", eid());
-        expect((await send(ghost)).status).toBe(200);
-        expect((await findOrder(app.pool, redeemed.id))!.state).toBe("redeemed");
+        for (const target of [redeemed, parked]) {
+            for (const refundable of [true, false]) {
+                const evId = eid();
+                const body = raw({
+                    id: evId,
+                    type: "wallet.blocked",
+                    created_at: "2026-11-06T12:00:00Z",
+                    payload: { order_id: target.id, refundable },
+                });
+                expect((await send(body)).status).toBe(200);
+                expect(await eventRows(evId)).toBe(1);
+            }
+        }
+        expect(await findOrder(app.pool, redeemed.id)).toMatchObject({
+            state: "redeemed",
+            eventSeenAt: null,
+        });
+        expect(await findOrder(app.pool, parked.id)).toMatchObject({
+            state: "manual",
+            manualReason: "no_event_unverifiable",
+            routerConfirmedAt: null,
+        });
+        expect(await refundRows(redeemed.id)).toBe(0);
+        const ghostId = eid();
+        expect((await send(failed("ord_aaaaaaaaaaaaaaaaaaaaaaaaaa", ghostId))).status).toBe(200);
+        expect(await eventRows(ghostId)).toBe(1);
     });
 
     it("marks the extend order seen on placement.extended", async () => {
@@ -305,9 +329,12 @@ describe("events", () => {
         await expect(
             handleEvent({ pool, key, log: memoryLog(), now: app.now.get }, body, headers),
         ).rejects.toThrow("db down");
-        expect(await eventRows(id)).toBe(0);
-        expect((await send(body)).status).toBe(200);
+        expect(await eventRows(id)).toBe(1);
+        const retry = await send(body);
+        expect(retry).toEqual({ status: 200, body: { ok: true } });
         expect((await findOrder(app.pool, redeemed.id))!.state).toBe("refunding");
+        expect(await send(body)).toEqual({ status: 200, body: { ok: true, duplicate: true } });
+        expect(await refundRows(redeemed.id)).toBe(1);
     });
 });
 

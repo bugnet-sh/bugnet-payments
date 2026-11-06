@@ -1,8 +1,10 @@
 /**
  * Signed router events. The router signs the raw body bytes with Ed25519, so the signature is
- * checked before the body is parsed. An event is stored once by its id; a stored event is then
- * applied: the order is marked as heard from, and a refundable end is turned into a refund or,
- * when the amounts are missing or wrong, parked in the manual queue.
+ * checked before the body is parsed. An event is stored by its id and stamped applied only once
+ * its effects are done, so the retry of an unapplied event applies it again (every effect is
+ * idempotent). Only the four placement.* types are applied: the order is marked as heard from,
+ * and a refundable end is turned into a refund or, when the amounts are missing or wrong, parked
+ * in the manual queue. Other types are only stored.
  */
 import { createPublicKey, type KeyObject, verify } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
@@ -16,6 +18,12 @@ import { findRefund, requestRefund, returnManualToRedeemed } from "../refunds/re
 const SPKI_ED25519_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 const KEY_BYTES = 32;
 const SIGNATURE_BYTES = 64;
+const ORDER_EVENT_TYPES = new Set([
+    "placement.ready",
+    "placement.failed",
+    "placement.extended",
+    "placement.terminated",
+]);
 const PARKED_BY_SWEEPER = ["no_event_unverifiable", "abandon_unverifiable"] as const;
 
 export function eventPublicKey(b64: string): KeyObject {
@@ -101,19 +109,27 @@ export async function handleEvent(
          values ($1, $2, $3, $4, $5) on conflict (event_id) do nothing`,
         [event.id, event.type, event.createdAt, orderId, JSON.stringify(event.payload)],
     );
-    if (inserted.rowCount === 0) return { status: 200, body: { ok: true, duplicate: true } };
-    try {
-        await applyEvent(d, event);
-    } catch (err) {
-        // The id is already stored, so without this the router's retry would be dropped as a duplicate
-        await d.pool.query("delete from events where event_id = $1", [event.id]).catch(() => {});
-        throw err;
+    if (inserted.rowCount === 0) {
+        // A stored but unapplied event is a first attempt that died; the retry applies it again.
+        const prior = await d.pool.query<{ applied_at: Date | null }>(
+            "select applied_at from events where event_id = $1",
+            [event.id],
+        );
+        if (prior.rows[0]?.applied_at != null) {
+            return { status: 200, body: { ok: true, duplicate: true } };
+        }
     }
+    await applyEvent(d, event);
+    await d.pool.query("update events set applied_at = $2 where event_id = $1", [
+        event.id,
+        d.now(),
+    ]);
     return { status: 200, body: { ok: true } };
 }
 
 async function applyEvent(d: EventDeps, event: RouterEvent): Promise<void> {
     const { payload } = event;
+    if (!ORDER_EVENT_TYPES.has(event.type)) return;
     const orderId =
         event.type === "placement.extended" ? str(payload.extend_order_id) : str(payload.order_id);
     if (orderId === undefined) return;

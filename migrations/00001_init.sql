@@ -81,6 +81,7 @@ create table events (
     type text not null,
     created_at timestamptz not null,
     received_at timestamptz not null default now(),
+    applied_at timestamptz,
     order_id text,
     payload jsonb not null
 );
