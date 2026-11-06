@@ -35,7 +35,11 @@ export const REDACTED_KEYS: ReadonlySet<string> = new Set([
     "wire",
     "wireTx",
     "transaction",
+    "payment-signature",
+    "x-payment",
 ]);
+
+const REDACTED_LOWER: ReadonlySet<string> = new Set([...REDACTED_KEYS].map((k) => k.toLowerCase()));
 
 const REDACTED = "[redacted]";
 
@@ -57,7 +61,7 @@ function sanitize(value: unknown, scrub: (s: string) => string, seen: WeakSet<ob
         if (Array.isArray(value)) return value.map((v) => sanitize(v, scrub, seen));
         const out: Fields = {};
         for (const [k, v] of Object.entries(value)) {
-            out[k] = REDACTED_KEYS.has(k) ? REDACTED : sanitize(v, scrub, seen);
+            out[k] = REDACTED_LOWER.has(k.toLowerCase()) ? REDACTED : sanitize(v, scrub, seen);
         }
         return out;
     } finally {

@@ -83,6 +83,28 @@ describe("test loggers", () => {
         expect(() => silentLog.alarm("refunds_paused")).not.toThrow();
     });
 
+    it("redacts keys case-insensitively, including nested objects", () => {
+        const log = memoryLog();
+        log.info("m", {
+            Authorization: "a",
+            "PAYMENT-SIGNATURE": "b",
+            "X-Payment": "c",
+            headers: { Authorization: "d", "Payment-Signature": "e", "x-payment": "f" },
+            ok: "visible",
+        });
+        expect(log.lines[0]).toMatchObject({
+            Authorization: "[redacted]",
+            "PAYMENT-SIGNATURE": "[redacted]",
+            "X-Payment": "[redacted]",
+            headers: {
+                Authorization: "[redacted]",
+                "Payment-Signature": "[redacted]",
+                "x-payment": "[redacted]",
+            },
+            ok: "visible",
+        });
+    });
+
     it("REDACTED_KEYS lists the secret keys", () => {
         expect(REDACTED_KEYS.has("mnemonic")).toBe(true);
         expect(REDACTED_KEYS.has("orderId")).toBe(false);
