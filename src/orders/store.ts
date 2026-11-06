@@ -223,6 +223,14 @@ export async function findPaymentByOrder(
     return res.rows[0] ? toPayment(res.rows[0]) : null;
 }
 
+export async function lockPayment(c: pg.PoolClient, orderId: string): Promise<PaymentRow | null> {
+    const res = await c.query<PaymentDbRow>(
+        "select * from payments where order_id = $1 for update",
+        [orderId],
+    );
+    return res.rows[0] ? toPayment(res.rows[0]) : null;
+}
+
 export async function confirmPayment(db: Queryable, orderId: string, at: Date): Promise<boolean> {
     const res = await db.query(
         `update payments set status = 'confirmed', confirmed_at = $2
