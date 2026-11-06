@@ -5,6 +5,8 @@ import { newOrderId } from "../orders/ids.ts";
 import { findOrder } from "../orders/store.ts";
 import { create, post, testApp, type TestApp, until } from "../testing/app.ts";
 import { seedOrder } from "../testing/orders.ts";
+import type { OrderServiceDeps } from "../orders/service.ts";
+import { createInternalHandler } from "./internal.ts";
 import { bearerOk, startServer } from "./server.ts";
 
 let app: TestApp;
@@ -176,9 +178,32 @@ describe("internal API", () => {
     );
 
     it("answers 503 for events when no event handler is wired", async () => {
+        const s = await startServer(
+            "127.0.0.1:0",
+            createInternalHandler({
+                service: {} as OrderServiceDeps,
+                token: "t",
+                maxBodyBytes: 1024,
+                log: memoryLog(),
+            }),
+            memoryLog(),
+        );
+        try {
+            const r = await fetch(`http://127.0.0.1:${s.port}/v1/events`, {
+                method: "POST",
+                body: "{}",
+            });
+            expect(r.status).toBe(503);
+            expect(await r.json()).toEqual({ error: "events_disabled" });
+        } finally {
+            await s.close();
+        }
+    });
+
+    it("takes events without a bearer token and refuses an unsigned one", async () => {
         const r = await raw("/v1/events", { method: "POST", body: "{}" });
-        expect(r.status).toBe(503);
-        expect(await r.json()).toEqual({ error: "events_disabled" });
+        expect(r.status).toBe(401);
+        expect(await r.json()).toEqual({ error: "bad_signature" });
     });
 
     it("answers 404 for an unknown route", async () => {

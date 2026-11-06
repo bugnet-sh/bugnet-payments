@@ -6,6 +6,7 @@ import type pg from "pg";
 import { stringify } from "smol-toml";
 import { parseSettings, type Secrets, type Settings } from "../config.ts";
 import type { PaymentsService } from "../gen/bugnet/router/v1/payments_pb.ts";
+import { eventPublicKey, handleEvent } from "../events/handler.ts";
 import { createInternalHandler } from "../http/internal.ts";
 import { createPublicHandler } from "../http/public.ts";
 import { startServer } from "../http/server.ts";
@@ -164,6 +165,17 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
         createInternalHandler({
             service,
             token: secrets.paymentsToken,
+            events: (raw, headers) =>
+                handleEvent(
+                    {
+                        pool: db.pool,
+                        key: eventPublicKey(settings.router.event_public_key),
+                        log,
+                        now: appNow,
+                    },
+                    raw,
+                    headers,
+                ),
             maxBodyBytes: settings.http.max_body_bytes,
             log,
         }),

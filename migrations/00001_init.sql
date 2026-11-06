@@ -50,7 +50,7 @@ create table failed_payments (
 create table refunds (
     id bigserial primary key,
     order_id text not null references orders(id),
-    kind text not null check (kind in ('full')),
+    kind text not null check (kind in ('full', 'partial')),
     reason text not null check (reason in
         ('unredeemed','late','router_refundable','abandoned','no_router_record','operator')),
     amount_micros bigint not null check (amount_micros > 0),
