@@ -86,7 +86,7 @@ describe("requestRefund", () => {
         }
     });
 
-    it("answers exists for refunding and refunded orders and unknown for a missing one", async () => {
+    it("answers exists for refunding and refunded orders, unknown for a missing one", async () => {
         for (const state of ["refunding", "refunded"] as const) {
             const { order } = await paidOrder(state);
             expect(await requestRefund(db.pool, order.id, "operator")).toBe("exists");
@@ -100,7 +100,10 @@ describe("requestRefund", () => {
     it("refunds a manual order that has no refund row, once", async () => {
         const { order } = await paidOrder("manual", { manualReason: "no_event_unverifiable" });
         expect(await requestRefund(db.pool, order.id, "router_refundable")).toBe("created");
-        expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
+        expect(await findOrder(db.pool, order.id)).toMatchObject({
+            state: "refunding",
+            manualReason: null,
+        });
         expect(await requestRefund(db.pool, order.id, "router_refundable")).toBe("exists");
 
         const withRow = await paidOrder("manual", { manualReason: "refund_failed" });

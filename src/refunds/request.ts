@@ -127,7 +127,13 @@ export async function requestRefund(
             ],
         );
         if (inserted.rowCount !== 1) return "exists";
-        await setOrderState(c, orderId, order.state, "refunding");
+        await setOrderState(
+            c,
+            orderId,
+            order.state,
+            "refunding",
+            order.state === "manual" ? { manualReason: null } : {},
+        );
         return "created";
     });
 }

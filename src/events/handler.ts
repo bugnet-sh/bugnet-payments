@@ -12,7 +12,13 @@ import type pg from "pg";
 import { withTx } from "../db/pool.ts";
 import { isRecord } from "../is-record.ts";
 import type { Log } from "../log.ts";
-import { findOrder, lockOrder, markEventSeen, setOrderState } from "../orders/store.ts";
+import {
+    findOrder,
+    lockOrder,
+    markEventSeen,
+    setManualReason,
+    setOrderState,
+} from "../orders/store.ts";
 import { findRefund, requestRefund, returnManualToRedeemed } from "../refunds/request.ts";
 
 const SPKI_ED25519_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
@@ -88,6 +94,13 @@ function str(v: unknown): string | undefined {
     return typeof v === "string" && v !== "" ? v : undefined;
 }
 
+// The order an event applies to: an extension's own order, not the start order it names.
+function eventOrderId(event: RouterEvent): string | undefined {
+    return event.type === "placement.extended"
+        ? str(event.payload.extend_order_id)
+        : str(event.payload.order_id);
+}
+
 export async function handleEvent(
     d: EventDeps,
     raw: Buffer,
@@ -103,7 +116,7 @@ export async function handleEvent(
     if (event.id !== headerValue(h["x-bugnet-event-id"])) {
         return { status: 400, body: { error: "event_id_mismatch" } };
     }
-    const orderId = str(event.payload.order_id) ?? null;
+    const orderId = eventOrderId(event) ?? null;
     const inserted = await d.pool.query(
         `insert into events (event_id, type, created_at, order_id, payload)
          values ($1, $2, $3, $4, $5) on conflict (event_id) do nothing`,
@@ -130,22 +143,27 @@ export async function handleEvent(
 async function applyEvent(d: EventDeps, event: RouterEvent): Promise<void> {
     const { payload } = event;
     if (!ORDER_EVENT_TYPES.has(event.type)) return;
-    const orderId =
-        event.type === "placement.extended" ? str(payload.extend_order_id) : str(payload.order_id);
-    if (orderId === undefined) return;
-    if ((await findOrder(d.pool, orderId)) === null) {
+    const orderId = eventOrderId(event);
+    let known = false;
+    if (orderId === undefined) {
+        d.log.warn("event without an order id", { eventId: event.id, type: event.type });
+    } else if ((await findOrder(d.pool, orderId)) === null) {
         d.log.warn("event for an unknown order", { eventId: event.id, orderId });
-        return;
+    } else {
+        known = true;
+        await markEventSeen(d.pool, orderId, d.now());
+        if (payload.refundable !== true) {
+            await returnManualToRedeemed(d.pool, orderId, d.now(), PARKED_BY_SWEEPER);
+        }
     }
-    await markEventSeen(d.pool, orderId, d.now());
-    if (payload.refundable !== true) {
-        await returnManualToRedeemed(d.pool, orderId, d.now(), PARKED_BY_SWEEPER);
-        return;
-    }
+    if (payload.refundable !== true) return;
+    // A terminated event carries the extension orders' entries, so it is applied whether or not
+    // its own order is known.
     if (event.type === "placement.terminated") {
-        await refundTerminated(d, event, orderId);
+        await refundTerminated(d, event, known ? orderId : undefined);
         return;
     }
+    if (!known || orderId === undefined) return;
     const out = await requestRefund(d.pool, orderId, "router_refundable");
     d.log.info("router refund requested", { eventId: event.id, orderId, result: out });
 }
@@ -174,11 +192,14 @@ function parseEntries(v: unknown): RefundEntry[] | null {
 async function refundTerminated(
     d: EventDeps,
     event: RouterEvent,
-    startOrder: string,
+    startOrder: string | undefined,
 ): Promise<void> {
     const raw = event.payload.refunds;
-    if (raw === undefined || (Array.isArray(raw) && raw.length === 0)) {
-        await parkManual(d, event, startOrder, "refund_amount_pending");
+    // Go marshals a nil slice as null
+    if (raw === undefined || raw === null || (Array.isArray(raw) && raw.length === 0)) {
+        if (startOrder !== undefined) {
+            await parkManual(d, event, startOrder, "refund_amount_pending");
+        }
         return;
     }
     const entries = parseEntries(raw);
@@ -186,22 +207,36 @@ async function refundTerminated(
         const named = Array.isArray(raw)
             ? raw.map((e) => (isRecord(e) ? str(e.order_id) : undefined))
             : [];
-        const orders = new Set([startOrder, ...named.filter((o) => o !== undefined)]);
+        const orders = new Set([
+            ...(startOrder === undefined ? [] : [startOrder]),
+            ...named.filter((o) => o !== undefined),
+        ]);
         for (const id of orders) await parkManual(d, event, id, "refund_amount_invalid");
         return;
     }
+    const live: RefundEntry[] = [];
+    for (const e of entries) {
+        if (e.amountMicros === 0) continue;
+        if ((await findOrder(d.pool, e.orderId)) === null) {
+            d.log.warn("refund entry for an unknown order", {
+                eventId: event.id,
+                orderId: e.orderId,
+            });
+            continue;
+        }
+        live.push(e);
+    }
     const seen = new Set<string>();
     const repeated = new Set<string>();
-    for (const e of entries) {
+    for (const e of live) {
         if (seen.has(e.orderId)) repeated.add(e.orderId);
         seen.add(e.orderId);
     }
-    for (const e of entries) {
+    for (const e of live) {
         if (repeated.has(e.orderId)) {
             await parkManual(d, event, e.orderId, "refund_amount_invalid");
             continue;
         }
-        if (e.amountMicros === 0) continue;
         const out = await requestRefund(d.pool, e.orderId, "router_refundable", e.amountMicros);
         if (out === "unknown") {
             d.log.warn("refund entry for an unknown order", {
@@ -210,6 +245,12 @@ async function refundTerminated(
             });
         } else if (out === "invalid_amount") {
             await parkManual(d, event, e.orderId, "refund_amount_invalid");
+        } else if (out === "not_refundable") {
+            d.log.warn("router refund not refundable", {
+                eventId: event.id,
+                orderId: e.orderId,
+                result: out,
+            });
         } else {
             await markEventSeen(d.pool, e.orderId, d.now());
             d.log.info("router refund requested", {
@@ -236,7 +277,8 @@ async function parkManual(
             return true;
         }
         if (order.state !== "manual" || (await findRefund(c, orderId)) !== null) return false;
-        await c.query("update orders set manual_reason = $2 where id = $1", [orderId, reason]);
+        if (order.manualReason === reason) return false;
+        await setManualReason(c, orderId, reason);
         return true;
     });
     if (!parked) return;
@@ -245,6 +287,5 @@ async function parkManual(
         reason,
         eventId: event.id,
         terminationReason: str(event.payload.termination_reason),
-        unusedSeconds: event.payload.unused_seconds,
     });
 }

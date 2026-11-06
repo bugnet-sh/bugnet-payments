@@ -279,3 +279,7 @@ export async function markEventSeen(db: Queryable, id: string, at: Date): Promis
         at,
     ]);
 }
+
+export async function setManualReason(db: Queryable, id: string, reason: string): Promise<void> {
+    await db.query("update orders set manual_reason = $2 where id = $1", [id, reason]);
+}

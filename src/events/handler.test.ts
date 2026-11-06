@@ -112,6 +112,7 @@ describe("signature helpers", () => {
         expect(verifyEventSignature(key, body, sig)).toBe(true);
         expect(verifyEventSignature(key, Buffer.from("hellO"), sig)).toBe(false);
         expect(verifyEventSignature(key, body, sig.replace(/=+$/, "") + "A")).toBe(false);
+        expect(verifyEventSignature(key, body, sig.replace(/=+$/, ""))).toBe(false);
         expect(verifyEventSignature(key, body, "")).toBe(false);
         expect(verifyEventSignature(key, body, Buffer.alloc(63).toString("base64"))).toBe(false);
         const other = eventPublicKey(orderPublicKeyBase64(Buffer.alloc(32, 8)));
@@ -266,6 +267,10 @@ describe("events", () => {
         expect((await send(body)).status).toBe(200);
         expect((await findOrder(app.pool, extend.id))!.eventSeenAt).toEqual(app.now.get());
         expect((await findOrder(app.pool, start.id))!.eventSeenAt).toBeNull();
+        const row = await app.pool.query("select order_id from events where event_id = $1", [
+            JSON.parse(body.toString()).id,
+        ]);
+        expect(row.rows[0].order_id).toBe(extend.id);
     });
 
     it("returns a parked manual order to redeemed on a non-refundable event", async () => {
@@ -312,7 +317,7 @@ describe("events", () => {
         expect(out).toEqual({ status: 503, body: { error: "events_disabled" } });
     });
 
-    it("removes the stored event when applying fails so the router can retry", async () => {
+    it("keeps the stored event when applying fails and applies it on the retry", async () => {
         const redeemed = await seeded("redeemed");
         const id = eid();
         const body = failed(redeemed.id, id);
@@ -412,7 +417,7 @@ describe("placement.terminated refunds", () => {
         ).toBe(true);
     });
 
-    it("parks an order whose entry exceeds what it paid as manual refund_amount_invalid", async () => {
+    it("parks an entry above what the order paid as manual refund_amount_invalid", async () => {
         const start = await seeded("redeemed");
         const body = terminated(start.id, eid(), {
             refundable: true,
@@ -474,12 +479,14 @@ describe("placement.terminated refunds", () => {
         );
     });
 
-    it("parks the start order as refund_amount_pending when refunds are missing or empty", async () => {
+    it("parks the start order as refund_amount_pending when refunds are absent", async () => {
         const missing = await seeded("redeemed");
         await send(terminated(missing.id, eid(), { refundable: true }));
         const empty = await seeded("paid");
         await send(terminated(empty.id, eid(), { refundable: true, refunds: [] }));
-        for (const o of [missing, empty]) {
+        const nil = await seeded("redeemed");
+        await send(terminated(nil.id, eid(), { refundable: true, refunds: null }));
+        for (const o of [missing, empty, nil]) {
             expect(await findOrder(app.pool, o.id)).toMatchObject({
                 state: "manual",
                 manualReason: "refund_amount_pending",
@@ -489,6 +496,58 @@ describe("placement.terminated refunds", () => {
         expect(
             app.log.lines.some((l) => l.alarm === "manual_queue" && l.orderId === missing.id),
         ).toBe(true);
+    });
+
+    it("refunds an extension entry when the start order id is unknown or missing", async () => {
+        const extend = await seeded("redeemed", {
+            kind: "extend",
+            handleSha256: "c".repeat(64),
+        });
+        const entries = [
+            { order_id: "ord_bbbbbbbbbbbbbbbbbbbbbbbbbb", refund_micros: 100 },
+            { order_id: extend.id, refund_micros: 2_000 },
+        ];
+        const log = app.log.lines.length;
+        await send(
+            terminated("ord_bbbbbbbbbbbbbbbbbbbbbbbbbb", eid(), {
+                refundable: true,
+                refunds: entries,
+            }),
+        );
+        expect(await findRefund(app.pool, extend.id)).toMatchObject({ amountMicros: 2_000 });
+        expect(
+            app.log.lines
+                .slice(log)
+                .some((l) => l.level === "warn" && /unknown order/.test(String(l.msg))),
+        ).toBe(true);
+        const other = await seeded("redeemed", { kind: "extend", handleSha256: "d".repeat(64) });
+        const mark = app.log.lines.length;
+        await send(
+            raw({
+                id: eid(),
+                type: "placement.terminated",
+                created_at: "2026-11-06T12:00:00Z",
+                payload: {
+                    refundable: true,
+                    refunds: [{ order_id: other.id, refund_micros: 500 }],
+                },
+            }),
+        );
+        expect(await findRefund(app.pool, other.id)).toMatchObject({ amountMicros: 500 });
+        expect(
+            app.log.lines
+                .slice(mark)
+                .some((l) => l.level === "warn" && /without an order id/.test(String(l.msg))),
+        ).toBe(true);
+    });
+
+    it("does not park an order already parked with the same reason again", async () => {
+        const start = await seeded("redeemed");
+        await send(terminated(start.id, eid(), { refundable: true }));
+        const alarms = () => app.log.lines.filter((l) => l.alarm === "manual_queue").length;
+        const before = alarms();
+        await send(terminated(start.id, eid(), { refundable: true }));
+        expect(alarms()).toBe(before);
     });
 
     it("pays a sweeper-parked refund_amount_pending order when the amounts arrive", async () => {
