@@ -20,6 +20,13 @@ function splitListen(listen: string): { host: string; port: number } {
     };
 }
 
+// Node's parser accepts targets that URL rejects, such as "//[" or a port over 65535; a throw here
+// would escape the access log's close listener and stop the process
+export function requestPath(target: string | undefined): string {
+    const raw = target ?? "/";
+    return URL.parse(raw, "http://local")?.pathname ?? raw.split("?", 1)[0]!;
+}
+
 function fail(res: ServerResponse, status: number, body: unknown): void {
     if (res.headersSent) {
         res.destroy();
@@ -38,7 +45,7 @@ export async function startServer(
         res.once("close", () => {
             log.info("request", {
                 method: req.method,
-                path: new URL(req.url ?? "/", "http://local").pathname,
+                path: requestPath(req.url),
                 status: res.statusCode,
                 ms: Math.round(performance.now() - started),
                 ip: req.socket.remoteAddress,

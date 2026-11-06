@@ -1,8 +1,9 @@
+import { connect } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { memoryLog } from "../log.ts";
 import { newOrderId } from "../orders/ids.ts";
 import { findOrder } from "../orders/store.ts";
-import { create, now, post, testApp, type TestApp } from "../testing/app.ts";
+import { create, now, post, testApp, type TestApp, until } from "../testing/app.ts";
 import { seedOrder } from "../testing/orders.ts";
 import { bearerOk, startServer } from "./server.ts";
 
@@ -17,6 +18,21 @@ afterAll(async () => {
 
 function raw(path: string, init: RequestInit): Promise<Response> {
     return fetch(`${app.internalUrl}${path}`, init);
+}
+
+// fetch cannot send a request target that URL rejects, so these go over a bare socket
+function rawRequestLine(target: string): Promise<string> {
+    const { port } = new URL(app.internalUrl);
+    return new Promise((resolve, reject) => {
+        let out = "";
+        const sock = connect(Number(port), "127.0.0.1", () => {
+            sock.write(`GET ${target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n`);
+        });
+        sock.setEncoding("utf8");
+        sock.on("data", (chunk: string) => (out += chunk));
+        sock.on("error", reject);
+        sock.on("close", () => resolve(out.split("\r\n", 1)[0]!));
+    });
 }
 
 async function orderCount(): Promise<number> {
@@ -120,6 +136,18 @@ describe("internal API", () => {
         expect(r.status).toBe(200);
         expect(await r.json()).toEqual({ ok: true });
     });
+
+    it.each(["//[", "http://a:99999/"])(
+        "answers 404 to the request target %s that URL rejects and keeps serving",
+        async (target) => {
+            expect(await rawRequestLine(target)).toBe("HTTP/1.1 404 Not Found");
+            await until(async () => app.log.lines.some((l) => l.path === target), 2_000);
+            const line = app.log.lines.findLast((l) => l.path === target)!;
+            expect(line).toMatchObject({ msg: "request", method: "GET", status: 404 });
+            const r = await raw("/healthz", { method: "GET" });
+            expect(r.status).toBe(200);
+        },
+    );
 
     it("answers 503 for events when no event handler is wired", async () => {
         const r = await raw("/v1/events", { method: "POST", body: "{}" });

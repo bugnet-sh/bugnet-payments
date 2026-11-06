@@ -7,7 +7,7 @@ import {
     type OrderServiceDeps,
     shortText,
 } from "../orders/service.ts";
-import { BodyTooLarge, bearerOk, type Handler, readBody, sendJson } from "./server.ts";
+import { BodyTooLarge, bearerOk, type Handler, readBody, requestPath, sendJson } from "./server.ts";
 
 export interface InternalDeps {
     service: OrderServiceDeps;
@@ -42,7 +42,7 @@ function hangupSignal(res: ServerResponse): AbortSignal {
 
 export function createInternalHandler(d: InternalDeps): Handler {
     return async (req, res) => {
-        const path = new URL(req.url ?? "/", "http://internal").pathname;
+        const path = requestPath(req.url);
         if (req.method === "GET" && path === "/healthz") {
             sendJson(res, 200, { ok: true });
             return;
