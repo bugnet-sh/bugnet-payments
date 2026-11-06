@@ -1,0 +1,50 @@
+{
+    "name": "bugnet-payments",
+    "private": true,
+    "type": "module",
+    "packageManager": "pnpm@12.6.0",
+    "engines": {
+        "node": ">=26"
+    },
+    "scripts": {
+        "proto": "buf generate --template buf.gen.yaml",
+        "typecheck": "pnpm proto && tsc -p .",
+        "test": "pnpm proto && vitest run",
+        "test:live": "pnpm proto && vitest run -c vitest.live.config.ts",
+        "lint": "eslint . && prettier --check .",
+        "format": "prettier --write .",
+        "build": "pnpm proto && esbuild src/main.ts src/cli.ts --bundle --platform=node --format=esm --target=node26 --packages=external --outdir=dist && pnpm build:checkout",
+        "build:checkout": "esbuild src/checkout/client.ts --bundle --platform=browser --format=esm --target=es2022 --minify --outfile=dist/checkout.js",
+        "dev": "pnpm proto && tsx src/main.ts -config config/dev.toml",
+        "cli": "tsx src/cli.ts"
+    },
+    "dependencies": {
+        "@bufbuild/protobuf": "2.16.0",
+        "@connectrpc/connect": "2.3.0",
+        "@connectrpc/connect-node": "2.3.0",
+        "@scure/bip39": "2.4.0",
+        "@solana-program/compute-budget": "0.20.0",
+        "@solana-program/system": "0.16.0",
+        "@solana-program/token": "0.18.0",
+        "@solana/kit": "8.6.0",
+        "@solana/pay-kit": "file:vendor/solana-pay-kit-0.14.0-e662d22.tgz",
+        "@x402/core": "2.30.0",
+        "@x402/svm": "2.30.0",
+        "pg": "8.23.1",
+        "smol-toml": "1.9.1",
+        "zod": "4.6.7"
+    },
+    "devDependencies": {
+        "@bufbuild/protoc-gen-es": "2.16.0",
+        "@eslint/js": "10.0.1",
+        "@types/node": "26.6.6",
+        "@types/pg": "8.23.1",
+        "esbuild": "0.28.2",
+        "eslint": "10.14.0",
+        "prettier": "3.9.10",
+        "tsx": "4.23.15",
+        "typescript": "6.0.3",
+        "typescript-eslint": "8.72.1",
+        "vitest": "5.1.0"
+    }
+}

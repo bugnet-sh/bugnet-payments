@@ -1,0 +1,15 @@
+# Local run, the fee-payer floors fit the funded test fee payer, which holds 0.05 SOL
+
+[http]
+public_url = "http://127.0.0.1:8446"
+
+[database]
+url = "postgres://localhost:5432/bugnet_payments_dev?sslmode=disable"
+
+[solana]
+# TEST ONLY: the address of BUGNET_RECIPIENT_KEY; check it against `pnpm cli keys show`
+recipient = "Bhhc3XNdjtCNr3pj2aZwhCt8pHwsU8wRL7dqJNDZEExw"
+fee_payer_boot_min_lamports = 20000000
+
+[alarms]
+fee_payer_min_lamports = 20000000

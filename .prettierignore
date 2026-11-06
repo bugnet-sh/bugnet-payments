@@ -1,0 +1,8 @@
+node_modules
+dist
+pnpm-lock.yaml
+pnpm-workspace.yaml
+src/gen
+vendor
+test/go
+.superpowers

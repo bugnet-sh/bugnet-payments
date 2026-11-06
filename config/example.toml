@@ -1,0 +1,63 @@
+# Every Payments setting, each at its default. Secrets never go here, they come only from the
+# environment (see .env.example). Durations take ms, s, m or h.
+
+[http]
+public_listen = "127.0.0.1:8446"
+internal_listen = "127.0.0.1:8447"
+public_url = "https://pay.bugnet.sh"
+trusted_proxies = ["127.0.0.1", "::1"]
+max_body_bytes = 65536
+
+[database]
+url = "postgres:///bugnet_payments?host=/var/run/postgresql"
+
+[solana]
+network = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+recipient = ""                          # cold owner address; its USDC account must exist
+transaction_versions = [0]
+max_compute_units = 50000
+max_priority_fee_micro_lamports = 10000
+max_required_signatures = 2
+blockhash_cache_ttl = "8s"
+fee_payer_boot_min_lamports = 100000000
+
+[orders]
+unpaid_ttl = "15m"
+unredeemed_refund_after = "30m"
+token_ttl = "10m"
+router_grace = "2m"
+max_amount_micros = 100000000
+attempts_per_order_per_minute = 5
+min_idempotency_key_length = 16
+
+[limits]
+public_per_ip_per_minute = 60
+status_per_ip_per_minute = 240          # GET /o/{id}/status only; it makes no RPC call
+
+[router]
+url = "http://127.0.0.1:8080"
+timeout = "3s"
+check_payer = false                     # true once router Task 28 serves PaymentsService.CheckPayer
+get_order = false                       # true once the router serves GetOrder
+event_public_key = ""                   # standard base64 of the router's 32-byte event key
+
+[refunds]
+enabled = true
+daily_cap_micros = 20000000
+max_per_hour = 10
+float_low_micros = 10000000
+compute_unit_limit = 20000
+compute_unit_price_micro_lamports = 10000
+max_attempts = 3
+
+[alarms]
+fee_payer_min_lamports = 100000000
+max_lamports_per_order = 20000
+
+[jobs]
+sweep_every = "30s"
+reconcile_every = "10s"
+refunds_every = "15s"
+alarms_every = "5m"
+audit_at_utc = "03:30"

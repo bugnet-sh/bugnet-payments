@@ -1,0 +1,4 @@
+allowBuilds:
+  esbuild: true
+overrides:
+  mppx: 0.8.15
