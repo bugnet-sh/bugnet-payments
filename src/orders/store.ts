@@ -10,6 +10,7 @@ import {
     type OrderUpdate,
     type PaymentRow,
 } from "./types.ts";
+import type { PayInto, StoredX402Setup, X402Refusal } from "../x402/types.ts";
 
 export class IllegalTransitionError extends Error {
     constructor(from: OrderState, to: OrderState) {
@@ -33,6 +34,9 @@ const COLUMNS: Record<string, string> = {
     manualReason: "manual_reason",
     routerConfirmedAt: "router_confirmed_at",
     eventSeenAt: "event_seen_at",
+    x402Refusal: "x402_refusal",
+    coldTransferId: "cold_transfer_id",
+    hotRouterRefundMicros: "hot_router_refund_micros",
     abandonReason: "abandon_reason",
     abandonAt: "abandon_at",
 };
@@ -59,6 +63,13 @@ interface OrderDbRow extends pg.QueryResultRow {
     abandon_reason: string | null;
     abandon_at: Date | null;
     manual_reason: string | null;
+    pay_into: PayInto;
+    allowance_micros: string | number;
+    fee_micros: string | number;
+    x402_setup: StoredX402Setup | null;
+    x402_refusal: X402Refusal | null;
+    cold_transfer_id: string | number | null;
+    hot_router_refund_micros: string | number;
 }
 
 interface PaymentDbRow extends pg.QueryResultRow {
@@ -73,6 +84,7 @@ interface PaymentDbRow extends pg.QueryResultRow {
     status: "settling" | "confirmed";
     created_at: Date;
     confirmed_at: Date | null;
+    landed_slot: string | number | bigint | null;
 }
 
 function toOrder(r: OrderDbRow): OrderRow {
@@ -98,6 +110,13 @@ function toOrder(r: OrderDbRow): OrderRow {
         abandonReason: r.abandon_reason,
         abandonAt: r.abandon_at,
         manualReason: r.manual_reason,
+        payInto: r.pay_into,
+        allowanceMicros: Number(r.allowance_micros),
+        feeMicros: Number(r.fee_micros),
+        x402Setup: r.x402_setup,
+        x402Refusal: r.x402_refusal,
+        coldTransferId: r.cold_transfer_id === null ? null : Number(r.cold_transfer_id),
+        hotRouterRefundMicros: Number(r.hot_router_refund_micros),
     };
 }
 
@@ -114,6 +133,7 @@ function toPayment(r: PaymentDbRow): PaymentRow {
         status: r.status,
         createdAt: r.created_at,
         confirmedAt: r.confirmed_at,
+        landedSlot: r.landed_slot === null ? null : BigInt(r.landed_slot),
     };
 }
 
@@ -137,8 +157,10 @@ function assignments(
 export async function insertOrder(db: Queryable, o: NewOrder): Promise<OrderRow> {
     const res = await db.query<OrderDbRow>(
         `insert into orders (id, kind, package_id, amount_micros, handle_sha256, description,
-            claim_sha256, claim_box, idempotency_key, state, expires_at)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'unpaid', $10) returning *`,
+            claim_sha256, claim_box, idempotency_key, state, expires_at, pay_into,
+            allowance_micros, fee_micros, x402_setup)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'unpaid', $10, $11, $12, $13, $14::jsonb)
+         returning *`,
         [
             o.id,
             o.kind,
@@ -150,6 +172,10 @@ export async function insertOrder(db: Queryable, o: NewOrder): Promise<OrderRow>
             o.claimBox,
             o.idempotencyKey,
             o.expiresAt,
+            o.payInto,
+            o.allowanceMicros,
+            o.feeMicros,
+            o.x402Setup === null ? null : JSON.stringify(o.x402Setup),
         ],
     );
     return toOrder(res.rows[0]!);
@@ -171,8 +197,18 @@ export async function findOrderByIdempotencyKey(
 }
 
 export async function lockOrder(c: pg.PoolClient, id: string): Promise<OrderRow | null> {
-    const res = await c.query<OrderDbRow>("select * from orders where id = $1 for update", [id]);
+    const res = await c.query<OrderDbRow>("select * from orders where id = $1 for no key update", [
+        id,
+    ]);
     return res.rows[0] ? toOrder(res.rows[0]) : null;
+}
+
+export async function lockOrders(c: pg.PoolClient, ids: readonly string[]): Promise<OrderRow[]> {
+    const res = await c.query<OrderDbRow>(
+        "select * from orders where id = any($1::text[]) order by id for no key update",
+        [ids],
+    );
+    return res.rows.map(toOrder);
 }
 
 export async function setOrderState(
@@ -234,10 +270,22 @@ export async function findPaymentByOrder(
 
 export async function lockPayment(c: pg.PoolClient, orderId: string): Promise<PaymentRow | null> {
     const res = await c.query<PaymentDbRow>(
-        "select * from payments where order_id = $1 for update",
+        "select * from payments where order_id = $1 for no key update",
         [orderId],
     );
     return res.rows[0] ? toPayment(res.rows[0]) : null;
+}
+
+export async function setPaymentLandedSlot(
+    db: Queryable,
+    orderId: string,
+    slot: bigint,
+): Promise<boolean> {
+    const res = await db.query(
+        "update payments set landed_slot = $2 where order_id = $1 and landed_slot is null",
+        [orderId, slot.toString()],
+    );
+    return res.rowCount === 1;
 }
 
 export async function confirmPayment(db: Queryable, orderId: string, at: Date): Promise<boolean> {

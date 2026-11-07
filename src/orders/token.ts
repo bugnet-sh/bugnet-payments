@@ -9,6 +9,7 @@ export interface OrderClaims {
     amount_micros: number;
     expires_at: string;
     handle_sha256?: string;
+    allowance_micros?: number;
 }
 
 const pkcs8Ed25519Prefix = Buffer.from("302e020100300506032b657004220420", "hex");
@@ -30,7 +31,8 @@ export function signOrderToken(key: KeyObject, claims: OrderClaims): string {
 }
 
 // Claims come from the stored order, never from the request, so a replayed or tampered request cannot change what the token grants.
-export function claimsFor(order: OrderRow, expiresAt: Date): OrderClaims {
+export function claimsFor(order: OrderRow, expiresAt: Date, allowanceClaim: boolean): OrderClaims {
+    if (order.kind === "allowance") throw new Error("allowance orders carry no token");
     const claims: OrderClaims = {
         order_id: order.id,
         kind: order.kind,
@@ -41,6 +43,9 @@ export function claimsFor(order: OrderRow, expiresAt: Date): OrderClaims {
     if (order.kind === "extend") {
         if (order.handleSha256 === null) throw new Error("extend order has no handle hash");
         claims.handle_sha256 = order.handleSha256;
+    }
+    if (order.kind === "start" && order.allowanceMicros > 0 && allowanceClaim) {
+        claims.allowance_micros = order.allowanceMicros;
     }
     return claims;
 }

@@ -31,6 +31,13 @@ export function orderRow(over: Partial<OrderRow> = {}): OrderRow {
         abandonReason: null,
         abandonAt: null,
         manualReason: null,
+        payInto: "cold",
+        allowanceMicros: 0,
+        feeMicros: 0,
+        x402Setup: null,
+        x402Refusal: null,
+        coldTransferId: null,
+        hotRouterRefundMicros: 0,
         ...over,
     };
 }
@@ -46,9 +53,10 @@ export async function seedOrder(
         `insert into orders (id, kind, package_id, amount_micros, handle_sha256, description,
             claim_sha256, claim_box, idempotency_key, state, created_at, expires_at, paid_at, payer,
             redeemed_at, token_expires_at, event_seen_at, router_confirmed_at, abandon_reason,
-            abandon_at, manual_reason)
+            abandon_at, manual_reason, pay_into, allowance_micros, fee_micros, x402_setup,
+            x402_refusal, cold_transfer_id, hot_router_refund_micros)
          values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-            $19, $20, $21)`,
+            $19, $20, $21, $22, $23, $24, $25::jsonb, $26, $27, $28)`,
         [
             o.id,
             o.kind,
@@ -71,9 +79,33 @@ export async function seedOrder(
             o.abandonReason,
             o.abandonAt,
             o.manualReason,
+            o.payInto,
+            o.allowanceMicros,
+            o.feeMicros,
+            o.x402Setup === null ? null : JSON.stringify(o.x402Setup),
+            o.x402Refusal,
+            o.coldTransferId,
+            o.hotRouterRefundMicros,
         ],
     );
     return { order: (await findOrder(pool, o.id))!, claim };
+}
+
+export async function seedAllowanceOrder(
+    pool: pg.Pool,
+    over: Partial<OrderRow> = {},
+): Promise<{ order: OrderRow; claim: string }> {
+    return seedOrder(pool, {
+        kind: "allowance",
+        packageId: "x402-allowance",
+        handleSha256: "ab".repeat(32),
+        allowanceMicros: 1_000_000,
+        feeMicros: 3_000,
+        amountMicros: 1_003_000,
+        payInto: "allowance",
+        x402Setup: { services: [], disable: [], spendPerMinuteMicros: null },
+        ...over,
+    });
 }
 
 export async function seedPayment(
@@ -94,12 +126,14 @@ export async function seedPayment(
         status: "settling",
         createdAt: new Date(),
         confirmedAt: null,
+        landedSlot: null,
         ...over,
     };
     await pool.query(
         `insert into payments (order_id, tx_signature, message_hash, payer, source_token_account,
-            amount_micros, blockhash, last_valid_block_height, status, created_at, confirmed_at)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+            amount_micros, blockhash, last_valid_block_height, status, created_at, confirmed_at,
+            landed_slot)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
         [
             p.orderId,
             p.txSignature,
@@ -112,6 +146,7 @@ export async function seedPayment(
             p.status,
             p.createdAt,
             p.confirmedAt,
+            p.landedSlot === null ? null : p.landedSlot.toString(),
         ],
     );
     return (await findPaymentByOrder(pool, orderId))!;

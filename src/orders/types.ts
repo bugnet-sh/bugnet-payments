@@ -1,7 +1,16 @@
 import type { PaymentRequired, SettleResponse } from "@x402/core/types";
 import type { PayRefusal } from "../x402/decode.ts";
+import type {
+    PayInto,
+    PinReason,
+    StoredX402Setup,
+    X402AccountView,
+    X402CreateRefusal,
+    X402Refusal,
+    X402Setup,
+} from "../x402/types.ts";
 
-export type OrderKind = "start" | "extend";
+export type OrderKind = "start" | "extend" | "allowance";
 
 export type OrderState =
     "unpaid" | "settling" | "paid" | "redeemed" | "refunding" | "refunded" | "expired" | "manual";
@@ -39,6 +48,13 @@ export interface OrderRow {
     abandonReason: string | null;
     abandonAt: Date | null;
     manualReason: string | null;
+    payInto: PayInto;
+    allowanceMicros: number;
+    feeMicros: number;
+    x402Setup: StoredX402Setup | null;
+    x402Refusal: X402Refusal | null;
+    coldTransferId: number | null;
+    hotRouterRefundMicros: number;
 }
 
 export type NewOrder = Pick<
@@ -53,6 +69,10 @@ export type NewOrder = Pick<
     | "claimBox"
     | "idempotencyKey"
     | "expiresAt"
+    | "payInto"
+    | "allowanceMicros"
+    | "feeMicros"
+    | "x402Setup"
 >;
 
 export interface PaymentRow {
@@ -67,17 +87,27 @@ export interface PaymentRow {
     status: "settling" | "confirmed";
     createdAt: Date;
     confirmedAt: Date | null;
+    landedSlot: bigint | null;
 }
 
 // createdAt comes from the injected clock, never from Postgres now(), so one clock decides every time rule.
-export type NewPayment = Omit<PaymentRow, "status" | "confirmedAt"> & {
+export type NewPayment = Omit<PaymentRow, "status" | "confirmedAt" | "landedSlot"> & {
     keySha256?: Buffer | null;
 };
 
 export type OrderUpdate = Partial<
     Pick<
         OrderRow,
-        "paidAt" | "payer" | "redeemedAt" | "tokenExpiresAt" | "manualReason" | "routerConfirmedAt"
+        | "paidAt"
+        | "payer"
+        | "redeemedAt"
+        | "tokenExpiresAt"
+        | "manualReason"
+        | "routerConfirmedAt"
+        | "x402Refusal"
+        | "coldTransferId"
+        | "hotRouterRefundMicros"
+        | "eventSeenAt"
     >
 >;
 
@@ -92,6 +122,9 @@ export interface OrderRequest {
     claim?: string;
     payment?: unknown;
     idempotencyKey?: string;
+    allowanceMicros?: number;
+    feeMicros?: number;
+    x402?: X402Setup;
 }
 
 export type RefusalReason =
@@ -104,7 +137,8 @@ export type RefusalReason =
     | "settling"
     | "payment_late"
     | "token_expired"
-    | "paid_claim_required";
+    | "paid_claim_required"
+    | X402CreateRefusal;
 
 export type OrderResult =
     | {
@@ -119,10 +153,34 @@ export type OrderResult =
           orderId: string;
           orderToken: string;
           payer: string;
-          kind: OrderKind;
+          kind: "start" | "extend";
           packageId: string;
           amountMicros: number;
           handleSha256?: string;
+          allowanceMicros?: number;
+          firstUse?: boolean;
+          x402?: X402AccountView;
           paymentResponse?: SettleResponse;
       }
-    | { status: "refused"; orderId?: string; reason: RefusalReason; retryAfterSeconds?: number };
+    | {
+          status: "paid";
+          orderId: string;
+          kind: "allowance";
+          handleSha256: string;
+          payer: string;
+          amountMicros: number;
+          allowanceMicros: number;
+          firstUse: boolean;
+          x402: X402AccountView;
+          paymentResponse?: SettleResponse;
+      }
+    | {
+          status: "refused";
+          orderId?: string;
+          reason: RefusalReason;
+          retryAfterSeconds?: number;
+          refundPending?: boolean;
+          charged?: false;
+          serviceId?: string;
+          pinReason?: PinReason;
+      };

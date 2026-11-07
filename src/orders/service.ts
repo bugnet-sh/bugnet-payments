@@ -53,7 +53,7 @@ export interface OrderServiceDeps {
 }
 
 type Refused = Extract<OrderResult, { status: "refused" }>;
-type Paid = Extract<OrderResult, { status: "paid" }>;
+type Paid = Extract<OrderResult, { status: "paid"; kind: "start" | "extend" }>;
 type PaymentRequiredResult = Extract<OrderResult, { status: "payment_required" }>;
 
 interface Found {
@@ -183,6 +183,10 @@ async function create(
             claimBox: sealClaim(d.claimKey, id, claim),
             idempotencyKey: key,
             expiresAt: new Date(d.now().getTime() + d.settings.orders.unpaid_ttl),
+            payInto: "cold",
+            allowanceMicros: 0,
+            feeMicros: 0,
+            x402Setup: null,
         });
     } catch (err) {
         if (key === null || !isKeyConflict(err)) throw err;
@@ -340,10 +344,14 @@ async function paid(
     const payment = await findPaymentByOrder(db, o.id);
     const payer = o.payer ?? payment?.payer;
     if (payer === undefined) throw new Error(`paid order ${o.id} has no payer`);
+    if (o.kind === "allowance") throw new Error("allowance orders carry no token");
     const out: Paid = {
         status: "paid",
         orderId: o.id,
-        orderToken: signOrderToken(d.orderKey, claimsFor(o, tokenExpiresAt)),
+        orderToken: signOrderToken(
+            d.orderKey,
+            claimsFor(o, tokenExpiresAt, d.settings.router.allowance_claim),
+        ),
         payer,
         kind: o.kind,
         packageId: o.packageId,

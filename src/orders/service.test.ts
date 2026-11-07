@@ -155,6 +155,10 @@ describe("create and replay", () => {
                 claimBox: sealClaim(app.secrets.claimKey, id, claim),
                 idempotencyKey: KEY + "d",
                 expiresAt: after(15 * 60_000),
+                payInto: "cold",
+                allowanceMicros: 0,
+                feeMicros: 0,
+                x402Setup: null,
             });
             const racing = post(app, "/v1/orders", create({ idempotencyKey: KEY + "d" }));
             // The create must wait on the uncommitted key, or the unique violation is not reached

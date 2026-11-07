@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { withTx } from "../db/pool.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
-import { seedOrder, seedPayment } from "../testing/orders.ts";
+import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts";
 import {
     archivePayment,
     confirmPayment,
@@ -12,13 +12,16 @@ import {
     insertOrder,
     insertPayment,
     lockOrder,
+    lockOrders,
     lockPayment,
     markEventSeen,
     setOrderState,
+    setPaymentLandedSlot,
     StaleStateError,
     updateOrderFields,
 } from "./store.ts";
 import { ALLOWED_TRANSITIONS } from "./types.ts";
+import type { StoredPin, StoredX402Setup } from "../x402/types.ts";
 import { newOrderId } from "./ids.ts";
 
 let db: TestDb;
@@ -57,6 +60,10 @@ describe("order store", () => {
             claimBox: Buffer.alloc(60, 1),
             idempotencyKey: "key-1",
             expiresAt: new Date("2026-11-06T12:15:00Z"),
+            payInto: "cold",
+            allowanceMicros: 0,
+            feeMicros: 0,
+            x402Setup: null,
         });
         expect(inserted).toMatchObject({ id, state: "unpaid", kind: "extend", paidAt: null });
         expect(await findOrder(db.pool, id)).toEqual(inserted);
@@ -236,6 +243,129 @@ describe("order store", () => {
             confirmedAt: null,
             lastValidBlockHeight: 2n ** 40n,
             createdAt: new Date("2026-11-06T12:00:00Z"),
+        });
+    });
+});
+
+const PIN: StoredPin = {
+    serviceId: "xs_w5a4htopmpzmmhos",
+    method: "POST",
+    host: "agent402.tools",
+    prefix: "/v1/auto/",
+    url: "https://agent402.tools/v1/auto/chat/completions",
+    maxPriceMicros: 10_000,
+    payTo: "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
+    listed: "indexed",
+    paidPath: null,
+    pinnedFrom: "probe",
+    probe: {
+        at: "2026-11-07T10:00:00.000Z",
+        status: 402,
+        accepted: { scheme: "exact", amount: "10000" },
+    },
+    newPin: true,
+};
+
+describe("x402 order columns", () => {
+    it("stores and reads every new order column", async () => {
+        const seeded = (await seedOrder(db.pool)).order;
+        const setup: StoredX402Setup = {
+            services: [PIN],
+            disable: [],
+            spendPerMinuteMicros: 2_000_000,
+        };
+        const inserted = await insertOrder(db.pool, {
+            id: newOrderId(),
+            kind: "start",
+            packageId: "cpu-small",
+            amountMicros: 1_013_000,
+            handleSha256: null,
+            description: "start",
+            claimSha256: seeded.claimSha256,
+            claimBox: null,
+            idempotencyKey: null,
+            expiresAt: new Date("2026-11-07T12:05:00Z"),
+            payInto: "allowance",
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+            x402Setup: setup,
+        });
+        expect(inserted).toMatchObject({
+            payInto: "allowance",
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+            amountMicros: 1_013_000,
+            x402Refusal: null,
+            coldTransferId: null,
+            hotRouterRefundMicros: 0,
+        });
+        expect(inserted.x402Setup).toEqual(setup);
+        expect(await findOrder(db.pool, inserted.id)).toEqual(inserted);
+    });
+
+    it("writes x402Refusal with a transition", async () => {
+        const { order } = await seedAllowanceOrder(db.pool, { state: "paid" });
+        await setOrderState(db.pool, order.id, "paid", "refunding", {
+            x402Refusal: "allowance_ceiling",
+        });
+        expect((await findOrder(db.pool, order.id))!.x402Refusal).toBe("allowance_ceiling");
+    });
+
+    it("lockOrder never blocks a foreign-key insert", async () => {
+        const { order } = await seedOrder(db.pool);
+        const a = await db.pool.connect();
+        const b = await db.pool.connect();
+        try {
+            await a.query("begin");
+            await lockOrder(a, order.id);
+            await b.query("begin");
+            await b.query("set local lock_timeout = '1000ms'");
+            await expect(
+                b.query(
+                    `insert into refunds (order_id, kind, reason, amount_micros, destination, payer,
+                        state) values ($1, 'full', 'late', 1000, 'dest', 'payer', 'pending')`,
+                    [order.id],
+                ),
+            ).resolves.toMatchObject({ rowCount: 1 });
+            await b.query("commit");
+            await a.query("commit");
+        } finally {
+            await b.query("rollback").catch(() => undefined);
+            await a.query("rollback").catch(() => undefined);
+            a.release();
+            b.release();
+        }
+    });
+
+    it("lockOrders returns rows in id order", async () => {
+        const ids = await Promise.all(
+            [1, 2, 3].map(async () => (await seedOrder(db.pool)).order.id),
+        );
+        const rows = await withTx(db.pool, (c) =>
+            lockOrders(c, [...ids].reverse().concat("ord_zzzzzzzzzzzzzzzzzzzzzzzzzz")),
+        );
+        expect(rows.map((r) => r.id)).toEqual([...ids].sort());
+    });
+
+    it("setPaymentLandedSlot writes once", async () => {
+        const { order } = await seedOrder(db.pool, { state: "settling" });
+        expect((await seedPayment(db.pool, order.id)).landedSlot).toBeNull();
+        expect(await setPaymentLandedSlot(db.pool, order.id, 100n)).toBe(true);
+        expect(await setPaymentLandedSlot(db.pool, order.id, 200n)).toBe(false);
+        expect((await findPaymentByOrder(db.pool, order.id))!.landedSlot).toBe(100n);
+    });
+
+    it("seedAllowanceOrder seeds a hot allowance order", async () => {
+        const { order } = await seedAllowanceOrder(db.pool);
+        expect(order).toMatchObject({
+            kind: "allowance",
+            packageId: "x402-allowance",
+            handleSha256: "ab".repeat(32),
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+            amountMicros: 1_003_000,
+            payInto: "allowance",
+            x402Setup: { services: [], disable: [], spendPerMinuteMicros: null },
         });
     });
 });

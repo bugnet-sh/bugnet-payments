@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { orderRow } from "../testing/orders.ts";
+import type { OrderRow } from "./types.ts";
 import { goAvailable, runGoVector } from "../testing/go-vector.ts";
 import {
     claimsFor,
@@ -28,7 +29,7 @@ describe("order token", () => {
             amountMicros: 50_000,
             handleSha256: null,
         });
-        expect(signOrderToken(orderKey(seed), claimsFor(o, at))).toBe(START);
+        expect(signOrderToken(orderKey(seed), claimsFor(o, at, false))).toBe(START);
     });
 
     it("matches the extend vector", () => {
@@ -39,7 +40,7 @@ describe("order token", () => {
             amountMicros: 20_000,
             handleSha256: "6e84ff9f1b031bc128494c91a9e0286578046eb6499d6e4e89a970813b2982a5",
         });
-        expect(signOrderToken(orderKey(seed), claimsFor(o, at))).toBe(EXTEND);
+        expect(signOrderToken(orderKey(seed), claimsFor(o, at, false))).toBe(EXTEND);
     });
 
     it("publishes the router public key", () => {
@@ -62,7 +63,49 @@ describe("order token", () => {
     });
 
     it("refuses an extend order without a handle hash", () => {
-        expect(() => claimsFor(orderRow({ kind: "extend", handleSha256: null }), at)).toThrow();
+        expect(() =>
+            claimsFor(orderRow({ kind: "extend", handleSha256: null }), at, false),
+        ).toThrow();
+    });
+});
+
+describe("allowance_micros claim", () => {
+    const start = (over: Partial<OrderRow> = {}) =>
+        orderRow({
+            kind: "start",
+            payInto: "allowance",
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+            amountMicros: 1_013_000,
+            ...over,
+        });
+
+    it("signs allowance_micros on start tokens only while the claim is on", () => {
+        expect(claimsFor(start(), at, true).allowance_micros).toBe(1_000_000);
+        expect("allowance_micros" in claimsFor(start(), at, false)).toBe(false);
+        const extend = orderRow({ kind: "extend", handleSha256: "ab".repeat(32) });
+        expect("allowance_micros" in claimsFor(extend, at, true)).toBe(false);
+        const cold = orderRow({ kind: "start" });
+        expect("allowance_micros" in claimsFor(cold, at, true)).toBe(false);
+        const allowance = orderRow({
+            kind: "allowance",
+            handleSha256: "ab".repeat(32),
+            payInto: "allowance",
+            allowanceMicros: 1_000_000,
+            amountMicros: 1_000_000,
+        });
+        expect(() => claimsFor(allowance, at, true)).toThrow("allowance orders carry no token");
+    });
+
+    it("puts allowance_micros last", () => {
+        expect(Object.keys(claimsFor(start(), at, true))).toEqual([
+            "order_id",
+            "kind",
+            "package_id",
+            "amount_micros",
+            "expires_at",
+            "allowance_micros",
+        ]);
     });
 });
 
@@ -74,7 +117,7 @@ describe.skipIf(!existsSync(join(router, "internal/ordertoken")) || !goAvailable
             expect(runGoVector(router, START, PUB, "ok", new Date("2026-11-06T12:00:00Z"))).toBe(0);
             expect(runGoVector(router, EXTEND, PUB, "ok")).toBe(0);
             const withPayer = signOrderToken(orderKey(seed), {
-                ...claimsFor(orderRow({}), at),
+                ...claimsFor(orderRow({}), at, false),
                 payer: "x",
             } as OrderClaims);
             expect(runGoVector(router, withPayer, PUB, "malformed")).toBe(0);
