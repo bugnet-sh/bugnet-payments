@@ -150,9 +150,13 @@ export async function signSellerPayment(
     allowance: KeyPairSigner,
 ): Promise<{ wireBase64: string; signature: Uint8Array; messageHash: string }> {
     const signed = await partiallySignTransaction([allowance.keyPair], tx);
+    const signature = signed.signatures[allowance.address];
+    if (!signature) {
+        throw new Error("allowance wallet did not sign the seller payment");
+    }
     return {
         wireBase64: getBase64EncodedWireTransaction(signed),
-        signature: signed.signatures[allowance.address] as Uint8Array,
+        signature,
         messageHash: await messageHash(signed),
     };
 }
