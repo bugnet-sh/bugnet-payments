@@ -32,7 +32,7 @@ export interface RouterClient {
         r: { payer: string; feePayer: string; packageId: string; kind: OrderKind },
         signal: AbortSignal,
     ): Promise<PayerCheck>;
-    getOrder(orderId: string, signal: AbortSignal): Promise<RouterOrder>;
+    getOrder(orderId: string, signal?: AbortSignal): Promise<RouterOrder>;
 }
 
 export interface RouterClientOptions {

@@ -167,13 +167,9 @@ async function retryManual(
     );
     if (typeof outcome === "object") return refuse(io, orderId, outcome.refused);
     if (outcome === "no_refund") {
-        const created = await requestRefund(
-            pool,
-            orderId,
-            "operator",
-            undefined,
-            (o) => o.state === "manual" && !needsAmount(o),
-        );
+        const created = await requestRefund(pool, orderId, "operator", {
+            eligible: (o) => o.state === "manual" && !needsAmount(o),
+        });
         if (created !== "created") return refuse(io, orderId, `no refund created (${created})`);
     }
     io.out(`${orderId}: refunding`);
@@ -187,13 +183,10 @@ async function refundManual(
 ): Promise<number> {
     const refused = notManual(await findOrder(pool, orderId));
     if (refused !== null) return refuse(io, orderId, refused);
-    const created = await requestRefund(
-        pool,
-        orderId,
-        "operator",
-        Number(amount),
-        (o) => o.state === "manual",
-    );
+    const created = await requestRefund(pool, orderId, "operator", {
+        amountMicros: Number(amount),
+        eligible: (o) => o.state === "manual",
+    });
     switch (created) {
         case "created":
             io.out(`${orderId}: refunding ${amount} micros`);

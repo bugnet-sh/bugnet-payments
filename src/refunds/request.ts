@@ -1,7 +1,7 @@
 import type pg from "pg";
 import { type Queryable, withTx } from "../db/pool.ts";
-import type { OrderRow } from "../orders/types.ts";
 import { findPaymentByOrder, lockOrder, setOrderState } from "../orders/store.ts";
+import type { OrderRow } from "../orders/types.ts";
 
 export type RefundReason =
     "unredeemed" | "late" | "router_refundable" | "abandoned" | "no_router_record" | "operator";
@@ -90,9 +90,9 @@ export async function requestRefund(
     pool: pg.Pool,
     orderId: string,
     reason: RefundReason,
-    amountMicros?: number,
-    eligible?: (order: OrderRow) => boolean,
+    opts: { amountMicros?: number; eligible?: (order: OrderRow) => boolean } = {},
 ): Promise<RefundRequest> {
+    const { amountMicros, eligible } = opts;
     return withTx(pool, async (c) => {
         const order = await lockOrder(c, orderId);
         if (order === null) return "unknown";

@@ -3,7 +3,7 @@ import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import { GetOrderResponseSchema } from "../gen/bugnet/router/v1/payments_pb.ts";
 import type { Settings } from "../config.ts";
 import { memoryLog, silentLog } from "../log.ts";
-import { findOrder } from "../orders/store.ts";
+import { findOrder, markEventSeen } from "../orders/store.ts";
 import type { OrderRow } from "../orders/types.ts";
 import { findRefund } from "../refunds/request.ts";
 import { createRouterClient } from "../router/client.ts";
@@ -32,12 +32,14 @@ let db: TestDb;
 let router: FakeRouter;
 let calls: string[];
 let answer: Answer;
+let beforeAnswer: (() => Promise<void>) | null;
 
 beforeAll(async () => {
     db = await testDb();
     router = await startFakeRouter({
-        getOrder: (m) => {
+        getOrder: async (m) => {
             calls.push(m.orderId);
+            await beforeAnswer?.();
             if (answer === "error") throw new Error("router down");
             return create(GetOrderResponseSchema, answer);
         },
@@ -50,6 +52,7 @@ afterAll(async () => {
 beforeEach(async () => {
     await db.pool.query("truncate orders cascade");
     calls = [];
+    beforeAnswer = null;
     answer = { redeemed: false };
 });
 
@@ -243,6 +246,53 @@ describe("redeemed orders with no event", () => {
     });
 });
 
+describe("an order that changes between selection and action", () => {
+    const disabledAfter = (hook: () => Promise<void>): SweepDeps => {
+        const base = deps(at(2 * MIN));
+        return {
+            ...base,
+            router: {
+                ...base.router,
+                getOrder: async () => {
+                    await hook();
+                    return { kind: "disabled" };
+                },
+            },
+        };
+    };
+
+    it("skips a no_router_record refund when an event arrives", async () => {
+        const order = await redeemed();
+        beforeAnswer = () => markEventSeen(db.pool, order.id, at(2 * MIN));
+        const report = await sweep(deps(at(2 * MIN)));
+        expect(report.refunds.no_router_record).toBe(0);
+        expect((await stateOf(order.id)).state).toBe("redeemed");
+        expect(await findRefund(db.pool, order.id)).toBeNull();
+    });
+
+    it("skips a no_event_unverifiable park when an event arrives", async () => {
+        const order = await redeemed();
+        const report = await sweep(
+            disabledAfter(() => markEventSeen(db.pool, order.id, at(2 * MIN))),
+        );
+        expect(report.manual).toBe(0);
+        expect((await stateOf(order.id)).state).toBe("redeemed");
+    });
+
+    it("skips an abandon park when the hint disappears", async () => {
+        const order = await redeemed({ abandonAt: at(-5 * MIN) });
+        const report = await sweep(
+            disabledAfter(async () => {
+                await db.pool.query("update orders set abandon_at = null where id = $1", [
+                    order.id,
+                ]);
+            }),
+        );
+        expect(report.manual).toBe(0);
+        expect((await stateOf(order.id)).state).toBe("redeemed");
+    });
+});
+
 describe("abandon hints", () => {
     it("waits for the grace before acting on an abandon hint", async () => {
         const order = await redeemed({ abandonAt: at(-5 * MIN), abandonReason: "client_gone" });
@@ -283,10 +333,13 @@ describe("abandon hints", () => {
         await sweep(deps(at(2 * MIN)));
         expect((await stateOf(order.id)).state).toBe("redeemed");
 
-        await sweep(deps(at(3 * MIN), { getOrder: false }));
+        const log = memoryLog();
+        const report = await sweep(deps(at(3 * MIN), { getOrder: false, log }));
         const row = await stateOf(order.id);
         expect(row.state).toBe("manual");
         expect(row.manualReason).toBe("abandon_unverifiable");
+        expect(report.manual).toBe(1);
+        expect(log.lines.some((l) => l.level === "alarm" && l.alarm === "manual_queue")).toBe(true);
     });
 
     it("never re-parks an order the router confirmed", async () => {

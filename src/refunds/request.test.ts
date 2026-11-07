@@ -119,7 +119,9 @@ describe("requestRefund", () => {
 
     it("refunds part of a payment when given an amount", async () => {
         const { order, payment } = await paidOrder("redeemed");
-        expect(await requestRefund(db.pool, order.id, "router_refundable", 4_000)).toBe("created");
+        expect(
+            await requestRefund(db.pool, order.id, "router_refundable", { amountMicros: 4_000 }),
+        ).toBe("created");
         expect(await findRefund(db.pool, order.id)).toMatchObject({
             kind: "partial",
             amountMicros: 4_000,
@@ -132,20 +134,26 @@ describe("requestRefund", () => {
     it("answers exists for a partial refund after a full one", async () => {
         const { order } = await paidOrder("paid");
         await requestRefund(db.pool, order.id, "unredeemed");
-        expect(await requestRefund(db.pool, order.id, "router_refundable", 100)).toBe("exists");
+        expect(
+            await requestRefund(db.pool, order.id, "router_refundable", { amountMicros: 100 }),
+        ).toBe("exists");
         expect(await countRefunds(order.id)).toBe(1);
     });
 
     it("rejects amounts outside 1..paid and creates nothing", async () => {
         const { order } = await paidOrder("redeemed");
         for (const amount of [0, -5, 10_001, 1.5, Number.NaN]) {
-            expect(await requestRefund(db.pool, order.id, "router_refundable", amount)).toBe(
-                "invalid_amount",
-            );
+            expect(
+                await requestRefund(db.pool, order.id, "router_refundable", {
+                    amountMicros: amount,
+                }),
+            ).toBe("invalid_amount");
         }
         expect(await countRefunds(order.id)).toBe(0);
         expect((await findOrder(db.pool, order.id))!.state).toBe("redeemed");
-        expect(await requestRefund(db.pool, order.id, "router_refundable", 10_000)).toBe("created");
+        expect(
+            await requestRefund(db.pool, order.id, "router_refundable", { amountMicros: 10_000 }),
+        ).toBe("created");
     });
 });
 
@@ -185,13 +193,9 @@ describe("returnManualToRedeemed", () => {
 describe("requestRefund eligibility check", () => {
     it("refuses and creates nothing when the check fails under the lock", async () => {
         const { order } = await paidOrder("redeemed");
-        const result = await requestRefund(
-            db.pool,
-            order.id,
-            "unredeemed",
-            undefined,
-            (o) => o.state === "paid",
-        );
+        const result = await requestRefund(db.pool, order.id, "unredeemed", {
+            eligible: (o) => o.state === "paid",
+        });
         expect(result).toBe("not_refundable");
         expect(await countRefunds(order.id)).toBe(0);
         expect((await findOrder(db.pool, order.id))!.state).toBe("redeemed");

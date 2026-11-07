@@ -22,8 +22,6 @@ export interface SweepReport {
     manual: number;
 }
 
-const ROUTER_CALL_TIMEOUT_MS = 10_000;
-
 type ManualReason = "no_event_unverifiable" | "abandon_unverifiable" | "refund_amount_pending";
 
 export async function sweep(d: SweepDeps): Promise<SweepReport> {
@@ -57,17 +55,19 @@ export async function sweep(d: SweepDeps): Promise<SweepReport> {
         reason: RefundReason,
         eligible: (o: OrderRow) => boolean,
     ): Promise<void> => {
-        if ((await requestRefund(d.pool, id, reason, undefined, eligible)) === "created") {
+        if ((await requestRefund(d.pool, id, reason, { eligible })) === "created") {
             report.refunds[reason]++;
             d.log.info("sweeper refund requested", { orderId: id, reason });
         }
     };
-    const park = async (id: string, reason: ManualReason): Promise<void> => {
+    const park = async (
+        id: string,
+        reason: ManualReason,
+        eligible: (o: OrderRow) => boolean,
+    ): Promise<void> => {
         const parked = await withTx(d.pool, async (c) => {
             const order = await lockOrder(c, id);
-            if (order === null || order.state !== "redeemed" || order.routerConfirmedAt !== null) {
-                return false;
-            }
+            if (order === null || !eligible(order)) return false;
             await setOrderState(c, id, "redeemed", "manual", { manualReason: reason });
             return true;
         });
@@ -111,16 +111,20 @@ export async function sweep(d: SweepDeps): Promise<SweepReport> {
     for (const { where, abandon } of checks) {
         await each(await ids(d.pool, where, [graceBefore]), async (id) => {
             report.routerChecks++;
-            const answer = await d.router.getOrder(id, AbortSignal.timeout(ROUTER_CALL_TIMEOUT_MS));
+            const answer = await d.router.getOrder(id);
             const stillUnconfirmed = (o: OrderRow): boolean =>
                 o.state === "redeemed" &&
                 o.routerConfirmedAt === null &&
-                (abandon || o.eventSeenAt === null);
+                (abandon ? o.abandonAt !== null : o.eventSeenAt === null && o.abandonAt === null);
             switch (answer.kind) {
                 case "absent":
                     return refund(id, abandon ? "abandoned" : "no_router_record", stillUnconfirmed);
                 case "disabled":
-                    return park(id, abandon ? "abandon_unverifiable" : "no_event_unverifiable");
+                    return park(
+                        id,
+                        abandon ? "abandon_unverifiable" : "no_event_unverifiable",
+                        stillUnconfirmed,
+                    );
                 case "unavailable":
                     return;
                 case "found": {
@@ -132,7 +136,7 @@ export async function sweep(d: SweepDeps): Promise<SweepReport> {
                             answer.placementState === "terminating" ||
                             answer.placementState === "terminated"
                         ) {
-                            return park(id, "refund_amount_pending");
+                            return park(id, "refund_amount_pending", stillUnconfirmed);
                         }
                     }
                     await confirm(id);

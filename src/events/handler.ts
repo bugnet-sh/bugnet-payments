@@ -237,7 +237,9 @@ async function refundTerminated(
             await parkManual(d, event, e.orderId, "refund_amount_invalid");
             continue;
         }
-        const out = await requestRefund(d.pool, e.orderId, "router_refundable", e.amountMicros);
+        const out = await requestRefund(d.pool, e.orderId, "router_refundable", {
+            amountMicros: e.amountMicros,
+        });
         if (out === "unknown") {
             d.log.warn("refund entry for an unknown order", {
                 eventId: event.id,
