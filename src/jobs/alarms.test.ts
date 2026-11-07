@@ -81,7 +81,7 @@ function run(
 const prevAt = (lamports: bigint): AlarmSnapshot => ({
     at: at(-5 * MIN),
     feePayerLamports: lamports,
-    feePayingTxs: 0,
+    confirmedPayments: 0,
 });
 
 async function confirmedPayments(n: number) {
@@ -92,19 +92,45 @@ async function confirmedPayments(n: number) {
 }
 
 describe("checkAlarms", () => {
-    it.each(["getBalance", "getTokenAccountBalance"] as const)(
-        "gives up on a stalled %s within solana.rpc_timeout and raises nothing",
-        async (method) => {
-            const started = performance.now();
-            const { result, log } = run({
-                script: { [method]: neverAnswers },
-                rpcTimeoutMs: STALL_MS,
-            });
-            await expect(result).rejects.toMatchObject({ name: "TimeoutError" });
-            expect(performance.now() - started).toBeLessThan(STALL_MS + 900);
-            expect(log.lines).toEqual([]);
-        },
-    );
+    it("gives up on a stalled getBalance within solana.rpc_timeout and raises nothing", async () => {
+        const started = performance.now();
+        const { result, log } = run({
+            script: { getBalance: neverAnswers },
+            rpcTimeoutMs: STALL_MS,
+        });
+        await expect(result).rejects.toMatchObject({ name: "TimeoutError" });
+        expect(performance.now() - started).toBeLessThan(STALL_MS + 900);
+        expect(log.lines).toEqual([]);
+    });
+
+    it("a stalled refund float read is logged at warn and does not hide refunds_per_hour_high", async () => {
+        for (let i = 0; i < 11; i++) {
+            const { order } = await seedOrder(db.pool, { state: "refunding" });
+            await db.pool.query(
+                `insert into refunds (order_id, kind, reason, amount_micros, destination, payer,
+                    state, created_at)
+                 values ($1, 'full', 'late', 10000, 'dest', 'payer', 'pending', $2)`,
+                [order.id, at(-MIN)],
+            );
+        }
+        const started = performance.now();
+        const { result, names, log } = run({
+            script: { getTokenAccountBalance: neverAnswers },
+            rpcTimeoutMs: STALL_MS,
+        });
+        await expect(result).resolves.toMatchObject({ at: t0 });
+        expect(performance.now() - started).toBeLessThan(STALL_MS + 900);
+        expect(await names()).toEqual(["refunds_per_hour_high"]);
+        expect(log.lines.some((l) => l.level === "warn")).toBe(true);
+    });
+
+    it("counts only confirmed payments, not settling ones", async () => {
+        await confirmedPayments(1);
+        const { order } = await seedOrder(db.pool, { state: "paid" });
+        await seedPayment(db.pool, order.id, { status: "settling", confirmedAt: at(-MIN) });
+        const snap = await run({ prev: prevAt(1_000_000_000n) }).result;
+        expect(snap.confirmedPayments).toBe(1);
+    });
 
     it("alarms below alarms.fee_payer_min_lamports", async () => {
         expect(await run({ lamports: 99_999_999n }).names()).toEqual(["fee_payer_sol_low"]);
@@ -119,7 +145,7 @@ describe("checkAlarms", () => {
     it("returns the snapshot of this run", async () => {
         await confirmedPayments(2);
         const snap = await run({ lamports: 990_000_000n, prev: prevAt(990_000_000n) }).result;
-        expect(snap).toEqual({ at: t0, feePayerLamports: 990_000_000n, feePayingTxs: 2 });
+        expect(snap).toEqual({ at: t0, feePayerLamports: 990_000_000n, confirmedPayments: 2 });
     });
 
     it("alarms above 20_000 lamports per confirmed payment", async () => {

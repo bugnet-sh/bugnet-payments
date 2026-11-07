@@ -2,8 +2,8 @@
  * Alarm checks, run every `jobs.alarms_every`.
  *
  * Each run reads the fee payer's SOL balance and compares it with the previous run's snapshot:
- * the SOL spent since then, divided by the payments confirmed since then (refunds are not counted), is the cost per paid
- * order. A balance that rose (a top-up) raises no ratio alarm. Refund float and refund rate are
+ * the SOL spent since then, divided by the payments confirmed since then (refunds are not
+ * counted), is the cost per paid order. A balance that rose (a top-up) raises no ratio alarm. Refund float and refund rate are
  * checked on every run.
  */
 import type { Address } from "@solana/kit";
@@ -16,7 +16,7 @@ import { deadline, type SolanaRpc } from "../solana/rpc.ts";
 export interface AlarmSnapshot {
     at: Date;
     feePayerLamports: bigint;
-    feePayingTxs: number;
+    confirmedPayments: number;
 }
 
 export interface AlarmDeps {
@@ -56,33 +56,41 @@ export async function checkAlarms(
         } else if (spent / BigInt(txs) > max) {
             d.log.alarm("sol_per_order_high", {
                 spentLamports: spent,
-                feePayingTxs: txs,
+                confirmedPayments: txs,
                 lamportsPerTx: spent / BigInt(txs),
             });
         }
     }
 
-    const { value: float } = await d.rpc
-        .getTokenAccountBalance(await usdcAta(d.refundWallet), { commitment: "confirmed" })
-        .send(deadline(d.rpcTimeoutMs));
-    if (BigInt(float.amount) < BigInt(d.refunds.float_low_micros)) {
-        d.log.alarm("refund_float_low", {
-            balanceMicros: BigInt(float.amount),
-            floatLowMicros: d.refunds.float_low_micros,
-        });
+    try {
+        const { value: float } = await d.rpc
+            .getTokenAccountBalance(await usdcAta(d.refundWallet), { commitment: "confirmed" })
+            .send(deadline(d.rpcTimeoutMs));
+        if (BigInt(float.amount) < BigInt(d.refunds.float_low_micros)) {
+            d.log.alarm("refund_float_low", {
+                balanceMicros: BigInt(float.amount),
+                floatLowMicros: d.refunds.float_low_micros,
+            });
+        }
+    } catch (err) {
+        d.log.warn("alarm check failed: refund_float_low", { error: String(err) });
     }
 
-    const created = await refundsCreatedLastHour(d.pool, now);
-    if (created > d.refunds.max_per_hour) {
-        d.log.alarm("refunds_per_hour_high", { created, maxPerHour: d.refunds.max_per_hour });
+    try {
+        const created = await refundsCreatedLastHour(d.pool, now);
+        if (created > d.refunds.max_per_hour) {
+            d.log.alarm("refunds_per_hour_high", { created, maxPerHour: d.refunds.max_per_hour });
+        }
+    } catch (err) {
+        d.log.warn("alarm check failed: refunds_per_hour_high", { error: String(err) });
     }
 
-    return { at: now, feePayerLamports: lamports, feePayingTxs: txs };
+    return { at: now, feePayerLamports: lamports, confirmedPayments: txs };
 }
 
 async function confirmedPayments(pool: pg.Pool, from: Date, to: Date): Promise<number> {
     const res = await pool.query<{ n: number }>(
-        `select count(*)::int as n from payments where confirmed_at > $1 and confirmed_at <= $2`,
+        `select count(*)::int as n from payments where status = 'confirmed' and confirmed_at > $1 and confirmed_at <= $2`,
         [from, to],
     );
     return res.rows[0]?.n ?? 0;
