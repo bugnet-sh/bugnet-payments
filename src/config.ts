@@ -271,6 +271,10 @@ export function loadSettings(path: string): Settings {
 
 export function readSecrets(env: NodeJS.ProcessEnv, s: Settings): Secrets {
     const bad = new Map<string, string>();
+    // systemd's EnvironmentFile keeps a same-line "# comment" as part of the value
+    const token = (name: string, v: string): void => {
+        if (/\s/.test(v)) bad.set(name, "must not contain whitespace");
+    };
     const text = (name: string): string => {
         const v = env[name] ?? "";
         if (v.trim() === "") bad.set(name, "must be set");
@@ -289,10 +293,13 @@ export function readSecrets(env: NodeJS.ProcessEnv, s: Settings): Secrets {
     const feePayerKey = text("BUGNET_FEE_PAYER_KEY");
     const refundKey = text("BUGNET_REFUND_KEY");
     const rpcUrl = text("BUGNET_SOLANA_RPC_URL");
+    token("BUGNET_PAYMENTS_TOKEN", paymentsToken);
+    token("BUGNET_SOLANA_RPC_URL", rpcUrl);
 
     const routerName = "BUGNET_PAYMENTS_ROUTER_TOKEN";
     const routerToken = env[routerName] ?? "";
     if (s.router.check_payer || s.router.get_order) text(routerName);
+    token(routerName, routerToken);
     // Spec section 4 keeps the router caller token apart from the gateway's token
     if (routerToken !== "" && routerToken === paymentsToken) {
         bad.set(routerName, "must differ from BUGNET_PAYMENTS_TOKEN");

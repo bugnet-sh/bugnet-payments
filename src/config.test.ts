@@ -163,6 +163,22 @@ describe("readSecrets", () => {
         }
     });
 
+    it.each(["BUGNET_PAYMENTS_TOKEN", "BUGNET_PAYMENTS_ROUTER_TOKEN", "BUGNET_SOLANA_RPC_URL"])(
+        "refuses %s with whitespace inside, such as a comment kept by systemd",
+        (name) => {
+            const value = "s3cr3t-value           # shared with the gateway";
+            const env = validEnv({ [name]: value });
+            expect(() => readSecrets(env, settings())).toThrow(
+                `${name} must not contain whitespace`,
+            );
+            try {
+                readSecrets(env, settings());
+            } catch (e) {
+                expect(String(e)).not.toContain("s3cr3t");
+            }
+        },
+    );
+
     it("needs a router token only when a router flag is on, and it must differ", () => {
         expect(() =>
             readSecrets(validEnv({ BUGNET_PAYMENTS_ROUTER_TOKEN: undefined }), settings()),

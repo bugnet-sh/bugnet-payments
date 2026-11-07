@@ -74,14 +74,24 @@ The listeners keep their defaults, `127.0.0.1:8447` and `127.0.0.1:8450`, and `p
 `root:root 0600`, holding only the production secrets of `.env.example`, never the test ones
 (`BUGNET_TEST_*`, `BUGNET_RECIPIENT_KEY`, `BUGNET_TEST_PG_URL`):
 
+systemd keeps a `# comment` written after a value as part of that value, so every comment sits
+on its own line:
+
 ```sh
-BUGNET_PAYMENTS_TOKEN=           # shared with the gateway, which sends it as a bearer token
-BUGNET_PAYMENTS_ROUTER_TOKEN=    # shared with the router (section 5)
-BUGNET_ORDER_PRIVATE_KEY=        # openssl rand -base64 32
-BUGNET_CLAIM_KEY=                # openssl rand -base64 32
-BUGNET_FEE_PAYER_KEY=            # base58 of the fee payer's 64-byte secret key
-BUGNET_REFUND_KEY=               # base58 of the refund wallet's 64-byte secret key
-BUGNET_SOLANA_RPC_URL=           # section 6
+# Shared with the gateway, which sends it as a bearer token
+BUGNET_PAYMENTS_TOKEN=
+# Shared with the router (section 5)
+BUGNET_PAYMENTS_ROUTER_TOKEN=
+# openssl rand -base64 32
+BUGNET_ORDER_PRIVATE_KEY=
+# openssl rand -base64 32
+BUGNET_CLAIM_KEY=
+# base58 of the fee payer's 64-byte secret key
+BUGNET_FEE_PAYER_KEY=
+# base58 of the refund wallet's 64-byte secret key
+BUGNET_REFUND_KEY=
+# Section 6
+BUGNET_SOLANA_RPC_URL=
 ```
 
 ```sh
