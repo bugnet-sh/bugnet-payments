@@ -27,6 +27,8 @@ const hostPort = z
 
 const jobEvery = duration.refine((ms) => ms >= 1 && ms <= 86_400_000, "from 1ms to 24h");
 
+const timeout = duration.refine((ms) => ms >= 1 && ms <= 2_147_483_647, "from 1ms to 2147483647ms");
+
 const count = z.int().min(1);
 const nonEmpty = z.string().min(1);
 const amount = z.int().min(0);
@@ -35,14 +37,25 @@ const key32 = z
     .string()
     .refine((s) => s === "" || isBase64Of32(s), "standard base64 of 32 bytes, or empty");
 
-type X402Input = {
+type X402Ordered =
+    | "min_spend_per_minute_micros"
+    | "default_spend_per_minute_micros"
+    | "max_spend_per_minute_micros"
+    | "min_allowance_micros"
+    | "suggested_allowance_micros"
+    | "max_allowance_per_sandbox_micros"
+    | "seller_compute_unit_price_micro_lamports"
+    | "seller_compute_unit_price_max_micro_lamports"
+    | "pool_unpaid_max_micros"
+    | "pool_max_micros";
+
+type X402Input = Record<X402Ordered, number> & {
     enabled: boolean;
     allowance_wallet: string;
-    [key: string]: unknown;
 };
 
 // Each pair reads "low must be at most high"; the issue lands on the low key
-const X402_ORDER: readonly (readonly [string, string])[] = [
+const X402_ORDER: readonly (readonly [X402Ordered, X402Ordered])[] = [
     ["min_spend_per_minute_micros", "default_spend_per_minute_micros"],
     ["default_spend_per_minute_micros", "max_spend_per_minute_micros"],
     ["min_allowance_micros", "suggested_allowance_micros"],
@@ -53,7 +66,7 @@ const X402_ORDER: readonly (readonly [string, string])[] = [
 
 function checkX402(x: X402Input, ctx: z.RefinementCtx): void {
     for (const [low, high] of X402_ORDER) {
-        if ((x[low] as number) > (x[high] as number)) {
+        if (x[low] > x[high]) {
             ctx.addIssue({ code: "custom", path: [low], message: `must be at most ${high}` });
         }
     }
@@ -203,18 +216,18 @@ const settingsSchema = z
                 signed_payload_keep: duration
                     .refine((ms) => ms < 60_000, "below 60s")
                     .prefault("45s"),
-                sign_timeout: duration.prefault("2s"),
-                lookup_timeout: duration.prefault("500ms"),
+                sign_timeout: timeout.prefault("2s"),
+                lookup_timeout: timeout.prefault("500ms"),
                 reserved_release_after: duration.prefault("30s"),
-                release_every: duration.prefault("5s"),
+                release_every: jobEvery.prefault("5s"),
                 seller_compute_unit_limit: count.default(20000),
                 seller_compute_unit_price_micro_lamports: count.default(1),
                 seller_compute_unit_price_max_micro_lamports: count.default(1000),
                 seller_memo_max_bytes: count.default(32),
-                fast_pass_every: duration.prefault("5s"),
+                fast_pass_every: jobEvery.prefault("5s"),
                 fast_pass_limit: count.default(100),
-                mirror_every: duration.prefault("5s"),
-                mirror_idle_every: duration.prefault("60s"),
+                mirror_every: jobEvery.prefault("5s"),
+                mirror_idle_every: jobEvery.prefault("60s"),
                 mirror_page_size: count.default(1000),
                 mirror_rescan_slots: count.default(300),
                 balance_mismatch_after: duration.prefault("2m"),
@@ -222,17 +235,17 @@ const settingsSchema = z
                 rpc_calls_per_hour_alarm: count.default(5000),
                 signer_check_stale_after: duration.prefault("2m"),
                 unresolved_alarm_after: duration.prefault("10m"),
-                close_check_every: duration.prefault("60s"),
+                close_check_every: jobEvery.prefault("60s"),
                 close_check_after: duration.prefault("10m"),
                 close_unverifiable_after: duration.prefault("30m"),
-                close_every: duration.prefault("5s"),
+                close_every: jobEvery.prefault("5s"),
                 close_slow_alarm_after: duration.prefault("10m"),
                 resign_wait_alarm_after: duration.prefault("10m"),
-                cold_transfer_check_every: duration.prefault("5m"),
+                cold_transfer_check_every: jobEvery.prefault("5m"),
                 cold_transfer_max_age: duration.prefault("1h"),
                 cold_transfer_threshold_micros: count.default(20000000),
                 cold_transfer_verify_age: duration.prefault("60s"),
-                events_every: duration.prefault("2s"),
+                events_every: jobEvery.prefault("2s"),
                 events_batch: count.default(50),
                 events_max_backoff: duration.prefault("5m"),
                 events_stuck_alarm_after: duration.prefault("10m"),

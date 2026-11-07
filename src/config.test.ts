@@ -398,6 +398,39 @@ describe("[x402] settings", () => {
     it("refuses a signed_payload_keep of 60s or more", () => {
         expect(() => x402('signed_payload_keep = "60s"')).toThrow(/x402.signed_payload_keep/);
     });
+    it.each([
+        "release_every",
+        "fast_pass_every",
+        "mirror_every",
+        "mirror_idle_every",
+        "close_check_every",
+        "close_every",
+        "cold_transfer_check_every",
+        "events_every",
+    ])("bounds x402.%s from 1ms to 24h", (key) => {
+        expect(() => x402(`${key} = "0ms"`)).toThrow(new RegExp(`x402.${key}`));
+        expect(() => x402(`${key} = "25h"`)).toThrow(new RegExp(`x402.${key}`));
+        expect(x402(`${key} = "1ms"`).x402).toHaveProperty(key, 1);
+        expect(x402(`${key} = "24h"`).x402).toHaveProperty(key, 86_400_000);
+    });
+    it.each(["sign_timeout", "lookup_timeout"])(
+        "bounds x402.%s above 0 and at most 2^31-1ms",
+        (key) => {
+            expect(() => x402(`${key} = "0ms"`)).toThrow(new RegExp(`x402.${key}`));
+            expect(() => x402(`${key} = "2147484s"`)).toThrow(new RegExp(`x402.${key}`));
+            expect(x402(`${key} = "1ms"`).x402).toHaveProperty(key, 1);
+            expect(x402(`${key} = "2147483s"`).x402).toHaveProperty(key, 2_147_483_000);
+        },
+    );
+    it.each(["tls_cert_file", "client_ca_file", "indexed_services_file"])(
+        "refuses an empty x402.%s",
+        (key) => {
+            expect(() => x402(`${key} = ""`)).toThrow(new RegExp(`x402.${key}`));
+        },
+    );
+    it("refuses an x402 integer key below its minimum", () => {
+        expect(() => x402("session_fee_micros = 0")).toThrow(/x402.session_fee_micros/);
+    });
     it("example.toml equals the defaults", () => {
         const text = readFileSync("config/example.toml", "utf8").replace(
             'recipient = ""',
@@ -461,6 +494,21 @@ describe("readSecrets for x402", () => {
             expect(message).not.toContain(value);
         },
     );
+    it.each([
+        ["URL-safe characters", Buffer.from(PEM + "~~?>>").toString("base64url")],
+        [
+            "76-column wrapping",
+            Buffer.from(PEM.repeat(3))
+                .toString("base64")
+                .replace(/(.{76})/g, "$1\n"),
+        ],
+        ["no BEGIN marker", Buffer.from("MC4CAQAwBQYDK2VwBCIEIA== PRIVATE KEY").toString("base64")],
+    ])("refuses a TLS key with %s", (_name, value) => {
+        const env = validEnv({ BUGNET_ALLOWANCE_KEY: "k", BUGNET_X402_TLS_KEY: value });
+        expect(() => readSecrets(env, withWallet())).toThrow(
+            "BUGNET_X402_TLS_KEY must be standard base64 of a PEM private key",
+        );
+    });
     it("needs neither secret when allowance_wallet is empty", () => {
         const s = readSecrets(
             validEnv({ BUGNET_ALLOWANCE_KEY: "set", BUGNET_X402_TLS_KEY: "set" }),
