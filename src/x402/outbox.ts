@@ -1,5 +1,13 @@
-import type { Queryable } from "../db/pool.ts";
-import type { AllowanceEventInput, X402ResolvedInput } from "../router/client.ts";
+import type pg from "pg";
+import type { Settings } from "../config.ts";
+import { type Queryable, withTx } from "../db/pool.ts";
+import type { Log } from "../log.ts";
+import type {
+    AllowanceEventInput,
+    AppendResult,
+    RouterClient,
+    X402ResolvedInput,
+} from "../router/client.ts";
 
 export type AllowancePhase = "paid" | "refunded" | "kept";
 
@@ -75,4 +83,136 @@ export async function paidEventSent(db: Queryable, orderId: string): Promise<boo
         [orderId],
     );
     return res.rows.length === 1;
+}
+
+const SEND_TIMEOUT_MS = 10_000;
+const BASE_BACKOFF_MS = 2_000;
+
+export interface OutboxDeps {
+    pool: pg.Pool;
+    router: RouterClient;
+    x402: Settings["x402"];
+    log: Log;
+    now: () => Date;
+}
+
+interface EventRow {
+    id: string;
+    kind: "allowance" | "x402_resolved";
+    start_order_id: string;
+    ref: string | null;
+    attempts: number;
+    payload: Record<string, unknown>;
+}
+
+const stuckAlarmed = new Set<string>();
+
+async function send(router: RouterClient, row: EventRow): Promise<AppendResult> {
+    const signal = AbortSignal.timeout(SEND_TIMEOUT_MS);
+    if (row.kind === "allowance") {
+        const p = row.payload as unknown as AllowanceEventInput;
+        return router.appendAllowanceEvent({ ...p, tx: p.tx ?? "" }, signal);
+    }
+    const p = row.payload as unknown as Omit<X402ResolvedInput, "at"> & { at: string };
+    return router.appendX402Resolved({ ...p, at: new Date(p.at) }, signal);
+}
+
+type Outcome = "sent" | "dropped" | "retried";
+
+// The row lock stays held through the router call, so a void cannot drop a paid row mid-send.
+async function sendOne(d: OutboxDeps, skip: string[]): Promise<{ id: string; out?: Outcome }> {
+    return withTx(
+        d.pool,
+        async (c) => {
+            const now = d.now();
+            const found = await c.query<EventRow>(
+                `select id, kind, start_order_id, ref, attempts, payload from x402_router_events
+                 where state = 'pending' and next_at <= $1 and id <> all($2::bigint[])
+                 order by next_at, id
+                 limit 1
+                 for no key update skip locked`,
+                [now, skip],
+            );
+            const row = found.rows[0];
+            if (!row) return { id: "" };
+            const answer = await send(d.router, row).catch(() => "retry" as const);
+            const backoff = Math.min(
+                BASE_BACKOFF_MS * 2 ** Math.min(row.attempts, 30),
+                d.x402.events_max_backoff,
+            );
+            const retryAt = new Date(now.getTime() + backoff);
+            if (answer === "ok") {
+                await c.query(
+                    `update x402_router_events
+                     set state = 'sent', sent_at = $2, attempts = attempts + 1, last_error = null
+                     where id = $1 and state = 'pending'`,
+                    [row.id, now],
+                );
+                return { id: row.id, out: "sent" };
+            }
+            if (answer === "invalid" || (answer === "order_unknown" && row.kind !== "allowance")) {
+                await c.query(
+                    `update x402_router_events set state = 'dropped', dropped_reason = $2
+                     where id = $1 and state = 'pending'`,
+                    [row.id, answer],
+                );
+                if (answer === "invalid") {
+                    d.log.alarm("x402_event_refused", {
+                        eventId: row.id,
+                        kind: row.kind,
+                        startOrderId: row.start_order_id,
+                    });
+                } else {
+                    d.log.alarm("x402_event_dropped", {
+                        eventId: row.id,
+                        startOrderId: row.start_order_id,
+                        ref: row.ref,
+                    });
+                }
+                return { id: row.id, out: "dropped" };
+            }
+            await c.query(
+                `update x402_router_events
+                 set attempts = attempts + 1, next_at = $2, last_error = $3
+                 where id = $1 and state = 'pending'`,
+                [row.id, retryAt, answer],
+            );
+            return { id: row.id, out: "retried" };
+        },
+        d.log,
+        { retryDeadlock: false },
+    );
+}
+
+export async function runOutbox(
+    d: OutboxDeps,
+): Promise<{ sent: number; dropped: number; retried: number }> {
+    const result = { sent: 0, dropped: 0, retried: 0 };
+    const seen: string[] = [];
+    for (let i = 0; i < d.x402.events_batch; i++) {
+        const r = await sendOne(d, seen);
+        if (!r.out) break;
+        seen.push(r.id);
+        result[r.out]++;
+    }
+    const stuck = await d.pool.query<{ id: string; start_order_id: string; created_at: Date }>(
+        `select e.id, e.start_order_id, e.created_at from x402_router_events e
+         join orders o on o.id = e.start_order_id
+         where e.state = 'pending' and o.state = 'redeemed'
+         order by e.created_at, e.id limit 1`,
+    );
+    const s = stuck.rows[0];
+    if (
+        s &&
+        !stuckAlarmed.has(s.id) &&
+        d.now().getTime() - s.created_at.getTime() > d.x402.events_stuck_alarm_after
+    ) {
+        stuckAlarmed.add(s.id);
+        d.log.alarm("x402_events_stuck", {
+            eventId: s.id,
+            startOrderId: s.start_order_id,
+            createdAt: s.created_at,
+        });
+    }
+    return result;
 }
