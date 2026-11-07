@@ -311,6 +311,35 @@ describe("runOutbox", () => {
         expect(warned[0]).toMatchObject({ error: "boom" });
     });
 
+    it("passes an abort signal to the router call", async () => {
+        const s = await start();
+        await queueResolved(s.id, 1);
+        const seen: unknown[] = [];
+        const stub = {
+            appendAllowanceEvent: async () => "ok" as const,
+            appendX402Resolved: async (_i: unknown, signal?: AbortSignal) => {
+                seen.push(signal);
+                return "ok" as const;
+            },
+        } as unknown as RouterClient;
+        await runOutbox(deps(stub, T0));
+        expect(seen).toHaveLength(1);
+        expect(seen[0]).toBeInstanceOf(AbortSignal);
+    });
+
+    it("forgets a stuck alarm once the event is no longer pending", async () => {
+        const s = await start();
+        await queueResolved(s.id, 1);
+        const r = router(() => "retry");
+        await runOutbox(deps(r.router, later(600_001)));
+        expect(alarms("x402_events_stuck")).toHaveLength(1);
+        await db.pool.query("update x402_router_events set state = 'sent'");
+        await runOutbox(deps(r.router, later(600_002)));
+        await db.pool.query("update x402_router_events set state = 'pending'");
+        await runOutbox(deps(r.router, later(600_003)));
+        expect(alarms("x402_events_stuck")).toHaveLength(2);
+    });
+
     it("x402_events_stuck after 10 minutes for a redeemed start order", async () => {
         const s = await start();
         const { order: paid } = await seedOrder(db.pool, { state: "paid" });

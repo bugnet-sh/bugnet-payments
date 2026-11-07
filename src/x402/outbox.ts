@@ -200,6 +200,14 @@ export async function runOutbox(
         seen.push(r.id);
         result[r.out]++;
     }
+    if (stuckAlarmed.size > 0) {
+        const pending = await d.pool.query<{ id: string }>(
+            "select id from x402_router_events where state = 'pending' and id = any($1::bigint[])",
+            [[...stuckAlarmed]],
+        );
+        const keep = new Set(pending.rows.map((r) => String(r.id)));
+        for (const id of stuckAlarmed) if (!keep.has(id)) stuckAlarmed.delete(id);
+    }
     const stuck = await d.pool.query<{ id: string; start_order_id: string; created_at: Date }>(
         `select e.id, e.start_order_id, e.created_at from x402_router_events e
          join orders o on o.id = e.start_order_id
