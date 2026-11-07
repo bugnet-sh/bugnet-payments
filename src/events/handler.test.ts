@@ -7,6 +7,8 @@ import type { OrderRow } from "../orders/types.ts";
 import { findOrderRefund } from "../refunds/request.ts";
 import { type TestApp, testApp } from "../testing/app.ts";
 import { seedOrder, seedPayment } from "../testing/orders.ts";
+import { seedAccount, seedFunding, seedX402Payment } from "../testing/x402.ts";
+import { findAccount } from "../x402/ledger.ts";
 import { eventPublicKey, handleEvent, verifyEventSignature } from "./handler.ts";
 
 const seed = Buffer.alloc(32, 9);
@@ -310,7 +312,14 @@ describe("events", () => {
 
     it("answers 503 when no key is configured", async () => {
         const out = await handleEvent(
-            { pool: app.pool, key: null, log: memoryLog(), now: app.now.get },
+            {
+                pool: app.pool,
+                key: null,
+                log: memoryLog(),
+                now: app.now.get,
+                funding: null,
+                x402: app.settings.x402,
+            },
             Buffer.from("{}"),
             {},
         );
@@ -332,7 +341,18 @@ describe("events", () => {
         });
         const headers = { "x-bugnet-signature": sign64(seed, body), "x-bugnet-event-id": id };
         await expect(
-            handleEvent({ pool, key, log: memoryLog(), now: app.now.get }, body, headers),
+            handleEvent(
+                {
+                    pool,
+                    key,
+                    log: memoryLog(),
+                    now: app.now.get,
+                    funding: null,
+                    x402: app.settings.x402,
+                },
+                body,
+                headers,
+            ),
         ).rejects.toThrow("db down");
         expect(await eventRows(id)).toBe(1);
         const retry = await send(body);
@@ -584,5 +604,298 @@ describe("placement.terminated refunds", () => {
             kind: "full",
             amountMicros: 10_000,
         });
+    });
+});
+
+describe("x402 accounts", () => {
+    const P = "8f9c0a52-0000-4000-8000-000000000001";
+
+    async function hot(state: OrderRow["state"]) {
+        const account = await seedAccount(app.pool, { handleSha256: null });
+        await app.pool.query("update orders set state = $2 where id = $1", [account.id, state]);
+        await seedPayment(app.pool, account.id, {
+            status: "confirmed",
+            payer: "payer-1",
+            sourceTokenAccount: "src-1",
+        });
+        await app.pool.query(
+            "update x402_pool set committed_micros = 1000000, unpaid_micros = 0 where id = 1",
+        );
+        await seedFunding(app.pool, {
+            accountId: account.id,
+            orderId: account.id,
+            allowanceMicros: 1_000_000,
+            payer: "payer-1",
+            sourceTokenAccount: "src-1",
+        });
+        return { account, order: (await findOrder(app.pool, account.id))! };
+    }
+
+    function placement(
+        type: string,
+        orderId: string,
+        payload: Record<string, unknown>,
+        id = eid(),
+    ): Buffer {
+        return raw({
+            id,
+            type,
+            created_at: "2030-01-01T00:00:00Z",
+            payload: { placement_id: P, order_id: orderId, deadline: null, ...payload },
+        });
+    }
+
+    const fundingOf = async (orderId: string) =>
+        (
+            await app.pool.query("select voided_at from x402_fundings where order_id = $1", [
+                orderId,
+            ])
+        ).rows.map((r) => ({ voidedAt: r.voided_at }))[0];
+    const alarmCount = () => app.log.lines.filter((l) => l.alarm === "manual_queue").length;
+    const ready = (id: string) =>
+        send(placement("placement.ready", id, { deadline: "2030-01-01T01:00:00Z" }));
+
+    it("stores placement_id and the deadline from ready and extended", async () => {
+        const { account } = await hot("redeemed");
+        await ready(account.id);
+        expect(await findAccount(app.pool, account.id)).toMatchObject({
+            placementId: P,
+            deadline: new Date("2030-01-01T01:00:00Z"),
+        });
+        await send(
+            placement("placement.extended", account.id, {
+                deadline: "2030-01-01T02:00:00Z",
+                extend_order_id: "extend-unknown",
+            }),
+        );
+        expect((await findAccount(app.pool, account.id))!.deadline).toEqual(
+            new Date("2030-01-01T02:00:00Z"),
+        );
+    });
+
+    it("matches the account by payload.order_id on placement.extended", async () => {
+        const { account } = await hot("redeemed");
+        const extend = await seeded("redeemed", {
+            kind: "extend",
+            handleSha256: "c".repeat(64),
+            amountMicros: 5_000,
+        });
+        const id = eid();
+        await send(
+            placement(
+                "placement.extended",
+                account.id,
+                { deadline: "2030-01-01T03:00:00Z", extend_order_id: extend.id },
+                id,
+            ),
+        );
+        const stored = await app.pool.query("select order_id from events where event_id = $1", [
+            id,
+        ]);
+        expect(stored.rows[0].order_id).toBe(extend.id);
+        expect((await findAccount(app.pool, account.id))!.deadline).toEqual(
+            new Date("2030-01-01T03:00:00Z"),
+        );
+        expect((await findOrder(app.pool, extend.id))!.eventSeenAt).not.toBeNull();
+    });
+
+    it("starts the close on terminated and on failed", async () => {
+        for (const type of ["placement.terminated", "placement.failed"]) {
+            const { account } = await hot("redeemed");
+            await send(placement(type, account.id, { refundable: false }));
+            expect(await findAccount(app.pool, account.id)).toMatchObject({
+                state: "closing",
+                closingAt: app.now.get(),
+            });
+        }
+    });
+
+    it("refunds in full and voids a refundable failure before ready", async () => {
+        const { order } = await hot("redeemed");
+        await send(
+            placement("placement.failed", order.id, { refundable: true, reason: "boot_failed" }),
+        );
+        expect(await findOrderRefund(app.pool, order.id)).toMatchObject({
+            kind: "full",
+            amountMicros: 1_013_000,
+            fromWallet: "allowance",
+        });
+        expect(await fundingOf(order.id)).toMatchObject({ voidedAt: expect.any(Date) });
+        expect((await findAccount(app.pool, order.id))!.state).toBe("closing");
+    });
+
+    it("pays the router's entry as one partial after 10 paid calls", async () => {
+        const { order: o } = await hot("redeemed");
+        for (let i = 0; i < 10; i++) await seedX402Payment(app.pool, { accountId: o.id });
+        await ready(o.id);
+        await send(
+            placement("placement.terminated", o.id, {
+                refundable: true,
+                termination_reason: "provider_failed",
+                refunds: [{ order_id: o.id, refund_micros: 8_000 }],
+            }),
+        );
+        expect(await findOrderRefund(app.pool, o.id)).toMatchObject({
+            kind: "partial",
+            amountMicros: 8_000,
+            fromWallet: "allowance",
+        });
+        expect(await findOrder(app.pool, o.id)).toMatchObject({
+            state: "redeemed",
+            hotRouterRefundMicros: 8_000,
+            routerConfirmedAt: expect.any(Date),
+        });
+        expect((await findAccount(app.pool, o.id))!.state).toBe("closing");
+    });
+
+    it("parks an entry above amount minus allowance as refund_amount_invalid and pays nothing", async () => {
+        const { order } = await hot("redeemed");
+        const before = alarmCount();
+        await send(
+            placement("placement.terminated", order.id, {
+                refundable: true,
+                refunds: [{ order_id: order.id, refund_micros: 13_001 }],
+            }),
+        );
+        expect(await findOrder(app.pool, order.id)).toMatchObject({
+            state: "manual",
+            manualReason: "refund_amount_invalid",
+        });
+        expect(await refundRows(order.id)).toBe(0);
+        expect(alarmCount() - before).toBe(1);
+    });
+
+    it("parks refunds null, missing or empty as refund_amount_pending", async () => {
+        for (const refunds of [null, undefined, []]) {
+            const { order } = await hot("redeemed");
+            await ready(order.id);
+            await send(
+                placement("placement.terminated", order.id, {
+                    refundable: true,
+                    termination_reason: "provider_failed",
+                    ...(refunds === undefined ? {} : { refunds }),
+                }),
+            );
+            expect(await findOrder(app.pool, order.id)).toMatchObject({
+                state: "manual",
+                manualReason: "refund_amount_pending",
+            });
+            expect(await findOrderRefund(app.pool, order.id)).toBeNull();
+        }
+    });
+
+    it("treats listed at 0 or not listed as a share of 0", async () => {
+        const listed = await hot("redeemed");
+        await send(
+            placement("placement.terminated", listed.order.id, {
+                refundable: true,
+                refunds: [{ order_id: listed.order.id, refund_micros: 0 }],
+            }),
+        );
+        expect(await refundRows(listed.order.id)).toBe(0);
+        expect((await findOrder(app.pool, listed.order.id))!.routerConfirmedAt).not.toBeNull();
+
+        const absent = await hot("redeemed");
+        await send(
+            placement("placement.terminated", absent.order.id, {
+                refundable: true,
+                refunds: [{ order_id: listed.order.id, refund_micros: 5_000 }],
+            }),
+        );
+        expect(await refundRows(absent.order.id)).toBe(0);
+        expect((await findOrder(app.pool, absent.order.id))!.routerConfirmedAt).not.toBeNull();
+
+        const parked = await hot("redeemed");
+        await send(
+            placement("placement.terminated", parked.order.id, {
+                refundable: true,
+                refunds: null,
+            }),
+        );
+        expect((await findOrder(app.pool, parked.order.id))!.state).toBe("manual");
+        await send(
+            placement("placement.terminated", parked.order.id, {
+                refundable: true,
+                refunds: [{ order_id: parked.order.id, refund_micros: 0 }],
+            }),
+        );
+        expect(await findOrder(app.pool, parked.order.id)).toMatchObject({
+            state: "redeemed",
+            manualReason: null,
+        });
+    });
+
+    it("pays the partial from the refund wallet after the share went to cold", async () => {
+        const { order } = await hot("redeemed");
+        await app.pool.query(
+            "insert into x402_cold_transfers (id, amount_micros, state) values (5, 1, 'confirmed') on conflict do nothing",
+        );
+        await app.pool.query("update orders set cold_transfer_id = 5 where id = $1", [order.id]);
+        await send(
+            placement("placement.terminated", order.id, {
+                refundable: true,
+                refunds: [{ order_id: order.id, refund_micros: 8_000 }],
+            }),
+        );
+        expect(await findOrderRefund(app.pool, order.id)).toMatchObject({
+            kind: "partial",
+            amountMicros: 8_000,
+            fromWallet: "refund",
+        });
+        expect((await findOrder(app.pool, order.id))!.hotRouterRefundMicros).toBe(0);
+    });
+
+    it("changes nothing when the event is applied again", async () => {
+        const { order } = await hot("redeemed");
+        const body = placement("placement.terminated", order.id, {
+            refundable: true,
+            refunds: [{ order_id: order.id, refund_micros: 8_000 }],
+        });
+        await send(body);
+        const closingAt = (await findAccount(app.pool, order.id))!.closingAt;
+        app.now.set(new Date(app.now.get().getTime() + 60_000));
+        await app.pool.query("update events set applied_at = null where event_id = $1", [
+            (JSON.parse(body.toString()) as { id: string }).id,
+        ]);
+        await send(body);
+        expect(await refundRows(order.id)).toBe(1);
+        expect((await findAccount(app.pool, order.id))!.closingAt).toEqual(closingAt);
+        expect((await findOrder(app.pool, order.id))!.hotRouterRefundMicros).toBe(8_000);
+
+        const parked = await hot("redeemed");
+        const pending = placement("placement.terminated", parked.order.id, {
+            refundable: true,
+            refunds: null,
+        });
+        const before = alarmCount();
+        await send(pending);
+        await app.pool.query("update events set applied_at = null where event_id = $1", [
+            (JSON.parse(pending.toString()) as { id: string }).id,
+        ]);
+        await send(pending);
+        expect(alarmCount() - before).toBe(1);
+    });
+
+    it("keeps the extend rules of Task 17", async () => {
+        const { order } = await hot("redeemed");
+        const extend = await seeded(
+            "redeemed",
+            { kind: "extend", handleSha256: "d".repeat(64), amountMicros: 5_000 },
+            { payer: "payer-2", sourceTokenAccount: "src-2" },
+        );
+        await send(
+            placement("placement.terminated", order.id, {
+                refundable: true,
+                refunds: [{ order_id: extend.id, refund_micros: 5_000 }],
+            }),
+        );
+        expect(await findOrderRefund(app.pool, extend.id)).toMatchObject({
+            kind: "partial",
+            amountMicros: 5_000,
+            fromWallet: "refund",
+        });
+        expect((await findOrder(app.pool, extend.id))!.state).toBe("refunding");
+        expect(await refundRows(order.id)).toBe(0);
+        expect((await findOrder(app.pool, order.id))!.routerConfirmedAt).not.toBeNull();
     });
 });

@@ -101,6 +101,8 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
         log,
         now,
     });
+    const funding =
+        s.x402.allowance_wallet === "" ? null : createAllowanceFunding({ x402: s.x402, log });
     const eventKey =
         s.router.event_public_key === "" ? null : eventPublicKey(s.router.event_public_key);
     const internalHandler = createInternalHandler({
@@ -128,7 +130,8 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
             now,
         },
         token: secrets.paymentsToken,
-        events: (raw, headers) => handleEvent({ pool, key: eventKey, log, now }, raw, headers),
+        events: (raw, headers) =>
+            handleEvent({ pool, key: eventKey, log, now, funding, x402: s.x402 }, raw, headers),
         maxBodyBytes: s.http.max_body_bytes,
         log,
     });

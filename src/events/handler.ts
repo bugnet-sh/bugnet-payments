@@ -19,7 +19,11 @@ import {
     setManualReason,
     setOrderState,
 } from "../orders/store.ts";
+import { writeHotPartial } from "../refunds/hot.ts";
 import { findOrderRefund, requestRefund, returnManualToRedeemed } from "../refunds/request.ts";
+import type { Settings } from "../config.ts";
+import type { AllowanceFunding } from "../x402/funding.ts";
+import { findAccount, lockAccount, startClosing, storePlacement } from "../x402/ledger.ts";
 
 const SPKI_ED25519_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 const KEY_BYTES = 32;
@@ -30,6 +34,7 @@ const ORDER_EVENT_TYPES = new Set([
     "placement.extended",
     "placement.terminated",
 ]);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const PARKED_BY_SWEEPER = ["no_event_unverifiable", "abandon_unverifiable"] as const;
 
 export function eventPublicKey(b64: string): KeyObject {
@@ -54,6 +59,8 @@ export interface EventDeps {
     key: KeyObject | null;
     log: Log;
     now: () => Date;
+    funding: AllowanceFunding | null;
+    x402: Settings["x402"];
 }
 
 interface RouterEvent {
@@ -143,6 +150,7 @@ export async function handleEvent(
 async function applyEvent(d: EventDeps, event: RouterEvent): Promise<void> {
     const { payload } = event;
     if (!ORDER_EVENT_TYPES.has(event.type)) return;
+    await applyAccountEvent(d, event);
     const orderId = eventOrderId(event);
     let known = false;
     if (orderId === undefined) {
@@ -164,8 +172,46 @@ async function applyEvent(d: EventDeps, event: RouterEvent): Promise<void> {
         return;
     }
     if (!known || orderId === undefined) return;
-    const out = await requestRefund(d.pool, orderId, "router_refundable");
+    const out = await requestRefund(d.pool, orderId, "router_refundable", {
+        triggerDeadline: parseDeadline(payload.deadline),
+        funding: d.funding ?? undefined,
+        at: d.now(),
+        log: d.log,
+    });
     d.log.info("router refund requested", { eventId: event.id, orderId, result: out });
+}
+
+function parseDeadline(v: unknown): Date | null {
+    if (typeof v !== "string") return null;
+    const at = new Date(v);
+    return Number.isNaN(at.getTime()) ? null : at;
+}
+
+// An x402 account is matched by the start order the router names, also on an extension's event.
+async function applyAccountEvent(d: EventDeps, event: RouterEvent): Promise<void> {
+    const start = str(event.payload.order_id);
+    if (start === undefined || (await findAccount(d.pool, start)) === null) return;
+    const placementId = str(event.payload.placement_id);
+    const valid = placementId !== undefined && UUID.test(placementId);
+    if (valid) {
+        await d.pool.query(
+            "update x402_accounts set placement_id = coalesce(placement_id, $2) where id = $1",
+            [start, placementId],
+        );
+    }
+    if (event.type === "placement.ready" || event.type === "placement.extended") {
+        if (valid) {
+            await storePlacement(d.pool, start, {
+                placementId,
+                deadline: parseDeadline(event.payload.deadline),
+            });
+        }
+        return;
+    }
+    await withTx(d.pool, async (c) => {
+        await lockAccount(c, start);
+        await startClosing(c, start, d.now());
+    });
 }
 
 interface RefundEntry {
@@ -239,6 +285,8 @@ async function refundTerminated(
         }
         const out = await requestRefund(d.pool, e.orderId, "router_refundable", {
             amountMicros: e.amountMicros,
+            log: d.log,
+            at: d.now(),
         });
         if (out === "unknown") {
             d.log.warn("refund entry for an unknown order", {
@@ -258,6 +306,17 @@ async function refundTerminated(
             d.log.info("router refund requested", {
                 eventId: event.id,
                 orderId: e.orderId,
+                result: out,
+            });
+        }
+    }
+    if (startOrder !== undefined && !seen.has(startOrder)) {
+        const order = await findOrder(d.pool, startOrder);
+        if (order?.payInto === "allowance") {
+            const out = await writeHotPartial(d.pool, startOrder, 0, d.now(), { log: d.log });
+            d.log.info("router refund requested", {
+                eventId: event.id,
+                orderId: startOrder,
                 result: out,
             });
         }
