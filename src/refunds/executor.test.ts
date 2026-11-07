@@ -309,6 +309,38 @@ describe("runRefunds", () => {
         expect(rpc.calls.sendTransaction).toBe(1);
     });
 
+    it("takes the refund in the same tick after a deadlock re-run", async () => {
+        const order = await pendingRefund();
+        let connects = 0;
+        const pool = new Proxy(db.pool, {
+            get(target, prop) {
+                if (prop !== "connect") {
+                    const v = Reflect.get(target, prop, target);
+                    return typeof v === "function" ? v.bind(target) : v;
+                }
+                return async () => {
+                    const client = await target.connect();
+                    if (++connects !== 1) return client;
+                    // The first transaction takes the refund row, then deadlocks on its next query
+                    let queries = 0;
+                    const query = client.query.bind(client) as (...a: unknown[]) => unknown;
+                    client.query = ((...a: unknown[]) =>
+                        ++queries === 3
+                            ? Promise.reject(
+                                  Object.assign(new Error("deadlock"), { code: "40P01" }),
+                              )
+                            : query(...a)) as typeof client.query;
+                    return client;
+                };
+            },
+        });
+        const rpc = createFakeRpc({ getAccountInfo: () => tokenAccount({}) });
+        const tick = await runRefunds({ ...deps(rpc), pool });
+        expect(tick.sent).toBe(1);
+        expect(connects).toBeGreaterThanOrEqual(3);
+        expect((await findRefund(db.pool, order.id))!.state).toBe("sent");
+    });
+
     it("confirms and marks the order refunded", async () => {
         const { order } = await sentRefund();
         const tick = await runRefunds(deps(okRpc(), later(30_000)));

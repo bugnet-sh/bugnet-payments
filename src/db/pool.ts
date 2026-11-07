@@ -37,8 +37,8 @@ async function once<T>(pool: pg.Pool, fn: (c: pg.PoolClient) => Promise<T>, log:
     }
 }
 
-// Every lock follows the 7.4 order, so a deadlock is a rare cross-job race and fn only touches
-// Postgres: re-running it once is safe.
+// No fn broadcasts or sends anything outside Postgres before COMMIT, so a re-run repeats only
+// database work and reads.
 export async function withTx<T>(
     pool: pg.Pool,
     fn: (c: pg.PoolClient) => Promise<T>,
@@ -48,7 +48,8 @@ export async function withTx<T>(
     try {
         return await once(pool, fn, log);
     } catch (err) {
-        if ((err as { code?: string }).code !== "40P01" || opts.retryDeadlock === false) throw err;
+        if ((err as { code?: unknown } | null)?.code !== "40P01" || opts.retryDeadlock === false)
+            throw err;
         log.warn("deadlock, re-running the transaction once");
         return once(pool, fn, log);
     }

@@ -159,8 +159,12 @@ export async function runRefunds(d: RefundDeps): Promise<RefundTick> {
     for (let i = 0; i < PER_TICK; i++) {
         const now = d.now();
         const current: { refund?: RefundRow } = {};
+        const takenBefore = taken.length;
         try {
             const step = await withTx(d.pool, async (c) => {
+                // A deadlock re-run starts this callback again over the same closure
+                taken.length = takenBefore;
+                current.refund = undefined;
                 const r = await takeRefund(c, taken, now, tick.paused === null);
                 if (r === null) return null;
                 taken.push(r.id);

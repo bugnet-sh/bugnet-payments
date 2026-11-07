@@ -114,6 +114,18 @@ describe("withTx deadlock re-run", () => {
         expect(calls).toBe(1);
     });
 
+    it.each([null, undefined])("rethrows a %s rejection as is", async (value) => {
+        const { pool } = freshClients();
+        let calls = 0;
+        await expect(
+            withTx(pool, async () => {
+                calls++;
+                throw value;
+            }),
+        ).rejects.toBe(value);
+        expect(calls).toBe(1);
+    });
+
     it("retryDeadlock false never re-runs", async () => {
         const { pool } = freshClients();
         let calls = 0;
