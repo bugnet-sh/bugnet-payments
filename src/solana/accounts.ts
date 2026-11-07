@@ -39,6 +39,12 @@ interface ParsedTokenAccount {
     };
 }
 
+export interface TokenAccountRead {
+    info: TokenAccountInfo | null;
+    // null when the node's answer names no context slot
+    contextSlot: bigint | null;
+}
+
 export async function inspectTokenAccount(
     rpc: SolanaRpc,
     account: Address,
@@ -48,6 +54,18 @@ export async function inspectTokenAccount(
         abortSignal?: AbortSignal;
     } = {},
 ): Promise<TokenAccountInfo | null> {
+    return (await readTokenAccount(rpc, account, o)).info;
+}
+
+export async function readTokenAccount(
+    rpc: SolanaRpc,
+    account: Address,
+    o: {
+        commitment?: "confirmed" | "finalized";
+        minContextSlot?: bigint;
+        abortSignal?: AbortSignal;
+    } = {},
+): Promise<TokenAccountRead> {
     const { context, value } = await rpc
         .getAccountInfo(account, {
             encoding: "jsonParsed",
@@ -55,11 +73,13 @@ export async function inspectTokenAccount(
             ...(o.minContextSlot === undefined ? {} : { minContextSlot: o.minContextSlot }),
         })
         .send({ abortSignal: o.abortSignal });
-    if (value === null) return null;
+    const contextSlot =
+        context?.slot === undefined || context.slot === null ? null : BigInt(context.slot);
+    if (value === null) return { info: null, contextSlot };
     const acct = value as unknown as ParsedTokenAccount;
     const info = acct.data?.parsed?.info;
     const state = info?.state;
-    return {
+    const parsed: TokenAccountInfo = {
         programOwner: acct.owner,
         mint: info?.mint ?? "",
         owner: info?.owner ?? "",
@@ -69,4 +89,5 @@ export async function inspectTokenAccount(
         closeAuthority: info?.closeAuthority ?? null,
         contextSlot: BigInt(context.slot),
     };
+    return { info: parsed, contextSlot };
 }

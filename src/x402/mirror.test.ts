@@ -302,6 +302,9 @@ describe("runMirror", () => {
 
     it("a missing token account is an incident and stops the run", async () => {
         const gone = { ...d, hotTokenAccount: address(payToAta.replace(/.$/, "1")) };
+        await db.pool.query("update x402_tail set token_account = $1 where id = 1", [
+            gone.hotTokenAccount,
+        ]);
         const r = await runMirror(gone);
         expect(r).toMatchObject({ verified: false, reason: "token_account" });
         expect(await incidents()).toEqual([
@@ -311,6 +314,71 @@ describe("runMirror", () => {
             }),
         ]);
         expect(gate.open()).toBe(false);
+    });
+
+    it("a null token-account answer from a node behind C0 is an rpc retry, never an incident", async () => {
+        const gone = { ...d, hotTokenAccount: address(payToAta.replace(/.$/, "1")) };
+        await db.pool.query("update x402_tail set token_account = $1 where id = 1", [
+            gone.hotTokenAccount,
+        ]);
+        chain.lagNode(5, { methods: ["getAccountInfo"], refuse: false });
+        expect(await runMirror(gone)).toMatchObject({ verified: false, reason: "rpc" });
+        expect(await incidents()).toEqual([]);
+        const bare = new Proxy(chain.rpc, {
+            get: (target, prop, recv) =>
+                prop === "getAccountInfo"
+                    ? () => ({ send: async () => ({ value: null }) })
+                    : Reflect.get(target, prop, recv),
+        });
+        expect(await runMirror({ ...gone, rpc: bare })).toMatchObject({
+            verified: false,
+            reason: "rpc",
+        });
+        expect(await incidents()).toEqual([]);
+    });
+
+    it("a tail opened on another token account is refused with a token_account reason", async () => {
+        const other = { ...d, hotTokenAccount: address(cold) };
+        const before = chain.calls().length;
+        expect(await runMirror(other)).toMatchObject({ verified: false, reason: "token_account" });
+        expect(chain.calls().length).toBe(before);
+        expect(
+            log.lines.some((l) => String(l.msg).includes("not the configured hot account")),
+        ).toBe(true);
+    });
+
+    it("listing stops at 10 pages per run and verified_slot waits until it reaches the lower bound", async () => {
+        for (let i = 0; i < 60; i++) chain.credit(hot, 1n);
+        chain.advance(1);
+        const small = { ...d, x402: { ...x402, mirror_page_size: 5 } };
+        const listCalls = () =>
+            chain.calls().filter((c) => c.method === "getSignaturesForAddress").length;
+        const opening = (await readTail(db.pool)).verifiedSlot;
+        let before = listCalls();
+        await runMirror(small);
+        expect(listCalls() - before).toBe(10);
+        expect((await readTail(db.pool)).verifiedSlot).toBe(opening);
+        let verified = false;
+        for (let i = 0; i < 40 && !verified; i++) {
+            before = listCalls();
+            verified = (await runMirror(small)).verified;
+            expect(listCalls() - before).toBeLessThanOrEqual(10);
+        }
+        expect(verified).toBe(true);
+        expect((await readTail(db.pool)).verifiedSlot).toBeGreaterThan(opening);
+        expect(await chainRows()).toHaveLength(60);
+        expect(await incidents()).toEqual([]);
+    }, 60_000);
+
+    it("a known payment waiting in the backlog is never a mirror_gap", async () => {
+        for (let i = 0; i < 30; i++) chain.credit(hot, 1n);
+        const s = chain.credit(hot, 1_013_000n);
+        await hotOrderPaidWith(db.pool, s);
+        chain.advance(400);
+        const small = { ...d, x402: { ...x402, mirror_page_size: 5 } };
+        expect(await runMirror(small)).toMatchObject({ verified: false, reason: "backlog" });
+        expect(await chainSignatures()).not.toContain(s);
+        expect(await incidents()).toEqual([]);
     });
 
     it("a tail that is not open returns token_account with no RPC call", async () => {

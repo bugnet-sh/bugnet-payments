@@ -4,7 +4,7 @@ import type { Settings } from "../config.ts";
 import { withTx, type Queryable } from "../db/pool.ts";
 import type { Log } from "../log.ts";
 import { setPaymentLandedSlot } from "../orders/store.ts";
-import { inspectTokenAccount, type TokenAccountInfo } from "../solana/accounts.ts";
+import { readTokenAccount, type TokenAccountInfo } from "../solana/accounts.ts";
 import { TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
 import { deadline, type SolanaRpc } from "../solana/rpc.ts";
 import { recordIncident, type IncidentFact } from "./incidents.ts";
@@ -45,8 +45,25 @@ class RpcFailure extends Error {}
 
 let lagAlarmed = false;
 
+const MAX_LIST_PAGES = 10;
+
+interface Segment {
+    before?: string;
+    until?: string;
+}
+
+// Where listing stopped when a run spent its pages; held in memory, so a restart lists afresh
+interface Cursor {
+    openingSlot: bigint;
+    newest: string | null;
+    segments: Segment[];
+}
+
+let cursor: Cursor | null = null;
+
 export function resetMirrorState(): void {
     lagAlarmed = false;
+    cursor = null;
 }
 
 async function rpcCall<T>(
@@ -116,26 +133,46 @@ interface Listed {
     slot: bigint;
 }
 
-async function listSignatures(d: MirrorDeps, c: bigint, lower: bigint): Promise<Listed[]> {
+interface Listing {
+    listed: Listed[];
+    complete: boolean;
+}
+
+// Newest first, at most MAX_LIST_PAGES pages per run. An unfinished run leaves the older part
+// (and, next time, the newer part since the newest signature seen) as segments to continue.
+async function listSignatures(
+    d: MirrorDeps,
+    tail: Tail,
+    c: bigint,
+    lower: bigint,
+): Promise<Listing> {
     const limit = d.x402.mirror_page_size;
+    const cur = cursor !== null && cursor.openingSlot === tail.openingSlot ? cursor : null;
+    const queue: Segment[] = [cur?.newest ? { until: cur.newest } : {}, ...(cur?.segments ?? [])];
     const out: Listed[] = [];
-    let before: string | undefined;
-    for (;;) {
+    let newest = cur?.newest ?? null;
+    for (let pages = 0; queue.length > 0 && pages < MAX_LIST_PAGES; pages++) {
+        const seg = queue[0]!;
         const page = await rpcCall(d, (abort) =>
             d.rpc
                 .getSignaturesForAddress(d.hotTokenAccount, {
                     commitment: "finalized",
                     minContextSlot: c,
                     limit,
-                    ...(before === undefined ? {} : { before: toSignature(before) }),
+                    ...(seg.before === undefined ? {} : { before: toSignature(seg.before) }),
+                    ...(seg.until === undefined ? {} : { until: toSignature(seg.until) }),
                 })
                 .send(abort),
         );
+        if (pages === 0 && page[0] !== undefined) newest = page[0].signature;
         for (const e of page) out.push({ signature: e.signature, slot: e.slot });
         const last = page[page.length - 1];
-        if (page.length < limit || last === undefined || last.slot < lower) return out;
-        before = last.signature;
+        if (page.length < limit || last === undefined || last.slot < lower) queue.shift();
+        else queue[0] = { ...seg, before: last.signature };
     }
+    const complete = queue.length === 0;
+    cursor = complete ? null : { openingSlot: tail.openingSlot, newest, segments: queue };
+    return { listed: out, complete };
 }
 
 async function storedSignatures(
@@ -227,12 +264,21 @@ function gapIncident(k: Known, detail: Record<string, unknown>): IncidentFact {
     };
 }
 
-// True while a known transaction is not yet in the stored history
-async function checkKnown(d: MirrorDeps, tail: Tail, c: bigint): Promise<boolean> {
+// True while a known transaction is not yet in the stored history. Only a transaction that is
+// neither stored nor listed, after listing reached the tip, is a gap: a listed one is waiting in
+// the backlog.
+async function checkKnown(
+    d: MirrorDeps,
+    tail: Tail,
+    c: bigint,
+    listed: ReadonlySet<string>,
+    complete: boolean,
+): Promise<boolean> {
     const known = await knownTransactions(d.pool, tail.openedAt ?? new Date(0));
     const after = d.x402.balance_mismatch_after;
     const rescan = BigInt(d.x402.mirror_rescan_slots);
     let missing = false;
+    const due: Known[] = [];
     for (const k of known) {
         if (k.landedSlot === null && k.orderId !== undefined) {
             const sig = k.signatures[0]!;
@@ -242,7 +288,12 @@ async function checkKnown(d: MirrorDeps, tail: Tail, c: bigint): Promise<boolean
                     .send(abort),
             );
             const found = statuses.value[0];
-            if (found === null || found === undefined) {
+            const status = found?.confirmationStatus;
+            if (
+                found === null ||
+                found === undefined ||
+                !(status === "confirmed" || status === "finalized")
+            ) {
                 missing = true;
                 if (d.now().getTime() - k.confirmedAt.getTime() > after) {
                     await raise(
@@ -257,17 +308,43 @@ async function checkKnown(d: MirrorDeps, tail: Tail, c: bigint): Promise<boolean
         }
         if (k.landedSlot === null) continue;
         if (k.landedSlot <= tail.openingSlot || k.landedSlot > c) continue;
-        const stored = await storedSignatures(d.pool, k.signatures);
-        if (stored.size > 0) continue;
+        due.push(k);
+    }
+    if (due.length === 0) return missing;
+    const unstored = await unstoredIndexes(d.pool, due);
+    for (const i of unstored) {
+        const k = due[i]!;
         missing = true;
-        if (k.landedSlot <= c - rescan) {
+        if (!complete || k.signatures.some((s) => listed.has(s))) continue;
+        if (k.landedSlot! <= c - rescan) {
             await raise(
                 d,
-                gapIncident(k, { landedSlot: k.landedSlot.toString(), problem: "unstored" }),
+                gapIncident(k, { landedSlot: k.landedSlot!.toString(), problem: "unstored" }),
             );
         }
     }
     return missing;
+}
+
+// The positions in `known` none of whose signatures is stored
+async function unstoredIndexes(db: Queryable, known: readonly Known[]): Promise<number[]> {
+    const positions: number[] = [];
+    const signatures: string[] = [];
+    known.forEach((k, i) => {
+        for (const s of k.signatures) {
+            positions.push(i);
+            signatures.push(s);
+        }
+    });
+    const res = await db.query<{ i: number }>(
+        `select k.i from generate_series(0, $3::int - 1) as k(i)
+         where not exists (
+            select 1 from unnest($1::int[], $2::text[]) as s(i, sig)
+            join x402_chain_txs t on t.signature = s.sig where s.i = k.i)
+         order by k.i`,
+        [positions, signatures, known.length],
+    );
+    return res.rows.map((r) => r.i);
 }
 
 async function ledgerBalance(db: Queryable, tail: Tail, c: bigint): Promise<bigint> {
@@ -303,10 +380,10 @@ async function mirror(d: MirrorDeps, md: MatchDeps, tail: Tail, p: Progress): Pr
     p.c0 = epoch.absoluteSlot;
     await raiseFinalizedHeight(d.pool, p.h0);
 
-    let info: TokenAccountInfo | null;
+    let read;
     try {
-        info = await rpcCall(d, (abort) =>
-            inspectTokenAccount(d.rpc, hot, {
+        read = await rpcCall(d, (abort) =>
+            readTokenAccount(d.rpc, hot, {
                 commitment: "finalized",
                 minContextSlot: p.c0,
                 abortSignal: abort.abortSignal,
@@ -316,7 +393,8 @@ async function mirror(d: MirrorDeps, md: MatchDeps, tail: Tail, p: Progress): Pr
         d.gate.record("token_account", "error");
         throw err;
     }
-    if (info !== null && info.contextSlot < p.c0) throw new RpcFailure();
+    if (read.contextSlot === null || read.contextSlot < p.c0) throw new RpcFailure();
+    const info = read.info;
     if (info === null) {
         await reportTokenAccount(d, "missing");
         return { verified: false, ...p, reason: "token_account" };
@@ -330,7 +408,7 @@ async function mirror(d: MirrorDeps, md: MatchDeps, tail: Tail, p: Progress): Pr
     const floor = tail.verifiedSlot - BigInt(d.x402.mirror_rescan_slots);
     const lowest = windows.reduce((m, w) => (w.from < m ? w.from : m), floor);
     const lower = lowest > tail.openingSlot + 1n ? lowest : tail.openingSlot + 1n;
-    const listed = await listSignatures(d, p.c, lower);
+    const { listed, complete } = await listSignatures(d, tail, p.c, lower);
     const inRange = listed.filter((e) => e.slot >= lower && e.slot <= p.c);
     const have = await storedSignatures(
         d.pool,
@@ -358,9 +436,15 @@ async function mirror(d: MirrorDeps, md: MatchDeps, tail: Tail, p: Progress): Pr
         await matchInTx(d.pool, tx, md);
         p.stored++;
     }
-    const backlog = kept.length > p.stored;
+    const backlog = !complete || kept.length > p.stored;
 
-    const knownMissing = await checkKnown(d, tail, p.c);
+    const knownMissing = await checkKnown(
+        d,
+        tail,
+        p.c,
+        new Set(listed.map((e) => e.signature)),
+        complete,
+    );
     const ledger = await ledgerBalance(d.pool, tail, p.c);
     const differs = ledger !== info.amount;
 
@@ -421,7 +505,13 @@ export async function runMirror(d: MirrorDeps): Promise<MirrorRun> {
     const tail = await readTail(d.pool);
     const p: Progress = { h0: 0n, c0: 0n, c: 0n, stored: 0 };
     let run: MirrorRun;
-    if (tail.tokenAccount === null) {
+    if (tail.tokenAccount === null || tail.tokenAccount !== d.hotTokenAccount) {
+        if (tail.tokenAccount !== null) {
+            d.log.warn("x402 mirror: the tail's token account is not the configured hot account", {
+                tail: tail.tokenAccount,
+                configured: d.hotTokenAccount,
+            });
+        }
         run = { verified: false, ...p, reason: "token_account" };
     } else {
         try {
