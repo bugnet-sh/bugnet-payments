@@ -347,6 +347,34 @@ describe("x402 order columns", () => {
         expect(rows.map((r) => r.id)).toEqual([...ids].sort());
     });
 
+    it("lockOrders holds a row lock until the transaction ends", async () => {
+        const { order } = await seedOrder(db.pool);
+        const a = await db.pool.connect();
+        const b = await db.pool.connect();
+        try {
+            await a.query("begin");
+            await lockOrders(a, [order.id]);
+            await b.query("begin");
+            await expect(
+                b.query("select id from orders where id = $1 for update nowait", [order.id]),
+            ).rejects.toMatchObject({ code: "55P03" });
+            await b.query("rollback");
+            await a.query("commit");
+            await expect(
+                db.pool.query("select id from orders where id = $1 for update nowait", [order.id]),
+            ).resolves.toMatchObject({ rowCount: 1 });
+        } finally {
+            await b.query("rollback").catch(() => undefined);
+            await a.query("rollback").catch(() => undefined);
+            a.release();
+            b.release();
+        }
+    });
+
+    it("lockOrders returns no rows for an empty id list", async () => {
+        expect(await withTx(db.pool, (c) => lockOrders(c, []))).toEqual([]);
+    });
+
     it("setPaymentLandedSlot writes once", async () => {
         const { order } = await seedOrder(db.pool, { state: "settling" });
         expect((await seedPayment(db.pool, order.id)).landedSlot).toBeNull();

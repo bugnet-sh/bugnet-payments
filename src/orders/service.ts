@@ -341,10 +341,10 @@ async function paid(
     o: OrderRow,
     tokenExpiresAt: Date,
 ): Promise<Paid> {
+    if (o.kind === "allowance") throw new Error("allowance orders carry no token");
     const payment = await findPaymentByOrder(db, o.id);
     const payer = o.payer ?? payment?.payer;
     if (payer === undefined) throw new Error(`paid order ${o.id} has no payer`);
-    if (o.kind === "allowance") throw new Error("allowance orders carry no token");
     const out: Paid = {
         status: "paid",
         orderId: o.id,

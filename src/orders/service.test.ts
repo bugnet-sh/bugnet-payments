@@ -10,7 +10,7 @@ import {
     until,
     withHints,
 } from "../testing/app.ts";
-import { seedOrder, seedPayment } from "../testing/orders.ts";
+import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts";
 import { signedPayment } from "../testing/payment.ts";
 import { claimHash, newClaim, sealClaim } from "./claim.ts";
 import { newOrderId } from "./ids.ts";
@@ -320,6 +320,48 @@ describe("redeem", () => {
             handleSha256: HANDLE,
         });
         expect(tokenClaims(r.body.orderToken)).toMatchObject({ handle_sha256: HANDLE });
+    });
+
+    it("puts allowance_micros in the token only when allowance_claim is on", async () => {
+        const flag = app.settings.router;
+        const was = flag.allowance_claim;
+        try {
+            for (const on of [true, false]) {
+                flag.allowance_claim = on;
+                const { order, claim } = await seedPaid({
+                    allowanceMicros: 500_000,
+                    feeMicros: 3_000,
+                    amountMicros: 503_000,
+                    payInto: "allowance",
+                });
+                const r = await post(app, "/v1/orders", { orderId: order.id, claim });
+                expect(r.body.status).toBe("paid");
+                const claims = tokenClaims(r.body.orderToken) as Record<string, unknown>;
+                if (on) expect(claims.allowance_micros).toBe(500_000);
+                else expect(claims).not.toHaveProperty("allowance_micros");
+            }
+        } finally {
+            flag.allowance_claim = was;
+        }
+    });
+
+    it("refuses to issue a token for an allowance order, whatever its payer", async () => {
+        const { order, claim } = await seedAllowanceOrder(app.pool, {
+            state: "paid",
+            paidAt: app.now.get(),
+            createdAt: app.now.get(),
+            expiresAt: after(15 * 60_000),
+            payer: null,
+        });
+        const r = await post(app, "/v1/orders", { orderId: order.id, claim });
+        expect(r.status).toBe(500);
+        expect(
+            app.log.lines.some(
+                (l) =>
+                    l.msg === "handler failed" &&
+                    (l.err as { message?: string }).message === "allowance orders carry no token",
+            ),
+        ).toBe(true);
     });
 
     it("carries the payment response when the order has a payment", async () => {
