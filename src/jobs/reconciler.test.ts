@@ -407,6 +407,7 @@ describe("reconcileSettling", () => {
             orders: defaults.orders,
             log: silentLog,
             now: () => later,
+            unavailableAlarmed: new Set(),
         });
         expect(Object.values(swept.refunds).every((n) => n === 0)).toBe(true);
         expect((await orderOf(order.id)).state).toBe("paid");

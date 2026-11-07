@@ -56,7 +56,10 @@ beforeEach(async () => {
     answer = { redeemed: false };
 });
 
-function deps(now: Date, over: { getOrder?: boolean; log?: SweepDeps["log"] } = {}): SweepDeps {
+function deps(
+    now: Date,
+    over: { getOrder?: boolean; log?: SweepDeps["log"]; alarmed?: Set<string> } = {},
+): SweepDeps {
     return {
         pool: db.pool,
         router: createRouterClient({
@@ -70,6 +73,7 @@ function deps(now: Date, over: { getOrder?: boolean; log?: SweepDeps["log"] } = 
         orders,
         log: over.log ?? silentLog,
         now: () => now,
+        unavailableAlarmed: over.alarmed ?? new Set(),
     };
 }
 
@@ -118,15 +122,19 @@ describe("expiry", () => {
 });
 
 describe("paid orders", () => {
-    it("refunds a late payment at once", async () => {
+    it("refunds a forced late payment at once and logs it as impossible", async () => {
         const { order } = await seedOrder(db.pool, {
             state: "paid",
             expiresAt: t0,
             paidAt: at(1_000),
         });
         await seedPayment(db.pool, order.id);
-        const report = await sweep(deps(at(2_000)));
+        const log = memoryLog();
+        const report = await sweep(deps(at(2_000), { log }));
         expect(report.refunds.late).toBe(1);
+        expect(log.lines.filter((l) => l.msg === "impossible late payment")).toEqual([
+            expect.objectContaining({ level: "error", orderId: order.id }),
+        ]);
         expect((await stateOf(order.id)).state).toBe("refunding");
         expect((await findRefund(db.pool, order.id))?.reason).toBe("late");
     });
@@ -139,8 +147,10 @@ describe("paid orders", () => {
         });
         await seedPayment(db.pool, order.id);
 
-        const early = await sweep(deps(at(30 * MIN - 1_000)));
+        const log = memoryLog();
+        const early = await sweep(deps(at(30 * MIN - 1_000), { log }));
         expect(early.refunds.unredeemed).toBe(0);
+        expect(log.lines.filter((l) => l.level === "error")).toEqual([]);
         expect((await stateOf(order.id)).state).toBe("paid");
 
         const report = await sweep(deps(at(30 * MIN)));
@@ -197,6 +207,42 @@ describe("redeemed orders with no event", () => {
             expect(calls).toHaveLength(1);
         }
         if (a === "error") expect(row.routerConfirmedAt).toBeNull();
+    });
+
+    it("alarms once per order when GetOrder stays unavailable 30 minutes past the token", async () => {
+        const order = await redeemed();
+        const other = await redeemed({ abandonAt: at(-5 * MIN) });
+        answer = "error";
+        const alarmed = new Set<string>();
+        const log = memoryLog();
+        const alarms = () =>
+            log.lines
+                .filter((l) => l.alarm === "router_get_order_unavailable")
+                .map((l) => l.orderId);
+
+        for (const minute of [2, 29]) await sweep(deps(at(minute * MIN), { log, alarmed }));
+        expect(alarms()).toEqual([]);
+
+        await sweep(deps(at(30 * MIN), { log, alarmed }));
+        expect(alarms()).toEqual([order.id, other.id]);
+        expect(log.lines.find((l) => l.alarm === "router_get_order_unavailable")).toMatchObject({
+            level: "alarm",
+            orderId: order.id,
+            tokenExpiresAt: t0.toISOString(),
+        });
+
+        await sweep(deps(at(31 * MIN), { log, alarmed }));
+        await sweep(deps(at(60 * MIN), { log, alarmed }));
+        expect(alarms()).toEqual([order.id, other.id]);
+        expect(calls.filter((id) => id === order.id)).toHaveLength(5);
+        for (const o of [order, other]) {
+            const row = await stateOf(o.id);
+            expect(row).toMatchObject({ state: "redeemed", routerConfirmedAt: null });
+            expect(await findRefund(db.pool, o.id)).toBeNull();
+        }
+
+        await sweep(deps(at(61 * MIN), { log, alarmed: new Set() }));
+        expect(alarms()).toEqual([order.id, other.id, order.id, other.id]);
     });
 
     it("does not ask the router about orders with an event", async () => {

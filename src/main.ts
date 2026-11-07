@@ -168,11 +168,14 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
         log.error("job failed", { job: "reconcile", err }),
     );
     let snapshot: AlarmSnapshot | null = null;
+    const unavailableAlarmed = new Set<string>();
     const stops = [
         every(
             s.jobs.sweep_every,
             "sweep",
-            tracked(() => sweep({ pool, router: d.router, orders: s.orders, log, now })),
+            tracked(() =>
+                sweep({ pool, router: d.router, orders: s.orders, log, now, unavailableAlarmed }),
+            ),
             log,
         ),
         // The first tick waits for the run at start, so the two never overlap

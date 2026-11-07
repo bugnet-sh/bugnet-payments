@@ -8,7 +8,8 @@ export type AlarmName =
     | "inflow_mismatch"
     | "payment_missing_inflow"
     | "audit_unreadable_tx"
-    | "manual_queue";
+    | "manual_queue"
+    | "router_get_order_unavailable";
 
 type Fields = Record<string, unknown>;
 

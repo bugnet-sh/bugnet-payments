@@ -55,6 +55,12 @@ async function stateOf(id: string) {
     return (await findOrder(app.pool, id))!.state;
 }
 
+function lateLines(orderId: string): Record<string, unknown>[] {
+    return app.log.lines.filter(
+        (l) => l.msg === "impossible late payment" && l.orderId === orderId,
+    );
+}
+
 async function lockWaiters(): Promise<number> {
     const res = await app.pool.query(
         `select count(*)::int as n from pg_stat_activity
@@ -432,6 +438,7 @@ describe("redeem", () => {
         const r = await post(app, "/v1/orders", { orderId: order.id, claim });
         expect(r.body).toEqual({ status: "refused", orderId: order.id, reason: "payment_late" });
         expect(await stateOf(order.id)).toBe("paid");
+        expect(lateLines(order.id)).toEqual([expect.objectContaining({ level: "error" })]);
     });
 
     it("redeems a payment recorded exactly at expiry", async () => {
@@ -439,6 +446,7 @@ describe("redeem", () => {
         const { order, claim } = await seedPaid({ expiresAt: t0, paidAt: t0 });
         const r = await post(app, "/v1/orders", { orderId: order.id, claim });
         expect(r.body.status).toBe("paid");
+        expect(lateLines(order.id)).toEqual([]);
     });
 
     it("refuses a redeem after the token expired", async () => {

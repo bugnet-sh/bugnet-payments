@@ -300,7 +300,9 @@ async function redeem(d: OrderServiceDeps, id: string, retryStale: boolean): Pro
             const now = d.now();
             switch (o.state) {
                 case "paid": {
+                    // Unreachable, payOrder records paid_at only before the order expires
                     if (o.paidAt !== null && o.paidAt.getTime() > o.expiresAt.getTime()) {
+                        d.log.error("impossible late payment", { orderId: id });
                         return refused("payment_late", id);
                     }
                     const tokenExpiresAt = new Date(now.getTime() + d.settings.orders.token_ttl);
