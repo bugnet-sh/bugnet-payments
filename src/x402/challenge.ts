@@ -10,6 +10,7 @@ const MAX_TIMEOUT_SECONDS = 300;
 export interface ChallengeContext {
     publicUrl: string;
     recipient: string;
+    allowanceWallet: string;
     feePayer: string;
     transactionVersions: readonly (0 | 1)[];
 }
@@ -19,7 +20,7 @@ export function payUrlFor(publicUrl: string, orderId: string): string {
 }
 
 export function requirementsFor(
-    order: Pick<OrderRow, "id" | "amountMicros">,
+    order: Pick<OrderRow, "id" | "amountMicros" | "payInto">,
     ctx: ChallengeContext,
 ): PaymentRequirements {
     return {
@@ -27,7 +28,7 @@ export function requirementsFor(
         network: SOLANA_MAINNET,
         asset: USDC_MINT,
         amount: String(order.amountMicros),
-        payTo: ctx.recipient,
+        payTo: order.payInto === "allowance" ? ctx.allowanceWallet : ctx.recipient,
         maxTimeoutSeconds: MAX_TIMEOUT_SECONDS,
         extra: {
             feePayer: ctx.feePayer,
@@ -38,7 +39,7 @@ export function requirementsFor(
 }
 
 export async function challengeFor(
-    order: Pick<OrderRow, "id" | "amountMicros" | "description">,
+    order: Pick<OrderRow, "id" | "amountMicros" | "description" | "payInto">,
     ctx: ChallengeContext,
     hints: BlockhashCache,
     log: Log,

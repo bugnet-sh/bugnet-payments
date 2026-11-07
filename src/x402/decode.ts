@@ -29,7 +29,10 @@ export type PayRefusal =
     | "router_unavailable"
     | "rpc_unavailable"
     | "settlement_unavailable"
-    | "too_many_attempts";
+    | "too_many_attempts"
+    | "x402_disabled"
+    | "x402_paused"
+    | "x402_unavailable";
 
 export class PaymentRefusal extends Error {
     constructor(

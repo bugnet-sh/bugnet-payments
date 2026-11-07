@@ -14,6 +14,7 @@ import {
 import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts";
 import { signedPayment } from "../testing/payment.ts";
 import { agentPin, seedAccount, seedFunding, seedService } from "../testing/x402.ts";
+import { setControls } from "../x402/controls.ts";
 import { readPool } from "../x402/ledger.ts";
 import type { OrderRequest } from "./types.ts";
 import { claimHash, newClaim, sealClaim } from "./claim.ts";
@@ -967,5 +968,40 @@ describe("x402 orders", () => {
             create({ amountMicros: 1_000_000, allowanceMicros: 1_000_000, feeMicros: 3_000 }),
         );
         expect(start.body).toEqual({ status: "refused", reason: "bad_request" });
+    });
+});
+
+describe("x402 settle gate on the paid retry", () => {
+    it("gates a paid retry of POST /v1/orders too", async () => {
+        const handleSha256 = randomBytes(32).toString("hex");
+        await seedAccount(app.pool, { handleSha256 });
+        const terms = {
+            kind: "allowance",
+            packageId: "x402-allowance",
+            handleSha256,
+            amountMicros: 1_003_000,
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+            description: "ignored: Payments writes it",
+        };
+        const created = await post(app, "/v1/orders", terms);
+        expect(created.body.status).toBe("payment_required");
+        const p = await signedPayment(
+            withHints(created.body.paymentRequired.accepts[0]),
+            app.payer,
+        );
+        await setControls(app.pool, { paused: true }, "test", app.now.get());
+        try {
+            const r = await post(app, "/v1/orders", { ...terms, payment: p });
+            expect(r.body).toEqual({
+                status: "refused",
+                reason: "x402_paused",
+                orderId: created.body.orderId,
+                retryAfterSeconds: 30,
+            });
+            expect(await stateOf(created.body.orderId)).toBe("unpaid");
+        } finally {
+            await setControls(app.pool, { paused: false }, "test", app.now.get());
+        }
     });
 });

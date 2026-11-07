@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import { connect } from "node:net";
 import { create as protoCreate } from "@bufbuild/protobuf";
@@ -16,8 +17,10 @@ import type { OrderRow } from "../orders/types.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { create, get, post, testApp, type TestApp, totalCalls, withHints } from "../testing/app.ts";
 import { testSigner } from "../testing/keys.ts";
-import { seedOrder } from "../testing/orders.ts";
+import { seedAllowanceOrder, seedOrder } from "../testing/orders.ts";
 import { signedPayment } from "../testing/payment.ts";
+import { seedAccount } from "../testing/x402.ts";
+import { setControls } from "../x402/controls.ts";
 import { requirementsFor } from "../x402/challenge.ts";
 import { clientIp, publicState } from "./public.ts";
 
@@ -37,6 +40,7 @@ function requirementsOf(o: OrderRow): PaymentRequirements {
         requirementsFor(o, {
             publicUrl: app.settings.http.public_url,
             recipient: app.settings.solana.recipient,
+            allowanceWallet: app.allowance.address,
             feePayer: app.feePayer.address,
             transactionVersions: app.settings.solana.transaction_versions,
         }),
@@ -169,6 +173,44 @@ describe("public order routes", () => {
             expect(await r.json()).toEqual({ error: "order_closed", orderId: o.id, state: shown });
         }
         expect(totalCalls(app.rpc)).toBe(0);
+    });
+
+    it("answers a paid POST /o/{id} with a refused funding with 410 and its code", async () => {
+        const { order: closed } = await seedAllowanceOrder(app.pool, {
+            state: "refunding",
+            x402Refusal: "allowance_ceiling",
+            expiresAt: inFuture(5 * 60_000),
+        });
+        const r = await pub(`/o/${closed.id}`, { "payment-signature": await headerFor(closed) });
+        expect(r.status).toBe(410);
+        expect(await r.json()).toEqual({
+            refused: "order_closed",
+            orderId: closed.id,
+            code: "allowance_ceiling",
+        });
+    });
+
+    it("answers a settle refusal with charged false and Retry-After", async () => {
+        const handleSha256 = randomBytes(32).toString("hex");
+        await seedAccount(app.pool, { handleSha256 });
+        const { order: hot } = await seedAllowanceOrder(app.pool, {
+            handleSha256,
+            expiresAt: inFuture(5 * 60_000),
+        });
+        await setControls(app.pool, { paused: true }, "test", app.now.get());
+        try {
+            const r = await pub(`/o/${hot.id}`, { "payment-signature": await headerFor(hot) });
+            expect(r.status).toBe(503);
+            expect(r.headers.get("retry-after")).toBe("30");
+            expect(await r.json()).toEqual({
+                refused: "x402_paused",
+                orderId: hot.id,
+                charged: false,
+                retryAfterSeconds: 30,
+            });
+        } finally {
+            await setControls(app.pool, { paused: false }, "test", app.now.get());
+        }
     });
 
     it("answers the same 410 in the HTML page and in JSON for every closed state", async () => {

@@ -82,6 +82,7 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
     const challenge = {
         publicUrl: s.http.public_url,
         recipient: s.solana.recipient,
+        allowanceWallet: s.x402.allowance_wallet,
         feePayer: feePayer.address,
         transactionVersions: s.solana.transaction_versions,
     };
@@ -91,6 +92,7 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
         router,
         attempts: perMinute(s.orders.attempts_per_order_per_minute),
         challenge,
+        x402: { x402: s.x402, signer: x402.signer },
         log,
         now,
     });

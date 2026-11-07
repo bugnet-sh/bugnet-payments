@@ -52,10 +52,15 @@ const FEE_PAYER = (await testSigner(5)).address;
 const ctx: ChallengeContext = {
     publicUrl: "https://pay.bugnet.sh",
     recipient: RECIPIENT,
+    allowanceWallet: (await testSigner(11)).address,
     feePayer: FEE_PAYER,
     transactionVersions: [0],
 };
-const order = { id: "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa", amountMicros: 10_000 };
+const order = {
+    id: "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+    amountMicros: 10_000,
+    payInto: "cold" as const,
+};
 const bare = requirementsFor(order, ctx);
 const reqWithHints: PaymentRequirements = {
     ...bare,

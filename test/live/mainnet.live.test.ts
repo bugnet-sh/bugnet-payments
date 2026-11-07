@@ -296,10 +296,11 @@ async function facilitatorVerdict(payload: PaymentPayload, orderId: string) {
     return new x402Facilitator().register(SOLANA_MAINNET, scheme).verify(
         payload,
         requirementsFor(
-            { id: orderId, amountMicros: AMOUNT },
+            { id: orderId, amountMicros: AMOUNT, payInto: "cold" },
             {
                 publicUrl: settings.http.public_url,
                 recipient: settings.solana.recipient,
+                allowanceWallet: settings.x402.allowance_wallet,
                 feePayer: feePayer.address,
                 transactionVersions: settings.solana.transaction_versions,
             },

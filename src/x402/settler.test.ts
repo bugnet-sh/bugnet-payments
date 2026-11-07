@@ -33,11 +33,12 @@ const feePayer = await testSigner(5);
 const ctx: ChallengeContext = {
     publicUrl: "https://pay.bugnet.sh",
     recipient: (await testSigner(1)).address,
+    allowanceWallet: (await testSigner(11)).address,
     feePayer: feePayer.address,
     transactionVersions: [0],
 };
 const requirements = requirementsFor(
-    { id: "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa", amountMicros: 10_000 },
+    { id: "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa", amountMicros: 10_000, payInto: "cold" },
     ctx,
 );
 const reqWithHints: PaymentRequirements = {

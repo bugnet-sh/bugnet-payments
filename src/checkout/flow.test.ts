@@ -30,10 +30,11 @@ let accepts: PaymentRequirements;
 beforeAll(async () => {
     payer = await testSigner(3);
     const req = requirementsFor(
-        { id, amountMicros: 10_000 },
+        { id, amountMicros: 10_000, payInto: "cold" },
         {
             publicUrl: "https://pay.bugnet.sh",
             recipient: (await testSigner(1)).address,
+            allowanceWallet: (await testSigner(11)).address,
             feePayer: (await testSigner(5)).address,
             transactionVersions: [0],
         },
@@ -633,6 +634,29 @@ describe("pageStep", () => {
             message: "busy, try again now",
             payAfterMs: 0,
         });
+    });
+});
+
+describe("order_closed_refunding", () => {
+    it("reads a paid order that could not be applied as being refunded", async () => {
+        const h = harness({
+            submit: () =>
+                json(410, { refused: "order_closed", orderId: id, code: "sandbox_ended" }),
+        });
+        expect(await payWithWallet({ fetch: h.f, wallet: h.w, orderUrl, sleep: h.sleep })).toEqual({
+            refused: "order_closed_refunding",
+        });
+        expect(pageStep({ refused: "order_closed_refunding" })).toEqual({
+            message:
+                "paid, but this order could not be applied: the money is being refunded to the paying wallet",
+            watch: {},
+        });
+        const other = harness({
+            submit: () => json(422, { refused: "payment_invalid", orderId: id, code: "x" }),
+        });
+        expect(
+            await payWithWallet({ fetch: other.f, wallet: other.w, orderUrl, sleep: other.sleep }),
+        ).toEqual({ refused: "x" });
     });
 });
 

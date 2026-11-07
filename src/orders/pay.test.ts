@@ -13,6 +13,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { PayerVerdict } from "../gen/bugnet/router/v1/payments_pb.ts";
 import { memoryLog, silentLog } from "../log.ts";
 import { RateLimiter } from "../ratelimit.ts";
+import { stringify } from "smol-toml";
+import { parseSettings } from "../config.ts";
 import { createRouterClient, type RouterClient } from "../router/client.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { BlockhashCache } from "../solana/blockhash.ts";
@@ -27,8 +29,11 @@ import {
 } from "../testing/fake-rpc.ts";
 import { type FakeRouter, startFakeRouter } from "../testing/fake-router.ts";
 import { testSigner } from "../testing/keys.ts";
-import { seedOrder, seedPayment } from "../testing/orders.ts";
+import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts";
 import { signedPayment } from "../testing/payment.ts";
+import { setControls } from "../x402/controls.ts";
+import { seedAccount } from "../testing/x402.ts";
+import { randomBytes } from "node:crypto";
 import { type ChallengeContext, requirementsFor } from "../x402/challenge.ts";
 import { decodePayment } from "../x402/decode.ts";
 import { createSettler, type Settler } from "../x402/settler.ts";
@@ -49,9 +54,12 @@ const FEE_PAYER = feePayer.address;
 const challenge: ChallengeContext = {
     publicUrl: "https://pay.bugnet.sh",
     recipient: (await testSigner(1)).address,
+    allowanceWallet: (await testSigner(11)).address,
     feePayer: FEE_PAYER,
     transactionVersions: [0],
 };
+const X = parseSettings(stringify({ solana: { recipient: challenge.recipient } }), "t").x402;
+const open = { x402: X, signer: { open: () => true } };
 const caps = {
     maxComputeUnits: 50_000,
     maxPriorityFeeMicroLamports: 10_000,
@@ -203,6 +211,7 @@ beforeEach(async () => {
         router: clientFor(router),
         attempts: new RateLimiter(5, 60_000, () => 0),
         challenge,
+        x402: open,
         log: silentLog,
         now: () => NOW,
     });
@@ -898,6 +907,7 @@ describe("createPayDeps", () => {
         router: clientFor(router),
         attempts: new RateLimiter(5, 60_000, () => 0),
         challenge: { ...challenge, ...over },
+        x402: open,
         log: silentLog,
         now: () => NOW,
     });
@@ -916,5 +926,147 @@ describe("createPayDeps", () => {
         expect(() => createPayDeps(deps({ transactionVersions: [0, 1] }))).toThrow(
             /transaction versions/,
         );
+    });
+});
+
+describe("allowance orders", () => {
+    const EXPIRES_AT = EXPIRES;
+    let hot: OrderRow;
+    let handle: string;
+
+    function hotDeps(over: { x402?: Partial<typeof X>; open?: boolean } = {}): PayDeps {
+        return {
+            ...d,
+            x402: {
+                x402: { ...X, enabled: true, ...over.x402 },
+                signer: { open: () => over.open ?? true },
+            },
+        };
+    }
+
+    beforeEach(async () => {
+        handle = randomBytes(32).toString("hex");
+        await seedAccount(db.pool, { handleSha256: handle, packageId: "cpu-small" });
+        hot = (await seedAllowanceOrder(db.pool, { handleSha256: handle, expiresAt: EXPIRES_AT }))
+            .order;
+    });
+    afterEach(async () => {
+        await setControls(db.pool, { paused: false, disabled: false }, "test", NOW);
+    });
+
+    async function hotPayment(o: OrderRow = hot) {
+        return signedPayment(withHints(requirementsFor(o, challenge)), payer);
+    }
+
+    it("refuses an allowance payment while paused, before verify", async () => {
+        await setControls(db.pool, { paused: true }, "test", NOW);
+        expect(await payOrder(hotDeps(), hot.id, await hotPayment(), sig())).toEqual({
+            kind: "refused",
+            orderId: hot.id,
+            httpStatus: 503,
+            reason: "x402_paused",
+            charged: false,
+            retryAfterSeconds: 30,
+        });
+        expect(rpc.calls.sendTransaction).toBe(0);
+        expect(rpc.calls.simulateTransaction).toBe(0);
+        expect(await stateOf(hot.id)).toBe("unpaid");
+        expect(await findPaymentByOrder(db.pool, hot.id)).toBeNull();
+    });
+
+    it("answers x402_disabled with 403", async () => {
+        const want = {
+            kind: "refused",
+            orderId: hot.id,
+            httpStatus: 403,
+            reason: "x402_disabled",
+            charged: false,
+        };
+        await setControls(db.pool, { disabled: true }, "test", NOW);
+        expect(await payOrder(hotDeps(), hot.id, await hotPayment(), sig())).toEqual(want);
+        await setControls(db.pool, { disabled: false }, "test", NOW);
+        expect(
+            await payOrder(
+                hotDeps({ x402: { enabled: false } }),
+                hot.id,
+                await hotPayment(),
+                sig(),
+            ),
+        ).toEqual(want);
+        expect(await stateOf(hot.id)).toBe("unpaid");
+    });
+
+    it("answers x402_unavailable with 503 while the signer is closed", async () => {
+        expect(
+            await payOrder(hotDeps({ open: false }), hot.id, await hotPayment(), sig()),
+        ).toMatchObject({
+            httpStatus: 503,
+            reason: "x402_unavailable",
+            charged: false,
+            retryAfterSeconds: 30,
+        });
+    });
+
+    it("lets package-only orders skip the gate", async () => {
+        await setControls(db.pool, { paused: true }, "test", NOW);
+        expect(await payOrder(hotDeps(), order.id, p, sig())).toMatchObject({ kind: "paid" });
+    });
+
+    it("asks CheckPayer about an allowance order as an extend of the account's package", async () => {
+        const seen: unknown[] = [];
+        const fake = await startFakeRouter({
+            checkPayer: (req) => {
+                seen.push(req);
+                return { verdict: PayerVerdict.OK };
+            },
+        });
+        routers.push(fake);
+        expect(
+            await payOrder(
+                { ...hotDeps(), router: clientFor(fake) },
+                hot.id,
+                await hotPayment(),
+                sig(),
+            ),
+        ).toMatchObject({ kind: "paid" });
+        expect(seen[0]).toMatchObject({ kind: "extend", packageId: "cpu-small" });
+    });
+
+    it("refuses an allowance order whose account is missing", async () => {
+        const log = memoryLog();
+        const { order: lone } = await seedAllowanceOrder(db.pool, {
+            handleSha256: "ee".repeat(32),
+            expiresAt: EXPIRES_AT,
+        });
+        expect(
+            await payOrder({ ...hotDeps(), log }, lone.id, await hotPayment(lone), sig()),
+        ).toEqual({
+            kind: "refused",
+            orderId: lone.id,
+            httpStatus: 503,
+            reason: "x402_unavailable",
+            charged: false,
+            retryAfterSeconds: 30,
+        });
+        expect(log.lines).toContainEqual(
+            expect.objectContaining({
+                msg: "allowance order has no account",
+                orderId: lone.id,
+            }),
+        );
+    });
+
+    it("answers a refused funding with order_closed and its code", async () => {
+        const { order: closed } = await seedAllowanceOrder(db.pool, {
+            state: "refunding",
+            x402Refusal: "allowance_ceiling",
+        });
+        expect(await payOrder(hotDeps(), closed.id, await hotPayment(closed), sig())).toEqual({
+            kind: "refused",
+            orderId: closed.id,
+            httpStatus: 410,
+            reason: "order_closed",
+            code: "allowance_ceiling",
+        });
     });
 });

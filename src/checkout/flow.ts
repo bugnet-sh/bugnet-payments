@@ -106,13 +106,24 @@ function decodeChallenge(header: string | null): PaymentRequired {
     return pr;
 }
 
+const FUNDING_REFUSALS = new Set([
+    "allowance_ceiling",
+    "allowance_pool_full",
+    "sandbox_ended",
+    "order_expired",
+]);
+
 async function reasonOf(res: Response): Promise<string> {
     const body: unknown = await res.json().catch(() => null);
     const field = (name: string): string | undefined => {
         const v = isRecord(body) ? body[name] : undefined;
         return typeof v === "string" && v !== "" ? v : undefined;
     };
-    return field("code") ?? field("refused") ?? field("error") ?? `http_${res.status}`;
+    const code = field("code");
+    if (field("refused") === "order_closed" && code !== undefined && FUNDING_REFUSALS.has(code)) {
+        return "order_closed_refunding";
+    }
+    return code ?? field("refused") ?? field("error") ?? `http_${res.status}`;
 }
 
 async function unavailable(res: Response): Promise<PayFlowResult> {
@@ -267,6 +278,12 @@ export function pageStep(r: PayFlowResult): PageStep {
             return stateStep("refunded");
         case "order_review":
             return stateStep("review");
+        case "order_closed_refunding":
+            return {
+                message:
+                    "paid, but this order could not be applied: the money is being refunded to the paying wallet",
+                watch: {},
+            };
         case "order_closed":
             return { message: "this order is closed", watch: {} };
         case "order_unknown":

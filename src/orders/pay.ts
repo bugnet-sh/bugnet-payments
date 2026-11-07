@@ -4,8 +4,10 @@ import type { PaymentRequirements, SettleResponse } from "@x402/core/types";
 import type pg from "pg";
 import { withTx } from "../db/pool.ts";
 import type { Log } from "../log.ts";
+import type { Settings } from "../config.ts";
 import type { RateLimiter } from "../ratelimit.ts";
 import type { PayerCheck, RouterClient } from "../router/client.ts";
+import { settleGate } from "../x402/create.ts";
 import { type ChallengeContext, requirementsFor } from "../x402/challenge.ts";
 import {
     type DecodedPayment,
@@ -13,6 +15,7 @@ import {
     PaymentRefusal,
     type PayRefusal,
 } from "../x402/decode.ts";
+import { findAccountByHandle } from "../x402/ledger.ts";
 import type { SettleAttempt, Settler } from "../x402/settler.ts";
 import {
     confirmPayment,
@@ -24,6 +27,7 @@ import {
     setOrderState,
     StaleStateError,
 } from "./store.ts";
+import type { SignerHealth } from "../x402/types.ts";
 import type { OrderRow } from "./types.ts";
 
 export type PayOutcome =
@@ -45,6 +49,7 @@ export type PayOutcome =
           httpStatus: 400 | 403 | 404 | 409 | 410 | 422 | 429 | 503;
           reason: PayRefusal;
           code?: string;
+          charged?: false;
           retryAfterSeconds?: number;
           blockedUntil?: string;
       };
@@ -55,6 +60,7 @@ export interface PayDeps {
     router: RouterClient;
     attempts: RateLimiter;
     challenge: ChallengeContext;
+    x402: { x402: Settings["x402"]; signer: SignerHealth };
     log: Log;
     now: () => Date;
 }
@@ -126,10 +132,11 @@ function refused(
     orderId: string,
     httpStatus: Refused["httpStatus"],
     reason: PayRefusal,
-    more: Pick<Refused, "code" | "retryAfterSeconds" | "blockedUntil"> = {},
+    more: Pick<Refused, "code" | "charged" | "retryAfterSeconds" | "blockedUntil"> = {},
 ): Refused {
     const out: Refused = { kind: "refused", orderId, httpStatus, reason };
     if (more.code !== undefined) out.code = more.code;
+    if (more.charged !== undefined) out.charged = more.charged;
     if (more.retryAfterSeconds !== undefined) out.retryAfterSeconds = more.retryAfterSeconds;
     if (more.blockedUntil !== undefined) out.blockedUntil = more.blockedUntil;
     return out;
@@ -163,6 +170,13 @@ export async function payOrder(
         const t = d.now();
         const answer = await answerForState(d, c, order, raw, key, t);
         if (answer !== undefined) return answer;
+        if (order.payInto === "allowance") {
+            const gate = await settleGate(c, d.x402);
+            if (gate === "x402_disabled") return refused(order.id, 403, gate, { charged: false });
+            if (gate !== null) {
+                return refused(order.id, 503, gate, { charged: false, retryAfterSeconds: 30 });
+            }
+        }
         const checked = await checkPayment(d, order, raw, signal);
         if ("kind" in checked) return checked;
         return await settle(d, c, tx, order, checked, key, t);
@@ -191,7 +205,9 @@ async function answerForState(
         case "refunding":
         case "refunded":
         case "manual":
-            return refused(order.id, 410, "order_closed");
+            return order.x402Refusal === null
+                ? refused(order.id, 410, "order_closed")
+                : refused(order.id, 410, "order_closed", { code: order.x402Refusal });
         case "unpaid":
             if (t.getTime() >= order.expiresAt.getTime()) {
                 return refused(order.id, 410, "order_expired");
@@ -258,13 +274,22 @@ async function checkPayment(
         if (!(err instanceof InvalidProofError)) throw err;
         return refused(order.id, 422, "payment_invalid", { code: err.code });
     }
+    let packageId = order.packageId;
+    let kind = order.kind;
+    if (order.kind === "allowance") {
+        const account = await findAccountByHandle(d.pool, order.handleSha256 ?? "");
+        if (account === null) {
+            d.log.error("allowance order has no account", { orderId: order.id });
+            return refused(order.id, 503, "x402_unavailable", {
+                charged: false,
+                retryAfterSeconds: 30,
+            });
+        }
+        packageId = account.packageId;
+        kind = "extend";
+    }
     const check = await d.router.checkPayer(
-        {
-            payer: dec.payer,
-            feePayer: d.challenge.feePayer,
-            packageId: order.packageId,
-            kind: order.kind,
-        },
+        { payer: dec.payer, feePayer: d.challenge.feePayer, packageId, kind },
         signal,
     );
     return payerRefusal(order.id, check) ?? { dec, req };

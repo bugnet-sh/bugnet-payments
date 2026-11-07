@@ -14,15 +14,18 @@ import {
 
 const RECIPIENT = (await testSigner(1)).address;
 const FEE_PAYER = (await testSigner(2)).address;
+const ALLOWANCE = (await testSigner(11)).address;
 const ctx: ChallengeContext = {
     publicUrl: "https://pay.bugnet.sh",
     recipient: RECIPIENT,
+    allowanceWallet: ALLOWANCE,
     feePayer: FEE_PAYER,
     transactionVersions: [0],
 };
 const order = {
     id: "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa",
     amountMicros: 10_000,
+    payInto: "cold" as const,
     description: "Bugnet sandbox 2 vCPU / 2 GiB, 10 min",
 };
 
@@ -100,5 +103,15 @@ describe("x402 challenge", () => {
         const h = paymentRequiredHeaders(pr);
         expect(decodePaymentRequiredHeader(h["PAYMENT-REQUIRED"]!)).toEqual(pr);
         expect(h["Cache-Control"]).toBe("no-store");
+    });
+
+    it("pays into the hot wallet exactly when pay_into is allowance", () => {
+        const id = order.id;
+        expect(
+            requirementsFor({ id, amountMicros: 1_003_000, payInto: "allowance" }, ctx).payTo,
+        ).toBe(ALLOWANCE);
+        expect(requirementsFor({ id, amountMicros: 10_000, payInto: "cold" }, ctx).payTo).toBe(
+            RECIPIENT,
+        );
     });
 });

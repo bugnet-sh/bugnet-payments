@@ -203,6 +203,7 @@ function sendOutcome(res: ServerResponse, out: PayOutcome): void {
                     refused: out.reason,
                     orderId: out.orderId,
                     code: out.code,
+                    charged: out.charged,
                     retryAfterSeconds: out.retryAfterSeconds,
                     blockedUntil: out.blockedUntil,
                 },
