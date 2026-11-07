@@ -9,13 +9,7 @@ import { TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
 import { deadline, type SolanaRpc } from "../solana/rpc.ts";
 import { recordIncident, type IncidentFact } from "./incidents.ts";
 import { liabilitiesAt } from "./liabilities.ts";
-import {
-    alarmUnresolved,
-    applyExpiry,
-    parseChainTx,
-    storeAndMatch,
-    type MatchDeps,
-} from "./match.ts";
+import { alarmUnresolved, applyExpiry, parseChainTx, matchInTx, type MatchDeps } from "./match.ts";
 import type { SignerGate } from "./listener.ts";
 import {
     advanceVerified,
@@ -361,7 +355,7 @@ async function mirror(d: MirrorDeps, md: MatchDeps, tail: Tail, p: Progress): Pr
         );
         if (raw === null) continue;
         const tx = parseChainTx(e.signature, raw.slot, raw, hot);
-        await withTx(d.pool, (c) => storeAndMatch(c, tx, md), d.log);
+        await matchInTx(d.pool, tx, md);
         p.stored++;
     }
     const backlog = kept.length > p.stored;

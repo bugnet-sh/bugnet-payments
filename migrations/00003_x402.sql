@@ -183,6 +183,7 @@ create table x402_chain_txs (
     read_at timestamptz not null default now()
 );
 create index x402_chain_txs_slot on x402_chain_txs (slot);
+create index x402_chain_txs_matched_id on x402_chain_txs (matched_id);
 
 create table x402_tail (
     id int primary key check (id = 1),

@@ -15,6 +15,7 @@ import { withTx, type Queryable } from "../db/pool.ts";
 import { isRecord } from "../is-record.ts";
 import type { Log } from "../log.ts";
 import { lockPayment, setPaymentLandedSlot } from "../orders/store.ts";
+import type { X402ResolvedInput } from "../router/client.ts";
 import { confirmHotRefund } from "../refunds/hot.ts";
 import { TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
 import { deadline, type SolanaRpc } from "../solana/rpc.ts";
@@ -81,7 +82,12 @@ export function parseChainTx(
     raw: unknown,
     hotTokenAccount: string,
 ): ChainTx {
-    if (!isRecord(raw) || !Array.isArray(raw.transaction) || !isRecord(raw.meta)) {
+    if (
+        !isRecord(raw) ||
+        !Array.isArray(raw.transaction) ||
+        raw.transaction[1] !== "base64" ||
+        !isRecord(raw.meta)
+    ) {
         throw new Error("getTransaction answer has no base64 transaction and meta");
     }
     const meta = raw.meta;
@@ -110,6 +116,10 @@ export function parseChainTx(
         .slice(0, header.numSignerAccounts)
         .map((signer) => tx.signatures[signer as Address])
         .map((s) => (s ? getBase58Decoder().decode(s) : zero));
+
+    if (signatures[0] !== signature) {
+        throw new Error("getTransaction answer is for a different signature");
+    }
 
     const pre = usdcBalances(meta.preTokenBalances);
     const post = usdcBalances(meta.postTokenBalances);
@@ -171,6 +181,7 @@ interface Matched {
     kind: MatchKind;
     id: string | null;
     incidents: IncidentFact[];
+    alarms?: Record<string, unknown>[];
 }
 
 const sha256 = (s: string): Buffer =>
@@ -258,6 +269,26 @@ async function lateLanding(
     ];
 }
 
+function resolvedInput(
+    row: X402PaymentRow,
+    status: X402ResolvedInput["status"],
+    tx: string,
+    at: Date,
+): X402ResolvedInput {
+    return {
+        startOrderId: row.accountId,
+        ref: row.ref,
+        status,
+        amountMicros: row.amountMicros,
+        tx,
+        at,
+        host: row.host,
+        method: row.method,
+        path: row.path,
+        payTo: row.payTo,
+    };
+}
+
 async function matchPayment(c: pg.PoolClient, tx: ChainTx, d: MatchDeps): Promise<Matched | null> {
     const found = await c.query(
         `select ${X402_PAYMENT_COLUMNS} from x402_payments
@@ -273,18 +304,7 @@ async function matchPayment(c: pg.PoolClient, tx: ChainTx, d: MatchDeps): Promis
         if (done === null) return;
         await enqueueX402Resolved(
             c,
-            {
-                startOrderId: done.accountId,
-                ref: done.ref,
-                status: to === "confirmed" ? "paid" : "released",
-                amountMicros: done.amountMicros,
-                tx: to === "confirmed" ? t : "",
-                at,
-                host: done.host,
-                method: done.method,
-                path: done.path,
-                payTo: done.payTo,
-            },
+            resolvedInput(done, to === "confirmed" ? "paid" : "released", t, at),
             at,
         );
     };
@@ -328,11 +348,7 @@ async function matchOrder(c: pg.PoolClient, tx: ChainTx): Promise<Matched | null
     return { kind: "order", id: orderId, incidents: [] };
 }
 
-async function matchLateOrder(
-    c: pg.PoolClient,
-    tx: ChainTx,
-    d: MatchDeps,
-): Promise<Matched | null> {
+async function matchLateOrder(c: pg.PoolClient, tx: ChainTx): Promise<Matched | null> {
     if (tx.failed) return null;
     const found = await c.query<{ order_id: string }>(
         `select f.order_id from failed_payments f join orders o on o.id = f.order_id
@@ -341,12 +357,12 @@ async function matchLateOrder(
     );
     const orderId = found.rows[0]?.order_id;
     if (orderId === undefined) return null;
-    d.log.alarm("inflow_mismatch", {
-        orderId,
-        signature: tx.signature,
-        micros: Number(tx.deltaMicros),
-    });
-    return { kind: "order", id: orderId, incidents: [] };
+    return {
+        kind: "order",
+        id: orderId,
+        incidents: [],
+        alarms: [{ orderId, signature: tx.signature, micros: Number(tx.deltaMicros) }],
+    };
 }
 
 // A hot refund or a transfer to cold: the one row that owns one of the transaction's signatures
@@ -439,11 +455,12 @@ async function matchOutgoing(c: pg.PoolClient, tx: ChainTx, d: MatchDeps): Promi
     return result(kind);
 }
 
-// The caller holds `c` inside withTx
+// The caller holds `c` inside withTx and runs `afterCommit` once the transaction committed
 export async function storeAndMatch(
     c: pg.PoolClient,
     tx: ChainTx,
     d: MatchDeps,
+    afterCommit: (() => void)[],
 ): Promise<MatchKind> {
     const stored = await c.query<{ matched: MatchKind }>(
         "select matched from x402_chain_txs where signature = $1",
@@ -454,22 +471,28 @@ export async function storeAndMatch(
     let m =
         (await matchPayment(c, tx, d)) ??
         (await matchOrder(c, tx)) ??
-        (await matchLateOrder(c, tx, d)) ??
+        (await matchLateOrder(c, tx)) ??
         (await matchOutgoing(c, tx, d));
     if (m === null) {
         const touching = hotInstructions(tx, d);
+        const creditOnly = touching.every(
+            (ix) => ix.name === "Transfer" || ix.name === "TransferChecked",
+        );
+        const bugnetDebit = [d.hotTokenAccount, d.coldTokenAccount].some(
+            (a) => (tx.tokenDeltas.get(a) ?? 0n) < 0n,
+        );
         if (tx.failed || (tx.deltaMicros === 0n && touching.length === 0)) {
             m = { kind: "no_effect", id: null, incidents: [] };
-        } else if (
-            tx.deltaMicros > 0n &&
-            touching.every((ix) => ix.name === "Transfer" || ix.name === "TransferChecked")
-        ) {
+        } else if (tx.deltaMicros === 0n && creditOnly && !bugnetDebit) {
+            m = { kind: "no_effect", id: null, incidents: [] };
+            d.log.info("x402 zero-amount transfer into the hot account", {
+                signature: tx.signature,
+                slot: tx.slot.toString(),
+            });
+        } else if (tx.deltaMicros > 0n && creditOnly) {
             m = { kind: "inflow", id: null, incidents: [] };
             if (tx.deltaMicros >= BigInt(d.x402.refund_min_micros)) {
-                d.log.alarm("inflow_mismatch", {
-                    signature: tx.signature,
-                    micros: Number(tx.deltaMicros),
-                });
+                m.alarms = [{ signature: tx.signature, micros: Number(tx.deltaMicros) }];
             }
         } else {
             m = { kind: "unknown", id: null, incidents: [unknownChange(tx)] };
@@ -483,7 +506,18 @@ export async function storeAndMatch(
     );
     if (inserted.rowCount !== 1) throw new Error("chain tx stored twice");
     for (const incident of m.incidents) await recordIncident(c, incident, d.log, d.now());
+    for (const fields of m.alarms ?? []) {
+        afterCommit.push(() => d.log.alarm("inflow_mismatch", fields));
+    }
     return m.kind;
+}
+
+// One transaction: the match, then the alarms it asked for
+export async function matchInTx(pool: pg.Pool, tx: ChainTx, d: MatchDeps): Promise<MatchKind> {
+    const afterCommit: (() => void)[] = [];
+    const kind = await withTx(pool, (c) => storeAndMatch(c, tx, d, afterCommit), d.log);
+    for (const fire of afterCommit) fire();
+    return kind;
 }
 
 // The swap of `confirm` in src/refunds/executor.ts
@@ -546,7 +580,7 @@ async function checkLanded(
             .send(deadline(d.rpcTimeoutMs));
         if (raw !== null) {
             const tx = parseChainTx(row.txSignature!, raw.slot, raw, d.hotTokenAccount);
-            await withTx(pool, (c) => storeAndMatch(c, tx, d), d.log);
+            await matchInTx(pool, tx, d);
             return true;
         }
         const statuses = await rpc
@@ -571,6 +605,34 @@ async function checkLanded(
     }
 }
 
+const alarmedElsewhere = new Set<string>();
+
+// A signed payment whose signature names a stored transaction that belongs to another row
+async function alarmMatchedElsewhere(
+    pool: pg.Pool,
+    row: X402PaymentRow,
+    d: MatchDeps,
+): Promise<boolean> {
+    if (row.txSignature === null) return false;
+    const res = await pool.query<{ matched: string; matched_id: string | null }>(
+        "select matched, matched_id from x402_chain_txs where signature = $1",
+        [row.txSignature],
+    );
+    const stored = res.rows[0];
+    if (stored === undefined || stored.matched_id === row.id) return false;
+    if (!alarmedElsewhere.has(row.id)) {
+        alarmedElsewhere.add(row.id);
+        d.log.alarm("x402_incident", {
+            kind: "unknown_change",
+            paymentId: row.id,
+            signature: row.txSignature,
+            matched: stored.matched,
+            matchedId: stored.matched_id,
+        });
+    }
+    return true;
+}
+
 export async function applyExpiry(
     pool: pg.Pool,
     rpc: SolanaRpc,
@@ -588,6 +650,7 @@ export async function applyExpiry(
     let expired = 0;
     for (const raw of due.rows) {
         const row = toX402Payment(raw);
+        if (await alarmMatchedElsewhere(pool, row, d)) continue;
         if (row.landedSlot !== null && row.txSignature !== null) {
             if (await checkLanded(pool, rpc, row, d)) continue;
         }
@@ -597,22 +660,7 @@ export async function applyExpiry(
             async (c) => {
                 const r = await resolveSigned(c, row.id, "expired_unlanded", {}, at, d.x402, d.log);
                 if (r === null) return false;
-                await enqueueX402Resolved(
-                    c,
-                    {
-                        startOrderId: r.accountId,
-                        ref: r.ref,
-                        status: "released",
-                        amountMicros: r.amountMicros,
-                        tx: "",
-                        at,
-                        host: r.host,
-                        method: r.method,
-                        path: r.path,
-                        payTo: r.payTo,
-                    },
-                    at,
-                );
+                await enqueueX402Resolved(c, resolvedInput(r, "released", "", at), at);
                 return true;
             },
             d.log,

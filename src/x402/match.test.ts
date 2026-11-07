@@ -41,6 +41,7 @@ import {
     applyExpiry,
     confirmColdTransfer,
     parseChainTx,
+    matchInTx,
     storeAndMatch,
     type ChainTx,
     type MatchDeps,
@@ -112,7 +113,7 @@ async function readTx(sig: string): Promise<ChainTx> {
     return parseChainTx(sig, raw!.slot, raw, hot);
 }
 
-const match = (tx: ChainTx) => withTx(db.pool, (c) => storeAndMatch(c, tx, deps));
+const match = (tx: ChainTx) => matchInTx(db.pool, tx, deps);
 const paymentRow = async (id: string) => (await findX402Payment(db.pool, id))!;
 const chainRow = async (sig: string) =>
     (await db.pool.query("select * from x402_chain_txs where signature = $1", [sig])).rows[0];
@@ -215,6 +216,32 @@ describe("parseChainTx", () => {
         expect(tx.failed).toBe(false);
     });
 
+    it("throws when the encoding is not base64", async () => {
+        const p = await landPayment(chain, db.pool, {});
+        const raw = await chain.rpc
+            .getTransaction(toSignature(p.txSignature), {
+                encoding: "base64",
+                commitment: "confirmed",
+                maxSupportedTransactionVersion: 0,
+            })
+            .send();
+        const json = { ...raw!, transaction: [raw!.transaction[0], "base58"] };
+        expect(() => parseChainTx(p.txSignature, raw!.slot, json, hot)).toThrow(/base64/);
+    });
+
+    it("throws when the signature is not the transaction's first signature", async () => {
+        const p = await landPayment(chain, db.pool, {});
+        const other = await landPayment(chain, db.pool, {});
+        const raw = await chain.rpc
+            .getTransaction(toSignature(p.txSignature), {
+                encoding: "base64",
+                commitment: "confirmed",
+                maxSupportedTransactionVersion: 0,
+            })
+            .send();
+        expect(() => parseChainTx(other.txSignature, raw!.slot, raw, hot)).toThrow(/signature/);
+    });
+
     it("reads a legacy transaction that moves USDC into the hot account", async () => {
         const message = pipe(
             createTransactionMessage({ version: "legacy" }),
@@ -248,7 +275,7 @@ describe("parseChainTx", () => {
             mint: USDC_MINT,
             uiTokenAmount: { amount },
         });
-        const sig = "5".repeat(88);
+        const sig = "1".repeat(64);
         const tx = parseChainTx(
             sig,
             9n,
@@ -604,6 +631,36 @@ describe("storeAndMatch: unmatched changes", () => {
         expect(alarms("inflow_mismatch")).toHaveLength(1);
     });
 
+    it("a zero-amount credit into the hot account is no_effect: no incident, no pause", async () => {
+        const s = chain.credit(hot, 0n);
+        expect(await match(await readTx(s))).toBe("no_effect");
+        expect(await chainRow(s)).toMatchObject({ matched: "no_effect", delta_micros: "0" });
+        expect(await incidents()).toEqual([]);
+        expect((await readControls(db.pool)).paused).toBe(false);
+        expect(alarms("inflow_mismatch")).toHaveLength(0);
+        expect(
+            log.lines.filter((l) => l.level === "info" && String(l.msg).includes("zero-amount")),
+        ).toHaveLength(1);
+    });
+
+    it("a positive unsolicited inflow stays an inflow", async () => {
+        expect(await match(await readTx(chain.credit(hot, 5_000n)))).toBe("inflow");
+        expect(await incidents()).toEqual([]);
+    });
+
+    it("inflow_mismatch fires only after the transaction committed", async () => {
+        const tx = await readTx(chain.credit(hot, 10_000n));
+        const afterCommit: (() => void)[] = [];
+        await withTx(db.pool, async (c) => {
+            await storeAndMatch(c, tx, deps, afterCommit);
+            expect(alarms("inflow_mismatch")).toHaveLength(0);
+        });
+        expect(afterCommit).toHaveLength(1);
+        expect(alarms("inflow_mismatch")).toHaveLength(0);
+        afterCommit[0]!();
+        expect(alarms("inflow_mismatch")).toHaveLength(1);
+    });
+
     it("a debit that matches nothing pauses at once", async () => {
         const s = chain.debit(hot, 5_000n);
         expect(await match(await readTx(s))).toBe("unknown");
@@ -669,6 +726,27 @@ describe("applyExpiry", () => {
         });
         expect(await dayMicros("x402_outflow_days", DAY)).toBe(0);
         expect((await resolvedRows())[0]!.payload).toMatchObject({ status: "released", tx: "" });
+    });
+
+    it("a signed payment whose signature belongs to another stored transaction alarms once", async () => {
+        const sig = "3".repeat(63) + "4";
+        await db.pool.query(
+            `insert into x402_chain_txs (signature, slot, delta_micros, failed, matched, matched_id)
+             values ($1, 5, 0, false, 'no_effect', null)`,
+            [sig],
+        );
+        const row = await signedRow(db.pool, {
+            lastValidBlockHeight: 1_200n,
+            txSignature: sig,
+            landedSlot: 5n,
+        });
+        const run = { h0: 2_000n, c0: 1_000n, verifiedSlot: FAR };
+        await applyExpiry(db.pool, chain.rpc, run, deps);
+        await applyExpiry(db.pool, chain.rpc, run, deps);
+        expect(alarms("x402_incident")).toEqual([
+            expect.objectContaining({ kind: "unknown_change", paymentId: row.id }),
+        ]);
+        expect((await paymentRow(row.id)).state).toBe("signed");
     });
 
     it("a hint failure row is never released by applyExpiry", async () => {
