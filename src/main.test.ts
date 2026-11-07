@@ -9,7 +9,7 @@ import { decodePaymentRequiredHeader } from "@x402/core/http";
 import { stringify } from "smol-toml";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { BootCheckError } from "./boot.ts";
-import { parseSettings, type Secrets, type Settings } from "./config.ts";
+import { parseSettings, SECRET_VARS, type Secrets, secretsEnv, type Settings } from "./config.ts";
 import { jsonLog, memoryLog, silentLog } from "./log.ts";
 import { main, routeConsole, startService } from "./main.ts";
 import { findOrder } from "./orders/store.ts";
@@ -190,6 +190,32 @@ function envFor(rpcUrl: string, over: Record<string, string | undefined> = {}): 
     return env;
 }
 
+// Signals main once both listeners answer, or when the wait fails, so it never outlives the test
+async function runMain(
+    env: NodeJS.ProcessEnv,
+    signal: NodeJS.Signals,
+    whileUp: () => void = () => {},
+): Promise<{ code: number; ports: number[] }> {
+    const ports = [await freePort(), await freePort()];
+    const config = writeConfig({
+        http: {
+            internal_listen: `127.0.0.1:${ports[0]}`,
+            public_listen: `127.0.0.1:${ports[1]}`,
+        },
+    });
+    const exit = main(["-config", config], env);
+    try {
+        await until(
+            async () => (await answersHealth(ports[0]!)) && (await answersHealth(ports[1]!)),
+            10_000,
+        );
+        whileUp();
+    } finally {
+        process.emit(signal);
+    }
+    return { code: await exit, ports };
+}
+
 function captureStderr(): string[] {
     const lines: string[] = [];
     vi.spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
@@ -232,14 +258,18 @@ beforeEach(async () => {
 });
 afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
 });
 
 describe("startService", () => {
     it("boots and answers health on both listeners", async () => {
         const s = await startService({ settings, secrets, rpc: okRpc(), log: silentLog });
-        expect((await fetch(`http://127.0.0.1:${s.internalPort}/healthz`)).status).toBe(200);
-        expect((await fetch(`http://127.0.0.1:${s.publicPort}/healthz`)).status).toBe(200);
-        await s.stop();
+        try {
+            expect((await fetch(`http://127.0.0.1:${s.internalPort}/healthz`)).status).toBe(200);
+            expect((await fetch(`http://127.0.0.1:${s.publicPort}/healthz`)).status).toBe(200);
+        } finally {
+            await s.stop();
+        }
     });
 
     it("opens no listener when a boot check fails", async () => {
@@ -255,9 +285,15 @@ describe("startService", () => {
                 return { value: null };
             },
         });
-        await expect(startService({ settings: failing, secrets, rpc })).rejects.toBeInstanceOf(
-            BootCheckError,
-        );
+        const started = startService({ settings: failing, secrets, rpc });
+        try {
+            await expect(started).rejects.toBeInstanceOf(BootCheckError);
+        } finally {
+            await started.then(
+                (s) => s.stop(),
+                () => {},
+            );
+        }
         expect(openDuringCheck).toEqual([false]);
         await expect(fetch(`http://${failing.http.internal_listen}/healthz`)).rejects.toThrow();
         await expect(fetch(`http://${failing.http.public_listen}/healthz`)).rejects.toThrow();
@@ -293,10 +329,13 @@ describe("startService", () => {
 
     it("checks router event signatures with the configured key", async () => {
         const s = await startService({ settings, secrets, rpc: okRpc(), log: silentLog });
-        const res = await postEvent(s.internalPort);
-        expect(res.status).toBe(401);
-        expect(await res.json()).toEqual({ error: "bad_signature" });
-        await s.stop();
+        try {
+            const res = await postEvent(s.internalPort);
+            expect(res.status).toBe(401);
+            expect(await res.json()).toEqual({ error: "bad_signature" });
+        } finally {
+            await s.stop();
+        }
     });
 
     it("without refunds needs no event key, refuses events 503 and sends no refunds", async () => {
@@ -320,11 +359,14 @@ describe("startService", () => {
             rpc,
             log: silentLog,
         });
-        const res = await postEvent(s.internalPort);
-        expect(res.status).toBe(503);
-        expect(await res.json()).toEqual({ error: "events_disabled" });
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        await s.stop();
+        try {
+            const res = await postEvent(s.internalPort);
+            expect(res.status).toBe(503);
+            expect(await res.json()).toEqual({ error: "events_disabled" });
+            await new Promise((resolve) => setTimeout(resolve, 200));
+        } finally {
+            await s.stop();
+        }
         expect(await stateOf(order.id)).toBe("refunding");
         expect(rpc.calls.getSignatureStatuses).toBe(0);
     });
@@ -337,8 +379,11 @@ describe("startService", () => {
             rpc: okRpc(),
             log: silentLog,
         });
-        await until(async () => (await stateOf(orderId)) === "paid", 5_000);
-        await s.stop();
+        try {
+            await until(async () => (await stateOf(orderId)) === "paid", 5_000);
+        } finally {
+            await s.stop();
+        }
     });
 
     it("lets a running job finish before it closes the pool", async () => {
@@ -354,15 +399,18 @@ describe("startService", () => {
             rpc,
             log: silentLog,
         });
-        await until(async () => rpc.calls.getBlockHeight === 1, 5_000);
         let stopped = false;
-        const stopping = s.stop().then(() => {
-            stopped = true;
-        });
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        expect(stopped).toBe(false);
-        release();
-        await stopping;
+        try {
+            await until(async () => rpc.calls.getBlockHeight === 1, 5_000);
+            void s.stop().then(() => {
+                stopped = true;
+            });
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            expect(stopped).toBe(false);
+        } finally {
+            release();
+            await s.stop();
+        }
         expect(await stateOf(orderId)).toBe("paid");
         await expect(health(s.internalPort)).rejects.toThrow();
         await expect(health(s.publicPort)).rejects.toThrow();
@@ -384,11 +432,14 @@ describe("startService", () => {
             rpc,
             log: silentLog,
         });
-        await until(async () => rpc.calls.getBlockHeight === 1, 5_000);
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        const stopping = s.stop();
-        release();
-        await stopping;
+        try {
+            await until(async () => rpc.calls.getBlockHeight === 1, 5_000);
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            void s.stop();
+        } finally {
+            release();
+            await s.stop();
+        }
         await new Promise((resolve) => setTimeout(resolve, 100));
         expect(rpc.calls.getBlockHeight).toBe(1);
     });
@@ -417,10 +468,48 @@ describe("startService", () => {
             rpc: okRpc(),
             log,
         });
-        await until(async () => (await stateOf(expiring.order.id)) === "expired", 5_000);
-        await until(async () => (await stateOf(refunding.order.id)) === "refunded", 5_000);
-        await until(async () => log.lines.some((l) => l.alarm === "fee_payer_sol_low"), 5_000);
-        await s.stop();
+        try {
+            await until(async () => (await stateOf(expiring.order.id)) === "expired", 5_000);
+            await until(async () => (await stateOf(refunding.order.id)) === "refunded", 5_000);
+            await until(async () => log.lines.some((l) => l.alarm === "fee_payer_sol_low"), 5_000);
+        } finally {
+            await s.stop();
+        }
+    });
+
+    it("redacts every loaded secret and every set test secret in its default log", async () => {
+        await seedSettling();
+        const all: Secrets = {
+            ...secrets,
+            routerToken: "router-token-start-test",
+            rpcUrl: "https://rpc.example/?api-key=start-test",
+        };
+        vi.stubEnv("BUGNET_TEST_PAYER_MNEMONIC", "abandon ability able, about above absent");
+        const values = [
+            ...Object.values(secretsEnv(all)),
+            process.env.BUGNET_TEST_PAYER_MNEMONIC!,
+        ] as string[];
+        const down = () => {
+            throw new Error(`rpc down: ${values.join(" | ")}`);
+        };
+        const lines = captureStderr();
+        const s = await startService({
+            settings: testSettings({ jobs: { reconcile_every: "1h" } }),
+            secrets: all,
+            rpc: okRpc({ getBlockHeight: down, getSignatureStatuses: down }),
+        });
+        try {
+            await until(async () => lines.some((l) => l.includes('"err"')), 5_000);
+        } finally {
+            await s.stop();
+        }
+        const failed = parsed(lines).filter((l) => l.err !== undefined);
+        expect(failed).toHaveLength(1);
+        expect(failed[0]!.err).toEqual({
+            name: "Error",
+            message: `rpc down: ${values.map(() => "[redacted]").join(" | ")}`,
+        });
+        for (const value of values) expect(lines.join("")).not.toContain(value);
     });
 });
 
@@ -449,6 +538,22 @@ describe("routeConsole", () => {
         ]);
         expect(console.error).toBe(error);
         expect(console.warn).toBe(warn);
+    });
+
+    it("prints an Error inside an argument as its name and message only", () => {
+        const log = memoryLog();
+        const restore = routeConsole(log);
+        const err = new Error("POST failed", { cause: new Error("https://rpc/?api-key=K") });
+        const loop: Record<string, unknown> = { errors: [err] };
+        loop.self = loop;
+        console.error("send failed", { attempt: 1, nested: loop });
+        restore();
+        expect(log.lines).toHaveLength(1);
+        expect(log.lines[0]!.level).toBe("error");
+        expect(String(log.lines[0]!.msg).replace(/\s+/g, " ")).toBe(
+            "send failed { attempt: 1, nested: { errors: [ 'Error: POST failed' ], self: '[Circular]' } }",
+        );
+        expect(JSON.stringify(log.lines)).not.toMatch(/api-key|cause|\bat /);
     });
 });
 
@@ -495,34 +600,51 @@ describe("main", () => {
         "runs until %s, then closes its listeners and returns 0",
         async (signal) => {
             const rpc = await rpcStub(true);
-            const internal = await freePort();
-            const pub = await freePort();
-            const config = writeConfig({
-                http: {
-                    internal_listen: `127.0.0.1:${internal}`,
-                    public_listen: `127.0.0.1:${pub}`,
-                },
-            });
             const lines = captureStderr();
+            let run: Awaited<ReturnType<typeof runMain>>;
             try {
-                const exit = main(["-config", config], envFor(rpc.url));
-                await until(
-                    async () => (await answersHealth(internal)) && (await answersHealth(pub)),
-                    10_000,
-                );
-                process.emit(signal);
-                expect(await exit).toBe(0);
+                run = await runMain(envFor(rpc.url), signal);
             } finally {
                 await rpc.close();
             }
-            await expect(health(internal)).rejects.toThrow();
-            await expect(health(pub)).rejects.toThrow();
+            expect(run.code).toBe(0);
+            for (const port of run.ports) await expect(health(port)).rejects.toThrow();
             const msgs = parsed(lines).map((l) => l.msg);
             expect(msgs).toContain("payments started");
             expect(msgs).toContain("payments stopped");
             expect(lines.join("")).not.toContain(API_KEY);
         },
     );
+
+    it("redacts every secret variable, as a value and inside an Error in an object", async () => {
+        const rpc = await rpcStub(true);
+        const env = envFor(rpc.url, {
+            BUGNET_PAYMENTS_ROUTER_TOKEN: "router-token-main-test",
+            BUGNET_TEST_PAYER_KEY: "test-payer-key-main-test",
+            BUGNET_TEST_PAYER_MNEMONIC: "abandon ability able, about above absent",
+            BUGNET_RECIPIENT_KEY: "recipient-key-main-test",
+            BUGNET_TEST_PG_URL: "postgres://tester:pw-main-test@localhost:5432/postgres",
+        });
+        const values = SECRET_VARS.map((name) => env[name] ?? "");
+        expect(values).not.toContain("");
+        const lines = captureStderr();
+        let run: Awaited<ReturnType<typeof runMain>>;
+        try {
+            run = await runMain(env, "SIGTERM", () => {
+                for (const value of values) {
+                    console.error("leaked %s", value, { err: new Error(`call failed: ${value}`) });
+                }
+            });
+        } finally {
+            await rpc.close();
+        }
+        expect(run.code).toBe(0);
+        const leaked = parsed(lines).filter((l) => String(l.msg).startsWith("leaked"));
+        expect(leaked.map((l) => String(l.msg).replace(/\s+/g, " "))).toEqual(
+            values.map(() => "leaked [redacted] { err: 'Error: call failed: [redacted]' }"),
+        );
+        for (const value of values) expect(lines.join("")).not.toContain(value);
+    });
 });
 
 describe("deploy unit", () => {

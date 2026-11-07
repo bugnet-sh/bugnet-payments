@@ -12,7 +12,7 @@ import {
     getSignatureFromTransaction,
     type KeyPairSigner,
 } from "@solana/kit";
-import { loadSettings } from "../config.ts";
+import { loadSettings, secretValues } from "../config.ts";
 import { jsonLog, type Log } from "../log.ts";
 import { orderPublicKeyBase64 } from "../orders/token.ts";
 import { inspectTokenAccount, usdcAta } from "../solana/accounts.ts";
@@ -46,19 +46,6 @@ const COMPUTE_UNIT_PRICE = 10_000n;
 const FEE_ESTIMATE_PER_TX = 5_000n + 200n;
 const CONFIRM_POLL_MS = 500;
 const CONFIRM_TIMEOUT_MS = 90_000;
-
-const SECRET_VARIABLES = [
-    "BUGNET_TEST_PAYER_MNEMONIC",
-    "BUGNET_TEST_PAYER_KEY",
-    "BUGNET_FEE_PAYER_KEY",
-    "BUGNET_REFUND_KEY",
-    "BUGNET_RECIPIENT_KEY",
-    "BUGNET_ORDER_PRIVATE_KEY",
-    "BUGNET_CLAIM_KEY",
-    "BUGNET_PAYMENTS_TOKEN",
-    "BUGNET_PAYMENTS_ROUTER_TOKEN",
-    "BUGNET_SOLANA_RPC_URL",
-];
 
 const COMMANDS: Record<string, { values: string[]; switches: string[] }> = {
     generate: { values: ["--env"], switches: [] },
@@ -140,8 +127,7 @@ export async function runKeys(
         action === "generate" && existsSync(envFile)
             ? parseEnvText(readFileSync(envFile, "utf8"))
             : env;
-    const secrets = SECRET_VARIABLES.map((v) => source[v] ?? "").filter((s) => s !== "");
-    const log = jsonLog("payments-keys", { secrets, write: io.err });
+    const log = jsonLog("payments-keys", { secrets: secretValues(source), write: io.err });
     try {
         switch (action) {
             case "generate":

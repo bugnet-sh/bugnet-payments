@@ -178,6 +178,39 @@ export interface Secrets {
 
 export class ConfigError extends Error {}
 
+// Every secret in .env.example, the test payer's account index is a small number and no secret
+export const SECRET_VARS = [
+    "BUGNET_PAYMENTS_TOKEN",
+    "BUGNET_PAYMENTS_ROUTER_TOKEN",
+    "BUGNET_ORDER_PRIVATE_KEY",
+    "BUGNET_CLAIM_KEY",
+    "BUGNET_FEE_PAYER_KEY",
+    "BUGNET_REFUND_KEY",
+    "BUGNET_SOLANA_RPC_URL",
+    "BUGNET_TEST_PAYER_KEY",
+    "BUGNET_TEST_PAYER_MNEMONIC",
+    "BUGNET_RECIPIENT_KEY",
+    "BUGNET_TEST_PG_URL",
+] as const;
+
+export function secretsEnv(s: Secrets): Partial<Record<(typeof SECRET_VARS)[number], string>> {
+    return {
+        BUGNET_PAYMENTS_TOKEN: s.paymentsToken,
+        BUGNET_PAYMENTS_ROUTER_TOKEN: s.routerToken,
+        BUGNET_ORDER_PRIVATE_KEY: s.orderSeed.toString("base64"),
+        BUGNET_CLAIM_KEY: s.claimKey.toString("base64"),
+        BUGNET_FEE_PAYER_KEY: s.feePayerKey,
+        BUGNET_REFUND_KEY: s.refundKey,
+        BUGNET_SOLANA_RPC_URL: s.rpcUrl,
+    };
+}
+
+// What every log redacts, longest first so a secret inside another is never half scrubbed
+export function secretValues(...envs: NodeJS.ProcessEnv[]): string[] {
+    const values = envs.flatMap((env) => SECRET_VARS.map((name) => env[name] ?? ""));
+    return [...new Set(values.filter((v) => v.trim() !== ""))].sort((a, b) => b.length - a.length);
+}
+
 export function parseDuration(s: string): number {
     const m = /^(\d+)(ms|s|m|h)$/.exec(s);
     if (!m) throw new ConfigError(`bad duration ${JSON.stringify(s)}`);

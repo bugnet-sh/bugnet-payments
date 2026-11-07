@@ -11,7 +11,15 @@ import { format } from "node:util";
 import { type Address, address, type KeyPairSigner } from "@solana/kit";
 import type pg from "pg";
 import { BootCheckError, bootChecks } from "./boot.ts";
-import { ConfigError, loadSettings, readSecrets, type Secrets, type Settings } from "./config.ts";
+import {
+    ConfigError,
+    loadSettings,
+    readSecrets,
+    type Secrets,
+    secretsEnv,
+    secretValues,
+    type Settings,
+} from "./config.ts";
 import { migrate } from "./db/migrate.ts";
 import { createPool } from "./db/pool.ts";
 import { createHttpApp } from "./http/app.ts";
@@ -43,32 +51,16 @@ export interface RunningService {
 }
 
 const USAGE = "usage: main.js -config FILE";
-const SECRET_VARS = [
-    "BUGNET_SOLANA_RPC_URL",
-    "BUGNET_PAYMENTS_TOKEN",
-    "BUGNET_PAYMENTS_ROUTER_TOKEN",
-    "BUGNET_FEE_PAYER_KEY",
-    "BUGNET_REFUND_KEY",
-];
 
 export async function startService(o: StartOptions): Promise<RunningService> {
     const { settings: s, secrets } = o;
     const now = o.now ?? (() => new Date());
     const log =
-        o.log ??
-        jsonLog("payments", {
-            secrets: [
-                secrets.rpcUrl,
-                secrets.paymentsToken,
-                secrets.routerToken,
-                secrets.feePayerKey,
-                secrets.refundKey,
-            ].filter(Boolean),
-        });
+        o.log ?? jsonLog("payments", { secrets: secretValues(secretsEnv(secrets), process.env) });
     const pool = createPool(s.database.url, log);
     const closers: Array<() => Promise<void>> = [() => pool.end()];
     const closeAll = async () => {
-        for (const close of closers.reverse()) {
+        for (const close of [...closers].reverse()) {
             await close().catch((err: unknown) => log.warn("close failed", { err }));
         }
     };
@@ -248,9 +240,22 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
     };
 }
 
-// An Error prints as its name and message, a stack or cause may hold the RPC URL in another form
+// An Error at any depth prints as its name and message, a stack or cause may hold a secret
+function plain(value: unknown, seen: WeakSet<object>): unknown {
+    if (value instanceof Error) return `${value.name}: ${value.message}`;
+    if (value === null || typeof value !== "object") return value;
+    if (seen.has(value)) return "[Circular]";
+    seen.add(value);
+    try {
+        if (Array.isArray(value)) return value.map((v) => plain(v, seen));
+        return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, plain(v, seen)]));
+    } finally {
+        seen.delete(value);
+    }
+}
+
 function formatArgs(args: unknown[]): string {
-    return format(...args.map((a) => (a instanceof Error ? `${a.name}: ${a.message}` : a)));
+    return format(...args.map((a) => plain(a, new WeakSet())));
 }
 
 export function routeConsole(log: Log): () => void {
@@ -281,9 +286,7 @@ function untilSignal(): Promise<NodeJS.Signals> {
 }
 
 export async function main(argv: string[], env: NodeJS.ProcessEnv): Promise<number> {
-    const log = jsonLog("payments", {
-        secrets: SECRET_VARS.map((name) => env[name] ?? "").filter(Boolean),
-    });
+    const log = jsonLog("payments", { secrets: secretValues(env) });
     const restore = routeConsole(log);
     try {
         const config = configPath(argv);

@@ -1,6 +1,14 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { loadSettings, parseSettings, readSecrets, type Settings } from "./config.ts";
+import {
+    loadSettings,
+    parseSettings,
+    readSecrets,
+    SECRET_VARS,
+    secretsEnv,
+    secretValues,
+    type Settings,
+} from "./config.ts";
 
 const ADDR = "11111111111111111111111111111111";
 const ORDER_SEED = Buffer.alloc(32, 1);
@@ -169,5 +177,33 @@ describe("readSecrets", () => {
                 on,
             ),
         ).toThrow(/must differ/);
+    });
+});
+
+describe("secret redaction list", () => {
+    it("names every variable of .env.example except the account index", () => {
+        const names = [...readFileSync(".env.example", "utf8").matchAll(/^([A-Z0-9_]+)=/gm)].map(
+            (m) => m[1],
+        );
+        expect(names).toContain("BUGNET_TEST_PAYER_ACCOUNT_INDEX");
+        expect([...SECRET_VARS].sort()).toEqual(
+            names.filter((n) => n !== "BUGNET_TEST_PAYER_ACCOUNT_INDEX").sort(),
+        );
+    });
+
+    it("gives every loaded secret back in its variable's form", () => {
+        const env = validEnv();
+        const secrets = readSecrets(env, settings());
+        expect(secretsEnv(secrets)).toEqual(env);
+        expect(Object.keys(secretsEnv(secrets))).toHaveLength(Object.keys(secrets).length);
+    });
+
+    it("keeps each set secret once, longest first, and nothing else", () => {
+        const values = secretValues(
+            { BUGNET_PAYMENTS_TOKEN: "abc", BUGNET_REFUND_KEY: "  ", HOME: "/home/x" },
+            { BUGNET_TEST_PAYER_MNEMONIC: "w1 w2 w3", BUGNET_CLAIM_KEY: "abc", PATH: "/bin" },
+            { BUGNET_TEST_PG_URL: "postgres://u:abc@h/db", BUGNET_FEE_PAYER_KEY: "" },
+        );
+        expect(values).toEqual(["postgres://u:abc@h/db", "w1 w2 w3", "abc"]);
     });
 });

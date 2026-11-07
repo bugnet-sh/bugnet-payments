@@ -1,9 +1,14 @@
 import pg from "pg";
+import { secretValues } from "../config.ts";
 import { jsonLog, type Log } from "../log.ts";
 
 export type Queryable = pg.Pool | pg.PoolClient;
 
-export function createPool(url: string, log: Log = jsonLog("payments")): pg.Pool {
+function defaultLog(): Log {
+    return jsonLog("payments", { secrets: secretValues(process.env) });
+}
+
+export function createPool(url: string, log: Log = defaultLog()): pg.Pool {
     const pool = new pg.Pool({ connectionString: url });
     // An idle client erroring (server restart, dropped connection) would otherwise crash the process.
     pool.on("error", (err) => log.error("postgres idle client error", { err }));
@@ -13,7 +18,7 @@ export function createPool(url: string, log: Log = jsonLog("payments")): pg.Pool
 export async function withTx<T>(
     pool: pg.Pool,
     fn: (c: pg.PoolClient) => Promise<T>,
-    log: Log = jsonLog("payments"),
+    log: Log = defaultLog(),
 ): Promise<T> {
     const client = await pool.connect();
     let broken: Error | undefined;

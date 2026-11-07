@@ -1,5 +1,5 @@
 import type pg from "pg";
-import { loadSettings } from "./config.ts";
+import { loadSettings, secretValues } from "./config.ts";
 import { createPool, withTx } from "./db/pool.ts";
 import { isKeysCommand, KEYS_USAGE, runKeys } from "./keys/commands.ts";
 import { jsonLog } from "./log.ts";
@@ -71,7 +71,8 @@ export async function cliMain(argv: string[], env: NodeJS.ProcessEnv, io: CliIo)
     let pool: pg.Pool | undefined;
     try {
         const settings = loadSettings(args.config);
-        pool = createPool(settings.database.url, jsonLog("payments-cli", { write: io.err }));
+        const log = jsonLog("payments-cli", { secrets: secretValues(env), write: io.err });
+        pool = createPool(settings.database.url, log);
         return await cmd.run(pool, io, rest);
     } catch (err) {
         io.err(`error: ${err instanceof Error ? err.message : String(err)}`);
