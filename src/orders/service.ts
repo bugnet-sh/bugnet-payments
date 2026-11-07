@@ -78,18 +78,31 @@ export function shortText(max: number) {
         .refine((s) => !CONTROL_CHARS.test(s));
 }
 
-const pinSchema = z.strictObject({
-    serviceId: z.string().regex(SERVICE_ID),
-    method: z.enum(["GET", "POST"]),
-    host: z.string().min(1).max(253),
-    prefix: z.string().startsWith("/"),
-    url: z.string().max(2_048),
-    maxPriceMicros: z.int().min(1),
-    payTo: z.string().max(64),
-    listed: z.enum(["indexed", "unlisted"]),
-    pinnedFrom: z.enum(["probe", "index"]),
-    probe: z.strictObject({ at: z.string(), status: z.int(), accepted: z.json() }),
-});
+function urlMatchesHost(pin: { url: string; host: string }): boolean {
+    try {
+        const u = new URL(pin.url);
+        return (
+            (u.protocol === "https:" || u.protocol === "http:") && u.host.toLowerCase() === pin.host
+        );
+    } catch {
+        return false;
+    }
+}
+
+const pinSchema = z
+    .strictObject({
+        serviceId: z.string().regex(SERVICE_ID),
+        method: z.enum(["GET", "POST"]),
+        host: z.string().min(1).max(253),
+        prefix: z.string().startsWith("/"),
+        url: z.string().max(2_048),
+        maxPriceMicros: z.int().min(1),
+        payTo: z.string().max(64),
+        listed: z.enum(["indexed", "unlisted"]),
+        pinnedFrom: z.enum(["probe", "index"]),
+        probe: z.strictObject({ at: z.string(), status: z.int(), accepted: z.json() }),
+    })
+    .refine(urlMatchesHost);
 
 const x402Schema = z.strictObject({
     services: z.array(pinSchema).max(MAX_PINS).optional(),

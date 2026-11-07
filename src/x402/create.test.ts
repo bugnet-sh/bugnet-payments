@@ -411,10 +411,42 @@ describe("planOrder", () => {
             });
             expect(await plan(allowance({ x402: { services: [pin] } }))).toMatchObject({
                 ok: false,
-                refused: { reason: "pin_refused", serviceId: pin.serviceId },
+                refused: {
+                    reason: "pin_refused",
+                    serviceId: pin.serviceId,
+                    pinReason: "flow_unsupported",
+                },
             });
         }
     });
+
+    it("checks the service id of a held pin with the same payTo", async () => {
+        const a = await seedAccount(db.pool);
+        const pin = agentPin();
+        await seedService(db.pool, { accountId: a.id, serviceId: pin.serviceId });
+        const wrong = { ...pin, prefix: "/v2/other/" };
+        expect(await plan(allowance({ x402: { services: [wrong] } }))).toMatchObject({
+            ok: false,
+            refused: {
+                reason: "pin_refused",
+                serviceId: pin.serviceId,
+                pinReason: "service_id_mismatch",
+            },
+        });
+        const ok = await plan(allowance({ x402: { services: [pin] } }), {
+            rpc: throwingAccountInfo,
+        });
+        expect(accepted(ok).services[0]).toMatchObject({ newPin: false });
+    });
+
+    it.each(["terminating", "terminated", "failed"] as const)(
+        "refuses sandbox_ended for a known account whose placement is %s",
+        async (state) => {
+            const a = await seedAccount(db.pool, { handleSha256: "dd".repeat(32) });
+            const router = lookup({ startOrderId: a.id, state });
+            expect(await why(allowance({ handleSha256: EF }), { router })).toBe("sandbox_ended");
+        },
+    );
 
     it("answers RpcUnavailableError when the payee check cannot reach the RPC", async () => {
         await seedAccount(db.pool);

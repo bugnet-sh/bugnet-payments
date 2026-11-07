@@ -917,6 +917,25 @@ describe("x402 orders", () => {
         expect(pinned.body).toMatchObject({ status: "refused", reason: "idempotency_conflict" });
     });
 
+    it("refuses a start retry that changes only the allowance as terms_mismatch", async () => {
+        const first = await post(
+            app,
+            "/v1/orders",
+            create({ amountMicros: 1_013_000, allowanceMicros: 1_000_000, feeMicros: 3_000 }),
+        );
+        expect(first.body.status).toBe("payment_required");
+        const r = await post(app, "/v1/orders", {
+            orderId: first.body.orderId,
+            claim: first.body.claim,
+            allowanceMicros: 500_000,
+        });
+        expect(r.body).toEqual({
+            status: "refused",
+            orderId: first.body.orderId,
+            reason: "terms_mismatch",
+        });
+    });
+
     it.each([
         ["an allowance order without a handle", { handleSha256: undefined }],
         ["a start order with allowance and a handle", { kind: "start", packageId: "cpu-small" }],
@@ -949,6 +968,15 @@ describe("x402 orders", () => {
             "a pin without probe.accepted",
             { x402: { services: [{ ...agentPin(), probe: { at: "x", status: 402 } }] } },
         ],
+        ["a pin url that does not parse", { x402: { services: [agentPin({ url: "not a url" })] } }],
+        [
+            "a pin url that is not http or https",
+            { x402: { services: [agentPin({ url: "ftp://agent402.tools/v1/auto/run" })] } },
+        ],
+        [
+            "a pin url on another host",
+            { x402: { services: [agentPin({ url: "https://other.example/v1/auto/run" })] } },
+        ],
         ["a duplicate pin", { x402: { services: [agentPin(), agentPin()] } }],
         ["a disable entry that is no service id", { x402: { disable: ["nope"] } }],
         ["a zero minute limit", { x402: { spendPerMinuteMicros: 0 } }],
@@ -967,6 +995,7 @@ describe("x402 orders", () => {
             ...create({ kind: "extend", handleSha256: h.handleSha256 }),
             allowanceMicros: 1,
         });
+        expect(extend.status).toBe(400);
         expect(extend.body).toEqual({ status: "refused", reason: "bad_request" });
         const start = await post(
             app,

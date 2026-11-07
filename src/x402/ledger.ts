@@ -2,7 +2,7 @@ import type pg from "pg";
 import type { Settings } from "../config.ts";
 import type { Queryable } from "../db/pool.ts";
 import type { Log } from "../log.ts";
-import type { PlacementLookup, RouterClient } from "../router/client.ts";
+import type { PlacementLookup, PlacementState, RouterClient } from "../router/client.ts";
 import type { AccountRow, AccountState } from "./types.ts";
 
 interface AccountDbRow extends pg.QueryResultRow {
@@ -120,7 +120,7 @@ export async function storePlacement(
 }
 
 export type AccountFind =
-    | { kind: "found"; account: AccountRow }
+    | { kind: "found"; account: AccountRow; placementState?: PlacementState }
     | { kind: "placement"; placement: Extract<PlacementLookup, { kind: "found" }> }
     | { kind: "unknown" }
     | { kind: "unavailable" };
@@ -141,7 +141,11 @@ export async function findAccountForHandle(
         placementId: placement.placementId,
         deadline: placement.deadline,
     });
-    return { kind: "found", account: (await findAccount(pool, placement.startOrderId))! };
+    return {
+        kind: "found",
+        account: (await findAccount(pool, placement.startOrderId))!,
+        placementState: placement.state,
+    };
 }
 
 export async function startClosing(

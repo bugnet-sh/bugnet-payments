@@ -328,6 +328,10 @@ describe("internal API with x402", () => {
             });
             expect(r.status).toBe(503);
             expect(r.body).toEqual({ error: "rpc_unavailable" });
+            const warned = down.log.lines.filter((l) => l.msg === "x402 payee check unreachable");
+            expect(warned).toHaveLength(1);
+            expect(warned[0]).toMatchObject({ level: "warn", errorClass: "Error" });
+            expect(JSON.stringify(warned[0])).not.toContain("rpc down");
             const orders = await down.pool.query("select id from orders");
             expect(orders.rows).toEqual([{ id: a.id }]);
             expect(await readPool(down.pool)).toEqual({ committedMicros: 0, unpaidMicros: 0 });

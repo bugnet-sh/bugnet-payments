@@ -3,12 +3,13 @@ import type { Settings } from "../config.ts";
 import type { Queryable } from "../db/pool.ts";
 import type { Log } from "../log.ts";
 import type { OrderRequest, OrderResult } from "../orders/types.ts";
-import type { RouterClient } from "../router/client.ts";
+import type { PlacementState, RouterClient } from "../router/client.ts";
 import type { SolanaRpc } from "../solana/rpc.ts";
 import { readControls } from "./controls.ts";
 import { describeOrder } from "./describe.ts";
 import type { IndexCopy } from "./index-file.ts";
 import { ceilingUsedMicros, feeDue, findAccountForHandle, insertAccount } from "./ledger.ts";
+import { serviceIdFor } from "./ids.ts";
 import { checkPin } from "./pins.ts";
 import type {
     AccountRow,
@@ -35,7 +36,11 @@ export interface X402OrderDeps {
     now: () => Date;
 }
 
-export class RpcUnavailableError extends Error {}
+export class RpcUnavailableError extends Error {
+    constructor(readonly errorClass: string) {
+        super("payee check unreachable");
+    }
+}
 
 export type ValidCreate = Required<
     Pick<OrderRequest, "kind" | "packageId" | "amountMicros" | "description">
@@ -158,6 +163,8 @@ async function heldServices(db: Queryable, accountId: string): Promise<HeldServi
     }));
 }
 
+const live = (state: PlacementState) => state === "placing" || state === "ready";
+
 type Located = { account: AccountRow | null } | { reason: Refused["reason"] };
 
 async function locateAccount(
@@ -175,12 +182,14 @@ async function locateAccount(
         case "unavailable":
             return no("router_unavailable");
         case "found":
-            return found.account.state === "open"
-                ? { account: found.account }
-                : no("sandbox_ended");
+            if (found.account.state !== "open") return no("sandbox_ended");
+            if (found.placementState !== undefined && !live(found.placementState)) {
+                return no("sandbox_ended");
+            }
+            return { account: found.account };
         case "placement": {
             const p = found.placement;
-            if (p.state !== "placing" && p.state !== "ready") return no("sandbox_ended");
+            if (!live(p.state)) return no("sandbox_ended");
             if (!p.x402Capable) return no("sandbox_not_capable");
             try {
                 const account = await insertAccount(pool, {
@@ -245,7 +254,13 @@ export async function planOrder(
     const rules = { bugnet: d.addresses.all, sellerMemoMaxBytes: x.seller_memo_max_bytes };
     for (const p of pins) {
         if (!storable(p)) {
-            return refuse("pin_refused", { serviceId: p.serviceId, pinReason: "no_402" });
+            return refuse("pin_refused", { serviceId: p.serviceId, pinReason: "flow_unsupported" });
+        }
+        if (serviceIdFor(p.method, p.host, p.prefix) !== p.serviceId) {
+            return refuse("pin_refused", {
+                serviceId: p.serviceId,
+                pinReason: "service_id_mismatch",
+            });
         }
         if (!isNew(p)) continue;
         const check = await checkPin(p, {
@@ -255,7 +270,7 @@ export async function planOrder(
             rpcTimeoutMs: d.rpcTimeoutMs,
         });
         if (!check.ok) {
-            if ("unavailable" in check) throw new RpcUnavailableError("payee check unreachable");
+            if ("unavailable" in check) throw new RpcUnavailableError(check.cause);
             return refuse("pin_refused", { serviceId: p.serviceId, pinReason: check.pinReason });
         }
         checks.set(p.serviceId, { listed: check.listed, paidPath: check.paidPath });

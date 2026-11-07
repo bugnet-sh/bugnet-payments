@@ -100,6 +100,7 @@ export function createInternalHandler(d: InternalDeps): Handler {
             result = await handleOrderRequest(d.service, body, hangupSignal(res));
         } catch (err) {
             if (!(err instanceof RpcUnavailableError)) throw err;
+            d.log.warn("x402 payee check unreachable", { errorClass: err.errorClass });
             sendJson(res, 503, { error: "rpc_unavailable" });
             return;
         }
