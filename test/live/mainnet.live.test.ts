@@ -324,6 +324,7 @@ describe("mainnet", () => {
         const hidden = [
             secrets.rpcUrl,
             secrets.paymentsToken,
+            secrets.routerToken,
             secrets.feePayerKey,
             secrets.refundKey,
             process.env.BUGNET_TEST_PAYER_KEY,
@@ -352,9 +353,21 @@ describe("mainnet", () => {
     }, 120_000);
 
     afterAll(async () => {
-        await svc?.stop();
-        restoreConsole?.();
-        await db?.close();
+        try {
+            await svc?.stop();
+        } catch (err) {
+            printLine(`afterAll: service stop failed: ${errorText(err)}`);
+        }
+        try {
+            await db?.close();
+        } catch (err) {
+            printLine(`afterAll: database drop failed: ${errorText(err)}`);
+        }
+        try {
+            restoreConsole?.();
+        } catch (err) {
+            printLine(`afterAll: console restore failed: ${errorText(err)}`);
+        }
     }, 120_000);
 
     it("pays, settles, redeems and refunds $0.01 on mainnet", async () => {
@@ -559,7 +572,8 @@ describe("mainnet", () => {
             recipient: address(settings.solana.recipient),
             rpcTimeoutMs: settings.solana.rpc_timeout,
             log,
-            now: () => new Date(),
+            // Six minutes on, the payment is past the confirmation lag and inside the missing window
+            now: () => new Date(Date.now() + 6 * 60_000),
         });
         finding.info("audit history", {
             scanned: report.scanned,
