@@ -296,6 +296,21 @@ describe("runOutbox", () => {
         ).toEqual([{ state: "pending", attempts: 1, next_at: later(2_000) }]);
     });
 
+    it("a thrown router call logs and stores the message", async () => {
+        const s = await start();
+        await queueResolved(s.id, 1);
+        const r = router(() => {
+            throw new Error("boom");
+        });
+        expect(await runOutbox(deps(r.router, T0))).toMatchObject({ retried: 1 });
+        expect((await db.pool.query("select last_error from x402_router_events")).rows).toEqual([
+            { last_error: "boom" },
+        ]);
+        const warned = log.lines.filter((l) => l.msg === "x402_event_send_failed");
+        expect(warned).toHaveLength(1);
+        expect(warned[0]).toMatchObject({ error: "boom" });
+    });
+
     it("x402_events_stuck after 10 minutes for a redeemed start order", async () => {
         const s = await start();
         const { order: paid } = await seedOrder(db.pool, { state: "paid" });

@@ -135,7 +135,12 @@ async function sendOne(d: OutboxDeps, skip: string[]): Promise<{ id: string; out
             );
             const row = found.rows[0];
             if (!row) return { id: "" };
-            const answer = await send(d.router, row).catch(() => "retry" as const);
+            let thrown: string | null = null;
+            const answer = await send(d.router, row).catch((err: unknown) => {
+                thrown = (err instanceof Error ? err.message : String(err)).slice(0, 500);
+                d.log.warn("x402_event_send_failed", { eventId: row.id, error: thrown });
+                return "retry" as const;
+            });
             const backoff = Math.min(
                 BASE_BACKOFF_MS * 2 ** Math.min(row.attempts, 30),
                 d.x402.events_max_backoff,
@@ -175,7 +180,7 @@ async function sendOne(d: OutboxDeps, skip: string[]): Promise<{ id: string; out
                 `update x402_router_events
                  set attempts = attempts + 1, next_at = $2, last_error = $3
                  where id = $1 and state = 'pending'`,
-                [row.id, retryAt, answer],
+                [row.id, retryAt, thrown ?? answer],
             );
             return { id: row.id, out: "retried" };
         },
