@@ -17,6 +17,7 @@ import { testSigner } from "../testing/keys.ts";
 import { BlockhashCache } from "./blockhash.ts";
 import { MEMO_PROGRAM, TOKEN_PROGRAM, USDC_MINT } from "./constants.ts";
 import { generateExportableKeypair, loadKeypair } from "./keys.ts";
+import { readLanding } from "./landing.ts";
 import { createRpc } from "./rpc.ts";
 
 describe("constants", () => {
@@ -131,5 +132,47 @@ describe("fake rpc", () => {
         const sig = await rpc.sendTransaction(wire as never).send();
         expect(sig).toBe(getSignatureFromTransaction(tx));
         expect(rpc.sent[0]).toBe(wire);
+    });
+});
+
+describe("readLanding", () => {
+    const sig = getBase58Decoder().decode(new Uint8Array(64).fill(7));
+    const status =
+        (confirmationStatus: string, err: unknown = null) =>
+        () => ({
+            value: [{ confirmationStatus, err, slot: 1n, confirmations: 1n }],
+        });
+    const missing = () => ({ value: [null] });
+    const failed = { InstructionError: [2, { Custom: 1 }] };
+
+    it.each([
+        ["finalized", status("finalized"), 1_001n, "landed"],
+        ["confirmed", status("confirmed"), 1_000n, "landed"],
+        ["a confirmed failure", status("confirmed", failed), 1_000n, "onchain_failed"],
+        ["processed only, even past expiry", status("processed", failed), 1_001n, "processed"],
+        ["missing while the blockhash is valid", missing, 1_000n, "not_found"],
+        ["missing past the last valid height", missing, 1_001n, "blockhash_expired"],
+    ])("answers %s", async (_n, getSignatureStatuses, height, want) => {
+        const rpc = createFakeRpc({ getSignatureStatuses, getBlockHeight: () => height });
+        expect(await readLanding(rpc, sig, 1_000n)).toBe(want);
+    });
+
+    it("reads the finalized height before the signature status", async () => {
+        const reads: unknown[][] = [];
+        const rpc = createFakeRpc({
+            getBlockHeight: (...args: unknown[]) => {
+                reads.push(["height", ...args]);
+                return 1_000n;
+            },
+            getSignatureStatuses: (...args: unknown[]) => {
+                reads.push(["status", ...args]);
+                return missing();
+            },
+        });
+        await readLanding(rpc, sig, 1_000n);
+        expect(reads).toEqual([
+            ["height", { commitment: "finalized" }],
+            ["status", [sig], { searchTransactionHistory: true }],
+        ]);
     });
 });

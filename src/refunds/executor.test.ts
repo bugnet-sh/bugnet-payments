@@ -123,6 +123,33 @@ function okRpc(script: Partial<FakeRpcScript> = {}): FakeRpc {
 }
 
 const notFound = () => ({ value: [null] });
+const CONFIRMED = { confirmationStatus: "confirmed", err: null, slot: 1n, confirmations: 1n };
+const LANDED_FAILED = {
+    confirmationStatus: "confirmed",
+    err: { InstructionError: [2, { Custom: 1 }] },
+    slot: 1n,
+};
+
+function usdcBalance(micros: number) {
+    return {
+        value: { amount: String(micros), decimals: 6, uiAmount: micros / 1e6, uiAmountString: "" },
+    };
+}
+
+// Holds each caller until n have arrived or ms passed, so racing runners overlap when they can
+function meetOrTimeOut<T>(n: number, ms: number, answer: () => T): () => Promise<T> {
+    let arrived = 0;
+    let open = () => {};
+    const met = new Promise<void>((resolve) => {
+        open = resolve;
+    });
+    return async () => {
+        arrived++;
+        if (arrived === n) open();
+        await Promise.race([met, new Promise((resolve) => setTimeout(resolve, ms))]);
+        return answer();
+    };
+}
 
 function signatureOf(wire: string): string {
     return getSignatureFromTransaction(
@@ -170,6 +197,10 @@ function transferOf(msg: Message) {
 
 function alarms(name: string): Record<string, unknown>[] {
     return log.lines.filter((l) => l.alarm === name);
+}
+
+function levels(level: string): Record<string, unknown>[] {
+    return log.lines.filter((l) => l.level === level);
 }
 
 async function pendingRefund(amountMicros = 10_000): Promise<OrderRow> {
@@ -292,7 +323,7 @@ describe("runRefunds", () => {
         await runRefunds(deps(rpc, later(30_000)));
         expect(await findRefund(db.pool, order.id)).toMatchObject({ state: "sent", attempts: 1 });
         expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
-        expect(rpc.calls.getBlockHeight).toBe(0);
+        expect(rpc.calls.getLatestBlockhash).toBe(0);
         expect(rpc.calls.sendTransaction).toBe(0);
     });
 
@@ -366,6 +397,30 @@ describe("runRefunds", () => {
         ]);
     });
 
+    it("never re-signs a refund that lands between the height and status reads", async () => {
+        const { order, refund } = await sentRefund();
+        // The refund lands in the last valid block, so a status read before the height sees nothing
+        let landed = false;
+        const rpc = okRpc({
+            getBlockHeight: () => {
+                landed = true;
+                return TEST_LVBH + 1n;
+            },
+            getSignatureStatuses: () => ({ value: [landed ? CONFIRMED : null] }),
+        });
+        const tick = await runRefunds(deps(rpc, later(30_000)));
+        expect(tick).toMatchObject({ confirmed: 1, resigned: 0, resent: 0 });
+        expect(await findRefund(db.pool, order.id)).toMatchObject({
+            state: "confirmed",
+            attempts: 1,
+            txSignature: refund.txSignature,
+            previousSignatures: [],
+        });
+        expect((await findOrder(db.pool, order.id))!.state).toBe("refunded");
+        expect(rpc.calls.getLatestBlockhash).toBe(0);
+        expect(rpc.calls.sendTransaction).toBe(0);
+    });
+
     it("queues a refund that expired max_attempts times for an operator", async () => {
         const { order } = await sentRefund({ max_attempts: 1 });
         const rpc = okRpc({ getSignatureStatuses: notFound, getBlockHeight: () => TEST_LVBH + 1n });
@@ -422,6 +477,39 @@ describe("runRefunds", () => {
         expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
         expect(log.lines.some((l) => l.level === "alarm")).toBe(false);
         expect(rpc.calls.sendTransaction ?? 0).toBe(0);
+        expect(levels("warn")).toEqual([
+            expect.objectContaining({
+                msg: "refund rpc call failed, retrying next tick",
+                orderId: order.id,
+                err: { name: "Error", message: "429" },
+            }),
+        ]);
+        expect(levels("error")).toEqual([]);
+    });
+
+    it("logs a failure that is not an RPC error at error level", async () => {
+        const { order } = await seedOrder(db.pool, { state: "refunding", payer: payer.address });
+        await seedPayment(db.pool, order.id, { payer: payer.address, sourceTokenAccount: SOURCE });
+        await db.pool.query(
+            `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
+                signed_at)
+             values ($1, 'full', 'late', 10000, $2, $3, 'sent', $4)`,
+            [order.id, SOURCE, payer.address, later(-60_000)],
+        );
+        const rpc = okRpc();
+        await runRefunds(deps(rpc));
+        expect(levels("error")).toEqual([
+            expect.objectContaining({
+                msg: "refund step failed, retrying next tick",
+                orderId: order.id,
+                err: expect.objectContaining({
+                    message: expect.stringContaining("without a stored transaction"),
+                }),
+            }),
+        ]);
+        expect(levels("warn")).toEqual([]);
+        expect(rpc.calls.getSignatureStatuses).toBe(0);
+        expect((await findRefund(db.pool, order.id))!.state).toBe("sent");
     });
 
     it.each(["getTokenAccountBalance", "getLatestBlockhash"] as const)(
@@ -461,21 +549,13 @@ describe("runRefunds", () => {
         expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
         expect(log.lines.some((l) => l.level === "alarm")).toBe(false);
         expect(rpc.calls.sendTransaction).toBe(0);
+        expect(levels("warn")).toHaveLength(1);
+        expect(levels("error")).toEqual([]);
     });
 
     it("queues a landed failure for an operator", async () => {
         const { order } = await sentRefund();
-        const rpc = okRpc({
-            getSignatureStatuses: () => ({
-                value: [
-                    {
-                        confirmationStatus: "confirmed",
-                        err: { InstructionError: [2, { Custom: 1 }] },
-                        slot: 1n,
-                    },
-                ],
-            }),
-        });
+        const rpc = okRpc({ getSignatureStatuses: () => ({ value: [LANDED_FAILED] }) });
         const tick = await runRefunds(deps(rpc, later(30_000)));
         expect(tick.manual).toBe(1);
         expect(await findRefund(db.pool, order.id)).toMatchObject({
@@ -559,13 +639,55 @@ describe("runRefunds", () => {
             sent: 0,
             resent: 0,
             resigned: 0,
-            confirmed: 0,
+            confirmed: 1,
             manual: 0,
             paused: "daily_cap",
         });
+        expect((await findRefund(db.pool, first.id))!.state).toBe("confirmed");
+        expect((await findRefund(db.pool, second.id))!.state).toBe("pending");
         expect(rpc.calls.sendTransaction).toBe(1);
-        expect(rpc.calls.getSignatureStatuses).toBe(0);
+        expect(rpc.calls.getLatestBlockhash).toBe(1);
         expect(alarms("refunds_paused")).toHaveLength(1);
+    });
+
+    it.each([
+        ["daily cap", { daily_cap_micros: 20_000 }, "daily_cap"],
+        ["hourly rate", { max_per_hour: 1 }, "hourly_rate"],
+    ] as const)("checks the %s of two racing runners one at a time", async (_n, cfg, reason) => {
+        const first = await pendingRefund(15_000);
+        const second = await pendingRefund(15_001);
+        const rpc = okRpc({ getAccountInfo: meetOrTimeOut(2, 300, () => tokenAccount({})) });
+        await Promise.all([runRefunds(deps(rpc, T0, cfg)), runRefunds(deps(rpc, T0, cfg))]);
+        expect(rpc.calls.sendTransaction).toBe(1);
+        const states = [
+            (await findRefund(db.pool, first.id))!.state,
+            (await findRefund(db.pool, second.id))!.state,
+        ];
+        expect(states.sort()).toEqual(["pending", "sent"]);
+        expect(await refundsPaused(db.pool)).toBe(reason);
+    });
+
+    it("subtracts refunds signed or sent but not confirmed from the float", async () => {
+        const first = await pendingRefund(10_000);
+        const second = await pendingRefund(10_001);
+        const rpc = okRpc({ getTokenAccountBalance: () => usdcBalance(15_000) });
+        const tick = await runRefunds(deps(rpc));
+        expect(tick).toMatchObject({ sent: 1, paused: "float_low" });
+        expect((await findRefund(db.pool, first.id))!.state).toBe("sent");
+        expect(await findRefund(db.pool, second.id)).toMatchObject({
+            state: "pending",
+            txSignature: null,
+        });
+        expect(rpc.calls.sendTransaction).toBe(1);
+        expect(alarms("refund_float_low")).toEqual([
+            expect.objectContaining({
+                orderId: second.id,
+                balanceMicros: "15000",
+                unconfirmedMicros: 10_000,
+                amountMicros: 10_001,
+            }),
+        ]);
+        expect(await refundsPaused(db.pool)).toBe("float_low");
     });
 
     it("pauses at the hourly rate and on a low float", async () => {
@@ -638,6 +760,24 @@ describe("runRefunds", () => {
         expect((await findRefund(db.pool, order.id))!.attempts).toBe(1);
     });
 
+    it("warns when the RPC answers another signature", async () => {
+        const order = await pendingRefund();
+        const other = getBase58Decoder().decode(new Uint8Array(64).fill(9));
+        const rpc = okRpc({ sendTransaction: () => other });
+        expect((await runRefunds(deps(rpc))).sent).toBe(1);
+        const row = (await findRefund(db.pool, order.id))!;
+        expect(row).toMatchObject({ state: "sent", txSignature: signatureOf(row.wireTx!) });
+        expect(levels("warn")).toEqual([
+            expect.objectContaining({
+                msg: "rpc answered another signature",
+                refundId: row.id,
+                orderId: order.id,
+                signature: row.txSignature,
+                answered: other,
+            }),
+        ]);
+    });
+
     it("handles at most 5 refunds per tick, oldest first", async () => {
         const orders: OrderRow[] = [];
         for (let i = 0; i < 6; i++) orders.push(await pendingRefund(10_000 + i));
@@ -669,6 +809,85 @@ describe("runRefunds", () => {
         const b = (await findRefund(db.pool, twin.id))!;
         expect(b.state).toBe("sent");
         expect(b.txSignature).not.toBe(a.txSignature);
+    });
+});
+
+describe("runRefunds while refunds are paused", () => {
+    it("confirms a sent refund that landed and signs no pending one", async () => {
+        const { order: sent } = await sentRefund();
+        const pending = await pendingRefund(20_000);
+        await pauseRefunds(db.pool, "daily_cap", log);
+        const rpc = okRpc();
+        const tick = await runRefunds(deps(rpc, later(30_000)));
+        expect(tick).toEqual({
+            sent: 0,
+            resent: 0,
+            resigned: 0,
+            confirmed: 1,
+            manual: 0,
+            paused: "daily_cap",
+        });
+        expect((await findRefund(db.pool, sent.id))!.state).toBe("confirmed");
+        expect((await findOrder(db.pool, sent.id))!.state).toBe("refunded");
+        expect(await findRefund(db.pool, pending.id)).toMatchObject({
+            state: "pending",
+            attempts: 0,
+            txSignature: null,
+        });
+        expect(rpc.calls.getAccountInfo).toBe(0);
+        expect(rpc.calls.getLatestBlockhash).toBe(0);
+        expect(rpc.calls.sendTransaction).toBe(0);
+    });
+
+    it("signs nothing once a pause lands during the tick", async () => {
+        await sentRefund();
+        const pending = await pendingRefund(20_000);
+        const rpc = okRpc({
+            getSignatureStatuses: async () => {
+                await pauseRefunds(db.pool, "operator", log);
+                return { value: [CONFIRMED] };
+            },
+        });
+        const tick = await runRefunds(deps(rpc, later(30_000)));
+        expect(tick).toMatchObject({ confirmed: 1, sent: 0, paused: "operator" });
+        expect((await findRefund(db.pool, pending.id))!.state).toBe("pending");
+        expect(rpc.calls.getLatestBlockhash).toBe(0);
+        expect(rpc.calls.sendTransaction).toBe(0);
+    });
+
+    it.each([
+        ["not found while its blockhash is valid", TEST_LVBH],
+        ["expired and not found", TEST_LVBH + 1n],
+    ])("neither resends nor re-signs a refund %s", async (_n, height) => {
+        const { order, refund } = await sentRefund();
+        await pauseRefunds(db.pool, "hourly_rate", log);
+        const rpc = okRpc({ getSignatureStatuses: notFound, getBlockHeight: () => height });
+        const tick = await runRefunds(deps(rpc, later(30_000)));
+        expect(tick).toMatchObject({ resent: 0, resigned: 0, paused: "hourly_rate" });
+        expect(await findRefund(db.pool, order.id)).toEqual(refund);
+        expect(rpc.calls.getSignatureStatuses).toBe(1);
+        expect(rpc.calls.getLatestBlockhash).toBe(0);
+        expect(rpc.calls.sendTransaction).toBe(0);
+    });
+
+    it.each([
+        ["landed with an error", { value: [LANDED_FAILED] }, "refund_failed_onchain"],
+        ["expired max_attempts times", { value: [null] }, "refund_expired_repeatedly"],
+    ])("queues a refund that %s for an operator", async (_n, statuses, reason) => {
+        const { order } = await sentRefund({ max_attempts: 1 });
+        await pauseRefunds(db.pool, "daily_cap", log);
+        const rpc = okRpc({
+            getSignatureStatuses: () => statuses,
+            getBlockHeight: () => TEST_LVBH + 1n,
+        });
+        const tick = await runRefunds(deps(rpc, later(30_000), { max_attempts: 1 }));
+        expect(tick).toMatchObject({ manual: 1, paused: "daily_cap" });
+        expect(await findRefund(db.pool, order.id)).toMatchObject({
+            state: "manual",
+            manualReason: reason,
+        });
+        expect(rpc.calls.getLatestBlockhash).toBe(0);
+        expect(rpc.calls.sendTransaction).toBe(0);
     });
 });
 

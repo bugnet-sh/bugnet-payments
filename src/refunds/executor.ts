@@ -2,12 +2,14 @@
  * Refund executor and its pause controls.
  *
  * Each tick takes up to five refunds, oldest first, each under its own row lock and transaction.
- * A pending refund passes the amount, destination, daily cap, hourly rate and float checks, then
- * is signed and stored as `signed` before the send, so a crash never loses a transaction that may
- * land. A signed or sent refund is checked by signature status once it is 20 s old. It is then
+ * A pending refund first locks the refund_controls row, so the pause, daily cap, hourly rate and
+ * float checks of every runner happen one at a time. It is then signed and stored as `signed`
+ * before the send, so a crash never loses a transaction that may land. A signed or sent refund is
+ * checked once it is 20 s old, finalized height first and signature status second. It is then
  * confirmed, sent to the manual queue when it failed, signed again when its blockhash expired and
- * the signature is not found (up to max_attempts), or else resent unchanged. An RPC error leaves
- * the refund as it was for the next tick.
+ * the signature is not found (up to max_attempts), or else resent unchanged. While refunds are
+ * paused a tick only records what the chain decided and signs or sends nothing. An RPC error
+ * leaves the refund as it was for the next tick.
  */
 import {
     address,
@@ -23,7 +25,6 @@ import {
     pipe,
     setTransactionMessageFeePayerSigner,
     setTransactionMessageLifetimeUsingBlockhash,
-    signature,
     signTransactionMessageWithSigners,
 } from "@solana/kit";
 import {
@@ -33,12 +34,13 @@ import {
 import { getTransferCheckedInstruction } from "@solana-program/token";
 import type pg from "pg";
 import type { Settings } from "../config.ts";
-import { withTx } from "../db/pool.ts";
+import { type Queryable, withTx } from "../db/pool.ts";
 import type { Log } from "../log.ts";
 import { findPaymentByOrder, lockOrder, setOrderState } from "../orders/store.ts";
 import { inspectTokenAccount, usdcAta } from "../solana/accounts.ts";
 import type { BlockhashHint } from "../solana/blockhash.ts";
 import { TOKEN_PROGRAM, USDC_DECIMALS, USDC_MINT } from "../solana/constants.ts";
+import { readLanding } from "../solana/landing.ts";
 import type { SolanaRpc } from "../solana/rpc.ts";
 import { type RefundDbRow, type RefundRow, toRefund } from "./request.ts";
 
@@ -79,7 +81,8 @@ type Step =
     | { kind: "confirmed" }
     | { kind: "manual"; reason: ManualReason }
     | { kind: "pause"; reason: "daily_cap" | "hourly_rate" }
-    | { kind: "float_low"; balanceMicros: bigint }
+    | { kind: "float_low"; balanceMicros: bigint; unconfirmedMicros: number }
+    | { kind: "held"; paused: string }
     | { kind: "wait" };
 
 type InFlight = RefundRow & { txSignature: string; wireTx: string; lastValidBlockHeight: bigint };
@@ -87,6 +90,18 @@ type InFlight = RefundRow & { txSignature: string; wireTx: string; lastValidBloc
 const PER_TICK = 5;
 const FRESH_SEND = { encoding: "base64", preflightCommitment: "confirmed" } as const;
 const RESEND = { encoding: "base64", skipPreflight: true, maxRetries: 0n } as const;
+const SELECT_CONTROLS = "select paused, reason from refund_controls where id = 1";
+
+// An RPC failure is routine and retried, every other failure in a step needs an operator's eye
+class RpcUnavailable extends Error {}
+
+async function viaRpc<T>(call: () => Promise<T>): Promise<T> {
+    try {
+        return await call();
+    } catch (err) {
+        throw new RpcUnavailable("rpc call failed", { cause: err });
+    }
+}
 
 export async function buildRefundTransaction(
     d: Pick<RefundDeps, "feePayer" | "refundSigner" | "cfg">,
@@ -147,10 +162,16 @@ export async function resumeRefunds(pool: pg.Pool): Promise<void> {
     );
 }
 
-export async function refundsPaused(pool: pg.Pool): Promise<string | null> {
-    const res = await pool.query<{ paused: boolean; reason: string | null }>(
-        "select paused, reason from refund_controls where id = 1",
-    );
+export async function refundsPaused(db: Queryable): Promise<string | null> {
+    return pauseReason(await db.query(SELECT_CONTROLS));
+}
+
+// Held until COMMIT, so a second runner checks the caps only after this refund is stored
+async function lockControls(c: pg.PoolClient): Promise<string | null> {
+    return pauseReason(await c.query(`${SELECT_CONTROLS} for update`));
+}
+
+function pauseReason(res: pg.QueryResult<{ paused: boolean; reason: string | null }>) {
     const row = res.rows[0];
     return row?.paused ? (row.reason ?? "paused") : null;
 }
@@ -165,12 +186,12 @@ export async function runRefunds(d: RefundDeps): Promise<RefundTick> {
         paused: await refundsPaused(d.pool),
     };
     const taken: number[] = [];
-    for (let i = 0; i < PER_TICK && tick.paused === null; i++) {
+    for (let i = 0; i < PER_TICK; i++) {
         const now = d.now();
         const current: { refund?: RefundRow } = {};
         try {
             const step = await withTx(d.pool, async (c) => {
-                const r = await takeRefund(c, taken, now);
+                const r = await takeRefund(c, taken, now, tick.paused === null);
                 if (r === null) return null;
                 taken.push(r.id);
                 current.refund = r;
@@ -181,11 +202,15 @@ export async function runRefunds(d: RefundDeps): Promise<RefundTick> {
             if (step === null || current.refund === undefined) break;
             await finish(d, current.refund, step, now, tick);
         } catch (err) {
-            d.log.warn("refund step failed, retrying next tick", {
-                refundId: current.refund?.id,
-                orderId: current.refund?.orderId,
-                err,
-            });
+            const ids = { refundId: current.refund?.id, orderId: current.refund?.orderId };
+            if (err instanceof RpcUnavailable) {
+                d.log.warn("refund rpc call failed, retrying next tick", {
+                    ...ids,
+                    err: err.cause,
+                });
+            } else {
+                d.log.error("refund step failed, retrying next tick", { ...ids, err });
+            }
         }
     }
     return tick;
@@ -196,17 +221,18 @@ async function takeRefund(
     c: pg.PoolClient,
     taken: readonly number[],
     now: Date,
+    withPending: boolean,
 ): Promise<RefundRow | null> {
     const res = await c.query<RefundDbRow>(
         `select * from refunds
          where id <> all($1::bigint[])
-           and (state = 'pending'
+           and ((state = 'pending' and $3::boolean)
                 or (state in ('signed', 'sent')
                     and coalesce(sent_at, signed_at) <= $2::timestamptz - interval '20 seconds'))
          order by created_at, id
          limit 1
          for update skip locked`,
-        [taken, now],
+        [taken, now, withPending],
     );
     return res.rows[0] ? toRefund(res.rows[0]) : null;
 }
@@ -217,22 +243,26 @@ async function checkPending(
     r: RefundRow,
     now: Date,
 ): Promise<Step> {
+    const paused = await lockControls(c);
+    if (paused !== null) return { kind: "held", paused };
     const payment = await findPaymentByOrder(c, r.orderId);
     if (payment === null || r.amountMicros > payment.amountMicros) {
         return toManual(c, r, "refund_exceeds_payment");
     }
-    if (!(await destinationValid(d.rpc, r))) return toManual(c, r, "refund_destination_invalid");
+    if (!(await viaRpc(() => destinationValid(d.rpc, r)))) {
+        return toManual(c, r, "refund_destination_invalid");
+    }
     if ((await signedToday(c, now)) + r.amountMicros > d.cfg.daily_cap_micros) {
         return { kind: "pause", reason: "daily_cap" };
     }
     if ((await signedLastHour(c, now)) >= d.cfg.max_per_hour) {
         return { kind: "pause", reason: "hourly_rate" };
     }
-    const { value } = await d.rpc
-        .getTokenAccountBalance(await usdcAta(d.refundSigner.address), { commitment: "confirmed" })
-        .send();
-    const balanceMicros = BigInt(value.amount);
-    if (balanceMicros < BigInt(r.amountMicros)) return { kind: "float_low", balanceMicros };
+    const balanceMicros = await viaRpc(() => floatBalance(d));
+    const unconfirmedMicros = await unconfirmedTotal(c);
+    if (balanceMicros - BigInt(unconfirmedMicros) < BigInt(r.amountMicros)) {
+        return { kind: "float_low", balanceMicros, unconfirmedMicros };
+    }
     return sign(d, c, r, now, false);
 }
 
@@ -245,36 +275,32 @@ async function checkInFlight(
     if (!isInFlight(r)) {
         throw new Error(`refund ${r.id} is ${r.state} without a stored transaction`);
     }
-    const {
-        value: [status],
-    } = await d.rpc
-        .getSignatureStatuses([signature(r.txSignature)], { searchTransactionHistory: true })
-        .send();
-    if (status) {
-        // A processed-only result can still be dropped with its fork, so it decides nothing
-        if (
-            status.confirmationStatus !== "confirmed" &&
-            status.confirmationStatus !== "finalized"
-        ) {
+    const landing = await viaRpc(() => readLanding(d.rpc, r.txSignature, r.lastValidBlockHeight));
+    switch (landing) {
+        case "processed":
             return { kind: "wait" };
-        }
-        if (status.err !== null) return toManual(c, r, "refund_failed_onchain");
-        await c.query("update refunds set state = 'confirmed', confirmed_at = $2 where id = $1", [
-            r.id,
-            now,
-        ]);
-        const order = await lockOrder(c, r.orderId);
-        if (order?.state === "refunding") {
-            await setOrderState(c, r.orderId, "refunding", "refunded");
-        }
-        return { kind: "confirmed" };
+        case "onchain_failed":
+            return toManual(c, r, "refund_failed_onchain");
+        case "landed":
+            return confirm(c, r, now);
+        case "blockhash_expired":
+            if (r.attempts >= d.cfg.max_attempts) {
+                return toManual(c, r, "refund_expired_repeatedly");
+            }
+            return unlessPaused(c, () => sign(d, c, r, now, true));
+        case "not_found":
+            return unlessPaused(c, async () => ({
+                kind: "resend",
+                wire: r.wireTx,
+                signature: r.txSignature,
+            }));
     }
-    const height = await d.rpc.getBlockHeight({ commitment: "finalized" }).send();
-    if (height <= r.lastValidBlockHeight) {
-        return { kind: "resend", wire: r.wireTx, signature: r.txSignature };
-    }
-    if (r.attempts >= d.cfg.max_attempts) return toManual(c, r, "refund_expired_repeatedly");
-    return sign(d, c, r, now, true);
+}
+
+// A pause stops money leaving, so a paused tick records chain results but sends nothing
+async function unlessPaused(c: pg.PoolClient, next: () => Promise<Step>): Promise<Step> {
+    const paused = await refundsPaused(c);
+    return paused === null ? next() : { kind: "held", paused };
 }
 
 function isInFlight(r: RefundRow): r is InFlight {
@@ -292,6 +318,22 @@ async function destinationValid(rpc: SolanaRpc, r: RefundRow): Promise<boolean> 
         account.state === "initialized" &&
         account.owner === r.payer
     );
+}
+
+async function floatBalance(d: RefundDeps): Promise<bigint> {
+    const { value } = await d.rpc
+        .getTokenAccountBalance(await usdcAta(d.refundSigner.address), { commitment: "confirmed" })
+        .send();
+    return BigInt(value.amount);
+}
+
+// A refund that landed but is not confirmed here yet counts twice, which can only pause early
+async function unconfirmedTotal(c: pg.PoolClient): Promise<number> {
+    const res = await c.query<{ total: string }>(
+        `select coalesce(sum(amount_micros), 0)::text as total from refunds
+         where state in ('signed', 'sent')`,
+    );
+    return Number(res.rows[0]?.total ?? 0);
 }
 
 async function signedToday(c: pg.PoolClient, now: Date): Promise<number> {
@@ -321,12 +363,23 @@ async function sign(
     now: Date,
     resigned: boolean,
 ): Promise<Step> {
-    const { value } = await d.rpc.getLatestBlockhash({ commitment: "confirmed" }).send();
+    const { value } = await viaRpc(() =>
+        d.rpc.getLatestBlockhash({ commitment: "confirmed" }).send(),
+    );
     const signed = await buildRefundTransaction(
         d,
         { destination: address(r.destination), amountMicros: r.amountMicros },
         value,
     );
+    // The same amount to the same account under the same blockhash is the same transaction
+    const twin = await c.query("select 1 from refunds where tx_signature = $1", [signed.signature]);
+    if (twin.rowCount !== 0) {
+        d.log.info("identical refund transaction already stored, signing on a later blockhash", {
+            refundId: r.id,
+            orderId: r.orderId,
+        });
+        return { kind: "wait" };
+    }
     await c.query(
         `update refunds set state = 'signed', wire_tx = $2, tx_signature = $3,
             last_valid_block_height = $4, signed_at = $5, sent_at = null, attempts = attempts + 1,
@@ -336,6 +389,18 @@ async function sign(
         [r.id, signed.wire, signed.signature, signed.lastValidBlockHeight.toString(), now],
     );
     return { kind: "send", signed, resigned };
+}
+
+async function confirm(c: pg.PoolClient, r: RefundRow, now: Date): Promise<Step> {
+    await c.query("update refunds set state = 'confirmed', confirmed_at = $2 where id = $1", [
+        r.id,
+        now,
+    ]);
+    const order = await lockOrder(c, r.orderId);
+    if (order?.state === "refunding") {
+        await setOrderState(c, r.orderId, "refunding", "refunded");
+    }
+    return { kind: "confirmed" };
 }
 
 async function toManual(c: pg.PoolClient, r: RefundRow, reason: ManualReason): Promise<Step> {
@@ -361,7 +426,7 @@ async function finish(
     const ids = { refundId: r.id, orderId: r.orderId };
     switch (step.kind) {
         case "send":
-            await send(d, r.id, step.signed.wire, step.signed.signature, FRESH_SEND, now);
+            await send(d, r, step.signed.wire, step.signed.signature, FRESH_SEND, now);
             if (step.resigned) tick.resigned++;
             else tick.sent++;
             d.log.info("refund sent", {
@@ -371,7 +436,7 @@ async function finish(
             });
             return;
         case "resend":
-            await send(d, r.id, step.wire, step.signature, RESEND, now);
+            await send(d, r, step.wire, step.signature, RESEND, now);
             tick.resent++;
             return;
         case "confirmed":
@@ -386,6 +451,7 @@ async function finish(
             d.log.alarm("refund_float_low", {
                 ...ids,
                 balanceMicros: step.balanceMicros,
+                unconfirmedMicros: step.unconfirmedMicros,
                 amountMicros: r.amountMicros,
             });
             await pauseRefunds(d.pool, "float_low", d.log);
@@ -395,6 +461,9 @@ async function finish(
             await pauseRefunds(d.pool, step.reason, d.log);
             tick.paused = step.reason;
             return;
+        case "held":
+            tick.paused = step.paused;
+            return;
         case "wait":
             return;
     }
@@ -402,16 +471,26 @@ async function finish(
 
 async function send(
     d: RefundDeps,
-    id: number,
+    r: RefundRow,
     wire: string,
     sig: string,
     config: typeof FRESH_SEND | typeof RESEND,
     now: Date,
 ): Promise<void> {
-    await d.rpc.sendTransaction(wire as Base64EncodedWireTransaction, config).send();
+    const answered = await viaRpc(() =>
+        d.rpc.sendTransaction(wire as Base64EncodedWireTransaction, config).send(),
+    );
+    if (answered !== sig) {
+        d.log.warn("rpc answered another signature", {
+            refundId: r.id,
+            orderId: r.orderId,
+            signature: sig,
+            answered,
+        });
+    }
     await d.pool.query(
         `update refunds set state = 'sent', sent_at = coalesce(sent_at, $3)
          where id = $1 and tx_signature = $2 and state in ('signed', 'sent')`,
-        [id, sig, now],
+        [r.id, sig, now],
     );
 }

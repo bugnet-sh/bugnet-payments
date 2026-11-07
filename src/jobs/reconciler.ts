@@ -1,4 +1,3 @@
-import { signature } from "@solana/kit";
 import type pg from "pg";
 import { withTx } from "../db/pool.ts";
 import type { Log } from "../log.ts";
@@ -9,6 +8,7 @@ import {
     lockPayment,
     setOrderState,
 } from "../orders/store.ts";
+import { type Landing, readLanding } from "../solana/landing.ts";
 import type { SolanaRpc } from "../solana/rpc.ts";
 
 export interface ReconcileDeps {
@@ -30,7 +30,7 @@ interface Candidate {
     lastValidBlockHeight: bigint;
 }
 
-type Verdict = "landed" | "onchain_failed" | "blockhash_expired" | "waiting";
+type Verdict = Exclude<Landing, "processed" | "not_found"> | "waiting";
 
 type Outcome =
     { kind: "paid" } | { kind: "reverted"; state: "unpaid" | "expired" } | { kind: "changed" };
@@ -97,24 +97,8 @@ async function candidates(db: pg.Pool, now: Date): Promise<Candidate[]> {
 }
 
 async function verdictFor(rpc: SolanaRpc, p: Candidate): Promise<Verdict> {
-    // Read before the status, so a transaction that landed before expiry is final when it is read
-    const height = await rpc.getBlockHeight({ commitment: "finalized" }).send();
-    const {
-        value: [status],
-    } = await rpc
-        .getSignatureStatuses([signature(p.txSignature)], { searchTransactionHistory: true })
-        .send();
-    if (status) {
-        // A processed-only result can still be dropped with its fork, so it decides nothing
-        if (
-            status.confirmationStatus !== "confirmed" &&
-            status.confirmationStatus !== "finalized"
-        ) {
-            return "waiting";
-        }
-        return status.err === null ? "landed" : "onchain_failed";
-    }
-    return height > p.lastValidBlockHeight ? "blockhash_expired" : "waiting";
+    const landing = await readLanding(rpc, p.txSignature, p.lastValidBlockHeight);
+    return landing === "processed" || landing === "not_found" ? "waiting" : landing;
 }
 
 async function apply(
