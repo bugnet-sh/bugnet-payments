@@ -31,6 +31,11 @@ interface OpenRow {
 const JUDGED_LIMIT = 10_000;
 const judged = new Set<string>();
 
+// A hint the node does not know yet may simply not have propagated; it is read again only after
+// this wait, so the 5 s runs do not hammer the RPC with it.
+const NULL_HINT_RETRY_MS = 60_000;
+const nullHintReadAt = new Map<string, number>();
+
 const sha256Hex = (signature: string): string =>
     createHash("sha256")
         .update(Buffer.from(getBase58Encoder().encode(signature)))
@@ -103,7 +108,15 @@ export async function runFastPass(
                   .filter((e) => e.slot >= windowStart && !seen.has(e.signature))
                   .map((e) => e.signature)
                   .filter((s) => !hintSet.has(s));
-    const candidates = [...hints.filter((h) => !judged.has(h)), ...fromListing];
+    const nowMs = d.now().getTime();
+    const candidates = [
+        ...hints.filter(
+            (h) =>
+                !judged.has(h) &&
+                nowMs - (nullHintReadAt.get(h) ?? -Infinity) >= NULL_HINT_RETRY_MS,
+        ),
+        ...fromListing,
+    ];
 
     let landed = 0;
     let ignoredHints = 0;
@@ -119,7 +132,13 @@ export async function runFastPass(
                     maxSupportedTransactionVersion: 0,
                 })
                 .send(deadline(d.rpcTimeoutMs));
-            if (raw === null) continue;
+            if (raw === null) {
+                if (isHint) {
+                    if (nullHintReadAt.size >= JUDGED_LIMIT) nullHintReadAt.clear();
+                    nullHintReadAt.set(sig, nowMs);
+                }
+                continue;
+            }
             tx = parseChainTx(sig, raw.slot, raw, d.hotTokenAccount);
         } catch (err) {
             d.log.warn("x402 fast pass skipped a transaction it could not read", {
@@ -143,13 +162,25 @@ export async function runFastPass(
         if (!isHint) continue;
         const naming = [...matched, ...open].filter((r) => r.hintTx === sig);
         if (naming.some((r) => matchedIds.has(r.id))) continue;
-        for (const row of naming) {
-            await d.pool.query(
-                `update x402_services set failures = failures + 1
-                 where account_id = $1 and service_id = $2`,
-                [row.accountId, row.serviceId],
-            );
+        const services = new Map(naming.map((r) => [`${r.accountId}/${r.serviceId}`, r]));
+        const client = await d.pool.connect();
+        try {
+            await client.query("begin");
+            for (const row of services.values()) {
+                await client.query(
+                    `update x402_services set failures = failures + 1
+                     where account_id = $1 and service_id = $2`,
+                    [row.accountId, row.serviceId],
+                );
+            }
+            await client.query("commit");
+        } catch (err) {
+            await client.query("rollback").catch(() => undefined);
+            throw err;
+        } finally {
+            client.release();
         }
+        nullHintReadAt.delete(sig);
         if (judged.size >= JUDGED_LIMIT) judged.clear();
         judged.add(sig);
         ignoredHints++;

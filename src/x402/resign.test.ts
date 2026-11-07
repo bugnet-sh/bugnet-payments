@@ -99,4 +99,16 @@ describe("resignProof", () => {
         const row = { signatures: sigs, expirySeenSlot: null };
         expect(await resignProof(pool(), createFakeRpc(), row, x402, 2_000)).toBe("absent");
     });
+
+    it("waits when the status array is not as long as the signatures asked", async () => {
+        await openTail(pool(), "ATA", 0n, 1_300n, T0);
+        const row = { signatures: sigs, expirySeenSlot: 1_000n };
+        expect(await resignProof(pool(), rpcAnswering(1_000n, [null]), row, x402, 2_000)).toBe(
+            "wait",
+        );
+        expect(await resignProof(pool(), rpcAnswering(1_000n, []), row, x402, 2_000)).toBe("wait");
+        expect(
+            await resignProof(pool(), rpcAnswering(1_000n, [null, null, null]), row, x402, 2_000),
+        ).toBe("wait");
+    });
 });

@@ -238,4 +238,52 @@ describe("runFastPass", () => {
         expect(after.expirySeenSlot).not.toBeNull();
         expect(after.state).toBe("signed");
     });
+
+    it("reads a hint that answers null once a minute, and never charges it", async () => {
+        const unknown = "1".repeat(63) + "3";
+        const row = await signedRow({ hintTx: unknown });
+        const reads = () =>
+            chain.calls().filter((c) => c.method === "getTransaction" && c.params[0] === unknown)
+                .length;
+        expect(await runFastPass(fastDeps)).toEqual({ landed: 0, ignoredHints: 0 });
+        expect(reads()).toBe(1);
+        const at = (ms: number) => ({ ...fastDeps, now: () => new Date(NOW.getTime() + ms) });
+        await runFastPass(at(5_000));
+        await runFastPass(at(55_000));
+        expect(reads()).toBe(1);
+        await runFastPass(at(61_000));
+        expect(reads()).toBe(2);
+        expect(await serviceFailures(row)).toBe(0);
+    });
+
+    it("charges the service once when several rows name one bogus hint", async () => {
+        const other = chain.credit(hot, 1n);
+        const rows = [await signedRow({ hintTx: other }), await signedRow({ hintTx: other })];
+        await signedRow({ hintTx: other });
+        expect(await runFastPass(fastDeps)).toEqual({ landed: 0, ignoredHints: 1 });
+        expect(await serviceFailures(rows[0]!)).toBe(1);
+    });
+
+    it("reads only listing entries inside the window and not already known", async () => {
+        const old = chain.credit(hot, 1n);
+        chain.advance(3);
+        const windowStart = chain.slot();
+        const known = chain.credit(hot, 1n);
+        const fresh = chain.credit(hot, 1n);
+        const row = await signedRow({ signingSlot: windowStart });
+        await db.pool.query(
+            `insert into x402_chain_txs (signature, slot, delta_micros, failed, matched)
+             values ($1, $2, 0, false, 'no_effect')`,
+            [known, windowStart.toString()],
+        );
+        expect((await paymentRow(row.id)).signingSlot).toBe(windowStart);
+        await runFastPass(fastDeps);
+        const read = chain
+            .calls()
+            .filter((c) => c.method === "getTransaction")
+            .map((c) => c.params[0]);
+        expect(read).toContain(fresh);
+        expect(read).not.toContain(old);
+        expect(read).not.toContain(known);
+    });
 });

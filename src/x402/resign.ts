@@ -35,6 +35,7 @@ export async function resignProof(
             .getSignatureStatuses(remaining.map(toSignature), { searchTransactionHistory: true })
             .send(deadline(rpcTimeoutMs));
         if (context.slot < row.expirySeenSlot) return "wait";
+        if (value.length !== remaining.length) return "wait";
         const unproven = remaining.some((_, i) => {
             const status = value[i] ?? null;
             return status !== null && status.err === null;
