@@ -127,6 +127,17 @@ describe("runCloseCheck", () => {
         }
     });
 
+    it("a terminating answer waits and leaves the account open", async () => {
+        const a = await seedAccount(db.pool, due);
+        const r = lookups(() => found("terminating"));
+        expect(await runCloseCheck(deps(r.router, T0))).toEqual({
+            closing: 0,
+            waiting: 1,
+            failing: 0,
+        });
+        expect(await findAccount(db.pool, a.id)).toMatchObject({ state: "open" });
+    });
+
     it("NotFound with the start order refunding, refunded or manual closes", async () => {
         for (const state of ["refunding", "refunded", "manual"] as const) {
             const { order } = await seedOrder(db.pool, { ...HOT_START, state });
@@ -281,6 +292,27 @@ describe("runCloseJob", () => {
         await runCloseJob(d(600_002));
         expect(alarms("x402_close_slow")).toEqual([expect.objectContaining({ accountId: a.id })]);
         expect(await count("select 1 from refunds")).toBe(0);
+    });
+
+    it("waits on a reserved row, and the slow alarm id is dropped once the account is gone", async () => {
+        const a = await closing({ heldMicros: 10_000 });
+        await seedX402Payment(db.pool, {
+            accountId: a.id,
+            state: "reserved",
+            amountMicros: 10_000,
+        });
+        expect(await runCloseJob(deps(nobody, later(600_001)))).toEqual({
+            refunded: 0,
+            kept: 0,
+            closed: 0,
+            waiting: 1,
+        });
+        expect(alarms("x402_close_slow")).toHaveLength(1);
+        await db.pool.query("update x402_accounts set state = 'closed' where id = $1", [a.id]);
+        await runCloseJob(deps(nobody, later(600_002)));
+        await db.pool.query("update x402_accounts set state = 'closing' where id = $1", [a.id]);
+        await runCloseJob(deps(nobody, later(600_003)));
+        expect(alarms("x402_close_slow")).toHaveLength(2);
     });
 
     it("unspent 0 closes with no event and no row", async () => {

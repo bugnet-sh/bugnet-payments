@@ -41,6 +41,8 @@ export async function runCloseCheck(
          order by id`,
         [now, d.x402.close_check_after],
     );
+    const dueIds = new Set(due.rows.map((r) => r.id));
+    for (const id of unverifiableAlarmed) if (!dueIds.has(id)) unverifiableAlarmed.delete(id);
     const counts = { closing: 0, waiting: 0, failing: 0 };
     for (const { id } of due.rows) {
         try {
@@ -53,63 +55,70 @@ export async function runCloseCheck(
 
     async function checkOne(id: string): Promise<void> {
         const answer = await d.router.lookupPlacement({ startOrderId: id });
-        const alarms: (() => void)[] = [];
-        const verdict = await withTx(d.pool, async (c): Promise<Verdict> => {
-            const account = await lockAccount(c, id);
-            if (account === null || account.state !== "open") return "skipped";
-            if (answer.kind === "unavailable") {
-                const since = account.closeCheckFailingSince ?? now;
-                await c.query(
-                    `update x402_accounts
-                     set close_check_failing_since = coalesce(close_check_failing_since, $2)
-                     where id = $1`,
-                    [id, now],
-                );
-                if (
-                    now.getTime() - since.getTime() > d.x402.close_unverifiable_after &&
-                    !unverifiableAlarmed.has(id)
-                ) {
-                    unverifiableAlarmed.add(id);
-                    alarms.push(() =>
-                        d.log.alarm("x402_close_unverifiable", {
-                            accountId: id,
-                            failingSince: since,
-                        }),
+        const result = await withTx(
+            d.pool,
+            async (c): Promise<{ verdict: Verdict; unverifiableSince: Date | null }> => {
+                const account = await lockAccount(c, id);
+                if (account === null || account.state !== "open") {
+                    return { verdict: "skipped", unverifiableSince: null };
+                }
+                if (answer.kind === "unavailable") {
+                    const since = account.closeCheckFailingSince ?? now;
+                    await c.query(
+                        `update x402_accounts
+                         set close_check_failing_since = coalesce(close_check_failing_since, $2)
+                         where id = $1`,
+                        [id, now],
                     );
+                    const long = now.getTime() - since.getTime() > d.x402.close_unverifiable_after;
+                    return { verdict: "failing", unverifiableSince: long ? since : null };
                 }
-                return "failing";
-            }
+                await clearFailing(c, id);
+                if (answer.kind === "found") {
+                    if (answer.state === "terminated" || answer.state === "failed") {
+                        await startClosing(c, id, now);
+                        return { verdict: "closing", unverifiableSince: null };
+                    }
+                    if (answer.state === "placing" || answer.state === "ready") {
+                        await storePlacement(c, id, {
+                            placementId: answer.placementId,
+                            deadline: answer.deadline,
+                        });
+                    }
+                    return { verdict: "waiting", unverifiableSince: null };
+                }
+                const start = await findOrder(c, id);
+                const ended =
+                    start !== null &&
+                    (start.state === "refunding" ||
+                        start.state === "refunded" ||
+                        start.state === "manual" ||
+                        (start.state === "redeemed" &&
+                            (start.routerConfirmedAt !== null || start.eventSeenAt !== null) &&
+                            start.tokenExpiresAt !== null &&
+                            now.getTime() >
+                                start.tokenExpiresAt.getTime() + d.orders.router_grace));
+                if (!ended) return { verdict: "waiting", unverifiableSince: null };
+                await startClosing(c, id, now);
+                return { verdict: "closing", unverifiableSince: null };
+            },
+        );
+        if (result.verdict === "skipped") {
             unverifiableAlarmed.delete(id);
-            await clearFailing(c, id);
-            if (answer.kind === "found") {
-                if (answer.state === "terminated" || answer.state === "failed") {
-                    await startClosing(c, id, now);
-                    return "closing";
-                }
-                if (answer.state === "placing" || answer.state === "ready") {
-                    await storePlacement(c, id, {
-                        placementId: answer.placementId,
-                        deadline: answer.deadline,
-                    });
-                }
-                return "waiting";
+            return;
+        }
+        if (result.unverifiableSince !== null) {
+            if (!unverifiableAlarmed.has(id)) {
+                unverifiableAlarmed.add(id);
+                d.log.alarm("x402_close_unverifiable", {
+                    accountId: id,
+                    failingSince: result.unverifiableSince,
+                });
             }
-            const start = await findOrder(c, id);
-            const ended =
-                start !== null &&
-                (start.state === "refunding" ||
-                    start.state === "refunded" ||
-                    start.state === "manual" ||
-                    (start.state === "redeemed" &&
-                        (start.routerConfirmedAt !== null || start.eventSeenAt !== null) &&
-                        start.tokenExpiresAt !== null &&
-                        now.getTime() > start.tokenExpiresAt.getTime() + d.orders.router_grace));
-            if (!ended) return "waiting";
-            await startClosing(c, id, now);
-            return "closing";
-        });
-        for (const alarm of alarms) alarm();
-        if (verdict !== "skipped") counts[verdict] += 1;
+        } else if (result.verdict !== "failing") {
+            unverifiableAlarmed.delete(id);
+        }
+        counts[result.verdict] += 1;
     }
 }
 
@@ -122,6 +131,8 @@ export async function runCloseJob(
     const ids = await d.pool.query<{ id: string }>(
         "select id from x402_accounts where state = 'closing' order by id",
     );
+    const closingIds = new Set(ids.rows.map((r) => r.id));
+    for (const id of slowAlarmed) if (!closingIds.has(id)) slowAlarmed.delete(id);
     const counts = { refunded: 0, kept: 0, closed: 0, waiting: 0 };
     for (const { id } of ids.rows) {
         try {
@@ -133,11 +144,12 @@ export async function runCloseJob(
     return counts;
 
     async function closeOne(id: string): Promise<void> {
-        const alarms: (() => void)[] = [];
-        const tally = { refunded: 0, kept: 0, closed: 0, waiting: 0 };
-        await withTx(d.pool, async (c) => {
+        const result = await withTx(d.pool, async (c) => {
+            const tally = { refunded: 0, kept: 0, closed: 0, waiting: 0 };
+            let slowSince: Date | null = null;
+            let done = false;
             const account = await lockAccount(c, id);
-            if (account === null || account.state !== "closing") return;
+            if (account === null || account.state !== "closing") return { tally, slowSince, done };
             const open = await c.query<{ n: string }>(
                 `select count(*) as n from x402_payments
                  where account_id = $1 and state in ('reserved', 'signed')`,
@@ -146,25 +158,19 @@ export async function runCloseJob(
             if (Number(open.rows[0]!.n) > 0) {
                 tally.waiting += 1;
                 const since = account.closingAt ?? now;
-                if (
-                    now.getTime() - since.getTime() > d.x402.close_slow_alarm_after &&
-                    !slowAlarmed.has(id)
-                ) {
-                    slowAlarmed.add(id);
-                    alarms.push(() =>
-                        d.log.alarm("x402_close_slow", { accountId: id, closingAt: since }),
-                    );
+                if (now.getTime() - since.getTime() > d.x402.close_slow_alarm_after) {
+                    slowSince = since;
                 }
-                return;
+                return { tally, slowSince, done };
             }
             const outcome = await d.funding.refund(c, account, now);
             if (outcome.kind === "not_ready") {
                 tally.waiting += 1;
-                return;
+                return { tally, slowSince, done };
             }
             if (outcome.kind === "refund") {
                 tally.refunded += 1;
-                return;
+                return { tally, slowSince, done };
             }
             if (outcome.kind === "kept") tally.kept += 1;
             if (outcome.kind === "already") {
@@ -174,7 +180,7 @@ export async function runCloseJob(
                      where f.account_id = $1 and r.kind = 'allowance'`,
                     [id],
                 );
-                if (Number(rows.rows[0]!.open) > 0) return;
+                if (Number(rows.rows[0]!.open) > 0) return { tally, slowSince, done };
             }
             const closed = await c.query(
                 `update x402_accounts set state = 'closed', closed_at = $2
@@ -182,9 +188,16 @@ export async function runCloseJob(
                 [id, now],
             );
             tally.closed += closed.rowCount ?? 0;
-            slowAlarmed.delete(id);
+            done = true;
+            return { tally, slowSince, done };
         });
-        for (const key of Object.keys(tally) as (keyof typeof tally)[]) counts[key] += tally[key];
-        for (const alarm of alarms) alarm();
+        for (const key of Object.keys(result.tally) as (keyof typeof result.tally)[]) {
+            counts[key] += result.tally[key];
+        }
+        if (result.done) slowAlarmed.delete(id);
+        if (result.slowSince !== null && !slowAlarmed.has(id)) {
+            slowAlarmed.add(id);
+            d.log.alarm("x402_close_slow", { accountId: id, closingAt: result.slowSince });
+        }
     }
 }
