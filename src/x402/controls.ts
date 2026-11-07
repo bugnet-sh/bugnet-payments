@@ -13,6 +13,7 @@ export async function readControls(db: Queryable): Promise<Controls> {
         "select disabled, paused, refunds_held, reason, changed_at from x402_controls where id = 1",
     );
     const r = rows[0];
+    if (!r) throw new Error("x402_controls row 1 is missing");
     return {
         disabled: r.disabled,
         paused: r.paused,

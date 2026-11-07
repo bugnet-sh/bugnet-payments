@@ -21,6 +21,11 @@ afterAll(async () => {
 });
 
 describe("x402 controls", () => {
+    it("readControls names the missing row", async () => {
+        const rows = [] as unknown[];
+        const empty = { query: async () => ({ rows, rowCount: 0 }) } as unknown as typeof db.pool;
+        await expect(readControls(empty)).rejects.toThrow(/x402_controls row 1/);
+    });
     it("controls default to all false", async () => {
         expect(await readControls(db.pool)).toEqual({
             disabled: false,

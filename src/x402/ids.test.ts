@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
     bugnetAddresses,
@@ -13,6 +14,19 @@ describe("x402 ids", () => {
         expect(serviceIdFor("POST", "agent402.tools", "/v1/auto/")).toBe("xs_w5a4htopmpzmmhos");
         expect(serviceIdFor("GET", "seller.example", "/ok/")).toBe("xs_beynw7muaoanyeri");
         expect(serviceIdFor("GET", "seller.example", "/ok/")).toMatch(SERVICE_ID);
+    });
+    it("serviceIdFor matches the bugnet-proto vector file", () => {
+        const file = new URL(
+            "../../../bugnet-proto/vectors/x402/service-ids.json",
+            import.meta.url,
+        );
+        const { v, cases } = JSON.parse(readFileSync(file, "utf8")) as {
+            v: number;
+            cases: { method: string; host: string; prefix: string; id: string }[];
+        };
+        expect(v).toBe(1);
+        expect(cases.length).toBeGreaterThan(0);
+        for (const c of cases) expect(serviceIdFor(c.method, c.host, c.prefix)).toBe(c.id);
     });
     it("payment ids match the column check", () => {
         const ids = new Set(Array.from({ length: 1_000 }, () => newX402PaymentId()));
