@@ -5,11 +5,11 @@ import { getTransferSolInstruction } from "@solana-program/system";
 import {
     getCloseAccountInstruction,
     getCreateAssociatedTokenIdempotentInstructionAsync,
-    getTransferCheckedInstruction,
 } from "@solana-program/token";
 import { usdcAta } from "../solana/accounts.ts";
-import { TOKEN_PROGRAM, USDC_DECIMALS, USDC_MINT } from "../solana/constants.ts";
+import { TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
 import { generateExportableKeypair, loadKeypair } from "../solana/keys.ts";
+import { usdcTransferChecked } from "../solana/transfer.ts";
 import { loadTestPayer } from "./test-payer.ts";
 
 export interface PlannedTx {
@@ -129,14 +129,11 @@ export async function fundingPlan(o: {
     }
     if (o.refundUsdcMicros > 0n) {
         instructions.push(
-            getTransferCheckedInstruction({
-                source: await usdcAta(o.testPayer.address),
-                mint: USDC_MINT,
-                destination: await usdcAta(o.refundWallet),
-                authority: o.testPayer,
-                amount: o.refundUsdcMicros,
-                decimals: USDC_DECIMALS,
-            }),
+            await usdcTransferChecked(
+                o.testPayer,
+                await usdcAta(o.refundWallet),
+                o.refundUsdcMicros,
+            ),
         );
     }
     return [{ feePayer: o.testPayer.address, instructions }];
@@ -178,16 +175,7 @@ export async function drainPlan(
     for (const { signer, usdc } of wallets) {
         if (usdc === 0n) continue;
         const source = await usdcAta(signer.address);
-        const instructions: Instruction[] = [
-            getTransferCheckedInstruction({
-                source,
-                mint: USDC_MINT,
-                destination,
-                authority: signer,
-                amount: usdc,
-                decimals: USDC_DECIMALS,
-            }),
-        ];
+        const instructions: Instruction[] = [await usdcTransferChecked(signer, destination, usdc)];
         if (o.closeAtas) {
             instructions.push(
                 getCloseAccountInstruction(

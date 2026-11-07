@@ -8,27 +8,17 @@
  */
 import {
     type Address,
-    appendTransactionMessageInstructions,
-    blockhash,
-    createTransactionMessage,
     getBase64EncodedWireTransaction,
     getSignatureFromTransaction,
     type KeyPairSigner,
-    pipe,
-    setTransactionMessageFeePayerSigner,
-    setTransactionMessageLifetimeUsingBlockhash,
-    signTransactionMessageWithSigners,
 } from "@solana/kit";
-import {
-    getSetComputeUnitLimitInstruction,
-    getSetComputeUnitPriceInstruction,
-} from "@solana-program/compute-budget";
 import { loadSettings } from "../config.ts";
 import { jsonLog, type Log } from "../log.ts";
 import { orderPublicKeyBase64 } from "../orders/token.ts";
 import { inspectTokenAccount, usdcAta } from "../solana/accounts.ts";
 import { loadKeypair } from "../solana/keys.ts";
 import { createRpc, type SolanaRpc } from "../solana/rpc.ts";
+import { signV0Transaction } from "../solana/transfer.ts";
 import { loadTestPayer } from "./test-payer.ts";
 import {
     drainPlan,
@@ -330,28 +320,14 @@ async function sendAndConfirm(
 ): Promise<string> {
     if (tx.feePayer !== testPayer.address) throw new Error("planned transaction has another payer");
     const { value: latest } = await rpc.getLatestBlockhash({ commitment: "confirmed" }).send();
-    const message = pipe(
-        createTransactionMessage({ version: 0 }),
-        (m) => setTransactionMessageFeePayerSigner(testPayer, m),
-        (m) =>
-            setTransactionMessageLifetimeUsingBlockhash(
-                {
-                    blockhash: blockhash(latest.blockhash),
-                    lastValidBlockHeight: latest.lastValidBlockHeight,
-                },
-                m,
-            ),
-        (m) =>
-            appendTransactionMessageInstructions(
-                [
-                    getSetComputeUnitLimitInstruction({ units: COMPUTE_UNIT_LIMIT }),
-                    getSetComputeUnitPriceInstruction({ microLamports: COMPUTE_UNIT_PRICE }),
-                    ...tx.instructions,
-                ],
-                m,
-            ),
-    );
-    const signed = await signTransactionMessageWithSigners(message);
+    const signed = await signV0Transaction({
+        feePayer: testPayer,
+        blockhash: latest.blockhash,
+        lastValidBlockHeight: latest.lastValidBlockHeight,
+        computeUnitLimit: COMPUTE_UNIT_LIMIT,
+        computeUnitPrice: COMPUTE_UNIT_PRICE,
+        instructions: tx.instructions,
+    });
     const signature = getSignatureFromTransaction(signed);
     await rpc
         .sendTransaction(getBase64EncodedWireTransaction(signed), {

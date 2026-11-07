@@ -14,24 +14,12 @@
 import {
     address,
     type Address,
-    appendTransactionMessageInstructions,
     type Base64EncodedWireTransaction,
-    blockhash,
-    createTransactionMessage,
     getBase64EncodedWireTransaction,
     getSignatureFromTransaction,
     isAddress,
     type KeyPairSigner,
-    pipe,
-    setTransactionMessageFeePayerSigner,
-    setTransactionMessageLifetimeUsingBlockhash,
-    signTransactionMessageWithSigners,
 } from "@solana/kit";
-import {
-    getSetComputeUnitLimitInstruction,
-    getSetComputeUnitPriceInstruction,
-} from "@solana-program/compute-budget";
-import { getTransferCheckedInstruction } from "@solana-program/token";
 import type pg from "pg";
 import type { Settings } from "../config.ts";
 import { type Queryable, withTx } from "../db/pool.ts";
@@ -39,9 +27,10 @@ import type { Log } from "../log.ts";
 import { findPaymentByOrder, lockOrder, setOrderState } from "../orders/store.ts";
 import { inspectTokenAccount, usdcAta } from "../solana/accounts.ts";
 import type { BlockhashHint } from "../solana/blockhash.ts";
-import { TOKEN_PROGRAM, USDC_DECIMALS, USDC_MINT } from "../solana/constants.ts";
+import { TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
 import { readLanding } from "../solana/landing.ts";
 import { deadline, type SolanaRpc } from "../solana/rpc.ts";
+import { signV0Transaction, usdcTransferChecked } from "../solana/transfer.ts";
 import { type RefundDbRow, type RefundRow, toRefund } from "./request.ts";
 
 export interface RefundDeps {
@@ -109,38 +98,16 @@ export async function buildRefundTransaction(
     r: { destination: Address; amountMicros: number },
     hint: BlockhashHint,
 ): Promise<SignedRefund> {
-    const transfer = getTransferCheckedInstruction({
-        source: await usdcAta(d.refundSigner.address),
-        mint: USDC_MINT,
-        destination: r.destination,
-        authority: d.refundSigner,
-        amount: BigInt(r.amountMicros),
-        decimals: USDC_DECIMALS,
+    const signed = await signV0Transaction({
+        feePayer: d.feePayer,
+        blockhash: hint.blockhash,
+        lastValidBlockHeight: hint.lastValidBlockHeight,
+        computeUnitLimit: d.cfg.compute_unit_limit,
+        computeUnitPrice: d.cfg.compute_unit_price_micro_lamports,
+        instructions: [
+            await usdcTransferChecked(d.refundSigner, r.destination, BigInt(r.amountMicros)),
+        ],
     });
-    const message = pipe(
-        createTransactionMessage({ version: 0 }),
-        (m) => setTransactionMessageFeePayerSigner(d.feePayer, m),
-        (m) =>
-            setTransactionMessageLifetimeUsingBlockhash(
-                {
-                    blockhash: blockhash(hint.blockhash),
-                    lastValidBlockHeight: hint.lastValidBlockHeight,
-                },
-                m,
-            ),
-        (m) =>
-            appendTransactionMessageInstructions(
-                [
-                    getSetComputeUnitLimitInstruction({ units: d.cfg.compute_unit_limit }),
-                    getSetComputeUnitPriceInstruction({
-                        microLamports: d.cfg.compute_unit_price_micro_lamports,
-                    }),
-                    transfer,
-                ],
-                m,
-            ),
-    );
-    const signed = await signTransactionMessageWithSigners(message);
     return {
         wire: getBase64EncodedWireTransaction(signed),
         signature: getSignatureFromTransaction(signed),
