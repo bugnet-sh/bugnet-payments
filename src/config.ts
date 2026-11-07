@@ -7,9 +7,9 @@
  */
 import { readFileSync } from "node:fs";
 import { isIP } from "node:net";
-import { isAddress } from "@solana/kit";
 import { parse } from "smol-toml";
 import { z } from "zod";
+import { isCanonicalAddress } from "./solana/base58.ts";
 
 const MAINNET = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -28,11 +28,39 @@ const hostPort = z
 const jobEvery = duration.refine((ms) => ms >= 1 && ms <= 86_400_000, "from 1ms to 24h");
 
 const count = z.int().min(1);
+const nonEmpty = z.string().min(1);
 const amount = z.int().min(0);
 
 const key32 = z
     .string()
     .refine((s) => s === "" || isBase64Of32(s), "standard base64 of 32 bytes, or empty");
+
+type X402Input = {
+    enabled: boolean;
+    allowance_wallet: string;
+    [key: string]: unknown;
+};
+
+// Each pair reads "low must be at most high"; the issue lands on the low key
+const X402_ORDER: readonly (readonly [string, string])[] = [
+    ["min_spend_per_minute_micros", "default_spend_per_minute_micros"],
+    ["default_spend_per_minute_micros", "max_spend_per_minute_micros"],
+    ["min_allowance_micros", "suggested_allowance_micros"],
+    ["suggested_allowance_micros", "max_allowance_per_sandbox_micros"],
+    ["seller_compute_unit_price_micro_lamports", "seller_compute_unit_price_max_micro_lamports"],
+    ["pool_unpaid_max_micros", "pool_max_micros"],
+];
+
+function checkX402(x: X402Input, ctx: z.RefinementCtx): void {
+    for (const [low, high] of X402_ORDER) {
+        if ((x[low] as number) > (x[high] as number)) {
+            ctx.addIssue({ code: "custom", path: [low], message: `must be at most ${high}` });
+        }
+    }
+    if (x.enabled && x.allowance_wallet === "") {
+        ctx.addIssue({ code: "custom", path: ["enabled"], message: "needs allowance_wallet" });
+    }
+}
 
 const settingsSchema = z
     .object({
@@ -84,7 +112,7 @@ const settingsSchema = z
                     .default(USDC_MINT),
                 recipient: z
                     .string()
-                    .refine((s) => isAddress(s), "the base58 address of the cold USDC owner")
+                    .refine(isCanonicalAddress, "the base58 address of the cold USDC owner")
                     .prefault(""),
                 // The builder makes v0 only and the decoder reads v0 instructions
                 transaction_versions: z
@@ -130,9 +158,88 @@ const settingsSchema = z
                 timeout: duration.prefault("3s"),
                 check_payer: z.boolean().default(false),
                 get_order: z.boolean().default(false),
+                allowance_claim: z.boolean().default(false),
                 event_public_key: key32.default(""),
             })
             .strict()
+            .prefault({}),
+        x402: z
+            .object({
+                enabled: z.boolean().default(false),
+                allowance_wallet: z
+                    .string()
+                    .refine(
+                        (s) => s === "" || isCanonicalAddress(s),
+                        "empty, or a base58 address that decodes to 32 bytes",
+                    )
+                    .default(""),
+                listen: hostPort.default("127.0.0.1:8449"),
+                tls_cert_file: nonEmpty.default("/etc/bugnet/payments/x402-server.pem"),
+                client_ca_file: nonEmpty.default("/etc/bugnet/internal-ca.pem"),
+                client_name: nonEmpty.default("bugnet-egress.internal"),
+                indexed_services_file: nonEmpty.default("/etc/bugnet/payments/x402-index.json"),
+                session_fee_micros: count.default(3000),
+                min_allowance_micros: count.default(100000),
+                suggested_allowance_micros: count.default(1000000),
+                max_allowance_per_sandbox_micros: count.default(5000000),
+                max_price_per_call_micros: count.default(500000),
+                default_spend_per_minute_micros: count.default(500000),
+                min_spend_per_minute_micros: count.default(10000),
+                max_spend_per_minute_micros: count.default(5000000),
+                max_services: count.default(5),
+                max_new_services_per_order: count.default(5),
+                refund_min_micros: count.default(10000),
+                pool_max_micros: count.default(50000000),
+                pool_unpaid_max_micros: count.default(10000000),
+                pool_high_alarm_percent: z.int().min(1).max(100).default(80),
+                unpaid_allowance_order_ttl: duration.prefault("5m"),
+                outflow_daily_cap_micros: count.default(100000000),
+                unlisted_daily_cap_micros: count.default(20000000),
+                payto_daily_cap_unlisted_micros: count.default(20000000),
+                payto_daily_cap_indexed_micros: count.default(200000000),
+                refund_daily_cap_micros: count.default(50000000),
+                max_open_payments_per_placement: count.default(8),
+                unreliable_after: count.default(3),
+                signed_payload_keep: duration
+                    .refine((ms) => ms < 60_000, "below 60s")
+                    .prefault("45s"),
+                sign_timeout: duration.prefault("2s"),
+                lookup_timeout: duration.prefault("500ms"),
+                reserved_release_after: duration.prefault("30s"),
+                release_every: duration.prefault("5s"),
+                seller_compute_unit_limit: count.default(20000),
+                seller_compute_unit_price_micro_lamports: count.default(1),
+                seller_compute_unit_price_max_micro_lamports: count.default(1000),
+                seller_memo_max_bytes: count.default(32),
+                fast_pass_every: duration.prefault("5s"),
+                fast_pass_limit: count.default(100),
+                mirror_every: duration.prefault("5s"),
+                mirror_idle_every: duration.prefault("60s"),
+                mirror_page_size: count.default(1000),
+                mirror_rescan_slots: count.default(300),
+                balance_mismatch_after: duration.prefault("2m"),
+                tail_lag_alarm_after: duration.prefault("60s"),
+                rpc_calls_per_hour_alarm: count.default(5000),
+                signer_check_stale_after: duration.prefault("2m"),
+                unresolved_alarm_after: duration.prefault("10m"),
+                close_check_every: duration.prefault("60s"),
+                close_check_after: duration.prefault("10m"),
+                close_unverifiable_after: duration.prefault("30m"),
+                close_every: duration.prefault("5s"),
+                close_slow_alarm_after: duration.prefault("10m"),
+                resign_wait_alarm_after: duration.prefault("10m"),
+                cold_transfer_check_every: duration.prefault("5m"),
+                cold_transfer_max_age: duration.prefault("1h"),
+                cold_transfer_threshold_micros: count.default(20000000),
+                cold_transfer_verify_age: duration.prefault("60s"),
+                events_every: duration.prefault("2s"),
+                events_batch: count.default(50),
+                events_max_backoff: duration.prefault("5m"),
+                events_stuck_alarm_after: duration.prefault("10m"),
+                cert_expiry_alarm_before: duration.prefault("720h"),
+            })
+            .strict()
+            .superRefine(checkX402)
             .prefault({}),
         refunds: z
             .object({
@@ -179,6 +286,8 @@ export interface Secrets {
     feePayerKey: string;
     refundKey: string;
     rpcUrl: string;
+    allowanceKey: string;
+    x402TlsKey: string;
 }
 
 export class ConfigError extends Error {}
@@ -191,6 +300,8 @@ export const SECRET_VARS = [
     "BUGNET_CLAIM_KEY",
     "BUGNET_FEE_PAYER_KEY",
     "BUGNET_REFUND_KEY",
+    "BUGNET_ALLOWANCE_KEY",
+    "BUGNET_X402_TLS_KEY",
     "BUGNET_SOLANA_RPC_URL",
     "BUGNET_TEST_PAYER_KEY",
     "BUGNET_TEST_PAYER_MNEMONIC",
@@ -206,14 +317,25 @@ export function secretsEnv(s: Secrets): Partial<Record<(typeof SECRET_VARS)[numb
         BUGNET_CLAIM_KEY: s.claimKey.toString("base64"),
         BUGNET_FEE_PAYER_KEY: s.feePayerKey,
         BUGNET_REFUND_KEY: s.refundKey,
+        BUGNET_ALLOWANCE_KEY: s.allowanceKey,
+        BUGNET_X402_TLS_KEY: Buffer.from(s.x402TlsKey).toString("base64"),
         BUGNET_SOLANA_RPC_URL: s.rpcUrl,
     };
 }
 
-// What every log redacts, longest first so a secret inside another is never half scrubbed
+// What every log redacts, longest first so a secret inside another is never half scrubbed.
+// The TLS key is also redacted as the PEM text it decodes to.
 export function secretValues(...envs: NodeJS.ProcessEnv[]): string[] {
-    const values = envs.flatMap((env) => SECRET_VARS.map((name) => env[name] ?? ""));
+    const values = envs.flatMap((env) => [
+        ...SECRET_VARS.map((name) => env[name] ?? ""),
+        decodedPem(env.BUGNET_X402_TLS_KEY ?? ""),
+    ]);
     return [...new Set(values.filter((v) => v.trim() !== ""))].sort((a, b) => b.length - a.length);
+}
+
+function decodedPem(b64: string): string {
+    const text = Buffer.from(b64, "base64").toString("utf8");
+    return text.includes("PRIVATE KEY-----") ? text : "";
 }
 
 export function parseDuration(s: string): number {
@@ -310,7 +432,8 @@ export function readSecrets(env: NodeJS.ProcessEnv, s: Settings): Secrets {
     const routerName = "BUGNET_PAYMENTS_ROUTER_TOKEN";
     const routerToken = env[routerName] ?? "";
     // The router client sends its token only while a router flag is on
-    if (s.router.check_payer || s.router.get_order) {
+    const x402On = s.x402.allowance_wallet !== "";
+    if (s.router.check_payer || s.router.get_order || x402On) {
         text(routerName);
         bearer(routerName, routerToken);
     } else {
@@ -321,9 +444,37 @@ export function readSecrets(env: NodeJS.ProcessEnv, s: Settings): Secrets {
         bad.set(routerName, "must differ from BUGNET_PAYMENTS_TOKEN");
     }
 
+    let allowanceKey = "";
+    let x402TlsKey = "";
+    if (x402On) {
+        allowanceKey = text("BUGNET_ALLOWANCE_KEY");
+        const name = "BUGNET_X402_TLS_KEY";
+        const v = env[name] ?? "";
+        if (v === "") bad.set(name, "must be set");
+        else {
+            const pem = Buffer.from(v, "base64").toString("utf8");
+            const ok =
+                Buffer.from(v, "base64").toString("base64") === v &&
+                pem.includes("-----BEGIN") &&
+                pem.includes("PRIVATE KEY-----");
+            if (ok) x402TlsKey = pem;
+            else bad.set(name, "must be standard base64 of a PEM private key");
+        }
+    }
+
     if (bad.size > 0) {
         const lines = [...bad].sort(([a], [b]) => a.localeCompare(b));
         throw new ConfigError(lines.map(([name, problem]) => `${name} ${problem}`).join("\n"));
     }
-    return { paymentsToken, routerToken, orderSeed, claimKey, feePayerKey, refundKey, rpcUrl };
+    return {
+        paymentsToken,
+        routerToken,
+        orderSeed,
+        claimKey,
+        feePayerKey,
+        refundKey,
+        rpcUrl,
+        allowanceKey,
+        x402TlsKey,
+    };
 }

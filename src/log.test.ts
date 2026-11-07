@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { jsonLog, memoryLog, REDACTED_KEYS, silentLog } from "./log.ts";
+import { type AlarmName, jsonLog, memoryLog, REDACTED_KEYS, silentLog } from "./log.ts";
 
 function capture(opts: { secrets?: readonly string[] } = {}) {
     const out: string[] = [];
@@ -108,5 +108,47 @@ describe("test loggers", () => {
     it("REDACTED_KEYS lists the secret keys", () => {
         expect(REDACTED_KEYS.has("mnemonic")).toBe(true);
         expect(REDACTED_KEYS.has("orderId")).toBe(false);
+    });
+});
+
+describe("x402 alarms", () => {
+    it("writes an x402 alarm line", () => {
+        const log = memoryLog();
+        log.alarm("x402_incident", { kind: "balance_short" });
+        expect(log.lines[0]).toMatchObject({
+            level: "alarm",
+            alarm: "x402_incident",
+            kind: "balance_short",
+        });
+    });
+
+    it("knows every x402 alarm of 7.17", () => {
+        // typed AlarmName[], so a missing name fails pnpm typecheck
+        const names: AlarmName[] = [
+            "x402_incident",
+            "x402_outflow_cap",
+            "x402_unresolved",
+            "x402_tail_lag",
+            "x402_rpc_budget",
+            "x402_ref_conflict",
+            "x402_refund_budget",
+            "x402_pool_high",
+            "x402_pool_drift",
+            "x402_audit_mismatch",
+            "x402_cert_expiry",
+            "x402_reload_failed",
+            "x402_payee_unreliable",
+            "x402_signer_down",
+            "x402_events_stuck",
+            "x402_event_dropped",
+            "x402_event_refused",
+            "x402_close_slow",
+            "x402_close_unverifiable",
+            "x402_resign_waiting",
+            "x402_cold_transfer_failed",
+        ];
+        const log = memoryLog();
+        for (const n of names) log.alarm(n);
+        expect(log.lines.map((l) => l.alarm)).toEqual(names);
     });
 });

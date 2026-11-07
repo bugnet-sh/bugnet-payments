@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { parse } from "smol-toml";
 import { describe, expect, it } from "vitest";
 import {
+    ConfigError,
     loadSettings,
     parseSettings,
     readSecrets,
@@ -10,6 +11,7 @@ import {
     secretValues,
     type Settings,
 } from "./config.ts";
+import { jsonLog } from "./log.ts";
 
 const ADDR = "11111111111111111111111111111111";
 const ORDER_SEED = Buffer.alloc(32, 1);
@@ -258,7 +260,7 @@ describe("secret redaction list", () => {
     });
 
     it("gives every loaded secret back in its variable's form", () => {
-        const env = validEnv();
+        const env = validEnv({ BUGNET_ALLOWANCE_KEY: "", BUGNET_X402_TLS_KEY: "" });
         const secrets = readSecrets(env, settings());
         expect(secretsEnv(secrets)).toEqual(env);
         expect(Object.keys(secretsEnv(secrets))).toHaveLength(Object.keys(secrets).length);
@@ -271,5 +273,219 @@ describe("secret redaction list", () => {
             { BUGNET_TEST_PG_URL: "postgres://u:abc@h/db", BUGNET_FEE_PAYER_KEY: "" },
         );
         expect(values).toEqual(["postgres://u:abc@h/db", "w1 w2 w3", "abc"]);
+    });
+});
+
+const WALLET = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi";
+const SOLANA = `[solana]\nrecipient = "${ADDR}"`;
+const PEM = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIA==\n-----END PRIVATE KEY-----\n";
+const X402_DEFAULTS = {
+    enabled: false,
+    allowance_wallet: "",
+    listen: "127.0.0.1:8449",
+    tls_cert_file: "/etc/bugnet/payments/x402-server.pem",
+    client_ca_file: "/etc/bugnet/internal-ca.pem",
+    client_name: "bugnet-egress.internal",
+    indexed_services_file: "/etc/bugnet/payments/x402-index.json",
+    session_fee_micros: 3_000,
+    min_allowance_micros: 100_000,
+    suggested_allowance_micros: 1_000_000,
+    max_allowance_per_sandbox_micros: 5_000_000,
+    max_price_per_call_micros: 500_000,
+    default_spend_per_minute_micros: 500_000,
+    min_spend_per_minute_micros: 10_000,
+    max_spend_per_minute_micros: 5_000_000,
+    max_services: 5,
+    max_new_services_per_order: 5,
+    refund_min_micros: 10_000,
+    pool_max_micros: 50_000_000,
+    pool_unpaid_max_micros: 10_000_000,
+    pool_high_alarm_percent: 80,
+    unpaid_allowance_order_ttl: 300_000,
+    outflow_daily_cap_micros: 100_000_000,
+    unlisted_daily_cap_micros: 20_000_000,
+    payto_daily_cap_unlisted_micros: 20_000_000,
+    payto_daily_cap_indexed_micros: 200_000_000,
+    refund_daily_cap_micros: 50_000_000,
+    max_open_payments_per_placement: 8,
+    unreliable_after: 3,
+    signed_payload_keep: 45_000,
+    sign_timeout: 2_000,
+    lookup_timeout: 500,
+    reserved_release_after: 30_000,
+    release_every: 5_000,
+    seller_compute_unit_limit: 20_000,
+    seller_compute_unit_price_micro_lamports: 1,
+    seller_compute_unit_price_max_micro_lamports: 1_000,
+    seller_memo_max_bytes: 32,
+    fast_pass_every: 5_000,
+    fast_pass_limit: 100,
+    mirror_every: 5_000,
+    mirror_idle_every: 60_000,
+    mirror_page_size: 1_000,
+    mirror_rescan_slots: 300,
+    balance_mismatch_after: 120_000,
+    tail_lag_alarm_after: 60_000,
+    rpc_calls_per_hour_alarm: 5_000,
+    signer_check_stale_after: 120_000,
+    unresolved_alarm_after: 600_000,
+    close_check_every: 60_000,
+    close_check_after: 600_000,
+    close_unverifiable_after: 1_800_000,
+    close_every: 5_000,
+    close_slow_alarm_after: 600_000,
+    resign_wait_alarm_after: 600_000,
+    cold_transfer_check_every: 300_000,
+    cold_transfer_max_age: 3_600_000,
+    cold_transfer_threshold_micros: 20_000_000,
+    cold_transfer_verify_age: 60_000,
+    events_every: 2_000,
+    events_batch: 50,
+    events_max_backoff: 300_000,
+    events_stuck_alarm_after: 600_000,
+    cert_expiry_alarm_before: 2_592_000_000,
+};
+const x402 = (lines: string) => parseSettings(`${SOLANA}\n[x402]\n${lines}`, "t");
+const withWallet = () => x402(`allowance_wallet = "${WALLET}"`);
+
+describe("[x402] settings", () => {
+    it("parses the [x402] defaults of 7.16", () => {
+        const s = parseSettings(SOLANA, "t");
+        expect(s.x402).toEqual(X402_DEFAULTS);
+        expect(s.router.allowance_claim).toBe(false);
+        expect(s.http.public_listen).toBe("127.0.0.1:8450");
+    });
+    it("refuses an unknown [x402] key", () => {
+        expect(() => x402("foo = 1")).toThrow(/unknown key x402.foo/);
+    });
+    it("refuses an allowance_wallet that is not 32 bytes", () => {
+        expect(() => x402(`allowance_wallet = "1${WALLET}"`)).toThrow(/x402.allowance_wallet/);
+    });
+    it("refuses a minimum above the default minute limit", () => {
+        expect(() => x402("min_spend_per_minute_micros = 600000")).toThrow(
+            /x402.min_spend_per_minute_micros/,
+        );
+    });
+    it("refuses a default minute limit above the maximum", () => {
+        expect(() => x402("max_spend_per_minute_micros = 400000")).toThrow(
+            /x402.default_spend_per_minute_micros/,
+        );
+    });
+    it("refuses allowance bounds out of order", () => {
+        expect(() => x402("min_allowance_micros = 2000000")).toThrow(/x402.min_allowance_micros/);
+        expect(() => x402("max_allowance_per_sandbox_micros = 900000")).toThrow(
+            /x402.suggested_allowance_micros/,
+        );
+    });
+    it("refuses a compute unit price above its maximum", () => {
+        expect(() => x402("seller_compute_unit_price_micro_lamports = 2000")).toThrow(
+            /x402.seller_compute_unit_price_micro_lamports/,
+        );
+    });
+    it("refuses an unpaid pool above the pool", () => {
+        expect(() => x402("pool_unpaid_max_micros = 60000000")).toThrow(
+            /x402.pool_unpaid_max_micros/,
+        );
+    });
+    it("bounds the alarm percent to 1..100", () => {
+        expect(() => x402("pool_high_alarm_percent = 101")).toThrow(/pool_high_alarm_percent/);
+        expect(() => x402("pool_high_alarm_percent = 0")).toThrow(/pool_high_alarm_percent/);
+    });
+    it("refuses enabled without a wallet", () => {
+        expect(() => x402("enabled = true")).toThrow(/x402.enabled/);
+        expect(x402(`enabled = true\nallowance_wallet = "${WALLET}"`).x402.enabled).toBe(true);
+    });
+    it("refuses a signed_payload_keep of 60s or more", () => {
+        expect(() => x402('signed_payload_keep = "60s"')).toThrow(/x402.signed_payload_keep/);
+    });
+    it("example.toml equals the defaults", () => {
+        const text = readFileSync("config/example.toml", "utf8").replace(
+            'recipient = ""',
+            `recipient = "${ADDR}"`,
+        );
+        const s = parseSettings(text, "example.toml");
+        expect(s.x402).toEqual(X402_DEFAULTS);
+        expect(s.router.allowance_claim).toBe(false);
+    });
+    it("dev.toml parses", () => {
+        const s = loadSettings("config/dev.toml");
+        expect(s.x402.enabled).toBe(false);
+        expect(s.x402.allowance_wallet).toBe("");
+        expect(s.x402.tls_cert_file).toBe(".dev/x402/x402-server.pem");
+        expect(s.x402.client_ca_file).toBe(".dev/x402/internal-ca.pem");
+        expect(s.x402.indexed_services_file).toBe(".dev/x402/x402-index.json");
+    });
+});
+
+describe("readSecrets for x402", () => {
+    it("requires the allowance key, the TLS key and the router token when allowance_wallet is set", () => {
+        const env = validEnv({ BUGNET_PAYMENTS_ROUTER_TOKEN: undefined });
+        expect(() => readSecrets(env, withWallet())).toThrow(
+            new ConfigError(
+                "BUGNET_ALLOWANCE_KEY must be set\nBUGNET_PAYMENTS_ROUTER_TOKEN must be set\nBUGNET_X402_TLS_KEY must be set",
+            ),
+        );
+    });
+    it("reads both secrets when allowance_wallet is set", () => {
+        const s = readSecrets(
+            validEnv({
+                BUGNET_ALLOWANCE_KEY: "allowance-key",
+                BUGNET_X402_TLS_KEY: Buffer.from(PEM).toString("base64"),
+            }),
+            withWallet(),
+        );
+        expect(s.allowanceKey).toBe("allowance-key");
+        expect(s.x402TlsKey).toBe(PEM);
+    });
+    it("keeps the router token different from the gateway token when allowance_wallet is set", () => {
+        const env = validEnv({
+            BUGNET_ALLOWANCE_KEY: "k",
+            BUGNET_X402_TLS_KEY: Buffer.from(PEM).toString("base64"),
+            BUGNET_PAYMENTS_ROUTER_TOKEN: PAYMENTS_TOKEN,
+        });
+        expect(() => readSecrets(env, withWallet())).toThrow(/must differ/);
+    });
+    it.each(["not base64!", Buffer.from("hello").toString("base64")])(
+        "refuses a TLS key that is not base64 of a PEM: %s",
+        (value) => {
+            const env = validEnv({ BUGNET_ALLOWANCE_KEY: "k", BUGNET_X402_TLS_KEY: value });
+            let message = "";
+            try {
+                readSecrets(env, withWallet());
+            } catch (e) {
+                message = String(e);
+            }
+            expect(message).toContain(
+                "BUGNET_X402_TLS_KEY must be standard base64 of a PEM private key",
+            );
+            expect(message).not.toContain(value);
+        },
+    );
+    it("needs neither secret when allowance_wallet is empty", () => {
+        const s = readSecrets(
+            validEnv({ BUGNET_ALLOWANCE_KEY: "set", BUGNET_X402_TLS_KEY: "set" }),
+            settings(),
+        );
+        expect(s.allowanceKey).toBe("");
+        expect(s.x402TlsKey).toBe("");
+    });
+});
+
+describe("x402 secret redaction", () => {
+    it("redacts the two new secrets, the TLS key also as its decoded PEM", () => {
+        const env = {
+            BUGNET_ALLOWANCE_KEY: "allowance-secret-value",
+            BUGNET_X402_TLS_KEY: Buffer.from(PEM).toString("base64"),
+        };
+        const out: string[] = [];
+        const log = jsonLog("payments", { secrets: secretValues(env), write: (l) => out.push(l) });
+        log.error(`k=${env.BUGNET_ALLOWANCE_KEY} b=${env.BUGNET_X402_TLS_KEY} p=${PEM}`);
+        expect(out[0]).not.toContain("allowance-secret-value");
+        expect(out[0]).not.toContain(env.BUGNET_X402_TLS_KEY);
+        expect(out[0]).not.toContain("MC4CAQAwBQYDK2VwBCIEIA==");
+        expect(out[0]!.match(/\[redacted\]/g)).toHaveLength(3);
+    });
+    it("never adds a decoded value that is not a PEM", () => {
+        expect(secretValues({ BUGNET_X402_TLS_KEY: "c2hvcnQ=" })).toEqual(["c2hvcnQ="]);
     });
 });

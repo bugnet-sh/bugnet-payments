@@ -100,6 +100,8 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
         feePayerKey: keypairSecret(FEE_PAYER_SEED, feePayer),
         refundKey: "",
         rpcUrl: "",
+        allowanceKey: "",
+        x402TlsKey: "",
     };
     const rpc = createFakeRpc();
     const http = createHttpApp(

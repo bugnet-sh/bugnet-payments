@@ -9,7 +9,28 @@ export type AlarmName =
     | "payment_missing_inflow"
     | "audit_unreadable_tx"
     | "manual_queue"
-    | "router_get_order_unavailable";
+    | "router_get_order_unavailable"
+    | "x402_incident"
+    | "x402_outflow_cap"
+    | "x402_unresolved"
+    | "x402_tail_lag"
+    | "x402_rpc_budget"
+    | "x402_ref_conflict"
+    | "x402_refund_budget"
+    | "x402_pool_high"
+    | "x402_pool_drift"
+    | "x402_audit_mismatch"
+    | "x402_cert_expiry"
+    | "x402_reload_failed"
+    | "x402_payee_unreliable"
+    | "x402_signer_down"
+    | "x402_events_stuck"
+    | "x402_event_dropped"
+    | "x402_event_refused"
+    | "x402_close_slow"
+    | "x402_close_unverifiable"
+    | "x402_resign_waiting"
+    | "x402_cold_transfer_failed";
 
 type Fields = Record<string, unknown>;
 

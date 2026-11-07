@@ -174,6 +174,9 @@ async function rpcStub(withAccounts: boolean): Promise<{ url: string; close(): P
     };
 }
 
+const PEM_MAIN_TEST =
+    "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIMainTest\n-----END PRIVATE KEY-----\n";
+
 function envFor(rpcUrl: string, over: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = {
         BUGNET_PAYMENTS_TOKEN: secrets.paymentsToken,
@@ -247,6 +250,8 @@ beforeAll(async () => {
         feePayerKey: await secretKey(5),
         refundKey: await secretKey(6),
         rpcUrl: "",
+        allowanceKey: "",
+        x402TlsKey: "",
     };
 });
 afterAll(async () => {
@@ -525,6 +530,8 @@ describe("startService", () => {
             ...secrets,
             routerToken: "router-token-start-test",
             rpcUrl: "https://rpc.example/?api-key=start-test",
+            allowanceKey: "allowance-key-start-test",
+            x402TlsKey: PEM_MAIN_TEST,
         };
         vi.stubEnv("BUGNET_TEST_PAYER_MNEMONIC", "abandon ability able, about above absent");
         const values = [
@@ -665,6 +672,8 @@ describe("main", () => {
             BUGNET_TEST_PAYER_KEY: "test-payer-key-main-test",
             BUGNET_TEST_PAYER_MNEMONIC: "abandon ability able, about above absent",
             BUGNET_RECIPIENT_KEY: "recipient-key-main-test",
+            BUGNET_ALLOWANCE_KEY: "allowance-key-main-test",
+            BUGNET_X402_TLS_KEY: Buffer.from(PEM_MAIN_TEST).toString("base64"),
             BUGNET_TEST_PG_URL: "postgres://tester:pw-main-test@localhost:5432/postgres",
         });
         const values = SECRET_VARS.map((name) => env[name] ?? "");

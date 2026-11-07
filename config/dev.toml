@@ -13,3 +13,11 @@ fee_payer_boot_min_lamports = 20000000
 
 [alarms]
 fee_payer_min_lamports = 20000000
+
+[x402]
+# Off locally; the files come from bugnet-dev mtls init --dev --out .dev/x402 (Handoff H6)
+enabled = false
+allowance_wallet = ""
+tls_cert_file = ".dev/x402/x402-server.pem"
+client_ca_file = ".dev/x402/internal-ca.pem"
+indexed_services_file = ".dev/x402/x402-index.json"
