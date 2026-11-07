@@ -10,6 +10,8 @@ interface TestPki {
     clientKey: string;
     otherClientCert: string;
     otherClientKey: string;
+    wildClientCert: string;
+    wildClientKey: string;
 }
 
 // Written for OpenSSL 3 and the LibreSSL of macOS alike: extensions come from files, keys from
@@ -24,7 +26,7 @@ export function makeTestPki(dir: string, o: { days?: number } = {}): TestPki {
         openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", at(`${n}.sec1`));
         openssl("pkcs8", "-topk8", "-nocrypt", "-in", at(`${n}.sec1`), "-out", at(`${n}.key`));
     };
-    for (const n of ["ca", "server", "client", "other"]) key(n);
+    for (const n of ["ca", "server", "client", "other", "wild"]) key(n);
 
     writeFileSync(
         at("ca.ext"),
@@ -67,6 +69,8 @@ export function makeTestPki(dir: string, o: { days?: number } = {}): TestPki {
     leaf("client", "bugnet-egress.internal", "clientAuth", 3);
     leaf("other", "bugnet-other.internal", "clientAuth", 4);
 
+    leaf("wild", "*.internal", "clientAuth", 5);
+
     return {
         ca: at("ca.pem"),
         serverCert: at("server.pem"),
@@ -75,5 +79,7 @@ export function makeTestPki(dir: string, o: { days?: number } = {}): TestPki {
         clientKey: at("client.key"),
         otherClientCert: at("other.pem"),
         otherClientKey: at("other.key"),
+        wildClientCert: at("wild.pem"),
+        wildClientKey: at("wild.key"),
     };
 }

@@ -255,6 +255,7 @@ export interface X402SellerStats {
 }
 export interface SignerHealth {
     open(): boolean;
+    onDown?(cb: () => void): void;
 }
 export interface BugnetAddresses {
     feePayer: string;

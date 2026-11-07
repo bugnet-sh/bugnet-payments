@@ -2,6 +2,7 @@ import { createPrivateKey, X509Certificate } from "node:crypto";
 import { createSecureServer, type ServerHttp2Session } from "node:http2";
 import type { AddressInfo } from "node:net";
 import type { ServiceImpl } from "@connectrpc/connect";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { connectNodeAdapter } from "@connectrpc/connect-node";
 import { X402SignerService } from "../gen/bugnet/payments/v1/x402_pb.ts";
 import { splitListen } from "../http/server.ts";
@@ -40,7 +41,7 @@ export function checkTlsFiles(f: TlsFiles, serverName: string, now: Date): TlsCh
     if (!cert.checkPrivateKey(key)) {
         return { ok: false, problem: "BUGNET_X402_TLS_KEY does not match tls_cert_file" };
     }
-    if (cert.checkHost(serverName, { subject: "never" }) === undefined) {
+    if (cert.checkHost(serverName, { subject: "never", wildcards: false }) === undefined) {
         return { ok: false, problem: `tls_cert_file does not name ${serverName}` };
     }
     const ca = parseCert(f.caPem);
@@ -65,6 +66,7 @@ const CHECKS: readonly LiveCheckName[] = ["token_account", "tls"];
 export class SignerGate implements SignerHealth {
     private readonly state = new Map<LiveCheckName, CheckState>();
     private wasDown = false;
+    private readonly downListeners: Array<() => void> = [];
 
     constructor(private readonly o: { staleAfterMs: number; log: Log; now: () => Date }) {}
 
@@ -88,6 +90,10 @@ export class SignerGate implements SignerHealth {
         this.evaluate(check, detail);
     }
 
+    onDown(cb: () => void): void {
+        this.downListeners.push(cb);
+    }
+
     open(): boolean {
         this.evaluate();
         return CHECKS.every((c) => this.state.has(c)) && !this.down();
@@ -109,8 +115,10 @@ export class SignerGate implements SignerHealth {
 
     private evaluate(check?: LiveCheckName, detail?: string): void {
         const down = this.down();
-        if (down && !this.wasDown) this.o.log.alarm("x402_signer_down", { check, detail });
+        const was = this.wasDown;
+        if (down && !was) this.o.log.alarm("x402_signer_down", { check, detail });
         this.wasDown = down;
+        if (down && !was) for (const cb of this.downListeners) cb();
     }
 }
 
@@ -131,6 +139,25 @@ export async function startSignerListener(o: {
     service: Partial<ServiceImpl<typeof X402SignerService>>;
     log: Log;
 }): Promise<SignerListener> {
+    const sessions = new Set<ServerHttp2Session>();
+    const dropSessions = () => {
+        for (const s of sessions) s.destroy();
+    };
+    o.gate.onDown?.(dropSessions);
+    // A session opened while the gate was open must not outlive it, so every call checks again
+    const guarded = <A extends unknown[], Res>(fn: ((...a: A) => Res | Promise<Res>) | undefined) =>
+        fn &&
+        (async (...args: A): Promise<Res> => {
+            if (!o.gate.open()) {
+                setImmediate(dropSessions);
+                throw new ConnectError("x402 signer is closed", Code.Unavailable);
+            }
+            return await fn(...args);
+        });
+    const service = {
+        reserveAndSign: guarded(o.service.reserveAndSign),
+        reportOutcome: guarded(o.service.reportOutcome),
+    } as Partial<ServiceImpl<typeof X402SignerService>>;
     const server = createSecureServer(
         {
             cert: o.files.certPem,
@@ -141,7 +168,7 @@ export async function startSignerListener(o: {
             ...TLS13,
             allowHTTP1: false,
         },
-        connectNodeAdapter({ routes: (r) => r.service(X402SignerService, o.service) }),
+        connectNodeAdapter({ routes: (r) => r.service(X402SignerService, service) }),
     );
     let clientNotAfter: Date | null = null;
     // Runs before http2 makes a session, so a refused peer never reaches the service
@@ -150,14 +177,13 @@ export async function startSignerListener(o: {
         if (
             !o.gate.open() ||
             !peer ||
-            peer.checkHost(o.clientName, { subject: "never" }) === undefined
+            peer.checkHost(o.clientName, { subject: "never", wildcards: false }) === undefined
         ) {
             socket.destroy();
             return;
         }
         clientNotAfter = peer.validToDate;
     });
-    const sessions = new Set<ServerHttp2Session>();
     server.on("session", (s: ServerHttp2Session) => {
         sessions.add(s);
         s.once("close", () => sessions.delete(s));
@@ -178,14 +204,22 @@ export async function startSignerListener(o: {
                 o.log.alarm("x402_reload_failed", { file: "x402 tls", problem: check.problem });
                 return false;
             }
-            server.setSecureContext({ cert: f.certPem, key: f.keyPem, ca: f.caPem, ...TLS13 });
+            try {
+                server.setSecureContext({ cert: f.certPem, key: f.keyPem, ca: f.caPem, ...TLS13 });
+            } catch {
+                o.log.alarm("x402_reload_failed", {
+                    file: "x402 tls",
+                    problem: "tls files rejected by the TLS stack",
+                });
+                return false;
+            }
             return true;
         },
         lastClientCertNotAfter: () => clientNotAfter,
         close: () =>
             new Promise<void>((resolve) => {
                 server.close(() => resolve());
-                for (const s of sessions) s.destroy();
+                dropSessions();
             }),
     };
 }

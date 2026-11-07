@@ -1,5 +1,6 @@
 import { X509Certificate } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { connect as h2Connect, type ClientHttp2Session } from "node:http2";
 import { connect as tlsConnect } from "node:tls";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -101,6 +102,36 @@ function peerFingerprint(port: number): Promise<string> {
         s.once("error", reject);
     });
 }
+function rawSession(port: number): Promise<ClientHttp2Session> {
+    return new Promise((resolve, reject) => {
+        const s = h2Connect(`https://127.0.0.1:${port}`, {
+            ca: files.caPem,
+            cert: pem(pki.clientCert),
+            key: pem(pki.clientKey),
+            servername: SERVER_NAME,
+        });
+        s.once("connect", () => resolve(s));
+        s.once("error", reject);
+    });
+}
+function rawCall(s: ClientHttp2Session, method: string): Promise<number> {
+    return new Promise((resolve, reject) => {
+        const req = s.request({
+            ":method": "POST",
+            ":path": `/bugnet.payments.v1.X402SignerService/${method}`,
+            "content-type": "application/json",
+            "connect-protocol-version": "1",
+        });
+        req.on("response", (h) => resolve(Number(h[":status"])));
+        req.on("error", reject);
+        req.end("{}");
+        req.resume();
+    });
+}
+const closed = (s: ClientHttp2Session) =>
+    s.closed || s.destroyed
+        ? Promise.resolve()
+        : new Promise<void>((r) => s.once("close", () => r()));
 function alarms(name: string) {
     return log.lines.filter((l) => l.alarm === name);
 }
@@ -149,6 +180,67 @@ describe("startSignerListener", () => {
         expect((await egress(l.port).reserveAndSign({ ref: "abcdefghijklmnop" })).result.case).toBe(
             "refused",
         );
+    });
+
+    it("refuses a client certificate named only by a wildcard", async () => {
+        const l = await listen();
+        const wild = client(l.port, { cert: pki.wildClientCert, key: pki.wildClientKey });
+        await expect(wild.reserveAndSign({ ref: "abcdefghijklmnop" })).rejects.toThrow();
+        expect(calls).toEqual([]);
+    });
+
+    it("answers Unavailable on an open session once the gate closes, then destroys it", async () => {
+        let open = true;
+        const l = await listen(() => open);
+        const s = await rawSession(l.port);
+        expect(await rawCall(s, "ReserveAndSign")).toBe(200);
+        open = false;
+        expect(await rawCall(s, "ReserveAndSign")).toBe(503);
+        expect(await rawCall(s, "ReportOutcome").catch(() => 503)).toBe(503);
+        await closed(s);
+        expect(s.destroyed || s.closed).toBe(true);
+        expect(calls).toEqual([""]);
+    });
+
+    it("destroys open sessions when a real gate goes down", async () => {
+        const gate = new SignerGate({ staleAfterMs: 120_000, log, now: () => T0 });
+        gate.record("tls", "pass");
+        gate.record("token_account", "pass");
+        const l = await startSignerListener({
+            listen: "127.0.0.1:0",
+            files,
+            clientName: "bugnet-egress.internal",
+            gate,
+            service: {},
+            log,
+        });
+        listeners.push(l);
+        const s = await rawSession(l.port);
+        gate.record("token_account", "fail");
+        await closed(s);
+        expect(s.destroyed || s.closed).toBe(true);
+    });
+
+    it("reload with a broken later certificate block alarms and returns false", async () => {
+        const l = await listen();
+        const broken = `${files.certPem}\n-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n`;
+        expect(l.reload({ ...files, certPem: broken })).toBe(false);
+        expect(alarms("x402_reload_failed")).toHaveLength(1);
+        expect((await egress(l.port).reserveAndSign({ ref: "abcdefghijklmnop" })).result.case).toBe(
+            "refused",
+        );
+    });
+
+    it("still refuses TLS 1.2 after a successful reload", async () => {
+        const l = await listen();
+        expect(l.reload(files)).toBe(true);
+        const old = client(l.port, {
+            cert: pki.clientCert,
+            key: pki.clientKey,
+            maxVersion: "TLSv1.2",
+        });
+        await expect(old.reserveAndSign({ ref: "abcdefghijklmnop" })).rejects.toThrow();
+        expect(calls).toEqual([]);
     });
 
     it("reload keeps the old files on a bad file and alarms", async () => {
