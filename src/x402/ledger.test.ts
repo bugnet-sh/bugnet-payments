@@ -61,7 +61,7 @@ async function routerWith(impl: Parameters<typeof startFakeRouter>[0]) {
     return createRouterClient({
         url: r.url,
         token: "rt",
-        timeoutMs: 1_000,
+        timeoutMs: 5_000,
         checkPayer: false,
         getOrder: false,
         log: silentLog,

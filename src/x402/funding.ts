@@ -13,7 +13,7 @@ export type UnspentOutcome =
     | { kind: "kept"; keptMicros: number }
     | { kind: "refund"; refundIds: number[]; amountMicros: number };
 
-// The caller holds the order and account row locks in every method.
+// The caller holds the account row lock in every method, and the order row lock in all but refund.
 export interface AllowanceFunding {
     fund(
         c: pg.PoolClient,
@@ -106,17 +106,20 @@ export function createAllowanceFunding(d: { x402: Settings["x402"]; log: Log }):
     ): Promise<boolean> {
         if (!(await voidConditionsHold(c, account, triggerDeadline))) return false;
         const voided = await c.query<{ allowance_micros: string; payer: string }>(
-            `update x402_fundings set voided_at = $2 where order_id = $1 and voided_at is null
+            `update x402_fundings set voided_at = $2
+             where order_id = $1 and account_id = $3 and voided_at is null
              returning allowance_micros, payer`,
-            [order.id, at],
+            [order.id, at, account.id],
         );
         if (voided.rows.length !== 1) return false;
         const { payer } = voided.rows[0]!;
         const amount = Number(voided.rows[0]!.allowance_micros);
-        await c.query("update x402_accounts set funded_micros = funded_micros - $2 where id = $1", [
-            account.id,
-            amount,
-        ]);
+        const lowered = await c.query(
+            `update x402_accounts set funded_micros = funded_micros - $2
+             where id = $1 and funded_micros >= $2`,
+            [account.id, amount],
+        );
+        if (lowered.rowCount !== 1) throw new Error(`x402 account ${account.id} changed`);
         await c.query(
             `delete from x402_payers p where p.payer = $1 and p.first_order_id = $2
              and not exists (select 1 from x402_fundings f where f.payer = $1 and f.voided_at is null)`,

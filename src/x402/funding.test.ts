@@ -286,6 +286,31 @@ describe("refund", () => {
         expect(states.rows.map((r) => r.state)).toEqual(["redeemed", "redeemed"]);
     });
 
+    it("skips voided fundings when allocating", async () => {
+        const a = await seedAccount(db.pool);
+        await seedFunding(db.pool, {
+            accountId: a.id,
+            allowanceMicros: 1_000_000,
+            createdAt: T0,
+            sourceTokenAccount: "src-a",
+            payer: "payer-a",
+        });
+        await seedFunding(db.pool, {
+            accountId: a.id,
+            allowanceMicros: 500_000,
+            createdAt: T1,
+            sourceTokenAccount: "src-b",
+            payer: "payer-b",
+            voidedAt: T1,
+        });
+        await db.pool.query("update x402_accounts set spent_micros = 300000 where id = $1", [a.id]);
+        const out = await inAccountTx(a.id, (c, locked) => F.refund(c, locked, AT));
+        expect(out).toMatchObject({ kind: "refund", amountMicros: 700_000 });
+        expect(await allowanceRows(a.id)).toEqual([
+            expect.objectContaining({ amountMicros: 700_000, destination: "src-a" }),
+        ]);
+    });
+
     it("keeps an unspent rest under the minimum once", async () => {
         const a = await fundedAccount(996_000);
         expect(await inAccountTx(a.id, (c, l) => F.refund(c, l, AT))).toEqual({
