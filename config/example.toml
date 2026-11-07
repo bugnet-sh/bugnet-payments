@@ -45,7 +45,7 @@ event_public_key = ""                   # standard base64 of the router's 32-byt
 
 [refunds]
 enabled = true
-daily_cap_micros = 20000000
+daily_cap_micros = 20000000             # a refund larger than this goes to the manual queue
 max_per_hour = 10
 float_low_micros = 10000000
 compute_unit_limit = 20000

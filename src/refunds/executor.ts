@@ -63,6 +63,7 @@ interface SignedRefund {
 type ManualReason =
     | "refund_exceeds_payment"
     | "refund_destination_invalid"
+    | "refund_exceeds_cap"
     | "refund_failed_onchain"
     | "refund_expired_repeatedly";
 
@@ -220,6 +221,10 @@ async function checkPending(
     }
     if (!(await viaRpc(() => destinationValid(d, r)))) {
         return toManual(c, r, "refund_destination_invalid");
+    }
+    // No later day would let it through, so pausing for it would stop every refund behind it
+    if (r.amountMicros > d.cfg.daily_cap_micros) {
+        return toManual(c, r, "refund_exceeds_cap");
     }
     if ((await signedToday(c, now)) + r.amountMicros > d.cfg.daily_cap_micros) {
         return { kind: "pause", reason: "daily_cap" };

@@ -677,6 +677,28 @@ describe("runRefunds", () => {
         expect(rpc.calls.sendTransaction).toBe(0);
     });
 
+    it("queues a refund larger than the daily cap for an operator and keeps refunding", async () => {
+        const large = await pendingRefund(25_000);
+        const small = await pendingRefund(10_000);
+        const rpc = okRpc();
+        const tick = await runRefunds(deps(rpc, T0, { daily_cap_micros: 20_000 }));
+        expect(tick).toMatchObject({ sent: 1, manual: 1, paused: null });
+        expect(await findRefund(db.pool, large.id)).toMatchObject({
+            state: "manual",
+            manualReason: "refund_exceeds_cap",
+            txSignature: null,
+        });
+        expect(await findOrder(db.pool, large.id)).toMatchObject({
+            state: "manual",
+            manualReason: "refund_exceeds_cap",
+        });
+        expect((await findRefund(db.pool, small.id))!.state).toBe("sent");
+        expect(await refundsPaused(db.pool)).toBeNull();
+        expect(alarms("manual_queue")).toEqual([
+            expect.objectContaining({ orderId: large.id, reason: "refund_exceeds_cap" }),
+        ]);
+    });
+
     it("pauses at the daily cap", async () => {
         const yesterday = await pendingRefund(15_000);
         await db.pool.query(
