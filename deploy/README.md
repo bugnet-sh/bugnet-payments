@@ -141,8 +141,10 @@ Run the `pnpm cli` commands in a checkout whose `.env` holds the production keys
   router's environment loaded.
 - `BUGNET_PAYMENTS_ROUTER_TOKEN` is shared with the router session's new variable: the same name
   and value in both environments (`bugnet-dev keys` prints one).
-- Router `wallets.facilitator_addresses = ["<fee_payer address from pnpm cli keys show>"]`, so the
-  router never counts our fee payer as a user.
+- Once the router ships it, router
+  `wallets.facilitator_addresses = ["<fee_payer address from pnpm cli keys show>"]`, so the router
+  never counts our fee payer as a user. Not before: the router refuses unknown TOML keys and would
+  not start.
 - `router.get_order` is true, since the router serves GetOrder. Flip `router.check_payer` to true
   only after the router ships CheckPayer (router Task 28).
 
