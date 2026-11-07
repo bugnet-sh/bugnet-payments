@@ -45,7 +45,13 @@ export type FakeRpc = SolanaRpc & { calls: Record<string, number>; sent: string[
 // Only the caller's abort signal ends a call answered by this
 export const neverAnswers = (): Promise<never> => new Promise(() => {});
 
-// A status answer scripted without a context comes from a node at the default finalized slot
+const CONTEXT_READS: ReadonlySet<string> = new Set([
+    "getSignatureStatuses",
+    "getAccountInfo",
+    "getTokenAccountBalance",
+]);
+
+// A status or account answer scripted without a context comes from a node at the default finalized slot
 async function withContext(answer: unknown): Promise<unknown> {
     const value = await answer;
     if (value === null || typeof value !== "object" || "context" in value) return value;
@@ -89,7 +95,7 @@ export function createFakeRpc(script: Partial<FakeRpcScript> = {}): FakeRpc {
             send: async (options?: { abortSignal?: AbortSignal }) => {
                 calls[name]!++;
                 const answer = (handlers[name] as (...a: unknown[]) => unknown)(...args);
-                const result = name === "getSignatureStatuses" ? withContext(answer) : answer;
+                const result = CONTEXT_READS.has(name) ? withContext(answer) : answer;
                 const signal = options?.abortSignal;
                 if (!signal) {
                     return result;

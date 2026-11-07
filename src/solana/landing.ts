@@ -4,11 +4,14 @@ import { deadline, type SolanaRpc } from "./rpc.ts";
 export type Landing = "landed" | "onchain_failed" | "processed" | "not_found" | "blockhash_expired";
 
 export type LandingRead =
-    { landing: "landed"; signature: string } | { landing: Exclude<Landing, "landed"> };
+    | { landing: "landed"; signature: string; slot: bigint }
+    | { landing: "onchain_failed"; slot: bigint }
+    | { landing: "processed" | "not_found" | "blockhash_expired" };
 
 type Status = {
     confirmationStatus: string | null;
     err: unknown;
+    slot: bigint;
 } | null;
 
 // A processed-only result can still be dropped with its fork, so it decides nothing
@@ -25,7 +28,8 @@ function settled(status: Status): status is NonNullable<Status> {
  * finalized slot, so a lagging node never turns a landed transaction into an expired one.
  * `earlier` are signatures of earlier attempts at the same transfer: any of them landing counts
  * as landed, and any of them still processed only keeps the verdict open. A landed verdict names
- * the signature that landed.
+ * the signature that landed, with that status's slot; onchain_failed carries the slot of
+ * txSignature's status.
  */
 export async function readLanding(
     rpc: SolanaRpc,
@@ -41,9 +45,10 @@ export async function readLanding(
         .send(deadline(timeoutMs));
     const statuses: Status[] = signatures.map((_, i) => value[i] ?? null);
     const landed = statuses.findIndex((s) => settled(s) && s.err === null);
-    if (landed !== -1) return { landing: "landed", signature: signatures[landed]! };
+    if (landed !== -1)
+        return { landing: "landed", signature: signatures[landed]!, slot: statuses[landed]!.slot };
     const [status = null, ...earlierStatuses] = statuses;
-    if (settled(status)) return { landing: "onchain_failed" };
+    if (settled(status)) return { landing: "onchain_failed", slot: status.slot };
     if (status !== null || earlierStatuses.some((s) => s !== null && !settled(s))) {
         return { landing: "processed" };
     }

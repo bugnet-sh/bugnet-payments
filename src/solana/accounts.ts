@@ -18,6 +18,9 @@ export interface TokenAccountInfo {
     owner: string;
     state: "initialized" | "frozen" | "uninitialized";
     amount: bigint;
+    delegate: string | null;
+    closeAuthority: string | null;
+    contextSlot: bigint;
 }
 
 interface ParsedTokenAccount {
@@ -27,6 +30,8 @@ interface ParsedTokenAccount {
             info?: {
                 mint?: string;
                 owner?: string;
+                delegate?: string;
+                closeAuthority?: string;
                 state?: string;
                 tokenAmount?: { amount?: string };
             };
@@ -37,11 +42,19 @@ interface ParsedTokenAccount {
 export async function inspectTokenAccount(
     rpc: SolanaRpc,
     account: Address,
-    send: { abortSignal?: AbortSignal } = {},
+    o: {
+        commitment?: "confirmed" | "finalized";
+        minContextSlot?: bigint;
+        abortSignal?: AbortSignal;
+    } = {},
 ): Promise<TokenAccountInfo | null> {
-    const { value } = await rpc
-        .getAccountInfo(account, { encoding: "jsonParsed", commitment: "confirmed" })
-        .send(send);
+    const { context, value } = await rpc
+        .getAccountInfo(account, {
+            encoding: "jsonParsed",
+            commitment: o.commitment ?? "confirmed",
+            ...(o.minContextSlot === undefined ? {} : { minContextSlot: o.minContextSlot }),
+        })
+        .send({ abortSignal: o.abortSignal });
     if (value === null) return null;
     const acct = value as unknown as ParsedTokenAccount;
     const info = acct.data?.parsed?.info;
@@ -52,5 +65,8 @@ export async function inspectTokenAccount(
         owner: info?.owner ?? "",
         state: state === "initialized" || state === "frozen" ? state : "uninitialized",
         amount: BigInt(info?.tokenAmount?.amount ?? "0"),
+        delegate: info?.delegate ?? null,
+        closeAuthority: info?.closeAuthority ?? null,
+        contextSlot: BigInt(context.slot),
     };
 }

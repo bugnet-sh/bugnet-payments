@@ -1,4 +1,5 @@
 import {
+    address,
     appendTransactionMessageInstruction,
     createTransactionMessage,
     getBase58Decoder,
@@ -21,6 +22,7 @@ import {
 } from "../testing/fake-rpc.ts";
 import { testSigner } from "../testing/keys.ts";
 import { BlockhashCache } from "./blockhash.ts";
+import { inspectTokenAccount } from "./accounts.ts";
 import { MEMO_PROGRAM, TOKEN_PROGRAM, USDC_MINT } from "./constants.ts";
 import { generateExportableKeypair, loadKeypair } from "./keys.ts";
 import { readLanding } from "./landing.ts";
@@ -200,11 +202,11 @@ describe("readLanding", () => {
     });
 
     it.each([
-        ["landed", [null, entry("confirmed")], { landing: "landed", signature: earlier }],
+        ["landed", [null, entry("confirmed")], { landing: "landed", signature: earlier, slot: 1n }],
         [
             "finalized after a failed current attempt",
             [entry("confirmed", failed), entry("finalized")],
-            { landing: "landed", signature: earlier },
+            { landing: "landed", signature: earlier, slot: 1n },
         ],
         ["processed only", [null, entry("processed")], { landing: "processed" }],
         ["failed", [null, entry("confirmed", failed)], { landing: "blockhash_expired" }],
@@ -238,10 +240,103 @@ describe("readLanding", () => {
         expect(await read([entry("confirmed"), null, null])).toEqual({
             landing: "landed",
             signature: sig,
+            slot: 1n,
         });
         expect(await read([null, entry("processed"), entry("finalized")])).toEqual({
             landing: "landed",
             signature: third,
+            slot: 1n,
         });
+    });
+
+    it("returns the status slot with landed and onchain_failed", async () => {
+        const at = (err: unknown) => () => ({
+            value: [{ confirmationStatus: "finalized", err, slot: 555n, confirmations: null }],
+        });
+        const read = (s: () => unknown) =>
+            readLanding(createFakeRpc({ getSignatureStatuses: s }), sig, 1_000n, 10_000);
+        expect(await read(at(null))).toEqual({ landing: "landed", signature: sig, slot: 555n });
+        expect(await read(at(failed))).toEqual({ landing: "onchain_failed", slot: 555n });
+        expect(await read(missing)).toEqual({ landing: "not_found" });
+    });
+
+    it("gives the slot of the earlier signature that landed", async () => {
+        const rpc = createFakeRpc({
+            getEpochInfo: () => epochAt(1_001n),
+            getSignatureStatuses: () => ({
+                value: [
+                    null,
+                    { confirmationStatus: "confirmed", err: null, slot: 777n, confirmations: 1n },
+                ],
+            }),
+        });
+        expect(await readLanding(rpc, sig, 1_000n, 10_000, [earlier])).toEqual({
+            landing: "landed",
+            signature: earlier,
+            slot: 777n,
+        });
+    });
+});
+
+const ACCOUNT = address("4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi");
+const parsed = (info: Record<string, unknown>) => () => ({
+    context: { slot: 1234n },
+    value: {
+        owner: TOKEN_PROGRAM,
+        data: {
+            parsed: {
+                info: {
+                    mint: USDC_MINT,
+                    owner: "O",
+                    state: "initialized",
+                    tokenAmount: { amount: "5" },
+                    ...info,
+                },
+            },
+        },
+    },
+});
+
+describe("inspectTokenAccount", () => {
+    it("returns delegate, close authority and the context slot", async () => {
+        const rpc = createFakeRpc({
+            getAccountInfo: parsed({ delegate: "D", closeAuthority: "C" }),
+        });
+        expect(await inspectTokenAccount(rpc, ACCOUNT)).toEqual({
+            programOwner: TOKEN_PROGRAM,
+            mint: USDC_MINT,
+            owner: "O",
+            state: "initialized",
+            amount: 5n,
+            delegate: "D",
+            closeAuthority: "C",
+            contextSlot: 1234n,
+        });
+    });
+
+    it("gives null for an absent delegate and close authority", async () => {
+        const rpc = createFakeRpc({ getAccountInfo: parsed({}) });
+        expect(await inspectTokenAccount(rpc, ACCOUNT)).toMatchObject({
+            delegate: null,
+            closeAuthority: null,
+        });
+    });
+
+    it("passes commitment and minContextSlot", async () => {
+        const seen: unknown[] = [];
+        const rpc = createFakeRpc({
+            getAccountInfo: (_a: unknown, cfg: unknown) => (seen.push(cfg), parsed({})()),
+        });
+        await inspectTokenAccount(rpc, ACCOUNT, { commitment: "finalized", minContextSlot: 99n });
+        await inspectTokenAccount(rpc, ACCOUNT);
+        expect(seen).toEqual([
+            { encoding: "jsonParsed", commitment: "finalized", minContextSlot: 99n },
+            { encoding: "jsonParsed", commitment: "confirmed" },
+        ]);
+    });
+
+    it("reads the default context slot from the fake RPC", async () => {
+        const rpc = createFakeRpc({ getAccountInfo: () => ({ value: parsed({})().value }) });
+        expect((await inspectTokenAccount(rpc, ACCOUNT))!.contextSlot).toBe(TEST_SLOT);
     });
 });
