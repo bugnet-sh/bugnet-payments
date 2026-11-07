@@ -12,7 +12,13 @@ import {
 } from "@solana/kit";
 import { getTransferSolInstruction } from "@solana-program/system";
 import { describe, expect, it } from "vitest";
-import { createFakeRpc, TEST_BLOCKHASH, TEST_LVBH } from "../testing/fake-rpc.ts";
+import {
+    createFakeRpc,
+    epochAt,
+    TEST_BLOCKHASH,
+    TEST_LVBH,
+    TEST_SLOT,
+} from "../testing/fake-rpc.ts";
 import { testSigner } from "../testing/keys.ts";
 import { BlockhashCache } from "./blockhash.ts";
 import { MEMO_PROGRAM, TOKEN_PROGRAM, USDC_MINT } from "./constants.ts";
@@ -137,11 +143,16 @@ describe("fake rpc", () => {
 
 describe("readLanding", () => {
     const sig = getBase58Decoder().decode(new Uint8Array(64).fill(7));
+    const earlier = getBase58Decoder().decode(new Uint8Array(64).fill(8));
+    const entry = (confirmationStatus: string, err: unknown = null) => ({
+        confirmationStatus,
+        err,
+        slot: 1n,
+        confirmations: 1n,
+    });
     const status =
         (confirmationStatus: string, err: unknown = null) =>
-        () => ({
-            value: [{ confirmationStatus, err, slot: 1n, confirmations: 1n }],
-        });
+        () => ({ value: [entry(confirmationStatus, err)] });
     const missing = () => ({ value: [null] });
     const failed = { InstructionError: [2, { Custom: 1 }] };
 
@@ -153,16 +164,16 @@ describe("readLanding", () => {
         ["missing while the blockhash is valid", missing, 1_000n, "not_found"],
         ["missing past the last valid height", missing, 1_001n, "blockhash_expired"],
     ])("answers %s", async (_n, getSignatureStatuses, height, want) => {
-        const rpc = createFakeRpc({ getSignatureStatuses, getBlockHeight: () => height });
+        const rpc = createFakeRpc({ getSignatureStatuses, getEpochInfo: () => epochAt(height) });
         expect(await readLanding(rpc, sig, 1_000n, 10_000)).toBe(want);
     });
 
-    it("reads the finalized height before the signature status", async () => {
+    it("reads the finalized height and slot in one call, before the signature status", async () => {
         const reads: unknown[][] = [];
         const rpc = createFakeRpc({
-            getBlockHeight: (...args: unknown[]) => {
-                reads.push(["height", ...args]);
-                return 1_000n;
+            getEpochInfo: (...args: unknown[]) => {
+                reads.push(["epoch", ...args]);
+                return epochAt(1_000n);
             },
             getSignatureStatuses: (...args: unknown[]) => {
                 reads.push(["status", ...args]);
@@ -171,8 +182,43 @@ describe("readLanding", () => {
         });
         await readLanding(rpc, sig, 1_000n, 10_000);
         expect(reads).toEqual([
-            ["height", { commitment: "finalized" }],
+            ["epoch", { commitment: "finalized" }],
             ["status", [sig], { searchTransactionHistory: true }],
         ]);
+        expect(rpc.calls.getBlockHeight).toBe(0);
+    });
+
+    it.each([
+        ["behind the finalized slot", TEST_SLOT - 1n, "not_found"],
+        ["at the finalized slot", TEST_SLOT, "blockhash_expired"],
+    ])("trusts a missing status only from a node %s", async (_n, slot, want) => {
+        const rpc = createFakeRpc({
+            getEpochInfo: () => epochAt(1_001n, TEST_SLOT),
+            getSignatureStatuses: () => ({ context: { slot }, value: [null] }),
+        });
+        expect(await readLanding(rpc, sig, 1_000n, 10_000)).toBe(want);
+    });
+
+    it.each([
+        ["landed", [null, entry("confirmed")], "landed"],
+        [
+            "finalized after a failed current attempt",
+            [entry("confirmed", failed), entry("finalized")],
+            "landed",
+        ],
+        ["processed only", [null, entry("processed")], "processed"],
+        ["failed", [null, entry("confirmed", failed)], "blockhash_expired"],
+        ["missing", [null, null], "blockhash_expired"],
+    ])("counts an earlier attempt that is %s", async (_n, value, want) => {
+        const reads: unknown[] = [];
+        const rpc = createFakeRpc({
+            getEpochInfo: () => epochAt(1_001n),
+            getSignatureStatuses: (sigs: unknown) => {
+                reads.push(sigs);
+                return { value };
+            },
+        });
+        expect(await readLanding(rpc, sig, 1_000n, 10_000, [earlier])).toBe(want);
+        expect(reads).toEqual([[sig, earlier]]);
     });
 });

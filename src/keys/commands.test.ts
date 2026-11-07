@@ -82,8 +82,15 @@ function result(method: string, params: unknown[]): unknown {
             return "5".repeat(87);
         case "getSignatureStatuses":
             return statusReply();
-        case "getBlockHeight":
-            return blockHeight;
+        case "getEpochInfo":
+            return {
+                absoluteSlot: 1,
+                blockHeight,
+                epoch: 0,
+                slotIndex: 1,
+                slotsInEpoch: 432_000,
+                transactionCount: null,
+            };
         default:
             throw new Error(`unscripted rpc method ${method}`);
     }

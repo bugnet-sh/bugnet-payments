@@ -26,6 +26,7 @@ import {
     type FakeRpc,
     type FakeRpcScript,
     neverAnswers,
+    epochAt,
     TEST_BLOCKHASH,
     TEST_LVBH,
 } from "../testing/fake-rpc.ts";
@@ -349,7 +350,7 @@ describe("runRefunds", () => {
         const recorder = sendRecorder();
         const rpc = okRpc({
             getSignatureStatuses: notFound,
-            getBlockHeight: () => TEST_LVBH,
+            getEpochInfo: () => epochAt(TEST_LVBH),
             sendTransaction: recorder.sendTransaction,
         });
         const tick = await runRefunds(deps(rpc, later(30_000)));
@@ -375,7 +376,7 @@ describe("runRefunds", () => {
         const recorder = sendRecorder();
         const rpc = okRpc({
             getSignatureStatuses: notFound,
-            getBlockHeight: () => TEST_LVBH + 1n,
+            getEpochInfo: () => epochAt(TEST_LVBH + 1n),
             getLatestBlockhash: () => ({
                 value: { blockhash: FRESH_BLOCKHASH, lastValidBlockHeight: 2_000n },
             }),
@@ -408,9 +409,9 @@ describe("runRefunds", () => {
         // The refund lands in the last valid block, so a status read before the height sees nothing
         let landed = false;
         const rpc = okRpc({
-            getBlockHeight: () => {
+            getEpochInfo: () => {
                 landed = true;
-                return TEST_LVBH + 1n;
+                return epochAt(TEST_LVBH + 1n);
             },
             getSignatureStatuses: () => ({ value: [landed ? CONFIRMED : null] }),
         });
@@ -427,9 +428,60 @@ describe("runRefunds", () => {
         expect(rpc.calls.sendTransaction).toBe(0);
     });
 
+    it("confirms rather than signs again when an earlier attempt landed late", async () => {
+        const { order, refund: first } = await sentRefund();
+        const reads: unknown[] = [];
+        let firstLanded = false;
+        const rpc = okRpc({
+            getSignatureStatuses: (sigs: string[]) => {
+                reads.push(sigs);
+                return {
+                    value: sigs.map((s) =>
+                        firstLanded && s === first.txSignature ? CONFIRMED : null,
+                    ),
+                };
+            },
+            getEpochInfo: () => epochAt(TEST_LVBH + 1n),
+            getLatestBlockhash: () => ({
+                value: { blockhash: FRESH_BLOCKHASH, lastValidBlockHeight: 2_000n },
+            }),
+        });
+        expect((await runRefunds(deps(rpc, later(30_000)))).resigned).toBe(1);
+        const second = (await findRefund(db.pool, order.id))!;
+        expect(second.previousSignatures).toEqual([first.txSignature]);
+
+        firstLanded = true;
+        const tick = await runRefunds(deps(rpc, later(60_000)));
+        expect(tick).toMatchObject({ confirmed: 1, resigned: 0, resent: 0 });
+        expect(reads.at(-1)).toEqual([second.txSignature, first.txSignature]);
+        expect((await findRefund(db.pool, order.id))!.state).toBe("confirmed");
+        expect((await findOrder(db.pool, order.id))!.state).toBe("refunded");
+        expect(rpc.calls.getLatestBlockhash).toBe(1);
+    });
+
+    it("never re-signs on a missing status from a node behind the finalized slot", async () => {
+        const { order, refund } = await sentRefund();
+        const rpc = okRpc({
+            getEpochInfo: () => epochAt(TEST_LVBH + 1n, 10_000n),
+            getSignatureStatuses: () => ({ context: { slot: 9_967n }, value: [null] }),
+        });
+        const tick = await runRefunds(deps(rpc, later(30_000)));
+        expect(tick).toMatchObject({ resigned: 0, resent: 1 });
+        expect(rpc.sent).toEqual([refund.wireTx]);
+        expect(await findRefund(db.pool, order.id)).toMatchObject({
+            attempts: 1,
+            txSignature: refund.txSignature,
+            previousSignatures: [],
+        });
+        expect(rpc.calls.getLatestBlockhash).toBe(0);
+    });
+
     it("queues a refund that expired max_attempts times for an operator", async () => {
         const { order } = await sentRefund({ max_attempts: 1 });
-        const rpc = okRpc({ getSignatureStatuses: notFound, getBlockHeight: () => TEST_LVBH + 1n });
+        const rpc = okRpc({
+            getSignatureStatuses: notFound,
+            getEpochInfo: () => epochAt(TEST_LVBH + 1n),
+        });
         const tick = await runRefunds(deps(rpc, later(30_000), { max_attempts: 1 }));
         expect(tick.manual).toBe(1);
         expect(await findRefund(db.pool, order.id)).toMatchObject({
@@ -460,7 +512,10 @@ describe("runRefunds", () => {
         expect(signed).toMatchObject({ state: "signed", attempts: 1, sentAt: null });
         expect(alarms("manual_queue")).toEqual([]);
 
-        const rpc = okRpc({ getSignatureStatuses: notFound, getBlockHeight: () => TEST_LVBH });
+        const rpc = okRpc({
+            getSignatureStatuses: notFound,
+            getEpochInfo: () => epochAt(TEST_LVBH),
+        });
         expect((await runRefunds(deps(rpc, later(30_000)))).resent).toBe(1);
         expect(rpc.sent).toEqual([signed.wireTx]);
         expect(await findRefund(db.pool, order.id)).toMatchObject({
@@ -541,7 +596,7 @@ describe("runRefunds", () => {
 
     it.each([
         ["getSignatureStatuses", {}],
-        ["getBlockHeight", { getSignatureStatuses: notFound }],
+        ["getEpochInfo", { getSignatureStatuses: notFound }],
     ] as const)("leaves a sent refund unchanged when %s fails", async (method, script) => {
         const { order, refund } = await sentRefund();
         const rpc = okRpc({
@@ -851,9 +906,12 @@ describe("runRefunds against a stalled RPC", () => {
     );
 
     it.each([
-        ["getBlockHeight", {}],
+        ["getEpochInfo", {}],
         ["getSignatureStatuses", {}],
-        ["sendTransaction", { getSignatureStatuses: notFound, getBlockHeight: () => TEST_LVBH }],
+        [
+            "sendTransaction",
+            { getSignatureStatuses: notFound, getEpochInfo: () => epochAt(TEST_LVBH) },
+        ],
     ] as const)(
         "gives up on a stalled %s within solana.rpc_timeout and leaves the sent refund",
         async (method, script) => {
@@ -938,7 +996,7 @@ describe("runRefunds while refunds are paused", () => {
     ])("neither resends nor re-signs a refund %s", async (_n, height) => {
         const { order, refund } = await sentRefund();
         await pauseRefunds(db.pool, "hourly_rate", log);
-        const rpc = okRpc({ getSignatureStatuses: notFound, getBlockHeight: () => height });
+        const rpc = okRpc({ getSignatureStatuses: notFound, getEpochInfo: () => epochAt(height) });
         const tick = await runRefunds(deps(rpc, later(30_000)));
         expect(tick).toMatchObject({ resent: 0, resigned: 0, paused: "hourly_rate" });
         expect(await findRefund(db.pool, order.id)).toEqual(refund);
@@ -955,7 +1013,7 @@ describe("runRefunds while refunds are paused", () => {
         await pauseRefunds(db.pool, "daily_cap", log);
         const rpc = okRpc({
             getSignatureStatuses: () => statuses,
-            getBlockHeight: () => TEST_LVBH + 1n,
+            getEpochInfo: () => epochAt(TEST_LVBH + 1n),
         });
         const tick = await runRefunds(deps(rpc, later(30_000), { max_attempts: 1 }));
         expect(tick).toMatchObject({ manual: 1, paused: "daily_cap" });

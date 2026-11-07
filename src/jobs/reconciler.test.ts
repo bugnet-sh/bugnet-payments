@@ -16,7 +16,7 @@ import { findRefund } from "../refunds/request.ts";
 import { createRouterClient } from "../router/client.ts";
 import { until } from "../testing/app.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
-import { createFakeRpc, type FakeRpc, neverAnswers } from "../testing/fake-rpc.ts";
+import { createFakeRpc, epochAt, type FakeRpc, neverAnswers } from "../testing/fake-rpc.ts";
 import { seedOrder, seedPayment } from "../testing/orders.ts";
 import { reconcileSettling, type ReconcileDeps, type ReconcileReport } from "./reconciler.ts";
 import { sweep } from "./sweeper.ts";
@@ -128,9 +128,9 @@ describe("reconcileSettling", () => {
                 statusCalls.push(args);
                 return { value: [CONFIRMED] };
             },
-            getBlockHeight: (...args: unknown[]) => {
+            getEpochInfo: (...args: unknown[]) => {
                 heightCalls.push(args);
-                return 900n;
+                return epochAt(900n);
             },
         });
 
@@ -167,7 +167,7 @@ describe("reconcileSettling", () => {
             });
         }
         expect(rpc.calls.getSignatureStatuses).toBe(0);
-        expect(rpc.calls.getBlockHeight).toBe(0);
+        expect(rpc.calls.getEpochInfo).toBe(0);
         expect((await orderOf(order.id)).state).toBe("settling");
 
         expect((await reconcileSettling(deps(rpc, at(46_000)))).paid).toBe(1);
@@ -197,7 +197,7 @@ describe("reconcileSettling", () => {
         let height = 1_000n;
         const rpc = createFakeRpc({
             getSignatureStatuses: notFound,
-            getBlockHeight: () => height,
+            getEpochInfo: () => epochAt(height),
         });
 
         expect(await reconcileSettling(deps(rpc, t0))).toEqual({
@@ -227,9 +227,9 @@ describe("reconcileSettling", () => {
         // The transaction lands in block 1_000, so a status read before the height sees nothing
         let landed = false;
         const rpc = createFakeRpc({
-            getBlockHeight: () => {
+            getEpochInfo: () => {
                 landed = true;
-                return 1_001n;
+                return epochAt(1_001n);
             },
             getSignatureStatuses: () => ({ value: [landed ? CONFIRMED : null] }),
         });
@@ -242,6 +242,18 @@ describe("reconcileSettling", () => {
         expect(await failedPayments(order.id)).toEqual([]);
     });
 
+    it("keeps waiting on a missing status from a node behind the finalized slot", async () => {
+        const { order } = await settling(at(-60_000), { lastValidBlockHeight: 1_000n });
+        const rpc = createFakeRpc({
+            getEpochInfo: () => epochAt(1_001n, 10_000n),
+            getSignatureStatuses: () => ({ context: { slot: 9_967n }, value: [null] }),
+        });
+
+        expect((await reconcileSettling(deps(rpc, t0))).waiting).toBe(1);
+        expect((await orderOf(order.id)).state).toBe("settling");
+        expect(await failedPayments(order.id)).toEqual([]);
+    });
+
     it("expires instead of reopening an order past its expiry", async () => {
         const failed = await settling(at(-5 * MIN), { expiresAt: at(-MIN) });
         const vanished = await settling(at(-5 * MIN), { expiresAt: t0 });
@@ -249,7 +261,7 @@ describe("reconcileSettling", () => {
             getSignatureStatuses: (sigs: string[]) => ({
                 value: sigs.map((s) => (s === failed.payment.txSignature ? LANDED_FAILED : null)),
             }),
-            getBlockHeight: () => 1_001n,
+            getEpochInfo: () => epochAt(1_001n),
         });
 
         expect(await reconcileSettling(deps(rpc, t0))).toEqual({
@@ -268,7 +280,7 @@ describe("reconcileSettling", () => {
         ]);
     });
 
-    it.each(["getSignatureStatuses", "getBlockHeight"] as const)(
+    it.each(["getSignatureStatuses", "getEpochInfo"] as const)(
         "keeps waiting when the RPC fails (%s throws)",
         async (method) => {
             const { order } = await settling(at(-60_000));
@@ -294,7 +306,7 @@ describe("reconcileSettling", () => {
         },
     );
 
-    it.each(["getBlockHeight", "getSignatureStatuses"] as const)(
+    it.each(["getEpochInfo", "getSignatureStatuses"] as const)(
         "gives up on a stalled %s within solana.rpc_timeout and changes nothing",
         async (method) => {
             const { order, payment } = await settling(at(-60_000));
@@ -344,7 +356,7 @@ describe("reconcileSettling", () => {
             }),
         ]);
         expect(levels(log, "warn")).toEqual([]);
-        expect(rpc.calls.getBlockHeight).toBe(0);
+        expect(rpc.calls.getEpochInfo).toBe(0);
         expect(rpc.calls.getSignatureStatuses).toBe(0);
         expect(await orderOf(order.id)).toEqual(order);
         expect(await findPaymentByOrder(db.pool, order.id)).toEqual(payment);
@@ -360,7 +372,7 @@ describe("reconcileSettling", () => {
             getSignatureStatuses: () => ({
                 value: [{ confirmationStatus: "processed", err, slot: 1n, confirmations: 0n }],
             }),
-            getBlockHeight: () => 1_001n,
+            getEpochInfo: () => epochAt(1_001n),
         });
 
         expect(await reconcileSettling(deps(rpc, t0))).toEqual({

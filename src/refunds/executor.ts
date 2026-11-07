@@ -5,7 +5,8 @@
  * A pending refund first locks the refund_controls row, so the pause, daily cap, hourly rate and
  * float checks of every runner happen one at a time. It is then signed and stored as `signed`
  * before the send, so a crash never loses a transaction that may land. A signed or sent refund is
- * checked once it is 20 s old, finalized height first and signature status second. It is then
+ * checked once it is 20 s old, finalized height first and signature status second, its earlier
+ * attempts' signatures read with it. It is then
  * confirmed, sent to the manual queue when it failed, signed again when its blockhash expired and
  * the signature is not found (up to max_attempts), or else resent unchanged. While refunds are
  * paused a tick only records what the chain decided and signs or sends nothing. An RPC error, or
@@ -243,8 +244,15 @@ async function checkInFlight(
     if (!isInFlight(r)) {
         throw new Error(`refund ${r.id} is ${r.state} without a stored transaction`);
     }
+    // An earlier attempt can still land after a re-sign, and then this refund is paid already
     const landing = await viaRpc(() =>
-        readLanding(d.rpc, r.txSignature, r.lastValidBlockHeight, d.rpcTimeoutMs),
+        readLanding(
+            d.rpc,
+            r.txSignature,
+            r.lastValidBlockHeight,
+            d.rpcTimeoutMs,
+            r.previousSignatures,
+        ),
     );
     switch (landing) {
         case "processed":

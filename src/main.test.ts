@@ -18,7 +18,7 @@ import { usdcAta } from "./solana/accounts.ts";
 import { TOKEN_PROGRAM, USDC_MINT } from "./solana/constants.ts";
 import { create, until } from "./testing/app.ts";
 import { testDb, type TestDb } from "./testing/db.ts";
-import { createFakeRpc, type FakeRpcScript } from "./testing/fake-rpc.ts";
+import { createFakeRpc, epochAt, type FakeRpcScript } from "./testing/fake-rpc.ts";
 import { testSigner } from "./testing/keys.ts";
 import { seedOrder, seedPayment } from "./testing/orders.ts";
 
@@ -392,7 +392,7 @@ describe("startService", () => {
         const held = new Promise<void>((resolve) => {
             release = resolve;
         });
-        const rpc = okRpc({ getBlockHeight: () => held.then(() => 1_000n) });
+        const rpc = okRpc({ getEpochInfo: () => held.then(() => epochAt(1_000n)) });
         const s = await startService({
             settings: testSettings({ jobs: { reconcile_every: "1h" } }),
             secrets,
@@ -401,7 +401,7 @@ describe("startService", () => {
         });
         let stopped = false;
         try {
-            await until(async () => rpc.calls.getBlockHeight === 1, 5_000);
+            await until(async () => rpc.calls.getEpochInfo === 1, 5_000);
             void s.stop().then(() => {
                 stopped = true;
             });
@@ -423,7 +423,7 @@ describe("startService", () => {
             release = resolve;
         });
         const rpc = okRpc({
-            getBlockHeight: () => held.then(() => 1_000n),
+            getEpochInfo: () => held.then(() => epochAt(1_000n)),
             getSignatureStatuses: () => ({ value: [null] }),
         });
         const s = await startService({
@@ -433,7 +433,7 @@ describe("startService", () => {
             log: silentLog,
         });
         try {
-            await until(async () => rpc.calls.getBlockHeight === 1, 5_000);
+            await until(async () => rpc.calls.getEpochInfo === 1, 5_000);
             await new Promise((resolve) => setTimeout(resolve, 100));
             void s.stop();
         } finally {
@@ -441,7 +441,7 @@ describe("startService", () => {
             await s.stop();
         }
         await new Promise((resolve) => setTimeout(resolve, 100));
-        expect(rpc.calls.getBlockHeight).toBe(1);
+        expect(rpc.calls.getEpochInfo).toBe(1);
     });
 
     it("runs the sweeper, the refund executor and the alarms on their schedules", async () => {
@@ -496,7 +496,7 @@ describe("startService", () => {
         const s = await startService({
             settings: testSettings({ jobs: { reconcile_every: "1h" } }),
             secrets: all,
-            rpc: okRpc({ getBlockHeight: down, getSignatureStatuses: down }),
+            rpc: okRpc({ getEpochInfo: down, getSignatureStatuses: down }),
         });
         try {
             await until(async () => lines.some((l) => l.includes('"err"')), 5_000);
