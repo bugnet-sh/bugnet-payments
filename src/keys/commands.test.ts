@@ -5,6 +5,7 @@ import {
     getCompiledTransactionMessageDecoder,
     getTransactionDecoder,
 } from "@solana/kit";
+import { getSetComputeUnitLimitInstructionDataDecoder } from "@solana-program/compute-budget";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { cliMain } from "../cli.ts";
 import { usdcAta } from "../solana/accounts.ts";
@@ -157,6 +158,23 @@ function decodeSent() {
     return sent.map((wire) => getTransactionDecoder().decode(getBase64Encoder().encode(wire)));
 }
 
+const COMPUTE_BUDGET = "ComputeBudget111111111111111111111111111111";
+const SET_COMPUTE_UNIT_LIMIT = 2;
+
+function computeUnitLimits(): number[] {
+    return decodeSent().map((tx) => {
+        const msg = getCompiledTransactionMessageDecoder().decode(tx.messageBytes);
+        if (msg.version !== 0) throw new Error(`expected a v0 message, got ${msg.version}`);
+        const limits = msg.instructions.filter(
+            (i) =>
+                msg.staticAccounts[i.programAddressIndex] === COMPUTE_BUDGET &&
+                i.data?.[0] === SET_COMPUTE_UNIT_LIMIT,
+        );
+        expect(limits).toHaveLength(1);
+        return getSetComputeUnitLimitInstructionDataDecoder().decode(limits[0]!.data!).units;
+    });
+}
+
 describe("keys over a stub RPC", () => {
     it("funds from the test payer in one confirmed transaction", async () => {
         sent.length = 0;
@@ -231,7 +249,7 @@ describe("keys over a stub RPC", () => {
         );
         expect(code).toBe(1);
         expect(sent).toHaveLength(0);
-        expect(io.errText()).toMatch(/short by 2143880/);
+        expect(io.errText()).toMatch(/short by 2144280/);
         expect(io.errText()).not.toContain("secret-api-key");
     });
 
@@ -239,7 +257,7 @@ describe("keys over a stub RPC", () => {
         sent.length = 0;
         lamports.clear();
         usdc.clear();
-        lamports.set(testPayer.address, 100_000_000 + 1_488_440 + 5_200 + 650_239);
+        lamports.set(testPayer.address, 100_000_000 + 1_488_440 + 5_600 + 650_239);
         const io = captureIo();
         const code = await cliMain(
             ["keys", "fund", "--fee-payer-lamports", "100000000", "--create-refund-ata"],
@@ -279,6 +297,32 @@ describe("keys over a stub RPC", () => {
         expect(txs).toHaveLength(4);
         for (const tx of txs) expect(Object.keys(tx.signatures)[0]).toBe(testPayer.address);
         expect(io.outText().split("\n")).toHaveLength(4);
+    });
+
+    it("gives 60_000 compute units to a transaction that creates a USDC account, 20_000 to others", async () => {
+        sent.length = 0;
+        lamports.clear();
+        usdc.clear();
+        lamports.set(testPayer.address, 5_000_000_000);
+        const funded = captureIo();
+        expect(
+            await cliMain(
+                ["keys", "fund", "--create-recipient-ata", cold.address, "--create-refund-ata"],
+                env(),
+                funded,
+            ),
+        ).toBe(0);
+        expect(computeUnitLimits()).toEqual([60_000]);
+
+        sent.length = 0;
+        lamports.clear();
+        usdc.clear();
+        lamports.set(feePayer.address, 50_000_000);
+        const refundAta = String(await usdcAta(refund.address as never));
+        usdc.set(refundAta, 5_000_000);
+        tokenOwners.set(refundAta, refund.address);
+        expect(await cliMain(["keys", "drain", "--close-atas"], env(), captureIo())).toBe(0);
+        expect(computeUnitLimits()).toEqual([20_000, 20_000]);
     });
 
     it("shows balances for each wallet", async () => {

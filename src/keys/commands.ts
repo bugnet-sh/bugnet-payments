@@ -14,6 +14,7 @@ import {
     isAddress,
     type KeyPairSigner,
 } from "@solana/kit";
+import { ASSOCIATED_TOKEN_PROGRAM_ADDRESS } from "@solana-program/token";
 import { secretValues } from "../config.ts";
 import { jsonLog, type Log } from "../log.ts";
 import { orderPublicKeyBase64 } from "../orders/token.ts";
@@ -44,9 +45,10 @@ interface Flags {
 }
 
 const COMPUTE_UNIT_LIMIT = 20_000;
+// A fund transaction may create two associated token accounts, 20_000 units cannot cover them
+const ATA_COMPUTE_UNIT_LIMIT = 60_000;
 const COMPUTE_UNIT_PRICE = 10_000n;
-// One signature plus the priority fee of 20_000 units at 10_000 micro-lamports
-const FEE_ESTIMATE_PER_TX = 5_000n + 200n;
+const SIGNATURE_FEE = 5_000n;
 const CONFIRM_POLL_MS = 500;
 const POLL_CALL_TIMEOUT_MS = 10_000;
 const MAX_POLL_FAILURES = 5;
@@ -235,8 +237,8 @@ async function fund(env: NodeJS.ProcessEnv, flags: Flags, io: Io, log: Log): Pro
     for (const owner of owners) {
         if ((await inspectTokenAccount(rpc, await usdcAta(owner))) === null) missing++;
     }
-    const need =
-        lamports + missing * ataRent + FEE_ESTIMATE_PER_TX * BigInt(plan.length) + rentExemptMin;
+    const fees = plan.reduce((sum, tx) => sum + feeEstimate(tx), 0n);
+    const need = lamports + missing * ataRent + fees + rentExemptMin;
     const have = await lamportsOf(rpc, testPayer.address);
     if (have < need) {
         throw new Error(
@@ -308,6 +310,18 @@ async function sendAll(
     }
 }
 
+function computeUnitLimitOf(tx: PlannedTx): number {
+    const createsAta = tx.instructions.some(
+        (i) => i.programAddress === ASSOCIATED_TOKEN_PROGRAM_ADDRESS,
+    );
+    return createsAta ? ATA_COMPUTE_UNIT_LIMIT : COMPUTE_UNIT_LIMIT;
+}
+
+// One signature plus the priority fee the compute unit limit allows
+function feeEstimate(tx: PlannedTx): bigint {
+    return SIGNATURE_FEE + (BigInt(computeUnitLimitOf(tx)) * COMPUTE_UNIT_PRICE) / 1_000_000n;
+}
+
 async function sendAndConfirm(
     rpc: SolanaRpc,
     testPayer: KeyPairSigner,
@@ -319,7 +333,7 @@ async function sendAndConfirm(
         feePayer: testPayer,
         blockhash: latest.blockhash,
         lastValidBlockHeight: latest.lastValidBlockHeight,
-        computeUnitLimit: COMPUTE_UNIT_LIMIT,
+        computeUnitLimit: computeUnitLimitOf(tx),
         computeUnitPrice: COMPUTE_UNIT_PRICE,
         instructions: tx.instructions,
     });
