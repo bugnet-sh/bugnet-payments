@@ -19,6 +19,9 @@ import type { Log } from "../log.ts";
 import type { BlockhashCache } from "../solana/blockhash.ts";
 import { SOLANA_MAINNET } from "../solana/constants.ts";
 import { type ChallengeContext, challengeFor, payUrlFor } from "../x402/challenge.ts";
+import { planOrder, sameSetupTerms, type ValidCreate, type X402OrderDeps } from "../x402/create.ts";
+import { reserveUnpaid } from "../x402/ledger.ts";
+import { SERVICE_ID } from "../x402/ids.ts";
 import { claimHash, claimMatches, newClaim, openClaim, sealClaim } from "./claim.ts";
 import { isOrderId, newOrderId } from "./ids.ts";
 import type { PayOutcome } from "./pay.ts";
@@ -48,6 +51,7 @@ export interface OrderServiceDeps {
         signal: AbortSignal,
         key: string | null,
     ) => Promise<PayOutcome>;
+    x402: X402OrderDeps;
     log: Log;
     now: () => Date;
 }
@@ -62,6 +66,8 @@ interface Found {
 }
 
 const CONTROL_CHARS = /\p{Cc}/u;
+const MAX_PINS = 64;
+const ALLOWANCE_PACKAGE_ID = "x402-allowance";
 const REQUIRED_CREATE_FIELDS = ["kind", "packageId", "amountMicros", "description"] as const;
 
 export function shortText(max: number) {
@@ -72,6 +78,25 @@ export function shortText(max: number) {
         .refine((s) => !CONTROL_CHARS.test(s));
 }
 
+const pinSchema = z.strictObject({
+    serviceId: z.string().regex(SERVICE_ID),
+    method: z.enum(["GET", "POST"]),
+    host: z.string().min(1).max(253),
+    prefix: z.string().startsWith("/"),
+    url: z.string().max(2_048),
+    maxPriceMicros: z.int().min(1),
+    payTo: z.string().max(64),
+    listed: z.enum(["indexed", "unlisted"]),
+    pinnedFrom: z.enum(["probe", "index"]),
+    probe: z.strictObject({ at: z.string(), status: z.int(), accepted: z.json() }),
+});
+
+const x402Schema = z.strictObject({
+    services: z.array(pinSchema).max(MAX_PINS).optional(),
+    disable: z.array(z.string().regex(SERVICE_ID)).max(MAX_PINS).optional(),
+    spendPerMinuteMicros: z.int().min(1).optional(),
+});
+
 const schemas = new Map<number, z.ZodType<OrderRequest>>();
 
 function requestSchema(maxAmountMicros: number): z.ZodType<OrderRequest> {
@@ -79,7 +104,7 @@ function requestSchema(maxAmountMicros: number): z.ZodType<OrderRequest> {
     if (schema !== undefined) return schema;
     schema = z
         .object({
-            kind: z.enum(["start", "extend"]).optional(),
+            kind: z.enum(["start", "extend", "allowance"]).optional(),
             packageId: z
                 .string()
                 .regex(/^[A-Za-z0-9._-]{1,64}$/)
@@ -97,10 +122,39 @@ function requestSchema(maxAmountMicros: number): z.ZodType<OrderRequest> {
                 .optional(),
             payment: z.unknown().optional(),
             idempotencyKey: z.string().max(200).optional(),
+            allowanceMicros: z.int().min(0).optional(),
+            feeMicros: z.int().min(0).optional(),
+            x402: x402Schema.optional(),
         })
         .refine((r) => (r.orderId !== undefined && r.claim !== undefined) || hasTerms(r))
         .refine(
-            (r) => r.kind === undefined || (r.kind === "extend") === (r.handleSha256 !== undefined),
+            (r) => r.kind === undefined || (r.kind !== "start") === (r.handleSha256 !== undefined),
+        )
+        .refine(
+            (r) =>
+                r.kind !== "extend" ||
+                (r.allowanceMicros === undefined && r.feeMicros === undefined),
+        )
+        .refine((r) => (r.feeMicros ?? 0) === 0 || (r.allowanceMicros ?? 0) > 0)
+        .refine((r) => r.x402 === undefined || (r.allowanceMicros ?? 0) > 0)
+        .refine(
+            (r) =>
+                r.x402?.services === undefined ||
+                new Set(r.x402.services.map((p) => p.serviceId)).size === r.x402.services.length,
+        )
+        .refine(
+            (r) =>
+                r.kind !== "allowance" ||
+                !hasTerms(r) ||
+                (r.packageId === ALLOWANCE_PACKAGE_ID &&
+                    (r.allowanceMicros ?? 0) >= 1 &&
+                    r.amountMicros === r.allowanceMicros! + (r.feeMicros ?? 0)),
+        )
+        .refine(
+            (r) =>
+                r.kind !== "start" ||
+                r.amountMicros === undefined ||
+                (r.allowanceMicros ?? 0) + (r.feeMicros ?? 0) <= r.amountMicros,
         );
     schemas.set(maxAmountMicros, schema);
     return schema;
@@ -153,7 +207,7 @@ export async function handleOrderRequest(
     } else {
         const order = key === null ? null : await findOrderByIdempotencyKey(d.pool, key);
         if (order === null) {
-            const created = await create(d, r, key);
+            const created = await create(d, r as ValidCreate, key, signal);
             if ("status" in created) return created;
             found = created;
         } else {
@@ -163,32 +217,48 @@ export async function handleOrderRequest(
     return answerFound(d, r, found, key, signal);
 }
 
+class PoolFull extends Error {}
+
 async function create(
     d: OrderServiceDeps,
-    r: OrderRequest,
+    r: ValidCreate,
     key: string | null,
-): Promise<PaymentRequiredResult | Found> {
+    signal: AbortSignal,
+): Promise<OrderResult | Found> {
+    const plan = (r.allowanceMicros ?? 0) > 0 ? await planOrder(d.pool, d.x402, r, signal) : null;
+    if (plan !== null && !plan.ok) return plan.refused;
     const id = newOrderId();
     const claim = newClaim();
+    const terms = {
+        id,
+        kind: r.kind,
+        packageId: r.packageId,
+        amountMicros: r.amountMicros,
+        handleSha256: r.handleSha256 ?? null,
+        description: plan?.description ?? r.description,
+        claimSha256: claimHash(claim)!,
+        claimBox: sealClaim(d.claimKey, id, claim),
+        idempotencyKey: key,
+        expiresAt: new Date(d.now().getTime() + (plan?.ttlMs ?? d.settings.orders.unpaid_ttl)),
+        payInto: plan?.payInto ?? "cold",
+        allowanceMicros: plan?.allowanceMicros ?? 0,
+        feeMicros: plan?.feeMicros ?? 0,
+        x402Setup: plan?.setup ?? null,
+    } as const;
     let order: OrderRow;
     try {
-        order = await insertOrder(d.pool, {
-            id,
-            kind: r.kind!,
-            packageId: r.packageId!,
-            amountMicros: r.amountMicros!,
-            handleSha256: r.handleSha256 ?? null,
-            description: r.description!,
-            claimSha256: claimHash(claim)!,
-            claimBox: sealClaim(d.claimKey, id, claim),
-            idempotencyKey: key,
-            expiresAt: new Date(d.now().getTime() + d.settings.orders.unpaid_ttl),
-            payInto: "cold",
-            allowanceMicros: 0,
-            feeMicros: 0,
-            x402Setup: null,
-        });
+        order =
+            plan === null
+                ? await insertOrder(d.pool, terms)
+                : await withTx(d.pool, async (c) => {
+                      const inserted = await insertOrder(c, terms);
+                      if (!(await reserveUnpaid(c, plan.allowanceMicros, d.x402.x402, d.log))) {
+                          throw new PoolFull();
+                      }
+                      return inserted;
+                  });
     } catch (err) {
+        if (err instanceof PoolFull) return refused("allowance_pool_full");
         if (key === null || !isKeyConflict(err)) throw err;
         const winner = await findOrderByIdempotencyKey(d.pool, key);
         if (winner === null) throw err;
@@ -241,7 +311,10 @@ function termsDiffer(r: OrderRequest, o: OrderRow): boolean {
         (r.kind !== undefined && r.kind !== o.kind) ||
         (r.packageId !== undefined && r.packageId !== o.packageId) ||
         (r.amountMicros !== undefined && r.amountMicros !== o.amountMicros) ||
-        (r.handleSha256 !== undefined && r.handleSha256 !== o.handleSha256)
+        (r.handleSha256 !== undefined && r.handleSha256 !== o.handleSha256) ||
+        (r.allowanceMicros !== undefined && r.allowanceMicros !== o.allowanceMicros) ||
+        (r.feeMicros !== undefined && r.feeMicros !== o.feeMicros) ||
+        !sameSetupTerms(r.x402, o.x402Setup)
     );
 }
 

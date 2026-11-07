@@ -5,8 +5,14 @@ import { findOrder } from "../orders/store.ts";
 import { base32Lower, newX402PaymentId, serviceIdFor } from "../x402/ids.ts";
 import { toFunding } from "../x402/funding.ts";
 import { findAccount } from "../x402/ledger.ts";
-import type { AccountRow, FundingRow, ServiceRow, X402PaymentRow } from "../x402/types.ts";
-import { TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
+import type {
+    AccountRow,
+    FundingRow,
+    ServiceRow,
+    X402PaymentRow,
+    X402ServicePin,
+} from "../x402/types.ts";
+import { SOLANA_MAINNET, TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
 import { parseIndex, type IndexCopy } from "../x402/index-file.ts";
 import { seedOrder, seedPayment } from "./orders.ts";
 
@@ -348,6 +354,47 @@ export function testIndex(): IndexCopy {
         }),
         "test index",
     );
+}
+
+// The 7.8 base entry of a seller that Bugnet can pay
+export const TEST_ACCEPTED = {
+    scheme: "exact",
+    network: SOLANA_MAINNET,
+    asset: USDC_MINT,
+    amount: "10000",
+    payTo: TEST_PAYTO,
+    maxTimeoutSeconds: 60,
+    extra: { feePayer: "11111111111111111111111111111112" },
+};
+
+// The 7.15 example pin: the indexed agent402 service, pinned from a 402 probe
+export function agentPin(over: Partial<X402ServicePin> = {}): X402ServicePin {
+    return {
+        serviceId: serviceIdFor("POST", "agent402.tools", "/v1/auto/"),
+        method: "POST",
+        host: "agent402.tools",
+        prefix: "/v1/auto/",
+        url: "https://agent402.tools/v1/auto/chat/completions",
+        maxPriceMicros: 10_000,
+        payTo: TEST_PAYTO,
+        listed: "indexed",
+        pinnedFrom: "probe",
+        probe: { at: "2030-01-01T00:00:00.000Z", status: 402, accepted: TEST_ACCEPTED },
+        ...over,
+    };
+}
+
+// An unlisted pin of seller.example on the prefix /p<n>/
+export function sellerPin(n: number, over: Partial<X402ServicePin> = {}): X402ServicePin {
+    const prefix = `/p${n}/`;
+    return agentPin({
+        serviceId: serviceIdFor("POST", "seller.example", prefix),
+        host: "seller.example",
+        prefix,
+        url: `https://seller.example${prefix}run`,
+        listed: "unlisted",
+        ...over,
+    });
 }
 
 // The PAYMENT-REQUIRED header of one real Solana exact seller, byte for byte; index 12 is its

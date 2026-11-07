@@ -1,6 +1,7 @@
 import type { IncomingHttpHeaders, IncomingMessage } from "node:http";
 import { z } from "zod";
 import type { Log } from "../log.ts";
+import { RpcUnavailableError } from "../x402/create.ts";
 import {
     abandonOrder,
     handleOrderRequest,
@@ -94,7 +95,14 @@ export function createInternalHandler(d: InternalDeps): Handler {
             sendJson(res, 400, BAD_REQUEST);
             return;
         }
-        const result = await handleOrderRequest(d.service, body, hangupSignal(res));
+        let result;
+        try {
+            result = await handleOrderRequest(d.service, body, hangupSignal(res));
+        } catch (err) {
+            if (!(err instanceof RpcUnavailableError)) throw err;
+            sendJson(res, 503, { error: "rpc_unavailable" });
+            return;
+        }
         const bad = result.status === "refused" && result.reason === "bad_request";
         sendJson(res, bad ? 400 : 200, result);
     };

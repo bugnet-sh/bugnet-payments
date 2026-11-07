@@ -12,9 +12,18 @@ import { memoryLog } from "../log.ts";
 import { orderPublicKeyBase64 } from "../orders/token.ts";
 import type { OrderRequest, OrderRow } from "../orders/types.ts";
 import { testDb } from "./db.ts";
-import { createFakeRpc, type FakeRpc, TEST_BLOCKHASH, TEST_LVBH } from "./fake-rpc.ts";
+import { bugnetAddresses } from "../x402/ids.ts";
+import type { IndexCopy } from "../x402/index-file.ts";
+import {
+    createFakeRpc,
+    type FakeRpc,
+    type FakeRpcScript,
+    TEST_BLOCKHASH,
+    TEST_LVBH,
+} from "./fake-rpc.ts";
 import { startFakeRouter } from "./fake-router.ts";
 import { testSigner } from "./keys.ts";
+import { TEST_PAYTO, testIndex, usdcAccountAnswer } from "./x402.ts";
 
 export interface TestAppOptions {
     now?: Date;
@@ -22,6 +31,10 @@ export interface TestAppOptions {
     checkPayer?: boolean;
     trustedProxies?: string[];
     checkoutJsPath?: string;
+    x402?: Partial<Settings["x402"]>;
+    allowanceClaim?: boolean;
+    signerOpen?: boolean;
+    rpc?: Partial<FakeRpcScript>;
 }
 
 export interface TestApp {
@@ -34,6 +47,8 @@ export interface TestApp {
     log: ReturnType<typeof memoryLog>;
     payer: KeyPairSigner;
     feePayer: KeyPairSigner;
+    allowance: KeyPairSigner;
+    index: IndexCopy;
     settings: Settings;
     secrets: Secrets;
     now: { get(): Date; set(d: Date): void };
@@ -44,6 +59,8 @@ const DEFAULT_NOW = new Date("2030-01-01T00:00:00Z");
 // Router events in tests are signed with this seed
 const EVENT_SEED = Buffer.alloc(32, 9);
 const FEE_PAYER_SEED = 5;
+const ALLOWANCE_SEED = 11;
+const REFUND_SEED = 6;
 
 function keypairSecret(seed: number, signer: KeyPairSigner): string {
     const bytes = new Uint8Array(64);
@@ -73,6 +90,9 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
     const payer = await testSigner(3);
     const feePayer = await testSigner(FEE_PAYER_SEED);
     const recipient = await testSigner(1);
+    const allowance = await testSigner(ALLOWANCE_SEED);
+    const refund = await testSigner(REFUND_SEED);
+    const index = testIndex();
     const settings = parseSettings(
         stringify({
             http: {
@@ -88,7 +108,9 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
                 url: router.url,
                 event_public_key: orderPublicKeyBase64(EVENT_SEED),
                 check_payer: over.checkPayer ?? false,
+                allowance_claim: over.allowanceClaim ?? true,
             },
+            x402: { enabled: true, allowance_wallet: allowance.address, ...over.x402 },
         }),
         "testApp",
     );
@@ -100,12 +122,33 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
         feePayerKey: keypairSecret(FEE_PAYER_SEED, feePayer),
         refundKey: "",
         rpcUrl: "",
-        allowanceKey: "",
+        allowanceKey: keypairSecret(ALLOWANCE_SEED, allowance),
         x402TlsKey: "",
     };
-    const rpc = createFakeRpc();
+    const rpc = createFakeRpc({
+        getAccountInfo: () => usdcAccountAnswer(TEST_PAYTO),
+        ...over.rpc,
+    });
     const http = createHttpApp(
-        { settings, secrets, pool: db.pool, rpc, feePayer, log, now: appNow },
+        {
+            settings,
+            secrets,
+            pool: db.pool,
+            rpc,
+            feePayer,
+            x402: {
+                signer: { open: () => over.signerOpen ?? true },
+                index: () => index,
+                addresses: bugnetAddresses({
+                    feePayer: feePayer.address,
+                    allowanceWallet: allowance.address,
+                    refundWallet: refund.address,
+                    recipient: recipient.address,
+                }),
+            },
+            log,
+            now: appNow,
+        },
         { limiterClock: () => clock.getTime(), checkoutJsPath: over.checkoutJsPath },
     );
     const internal = await startServer(settings.http.internal_listen, http.internalHandler, log);
@@ -121,6 +164,8 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
         log,
         payer,
         feePayer,
+        allowance,
+        index,
         settings,
         secrets,
         now: {

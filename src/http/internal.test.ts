@@ -5,6 +5,8 @@ import { newOrderId } from "../orders/ids.ts";
 import { findOrder } from "../orders/store.ts";
 import { create, post, testApp, type TestApp, until } from "../testing/app.ts";
 import { seedOrder } from "../testing/orders.ts";
+import { agentPin, seedAccount } from "../testing/x402.ts";
+import { readPool } from "../x402/ledger.ts";
 import type { OrderServiceDeps } from "../orders/service.ts";
 import { createInternalHandler } from "./internal.ts";
 import { bearerOk, startServer } from "./server.ts";
@@ -300,5 +302,37 @@ describe("server", () => {
         expect(bearerOk("s3cret", "s3cret")).toBe(false);
         expect(bearerOk(undefined, "s3cret")).toBe(false);
         expect(bearerOk("Bearer ", "")).toBe(false);
+    });
+});
+
+describe("internal API with x402", () => {
+    it("answers 503 rpc_unavailable when a pin cannot be checked, and creates nothing", async () => {
+        const down = await testApp({
+            rpc: {
+                getAccountInfo: () => {
+                    throw new Error("rpc down");
+                },
+            },
+        });
+        try {
+            const a = await seedAccount(down.pool, { handleSha256: "77".repeat(32) });
+            const r = await post(down, "/v1/orders", {
+                kind: "allowance",
+                packageId: "x402-allowance",
+                handleSha256: a.handleSha256,
+                amountMicros: 1_003_000,
+                allowanceMicros: 1_000_000,
+                feeMicros: 3_000,
+                description: "ignored",
+                x402: { services: [agentPin()] },
+            });
+            expect(r.status).toBe(503);
+            expect(r.body).toEqual({ error: "rpc_unavailable" });
+            const orders = await down.pool.query("select id from orders");
+            expect(orders.rows).toEqual([{ id: a.id }]);
+            expect(await readPool(down.pool)).toEqual({ committedMicros: 0, unpaidMicros: 0 });
+        } finally {
+            await down.close();
+        }
     });
 });

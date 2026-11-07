@@ -9,6 +9,9 @@ import { RateLimiter } from "../ratelimit.ts";
 import { createRouterClient, type RouterClient } from "../router/client.ts";
 import { BlockhashCache } from "../solana/blockhash.ts";
 import type { SolanaRpc } from "../solana/rpc.ts";
+import { parseIndex, type IndexCopy } from "../x402/index-file.ts";
+import { bugnetAddresses } from "../x402/ids.ts";
+import type { BugnetAddresses, SignerHealth } from "../x402/types.ts";
 import { createSettler } from "../x402/settler.ts";
 import { createInternalHandler } from "./internal.ts";
 import { createPublicHandler } from "./public.ts";
@@ -20,6 +23,7 @@ export interface HttpAppDeps {
     pool: pg.Pool;
     rpc: SolanaRpc;
     feePayer: KeyPairSigner;
+    x402?: { signer: SignerHealth; index: () => IndexCopy; addresses: BugnetAddresses };
     log: Log;
     now: () => Date;
 }
@@ -41,6 +45,17 @@ const CHECKOUT_JS = "dist/checkout.js";
 
 export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
     const { settings: s, secrets, pool, rpc, feePayer, log, now } = d;
+    const emptyIndex = parseIndex('{"v":1,"services":[]}', "none");
+    const x402 = d.x402 ?? {
+        signer: { open: () => false },
+        index: () => emptyIndex,
+        addresses: bugnetAddresses({
+            feePayer: feePayer.address,
+            allowanceWallet: s.x402.allowance_wallet,
+            refundWallet: "",
+            recipient: s.solana.recipient,
+        }),
+    };
     const perMinute = (limit: number) => new RateLimiter(limit, MINUTE_MS, o.limiterClock);
     const hints = new BlockhashCache(rpc, s.solana.blockhash_cache_ttl, () => now().getTime());
     const settler = createSettler({
@@ -90,6 +105,18 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
             orderKey: orderKey(secrets.orderSeed),
             claimKey: secrets.claimKey,
             pay: (orderId, raw, signal, key) => payOrder(pay, orderId, raw, signal, key),
+            x402: {
+                x402: s.x402,
+                allowanceClaim: s.router.allowance_claim,
+                router,
+                rpc,
+                index: x402.index,
+                signer: x402.signer,
+                addresses: x402.addresses,
+                rpcTimeoutMs: s.solana.rpc_timeout,
+                log,
+                now,
+            },
             log,
             now,
         },

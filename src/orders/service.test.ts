@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { encodePaymentSignatureHeader } from "@x402/core/http";
 import {
@@ -12,6 +13,9 @@ import {
 } from "../testing/app.ts";
 import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts";
 import { signedPayment } from "../testing/payment.ts";
+import { agentPin, seedAccount, seedFunding, seedService } from "../testing/x402.ts";
+import { readPool } from "../x402/ledger.ts";
+import type { OrderRequest } from "./types.ts";
 import { claimHash, newClaim, sealClaim } from "./claim.ts";
 import { newOrderId } from "./ids.ts";
 import { abandonOrder } from "./service.ts";
@@ -628,5 +632,340 @@ describe("abandonOrder", () => {
     it("answers unknown for a missing or malformed id", async () => {
         expect(await abandonOrder(app.pool, newOrderId(), "denied", app.now.get())).toBe("unknown");
         expect(await abandonOrder(app.pool, "ord_X", "denied", app.now.get())).toBe("unknown");
+    });
+});
+
+describe("x402 orders", () => {
+    const randomHandle = () => randomBytes(32).toString("hex");
+
+    function topUp(handleSha256: string, over: Partial<OrderRequest> = {}): OrderRequest {
+        return {
+            kind: "allowance",
+            packageId: "x402-allowance",
+            handleSha256,
+            amountMicros: 1_003_000,
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+            description: "ignored: Payments writes it",
+            ...over,
+        };
+    }
+
+    async function account(over: Parameters<typeof seedAccount>[1] = {}) {
+        const handleSha256 = randomHandle();
+        const a = await seedAccount(app.pool, { handleSha256, ...over });
+        return { ...a, handleSha256 };
+    }
+
+    async function orderCount(): Promise<number> {
+        return (await app.pool.query("select count(*)::int as n from orders")).rows[0].n;
+    }
+
+    beforeEach(async () => {
+        await app.pool.query("update x402_pool set unpaid_micros = 0 where id = 1");
+    });
+
+    it("stores each row of the 7.2 table", async () => {
+        const plain = await post(app, "/v1/orders", create());
+        expect(await findOrder(app.pool, plain.body.orderId)).toMatchObject({
+            payInto: "cold",
+            allowanceMicros: 0,
+            feeMicros: 0,
+            x402Setup: null,
+        });
+        const hotStart = await post(
+            app,
+            "/v1/orders",
+            create({ amountMicros: 1_013_000, allowanceMicros: 1_000_000, feeMicros: 3_000 }),
+        );
+        expect(hotStart.body.status).toBe("payment_required");
+        expect(await findOrder(app.pool, hotStart.body.orderId)).toMatchObject({
+            kind: "start",
+            payInto: "allowance",
+            amountMicros: 1_013_000,
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+            x402Setup: { services: [], disable: [], spendPerMinuteMicros: null },
+        });
+        const h = await account();
+        const due = await post(app, "/v1/orders", topUp(h.handleSha256));
+        expect(due.body.status).toBe("payment_required");
+        expect(await findOrder(app.pool, due.body.orderId)).toMatchObject({
+            kind: "allowance",
+            payInto: "allowance",
+            handleSha256: h.handleSha256,
+            amountMicros: 1_003_000,
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+        });
+        const paid = await account();
+        await seedFunding(app.pool, { accountId: paid.id, orderId: paid.id });
+        const noFee = await post(
+            app,
+            "/v1/orders",
+            topUp(paid.handleSha256, { amountMicros: 1_000_000, feeMicros: 0 }),
+        );
+        expect(noFee.body.status).toBe("payment_required");
+        expect(await findOrder(app.pool, noFee.body.orderId)).toMatchObject({
+            payInto: "allowance",
+            amountMicros: 1_000_000,
+            allowanceMicros: 1_000_000,
+            feeMicros: 0,
+        });
+        const extend = await post(
+            app,
+            "/v1/orders",
+            create({ kind: "extend", handleSha256: h.handleSha256 }),
+        );
+        expect(await findOrder(app.pool, extend.body.orderId)).toMatchObject({
+            payInto: "cold",
+            allowanceMicros: 0,
+            feeMicros: 0,
+        });
+    });
+
+    it("skips every check for orders without allowance money", async () => {
+        const off = await testApp({ x402: { enabled: false } });
+        try {
+            const r = await post(off, "/v1/orders", create());
+            expect(r.body.status).toBe("payment_required");
+            const h = await seedAccount(off.pool, { handleSha256: randomHandle() });
+            const t = await post(off, "/v1/orders", topUp(h.handleSha256!));
+            expect(t.status).toBe(200);
+            expect(t.body).toEqual({ status: "refused", reason: "x402_disabled" });
+        } finally {
+            await off.close();
+        }
+    });
+
+    it("answers a refusal with nothing created and the pool untouched", async () => {
+        const h = await account();
+        const before = await orderCount();
+        const r = await post(
+            app,
+            "/v1/orders",
+            topUp(h.handleSha256, { feeMicros: 0, amountMicros: 1_000_000 }),
+        );
+        expect(r.body).toEqual({ status: "refused", reason: "fee_mismatch" });
+        expect(await orderCount()).toBe(before);
+        expect(await readPool(app.pool)).toEqual({ committedMicros: 0, unpaidMicros: 0 });
+    });
+
+    it("reserves the pool for the allowance of a created order", async () => {
+        const h = await account();
+        const r = await post(app, "/v1/orders", topUp(h.handleSha256));
+        expect(r.body.status).toBe("payment_required");
+        expect(await readPool(app.pool)).toEqual({ committedMicros: 0, unpaidMicros: 1_000_000 });
+    });
+
+    it("reserves the pool under concurrent creates", async () => {
+        const tight = await testApp({ x402: { pool_unpaid_max_micros: 5_000_000 } });
+        try {
+            const h = await seedAccount(tight.pool, { handleSha256: "77".repeat(32) });
+            const r = await Promise.all(
+                [1, 2].map(() =>
+                    post(
+                        tight,
+                        "/v1/orders",
+                        topUp(h.handleSha256!, {
+                            allowanceMicros: 3_000_000,
+                            amountMicros: 3_003_000,
+                        }),
+                    ),
+                ),
+            );
+            expect(
+                r.map((x) => (x.body.status === "refused" ? x.body.reason : x.body.status)).sort(),
+            ).toEqual(["allowance_pool_full", "payment_required"]);
+            expect(await readPool(tight.pool)).toEqual({
+                committedMicros: 0,
+                unpaidMicros: 3_000_000,
+            });
+        } finally {
+            await tight.close();
+        }
+    });
+
+    it("refuses a full pool and creates nothing", async () => {
+        const h = await account();
+        await app.pool.query("update x402_pool set unpaid_micros = 9_500_000 where id = 1");
+        const before = await orderCount();
+        const r = await post(app, "/v1/orders", topUp(h.handleSha256));
+        expect(r.body).toEqual({ status: "refused", reason: "allowance_pool_full" });
+        expect(await orderCount()).toBe(before);
+        expect(await readPool(app.pool)).toEqual({ committedMicros: 0, unpaidMicros: 9_500_000 });
+    });
+
+    it("expires an unpaid allowance order after 5 minutes", async () => {
+        const h = await account();
+        const r = await post(app, "/v1/orders", topUp(h.handleSha256));
+        expect((await findOrder(app.pool, r.body.orderId))!.expiresAt).toEqual(
+            new Date(START.getTime() + 300_000),
+        );
+    });
+
+    it("writes the description from the pins and ignores the request's", async () => {
+        const h = await account();
+        const r = await post(
+            app,
+            "/v1/orders",
+            topUp(h.handleSha256, { description: "mine", x402: { services: [agentPin()] } }),
+        );
+        const text =
+            "Bugnet x402 $1.00 + $0.003 fee: agent402.tools/v1/auto/ up to $0.01 pays 4vJ9...kLKi";
+        expect((await findOrder(app.pool, r.body.orderId))!.description).toBe(text);
+        expect(r.body.paymentRequired.resource.description).toBe(text);
+    });
+
+    it("stores Payments' listed and paid_path, whatever the gateway sent", async () => {
+        const h = await account();
+        const r = await post(
+            app,
+            "/v1/orders",
+            topUp(h.handleSha256, { x402: { services: [agentPin({ listed: "unlisted" })] } }),
+        );
+        const stored = (await findOrder(app.pool, r.body.orderId))!;
+        expect(stored.x402Setup!.services[0]).toMatchObject({
+            listed: "unlisted",
+            paidPath: "/v1/auto/chat/completions",
+            newPin: true,
+        });
+    });
+
+    it("keeps held services' listed and paid_path for a re-pin with the same payee", async () => {
+        const h = await account();
+        await seedService(app.pool, {
+            accountId: h.id,
+            listed: "unlisted",
+            paidPath: "/v1/auto/chat/completions",
+        });
+        const r = await post(
+            app,
+            "/v1/orders",
+            topUp(h.handleSha256, { x402: { services: [agentPin({ maxPriceMicros: 20_000 })] } }),
+        );
+        const stored = (await findOrder(app.pool, r.body.orderId))!;
+        expect(stored.x402Setup!.services[0]).toMatchObject({
+            maxPriceMicros: 20_000,
+            listed: "unlisted",
+            paidPath: "/v1/auto/chat/completions",
+            newPin: false,
+        });
+        expect(stored.description).toBe("Bugnet x402 $1.00 + $0.003 fee");
+    });
+
+    it("keeps probe.accepted unchanged through the schema", async () => {
+        const h = await account();
+        const base = agentPin();
+        const accepted = { ...(base.probe.accepted as object), future: [1, "x", { y: null }] };
+        const r = await post(
+            app,
+            "/v1/orders",
+            topUp(h.handleSha256, {
+                x402: { services: [{ ...base, probe: { ...base.probe, accepted } }] },
+            }),
+        );
+        expect(r.body.status).toBe("payment_required");
+        const stored = (await findOrder(app.pool, r.body.orderId))!;
+        expect(stored.x402Setup!.services[0]!.probe.accepted).toEqual(accepted);
+    });
+
+    it("answers pin_refused with the service and the reason", async () => {
+        const h = await account();
+        const pin = agentPin({ probe: { at: "x", status: 200, accepted: null } });
+        const r = await post(
+            app,
+            "/v1/orders",
+            topUp(h.handleSha256, { x402: { services: [pin] } }),
+        );
+        expect(r.status).toBe(200);
+        expect(r.body).toEqual({
+            status: "refused",
+            reason: "pin_refused",
+            serviceId: pin.serviceId,
+            pinReason: "no_402",
+        });
+    });
+
+    it("replays a key hit and refuses the same key with another allowance", async () => {
+        const h = await account();
+        const body = topUp(h.handleSha256, { idempotencyKey: KEY });
+        const first = await post(app, "/v1/orders", body);
+        const again = await post(app, "/v1/orders", body);
+        expect(again.body.orderId).toBe(first.body.orderId);
+        const other = await post(app, "/v1/orders", {
+            ...body,
+            allowanceMicros: 500_000,
+            amountMicros: 503_000,
+        });
+        expect(other.body).toMatchObject({
+            status: "refused",
+            reason: "idempotency_conflict",
+            orderId: first.body.orderId,
+        });
+        const pinned = await post(app, "/v1/orders", {
+            ...body,
+            x402: { services: [agentPin()] },
+        });
+        expect(pinned.body).toMatchObject({ status: "refused", reason: "idempotency_conflict" });
+    });
+
+    it.each([
+        ["an allowance order without a handle", { handleSha256: undefined }],
+        ["a start order with allowance and a handle", { kind: "start", packageId: "cpu-small" }],
+        ["an amount that is not allowance plus fee", { amountMicros: 1_003_001 }],
+        ["another package id", { packageId: "pkg-test" }],
+        ["a zero allowance", { allowanceMicros: 0, feeMicros: 0, amountMicros: 0 }],
+        [
+            "a fee without an allowance",
+            { kind: "start", handleSha256: undefined, allowanceMicros: 0 },
+        ],
+        ["a fractional allowance", { allowanceMicros: 1.5 }],
+        ["a negative fee", { feeMicros: -1 }],
+        [
+            "pins on a zero allowance",
+            {
+                kind: "start",
+                handleSha256: undefined,
+                allowanceMicros: 0,
+                feeMicros: 0,
+                amountMicros: 10_000,
+                x402: { disable: [] },
+            },
+        ],
+        ["an unknown x402 member", { x402: { extra: 1 } }],
+        ["an unknown pin member", { x402: { services: [{ ...agentPin(), extra: 1 }] } }],
+        ["a pin with a bad service id", { x402: { services: [agentPin({ serviceId: "xs_x" })] } }],
+        ["a pin with a zero price", { x402: { services: [agentPin({ maxPriceMicros: 0 })] } }],
+        ["a pin prefix without a slash", { x402: { services: [agentPin({ prefix: "v1" })] } }],
+        [
+            "a pin without probe.accepted",
+            { x402: { services: [{ ...agentPin(), probe: { at: "x", status: 402 } }] } },
+        ],
+        ["a duplicate pin", { x402: { services: [agentPin(), agentPin()] } }],
+        ["a disable entry that is no service id", { x402: { disable: ["nope"] } }],
+        ["a zero minute limit", { x402: { spendPerMinuteMicros: 0 } }],
+        ["65 disable entries", { x402: { disable: Array(65).fill("xs_aaaaaaaaaaaaaaaa") } }],
+    ])("refuses %s as bad_request", async (_n, over) => {
+        const h = await account();
+        const body = { ...topUp(h.handleSha256), ...over };
+        const r = await post(app, "/v1/orders", body);
+        expect(r.status).toBe(400);
+        expect(r.body).toEqual({ status: "refused", reason: "bad_request" });
+    });
+
+    it("refuses allowance fields on an extend and a start above its amount", async () => {
+        const h = await account();
+        const extend = await post(app, "/v1/orders", {
+            ...create({ kind: "extend", handleSha256: h.handleSha256 }),
+            allowanceMicros: 1,
+        });
+        expect(extend.body).toEqual({ status: "refused", reason: "bad_request" });
+        const start = await post(
+            app,
+            "/v1/orders",
+            create({ amountMicros: 1_000_000, allowanceMicros: 1_000_000, feeMicros: 3_000 }),
+        );
+        expect(start.body).toEqual({ status: "refused", reason: "bad_request" });
     });
 });
