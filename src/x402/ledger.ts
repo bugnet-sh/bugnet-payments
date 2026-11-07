@@ -183,6 +183,15 @@ export async function feeDue(db: Queryable, accountId: string | null): Promise<b
     return res.rows.length === 0;
 }
 
+// The pending fee an order carries is credited to the allowance only until the account's first fee
+export async function creditMicros(
+    db: Queryable,
+    feeMicros: number,
+    accountId: string | null,
+): Promise<number> {
+    return feeMicros > 0 && (await feeDue(db, accountId)) === false ? feeMicros : 0;
+}
+
 export async function isFirstUse(db: Queryable, payer: string, orderId: string): Promise<boolean> {
     const res = await db.query(
         "select 1 from x402_payers where payer = $1 and first_order_id = $2",

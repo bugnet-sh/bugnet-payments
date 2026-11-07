@@ -610,6 +610,36 @@ describe("a settling hot order", () => {
         expect(await orderOf(hot.id)).toMatchObject({ state: "redeemed", paidAt: at(-46_000) });
     });
 
+    it("creates the account and funds a settling hot START order, which stays paid", async () => {
+        const { order: start } = await seedAllowanceOrder(db.pool, {
+            kind: "start",
+            state: "settling",
+            packageId: "cpu-small",
+            handleSha256: null,
+            payer: PAYER,
+            createdAt: at(-2 * MIN),
+            expiresAt: at(13 * MIN),
+        });
+        await seedPayment(db.pool, start.id, {
+            txSignature: newSignature(),
+            payer: PAYER,
+            createdAt: at(-46_000),
+        });
+        await db.pool.query("update x402_pool set unpaid_micros = 3000000 where id = 1");
+        await reconcileSettling({ ...deps(landedRpc(), t0), paid: paidDeps });
+        expect(await orderOf(start.id)).toMatchObject({ state: "paid", paidAt: at(-46_000) });
+        const accounts = await db.pool.query<{ state: string; funded: number }>(
+            "select state, funded_micros::int as funded from x402_accounts where id = $1",
+            [start.id],
+        );
+        expect(accounts.rows).toEqual([{ state: "open", funded: start.allowanceMicros }]);
+        const funded = await db.pool.query<{ n: number }>(
+            "select count(*)::int as n from x402_fundings where order_id = $1",
+            [start.id],
+        );
+        expect(funded.rows[0]!.n).toBe(1);
+    });
+
     it("rolls back when onOrderPaid throws and funds on the next run", async () => {
         const broken = {
             ...paidDeps,

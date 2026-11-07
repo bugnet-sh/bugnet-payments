@@ -1222,6 +1222,59 @@ describe("allowance orders", () => {
         expect(await fundingCount(hot.id)).toBe(1);
     });
 
+    async function closeHotAccount() {
+        await db.pool.query("update x402_accounts set state = 'closing' where handle_sha256 = $1", [
+            handle,
+        ]);
+    }
+
+    it("answers the stored refusal when markPaid refuses the funding", async () => {
+        await closeHotAccount();
+        expect(await payOrder(hotDeps(), hot.id, await hotPayment(), sig())).toEqual({
+            kind: "refused",
+            orderId: hot.id,
+            httpStatus: 410,
+            reason: "order_closed",
+            code: "sandbox_ended",
+        });
+        expect(await findOrder(db.pool, hot.id)).toMatchObject({
+            state: "refunding",
+            x402Refusal: "sandbox_ended",
+        });
+        expect(await fundingCount(hot.id)).toBe(0);
+    });
+
+    it("answers the stored refusal when the reconciler refused the same payment first", async () => {
+        await closeHotAccount();
+        const log = memoryLog();
+        const r = confirmingAfter(() =>
+            reconcileSettling({
+                pool: db.pool,
+                rpc: landedRpc(),
+                rpcTimeoutMs: 1_000,
+                log: silentLog,
+                now: () => new Date(NOW.getTime() + 60_000),
+                paid: paidDeps,
+            }).then(() => {}),
+        );
+        expect(
+            await payOrder(
+                { ...hotDeps(), log, settler: settlerOn(r) },
+                hot.id,
+                await hotPayment(),
+                sig(),
+            ),
+        ).toEqual({
+            kind: "refused",
+            orderId: hot.id,
+            httpStatus: 410,
+            reason: "order_closed",
+            code: "sandbox_ended",
+        });
+        expect(await stateOf(hot.id)).toBe("refunding");
+        expect(JSON.stringify(log.lines)).not.toContain("not settling at confirmation");
+    });
+
     it("answers a refused funding with order_closed and its code", async () => {
         const { order: closed } = await seedAllowanceOrder(db.pool, {
             state: "refunding",

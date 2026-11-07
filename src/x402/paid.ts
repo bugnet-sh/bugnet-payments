@@ -6,7 +6,7 @@ import type { OrderRow, PaymentRow } from "../orders/types.ts";
 import type { AllowanceFunding } from "./funding.ts";
 import {
     ceilingUsedMicros,
-    feeDue,
+    creditMicros,
     findAccountByHandle,
     insertAccount,
     lockAccount,
@@ -119,7 +119,7 @@ async function refusalFor(
     if ((await ceilingUsedMicros(c, account.id)) + order.allowanceMicros > ceiling) {
         return "allowance_ceiling";
     }
-    const credit = order.feeMicros > 0 && !(await feeDue(c, account.id)) ? order.feeMicros : 0;
+    const credit = await creditMicros(c, order.feeMicros, account.id);
     // Create check 12 already bounds the sum; this guards the credited fee
     const pool = await readPool(c);
     if (pool.committedMicros + order.allowanceMicros + credit > d.x402.pool_max_micros) {

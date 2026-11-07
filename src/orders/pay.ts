@@ -29,7 +29,7 @@ import {
     StaleStateError,
 } from "./store.ts";
 import { onOrderPaid, type PaidDeps } from "../x402/paid.ts";
-import type { SignerHealth } from "../x402/types.ts";
+import type { SignerHealth, X402Refusal } from "../x402/types.ts";
 import type { OrderRow } from "./types.ts";
 
 export type PayOutcome =
@@ -387,7 +387,7 @@ async function markPaid(
     paidAt: Date,
 ): Promise<PayOutcome> {
     const paid: PayOutcome = { kind: "paid", orderId, payer, signature };
-    let confirmed: boolean;
+    let confirmed: boolean | Refused;
     try {
         confirmed = await withTx(d.pool, async (c) => {
             // Payment row before order row, the order the reconciler locks them in
@@ -396,13 +396,14 @@ async function markPaid(
             if (!(await confirmPayment(c, orderId, d.now()))) return false;
             await setOrderState(c, orderId, "settling", "paid", { paidAt });
             if (order?.payInto === "allowance" && payment !== null) {
-                await onOrderPaid(
+                const out = await onOrderPaid(
                     c,
                     d.x402.paid,
                     { ...order, state: "paid", paidAt },
                     { ...payment, status: "confirmed" },
                     d.now(),
                 );
+                if (out.kind === "refused") return closed(orderId, out.refusal);
             }
             return true;
         });
@@ -411,23 +412,39 @@ async function markPaid(
             d.log.error("marking the order paid failed", { orderId, err });
             return settling(orderId);
         }
-        return (await paidElsewhere(d, orderId, signature)) ? paid : settling(orderId);
+        return (await paidElsewhere(d, orderId, signature)) ?? settling(orderId);
     }
-    if (confirmed || (await paidElsewhere(d, orderId, signature))) return paid;
+    if (confirmed === true) return paid;
+    if (confirmed !== false) return confirmed;
+    const elsewhere = await paidElsewhere(d, orderId, signature);
+    if (elsewhere !== null) return elsewhere;
     d.log.error("payment was not settling at confirmation", { orderId, signature });
     return settling(orderId);
 }
 
-async function paidElsewhere(d: PayDeps, orderId: string, signature: string): Promise<boolean> {
+function closed(orderId: string, refusal: X402Refusal): Refused {
+    return refused(orderId, 410, "order_closed", { code: refusal });
+}
+
+// The answer for a payment another path already confirmed, built from the stored rows
+async function paidElsewhere(
+    d: PayDeps,
+    orderId: string,
+    signature: string,
+): Promise<PayOutcome | null> {
     try {
         const order = await findOrder(d.pool, orderId);
         const payment = await findPaymentByOrder(d.pool, orderId);
-        return (
-            (order?.state === "paid" || order?.state === "redeemed") &&
-            payment?.txSignature === signature
-        );
+        if (order === null || payment?.txSignature !== signature) return null;
+        if (order.state === "paid" || order.state === "redeemed") {
+            return { kind: "paid", orderId, payer: payment.payer, signature };
+        }
+        if (order.state === "refunding" && order.x402Refusal !== null) {
+            return closed(orderId, order.x402Refusal);
+        }
+        return null;
     } catch (err) {
         d.log.error("re-reading the order failed", { orderId, err });
-        return false;
+        return null;
     }
 }

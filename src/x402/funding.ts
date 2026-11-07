@@ -2,7 +2,13 @@ import type pg from "pg";
 import type { Settings } from "../config.ts";
 import type { Log } from "../log.ts";
 import type { OrderRow, PaymentRow } from "../orders/types.ts";
-import { feeDue, insertFirstUse, movePool, startClosing, voidConditionsHold } from "./ledger.ts";
+import {
+    creditMicros,
+    insertFirstUse,
+    movePool,
+    startClosing,
+    voidConditionsHold,
+} from "./ledger.ts";
 import { dropPendingPaidEvent, enqueueAllowanceEvent } from "./outbox.ts";
 import type { AccountRow, FundingRow } from "./types.ts";
 
@@ -66,7 +72,7 @@ export function createAllowanceFunding(d: { x402: Settings["x402"]; log: Log }):
         account: AccountRow,
         at: Date,
     ): Promise<FundingRow> {
-        const credit = order.feeMicros > 0 && !(await feeDue(c, account.id)) ? order.feeMicros : 0;
+        const credit = await creditMicros(c, order.feeMicros, account.id);
         const amount = order.allowanceMicros + credit;
         const inserted = await c.query<FundingDbRow>(
             `insert into x402_fundings (order_id, account_id, allowance_micros,

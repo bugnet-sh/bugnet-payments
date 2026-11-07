@@ -297,6 +297,39 @@ describe("onOrderPaid", () => {
         expect((await refundRow(a.order.id))[0]).toMatchObject({ reason: "x402_ceiling" });
     });
 
+    it("refuses when only the credited fee tips the pool over its maximum", async () => {
+        const account = await seedAccount(db.pool);
+        const { order: first } = await seedAllowanceOrder(db.pool, {
+            state: "redeemed",
+            handleSha256: account.handleSha256,
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+        });
+        await seedFunding(db.pool, {
+            accountId: account.id,
+            orderId: first.id,
+            allowanceMicros: 1_003_000,
+            feeCreditedMicros: 3_000,
+        });
+        await setPool(49_000_000, 0);
+        const a = await hotAllowance(account.handleSha256!, {
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+            amountMicros: 1_003_000,
+        });
+        expect(await paid(a.order, a.payment)).toEqual({
+            kind: "refused",
+            refusal: "allowance_pool_full",
+        });
+        await setPool(48_997_000, 0);
+        const b = await hotAllowance(account.handleSha256!, {
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+            amountMicros: 1_003_000,
+        });
+        expect(await paid(b.order, b.payment)).toMatchObject({ kind: "funded" });
+    });
+
     it("writes no funding, pin, first use or event for a refused order and lowers only unpaid", async () => {
         const account = await seedAccount(db.pool, { state: "closing" });
         const a = await hotAllowance(account.handleSha256!, {
