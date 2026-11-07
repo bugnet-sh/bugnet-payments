@@ -7,34 +7,56 @@ export function countingRpc(
     rpc: SolanaRpc,
     o: { limitPerHour: number; log: Log; now: () => number },
 ): SolanaRpc {
-    let sends: number[] = [];
+    const sends: number[] = [];
+    let head = 0;
     let alarmed = false;
     const record = () => {
         const now = o.now();
-        sends = sends.filter((t) => now - t <= HOUR_MS);
+        while (head < sends.length && now - sends[head]! > HOUR_MS) head++;
+        if (head > 1024) {
+            sends.splice(0, head);
+            head = 0;
+        }
         sends.push(now);
-        if (sends.length <= o.limitPerHour) {
+        const calls = sends.length - head;
+        if (calls <= o.limitPerHour) {
             alarmed = false;
         } else if (!alarmed) {
             alarmed = true;
-            o.log.alarm("x402_rpc_budget", { calls: sends.length, limitPerHour: o.limitPerHour });
+            o.log.alarm("x402_rpc_budget", { calls, limitPerHour: o.limitPerHour });
         }
+    };
+    const counted = (fn: unknown, self: unknown) => {
+        return (...args: unknown[]) => {
+            record();
+            return (fn as (...a: unknown[]) => unknown).apply(self, args);
+        };
     };
     return new Proxy(rpc, {
         get(target, prop, receiver) {
             const value: unknown = Reflect.get(target, prop, receiver);
             if (typeof value !== "function") return value;
             return (...args: unknown[]) => {
-                const pending = (
-                    value as (...a: unknown[]) => { send: (...s: unknown[]) => unknown }
-                ).apply(target, args);
-                return {
-                    ...pending,
-                    send: (...s: unknown[]) => {
-                        record();
-                        return pending.send(...s);
-                    },
+                const pending: unknown = (value as (...a: unknown[]) => unknown).apply(
+                    target,
+                    args,
+                );
+                if (
+                    pending === null ||
+                    typeof pending !== "object" ||
+                    typeof (pending as { send?: unknown }).send !== "function"
+                ) {
+                    return pending;
+                }
+                const p = pending as { send: unknown; reactiveStore?: unknown };
+                const wrapped: Record<string, unknown> = {
+                    ...p,
+                    send: counted(p.send, pending),
                 };
+                if (typeof p.reactiveStore === "function") {
+                    wrapped.reactiveStore = counted(p.reactiveStore, pending);
+                }
+                return wrapped;
             };
         },
     });

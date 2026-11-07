@@ -10,7 +10,8 @@ export const TEST_BLOCKHASH = getBase58Decoder().decode(new Uint8Array(32).fill(
 export const TEST_LVBH = 900n;
 export const TEST_RENT_EXEMPT_MIN_LAMPORTS = 650_240n;
 export const TEST_ATA_RENT_LAMPORTS = 1_488_440n;
-// The finalized slot of the default epoch info, and of a status answer that names none
+// The finalized slot of the default epoch info, and the context slot that fills status,
+// getAccountInfo and getTokenAccountBalance answers that name none
 export const TEST_SLOT = 5_000n;
 
 // A finalized epoch info at the given block height, read with a status from a caught-up node
@@ -51,7 +52,8 @@ const CONTEXT_READS: ReadonlySet<string> = new Set([
     "getTokenAccountBalance",
 ]);
 
-// A status or account answer scripted without a context comes from a node at the default finalized slot
+// A status or account answer scripted without a context comes from a node at the default
+// finalized slot
 async function withContext(answer: unknown): Promise<unknown> {
     const value = await answer;
     if (value === null || typeof value !== "object" || "context" in value) return value;
