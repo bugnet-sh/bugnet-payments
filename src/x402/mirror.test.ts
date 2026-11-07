@@ -381,6 +381,22 @@ describe("runMirror", () => {
         expect(await incidents()).toEqual([]);
     });
 
+    it("a known payment listed by an earlier run is not a mirror_gap on the run that completes", async () => {
+        for (let i = 0; i < 40; i++) chain.credit(hot, 1n);
+        const s = chain.credit(hot, 1_013_000n);
+        await hotOrderPaidWith(db.pool, s);
+        chain.advance(400);
+        const small = { ...d, x402: { ...x402, mirror_page_size: 3 } };
+        let completed = false;
+        for (let i = 0; i < 40 && !completed; i++) {
+            const run = await runMirror(small);
+            const stored = (await chainSignatures()).includes(s);
+            if (!stored && run.verified === false && run.reason === "backlog") continue;
+            completed = true;
+        }
+        expect(await incidents()).toEqual([]);
+    }, 60_000);
+
     it("a tail that is not open returns token_account with no RPC call", async () => {
         await db.pool.query("update x402_tail set token_account = null where id = 1");
         const before = chain.calls().length;

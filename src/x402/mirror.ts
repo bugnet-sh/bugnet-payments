@@ -57,6 +57,9 @@ interface Cursor {
     openingSlot: bigint;
     newest: string | null;
     segments: Segment[];
+    // Every signature listed so far this cycle, so the run that completes the listing still knows
+    // the ones listed by earlier runs
+    seen: Set<string>;
 }
 
 let cursor: Cursor | null = null;
@@ -135,6 +138,7 @@ interface Listed {
 
 interface Listing {
     listed: Listed[];
+    listedEver: ReadonlySet<string>;
     complete: boolean;
 }
 
@@ -150,6 +154,7 @@ async function listSignatures(
     const cur = cursor !== null && cursor.openingSlot === tail.openingSlot ? cursor : null;
     const queue: Segment[] = [cur?.newest ? { until: cur.newest } : {}, ...(cur?.segments ?? [])];
     const out: Listed[] = [];
+    const seen = new Set(cur?.seen);
     let newest = cur?.newest ?? null;
     for (let pages = 0; queue.length > 0 && pages < MAX_LIST_PAGES; pages++) {
         const seg = queue[0]!;
@@ -165,14 +170,17 @@ async function listSignatures(
                 .send(abort),
         );
         if (pages === 0 && page[0] !== undefined) newest = page[0].signature;
-        for (const e of page) out.push({ signature: e.signature, slot: e.slot });
+        for (const e of page) {
+            out.push({ signature: e.signature, slot: e.slot });
+            seen.add(e.signature);
+        }
         const last = page[page.length - 1];
         if (page.length < limit || last === undefined || last.slot < lower) queue.shift();
         else queue[0] = { ...seg, before: last.signature };
     }
     const complete = queue.length === 0;
-    cursor = complete ? null : { openingSlot: tail.openingSlot, newest, segments: queue };
-    return { listed: out, complete };
+    cursor = complete ? null : { openingSlot: tail.openingSlot, newest, segments: queue, seen };
+    return { listed: out, listedEver: seen, complete };
 }
 
 async function storedSignatures(
@@ -408,7 +416,7 @@ async function mirror(d: MirrorDeps, md: MatchDeps, tail: Tail, p: Progress): Pr
     const floor = tail.verifiedSlot - BigInt(d.x402.mirror_rescan_slots);
     const lowest = windows.reduce((m, w) => (w.from < m ? w.from : m), floor);
     const lower = lowest > tail.openingSlot + 1n ? lowest : tail.openingSlot + 1n;
-    const { listed, complete } = await listSignatures(d, tail, p.c, lower);
+    const { listed, listedEver, complete } = await listSignatures(d, tail, p.c, lower);
     const inRange = listed.filter((e) => e.slot >= lower && e.slot <= p.c);
     const have = await storedSignatures(
         d.pool,
@@ -438,13 +446,7 @@ async function mirror(d: MirrorDeps, md: MatchDeps, tail: Tail, p: Progress): Pr
     }
     const backlog = !complete || kept.length > p.stored;
 
-    const knownMissing = await checkKnown(
-        d,
-        tail,
-        p.c,
-        new Set(listed.map((e) => e.signature)),
-        complete,
-    );
+    const knownMissing = await checkKnown(d, tail, p.c, listedEver, complete);
     const ledger = await ledgerBalance(d.pool, tail, p.c);
     const differs = ledger !== info.amount;
 
