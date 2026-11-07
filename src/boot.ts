@@ -62,12 +62,14 @@ export async function bootChecks(
 ): Promise<{ recipientAta: Address; feePayerLamports: bigint }> {
     if (d.refundsEnabled && d.eventPublicKey === "") {
         throw new BootCheckError(
-            'router.event_public_key: set it to the output of bugnet-dev pubkey --priv "$BUGNET_EVENT_SIGNING_KEY"',
+            'router.event_public_key: set it to the output of bugnet-dev pubkey --priv "$BUGNET_EVENT_SIGNING_KEY" ' +
+                "(dev only: the key appears in argv and shell history; use pubkey --event once router Task 39 ships)",
         );
     }
     if (d.recipient === d.feePayer || d.recipient === d.refundWallet) {
         throw new BootCheckError(
-            `recipient must be a cold address: ${d.recipient} is also the fee payer or the refund wallet; set BUGNET_RECIPIENT_KEY to a different wallet`,
+            `recipient must be a cold address: ${d.recipient} is also the fee payer or the refund wallet; ` +
+                "set [solana] recipient in the TOML settings to the cold wallet's address",
         );
     }
 

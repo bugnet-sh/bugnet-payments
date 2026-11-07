@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { parse } from "smol-toml";
 import { describe, expect, it } from "vitest";
 import {
     loadSettings,
@@ -13,6 +14,8 @@ import {
 const ADDR = "11111111111111111111111111111111";
 const ORDER_SEED = Buffer.alloc(32, 1);
 const CLAIM_KEY = Buffer.alloc(32, 2);
+const PAYMENTS_TOKEN = "gateway-to-payments-0123456789abcdef";
+const ROUTER_TOKEN = "payments-to-router-0123456789abcdef";
 
 function settings(router: Partial<Settings["router"]> = {}): Settings {
     const s = parseSettings(`[solana]\nrecipient = "${ADDR}"`, "t.toml");
@@ -21,8 +24,8 @@ function settings(router: Partial<Settings["router"]> = {}): Settings {
 
 function validEnv(overrides: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = {
-        BUGNET_PAYMENTS_TOKEN: "gateway-to-payments",
-        BUGNET_PAYMENTS_ROUTER_TOKEN: "payments-to-router",
+        BUGNET_PAYMENTS_TOKEN: PAYMENTS_TOKEN,
+        BUGNET_PAYMENTS_ROUTER_TOKEN: ROUTER_TOKEN,
         BUGNET_ORDER_PRIVATE_KEY: ORDER_SEED.toString("base64"),
         BUGNET_CLAIM_KEY: CLAIM_KEY.toString("base64"),
         BUGNET_FEE_PAYER_KEY: "fee-payer-key",
@@ -76,12 +79,18 @@ describe("parseSettings", () => {
         ).toThrow(/solana.transaction_versions: only \[0\] is supported/);
     });
 
-    it("example.toml lists valid keys", () => {
-        const text = readFileSync("config/example.toml", "utf8").replace(
-            'recipient = ""',
-            `recipient = "${ADDR}"`,
-        );
-        expect(() => parseSettings(text, "example.toml")).not.toThrow();
+    it("example.toml lists every setting at exactly its schema default", () => {
+        const text = readFileSync("config/example.toml", "utf8");
+        expect(text).toContain('recipient = ""');
+        const filled = text.replace('recipient = ""', `recipient = "${ADDR}"`);
+        const defaults = parseSettings(`[solana]\nrecipient = "${ADDR}"`, "minimal.toml");
+        expect(parseSettings(filled, "example.toml")).toEqual(defaults);
+        const listed = parse(text) as Record<string, Record<string, unknown>>;
+        const keys = (doc: object) =>
+            Object.fromEntries(
+                Object.entries(doc).map(([table, fields]) => [table, Object.keys(fields).sort()]),
+            );
+        expect(keys(listed)).toEqual(keys(defaults));
     });
 
     it("names an unknown key", () => {
@@ -133,6 +142,19 @@ describe("parseSettings", () => {
         }
     });
 
+    it("requires an https router.url unless loopback, as every call carries the router token", () => {
+        const router = (url: string) =>
+            parseSettings(`[solana]\nrecipient = "${ADDR}"\n[router]\nurl = "${url}"`, "t").router
+                .url;
+        expect(() => router("http://10.0.0.5:8080")).toThrow(
+            "t: router.url: must be https unless the host is loopback",
+        );
+        expect(() => router("http://router.bugnet.internal:8080")).toThrow(/router.url/);
+        expect(router("http://127.0.0.1:38080")).toBe("http://127.0.0.1:38080");
+        expect(router("http://[::1]:8080")).toBe("http://[::1]:8080");
+        expect(router("https://10.0.0.5:8443")).toBe("https://10.0.0.5:8443");
+    });
+
     it("accepts router.get_order = true", () => {
         const s = parseSettings(`[solana]\nrecipient = "${ADDR}"\n[router]\nget_order = true`, "t");
         expect(s.router.get_order).toBe(true);
@@ -144,8 +166,8 @@ describe("readSecrets", () => {
         const s = readSecrets(validEnv(), settings());
         expect(s.orderSeed.equals(ORDER_SEED)).toBe(true);
         expect(s.claimKey.equals(CLAIM_KEY)).toBe(true);
-        expect(s.paymentsToken).toBe("gateway-to-payments");
-        expect(s.routerToken).toBe("payments-to-router");
+        expect(s.paymentsToken).toBe(PAYMENTS_TOKEN);
+        expect(s.routerToken).toBe(ROUTER_TOKEN);
         expect(s.feePayerKey).toBe("fee-payer-key");
         expect(s.refundKey).toBe("refund-key");
         expect(s.rpcUrl).toBe("https://rpc.example/?api-key=k");
@@ -188,11 +210,39 @@ describe("readSecrets", () => {
             readSecrets(validEnv({ BUGNET_PAYMENTS_ROUTER_TOKEN: undefined }), on),
         ).toThrow(/BUGNET_PAYMENTS_ROUTER_TOKEN/);
         expect(() =>
-            readSecrets(
-                validEnv({ BUGNET_PAYMENTS_ROUTER_TOKEN: "same", BUGNET_PAYMENTS_TOKEN: "same" }),
-                on,
-            ),
+            readSecrets(validEnv({ BUGNET_PAYMENTS_ROUTER_TOKEN: PAYMENTS_TOKEN }), on),
         ).toThrow(/must differ/);
+    });
+
+    it("refuses a gateway token shorter than 32 characters, naming it, never its value", () => {
+        const short = "s3cr3t-0123456789abcdef-0123456";
+        expect(short).toHaveLength(31);
+        const env = validEnv({ BUGNET_PAYMENTS_TOKEN: short });
+        expect(() => readSecrets(env, settings())).toThrow(
+            /^BUGNET_PAYMENTS_TOKEN must be at least 32 characters$/,
+        );
+        expect(() => readSecrets(env, settings())).not.toThrow(/s3cr3t/);
+        expect(() =>
+            readSecrets(validEnv({ BUGNET_PAYMENTS_TOKEN: `${short}x` }), settings()),
+        ).not.toThrow();
+    });
+
+    it("refuses a router token shorter than 32 characters only when a router flag is on", () => {
+        const short = "s3cr3t-0123456789abcdef-0123456";
+        const env = validEnv({ BUGNET_PAYMENTS_ROUTER_TOKEN: short });
+        for (const flag of ["check_payer", "get_order"] as const) {
+            expect(() => readSecrets(env, settings({ [flag]: true }))).toThrow(
+                /^BUGNET_PAYMENTS_ROUTER_TOKEN must be at least 32 characters$/,
+            );
+            expect(() => readSecrets(env, settings({ [flag]: true }))).not.toThrow(/s3cr3t/);
+        }
+        expect(() => readSecrets(env, settings())).not.toThrow();
+        expect(() =>
+            readSecrets(
+                validEnv({ BUGNET_PAYMENTS_ROUTER_TOKEN: `${short}x` }),
+                settings({ get_order: true }),
+            ),
+        ).not.toThrow();
     });
 });
 

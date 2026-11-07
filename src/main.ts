@@ -82,6 +82,17 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             refundsEnabled: s.refunds.enabled,
             eventPublicKey: s.router.event_public_key,
         });
+        if (s.orders.max_amount_micros > s.refunds.daily_cap_micros) {
+            log.warn(
+                "orders.max_amount_micros is above refunds.daily_cap_micros, " +
+                    "a refund above the cap always goes to the manual queue",
+                {
+                    maxAmountMicros: s.orders.max_amount_micros,
+                    dailyCapMicros: s.refunds.daily_cap_micros,
+                    manualReason: "refund_exceeds_cap",
+                },
+            );
+        }
 
         const internal = await startServer(s.http.internal_listen, http.internalHandler, log);
         closers.push(internal.close);

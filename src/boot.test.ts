@@ -1,6 +1,6 @@
 import { type Address, address } from "@solana/kit";
 import { describe, expect, it } from "vitest";
-import { bootChecks } from "./boot.ts";
+import { BootCheckError, bootChecks } from "./boot.ts";
 import { usdcAta } from "./solana/accounts.ts";
 import { TOKEN_PROGRAM, USDC_MINT } from "./solana/constants.ts";
 import { createFakeRpc, type FakeRpc, type FakeRpcScript } from "./testing/fake-rpc.ts";
@@ -108,7 +108,8 @@ describe("bootChecks", () => {
         await expect(
             bootChecks({ ...deps(rpc), refundsEnabled: true, eventPublicKey: "" }),
         ).rejects.toThrow(
-            'router.event_public_key: set it to the output of bugnet-dev pubkey --priv "$BUGNET_EVENT_SIGNING_KEY"',
+            'router.event_public_key: set it to the output of bugnet-dev pubkey --priv "$BUGNET_EVENT_SIGNING_KEY" ' +
+                "(dev only: the key appears in argv and shell history; use pubkey --event once router Task 39 ships)",
         );
         expect(Object.values(rpc.calls).reduce((a, b) => a + b, 0)).toBe(0);
         await expect(
@@ -117,12 +118,17 @@ describe("bootChecks", () => {
     });
 
     it("refuses a recipient equal to the fee payer or the refund wallet", async () => {
-        await expect(bootChecks({ ...deps(okAccounts()), recipient: feePayer })).rejects.toThrow(
-            /recipient must be a cold address/,
-        );
-        await expect(
-            bootChecks({ ...deps(okAccounts()), recipient: refundWallet }),
-        ).rejects.toThrow(/recipient must be a cold address/);
+        for (const hot of [feePayer, refundWallet]) {
+            const err = await bootChecks({ ...deps(okAccounts()), recipient: hot }).catch(
+                (e: unknown) => e,
+            );
+            expect(err).toBeInstanceOf(BootCheckError);
+            expect((err as Error).message).toBe(
+                `recipient must be a cold address: ${hot} is also the fee payer or the refund ` +
+                    "wallet; set [solana] recipient in the TOML settings to the cold wallet's address",
+            );
+            expect((err as Error).message).not.toContain("BUGNET_RECIPIENT_KEY");
+        }
     });
 
     it("passes and reports the recipient account and fee payer balance", async () => {

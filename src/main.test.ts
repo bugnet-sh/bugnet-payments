@@ -240,7 +240,7 @@ beforeAll(async () => {
     ]);
     settings = testSettings();
     secrets = {
-        paymentsToken: "gateway-to-payments-main-test",
+        paymentsToken: "gateway-to-payments-main-test-0123456789",
         routerToken: "",
         orderSeed: Buffer.alloc(32, 1),
         claimKey: Buffer.alloc(32, 2),
@@ -297,6 +297,48 @@ describe("startService", () => {
         expect(openDuringCheck).toEqual([false]);
         await expect(fetch(`http://${failing.http.internal_listen}/healthz`)).rejects.toThrow();
         await expect(fetch(`http://${failing.http.public_listen}/healthz`)).rejects.toThrow();
+    });
+
+    it("warns at boot when an order can be larger than the refund daily cap", async () => {
+        const capWarnings = (log: ReturnType<typeof memoryLog>) =>
+            log.lines.filter(
+                (l) => typeof l.msg === "string" && l.msg.startsWith("orders.max_amount_micros"),
+            );
+        for (const [cap, warned] of [
+            [100_000_000, false],
+            [99_999_999, true],
+        ] as const) {
+            const log = memoryLog();
+            const s = await startService({
+                settings: testSettings({
+                    orders: { max_amount_micros: 100_000_000 },
+                    refunds: { daily_cap_micros: cap },
+                }),
+                secrets,
+                rpc: okRpc(),
+                log,
+            });
+            try {
+                expect(log.lines.some((l) => l.msg === "payments started")).toBe(true);
+            } finally {
+                await s.stop();
+            }
+            expect(capWarnings(log)).toEqual(
+                warned
+                    ? [
+                          expect.objectContaining({
+                              level: "warn",
+                              msg:
+                                  "orders.max_amount_micros is above refunds.daily_cap_micros, " +
+                                  "a refund above the cap always goes to the manual queue",
+                              maxAmountMicros: 100_000_000,
+                              dailyCapMicros: 99_999_999,
+                              manualReason: "refund_exceeds_cap",
+                          }),
+                      ]
+                    : [],
+            );
+        }
     });
 
     it("takes orders on the internal listener and challenges them on the public one", async () => {

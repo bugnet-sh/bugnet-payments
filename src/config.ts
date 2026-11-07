@@ -14,6 +14,7 @@ import { z } from "zod";
 const MAINNET = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const ONLY_V0 = "only [0] is supported";
+const MIN_TOKEN_LENGTH = 32;
 
 const duration = z
     .string()
@@ -121,7 +122,11 @@ const settingsSchema = z
             .prefault({}),
         router: z
             .object({
-                url: z.url().default("http://127.0.0.1:8080"),
+                // Every router call carries BUGNET_PAYMENTS_ROUTER_TOKEN
+                url: z
+                    .url()
+                    .refine(httpsOrLoopback, "must be https unless the host is loopback")
+                    .default("http://127.0.0.1:8080"),
                 timeout: duration.prefault("3s"),
                 check_payer: z.boolean().default(false),
                 get_order: z.boolean().default(false),
@@ -275,6 +280,12 @@ export function readSecrets(env: NodeJS.ProcessEnv, s: Settings): Secrets {
     const token = (name: string, v: string): void => {
         if (/\s/.test(v)) bad.set(name, "must not contain whitespace");
     };
+    const bearer = (name: string, v: string): void => {
+        token(name, v);
+        if (!bad.has(name) && v.length < MIN_TOKEN_LENGTH) {
+            bad.set(name, `must be at least ${MIN_TOKEN_LENGTH} characters`);
+        }
+    };
     const text = (name: string): string => {
         const v = env[name] ?? "";
         if (v.trim() === "") bad.set(name, "must be set");
@@ -293,13 +304,18 @@ export function readSecrets(env: NodeJS.ProcessEnv, s: Settings): Secrets {
     const feePayerKey = text("BUGNET_FEE_PAYER_KEY");
     const refundKey = text("BUGNET_REFUND_KEY");
     const rpcUrl = text("BUGNET_SOLANA_RPC_URL");
-    token("BUGNET_PAYMENTS_TOKEN", paymentsToken);
+    bearer("BUGNET_PAYMENTS_TOKEN", paymentsToken);
     token("BUGNET_SOLANA_RPC_URL", rpcUrl);
 
     const routerName = "BUGNET_PAYMENTS_ROUTER_TOKEN";
     const routerToken = env[routerName] ?? "";
-    if (s.router.check_payer || s.router.get_order) text(routerName);
-    token(routerName, routerToken);
+    // The router client sends its token only while a router flag is on
+    if (s.router.check_payer || s.router.get_order) {
+        text(routerName);
+        bearer(routerName, routerToken);
+    } else {
+        token(routerName, routerToken);
+    }
     // Spec section 4 keeps the router caller token apart from the gateway's token
     if (routerToken !== "" && routerToken === paymentsToken) {
         bad.set(routerName, "must differ from BUGNET_PAYMENTS_TOKEN");
