@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import { bindX402ExactCredential, InvalidProofError } from "@solana/pay-kit";
 import type { PaymentRequirements, SettleResponse } from "@x402/core/types";
 import type pg from "pg";
@@ -19,6 +20,7 @@ import {
     findPaymentByOrder,
     insertPayment,
     lockOrder,
+    paymentKeyHash,
     setOrderState,
     StaleStateError,
 } from "./store.ts";
@@ -31,6 +33,8 @@ export type PayOutcome =
           kind: "already_paid";
           orderId: string;
           samePayment: true;
+          // The settling request's idempotency key came back, which a settled transaction never shows
+          sameKey: boolean;
           signature: string;
           payer: string;
       }
@@ -135,11 +139,20 @@ function settling(orderId: string): PayOutcome {
     return { kind: "settling", orderId };
 }
 
+function keyHash(key: string | null): Buffer | null {
+    return key === null ? null : createHash("sha256").update(key, "utf8").digest();
+}
+
+/**
+ * `key` is the paying request's idempotency key. It is stored with the payment, so a retry of
+ * that request can be told from a stranger replaying the transaction once it is public on chain.
+ */
 export async function payOrder(
     d: PayDeps,
     orderId: string,
     raw: unknown,
     signal: AbortSignal,
+    key: string | null = null,
 ): Promise<PayOutcome> {
     const c = await d.pool.connect();
     const tx = new Tx(c);
@@ -148,11 +161,11 @@ export async function payOrder(
         const order = await lockOrder(c, orderId);
         if (order === null) return refused(orderId, 404, "order_unknown");
         const t = d.now();
-        const answer = await answerForState(d, c, order, raw, t);
+        const answer = await answerForState(d, c, order, raw, key, t);
         if (answer !== undefined) return answer;
         const checked = await checkPayment(d, order, raw, signal);
         if ("kind" in checked) return checked;
-        return await settle(d, c, tx, order, checked, t);
+        return await settle(d, c, tx, order, checked, key, t);
     } finally {
         await tx.rollback();
         tx.release();
@@ -164,12 +177,13 @@ async function answerForState(
     c: pg.PoolClient,
     order: OrderRow,
     raw: unknown,
+    key: string | null,
     t: Date,
 ): Promise<PayOutcome | undefined> {
     switch (order.state) {
         case "paid":
         case "redeemed":
-            return alreadyPaid(d, c, order.id, raw);
+            return alreadyPaid(d, c, order.id, raw, key);
         case "settling":
             return settling(order.id);
         case "expired":
@@ -191,6 +205,7 @@ async function alreadyPaid(
     c: pg.PoolClient,
     orderId: string,
     raw: unknown,
+    key: string | null,
 ): Promise<PayOutcome> {
     const payment = await findPaymentByOrder(c, orderId);
     let hash: string | undefined;
@@ -202,10 +217,13 @@ async function alreadyPaid(
     if (payment === null || hash !== payment.messageHash) {
         return { kind: "already_paid", orderId, samePayment: false };
     }
+    const stored = await paymentKeyHash(c, orderId);
+    const given = keyHash(key);
     return {
         kind: "already_paid",
         orderId,
         samePayment: true,
+        sameKey: stored !== null && given !== null && timingSafeEqual(stored, given),
         signature: payment.txSignature,
         payer: payment.payer,
     };
@@ -280,6 +298,7 @@ async function settle(
     tx: Tx,
     order: OrderRow,
     { dec, req }: Checked,
+    key: string | null,
     t: Date,
 ): Promise<PayOutcome> {
     const attempt: SettleAttempt = {
@@ -298,6 +317,7 @@ async function settle(
                 blockhash: r.blockhash,
                 lastValidBlockHeight: r.lastValidBlockHeight,
                 createdAt: t,
+                keySha256: keyHash(key),
             });
             await setOrderState(c, order.id, "unpaid", "settling", { payer: dec.payer });
             await tx.commit();

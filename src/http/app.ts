@@ -88,7 +88,7 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
             hints,
             orderKey: orderKey(secrets.orderSeed),
             claimKey: secrets.claimKey,
-            pay: (orderId, raw, signal) => payOrder(pay, orderId, raw, signal),
+            pay: (orderId, raw, signal, key) => payOrder(pay, orderId, raw, signal, key),
             log,
             now,
         },

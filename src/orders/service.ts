@@ -2,8 +2,10 @@
  * The internal order API: create, idempotent replay, x402 payment from MCP _meta, and redeem.
  *
  * A request is validated, matched to an order (by orderId, then the payment's memo, then the
- * idempotency key) or creates one. A caller is authorized by the order's claim, or by presenting
- * the payment that paid it. Only an authorized caller gets an order token, and a redeem decides
+ * idempotency key) or creates one. A caller is authorized by the order's claim, by the payment it
+ * just settled, or by presenting that payment again with the idempotency key that settled it. A
+ * settled transaction is public on chain, so it never authorizes on its own. Only an authorized
+ * caller gets an order token, and a redeem decides
  * under the row lock so it never races the refund sweeper. Every answer comes from the stored
  * order, never from the request's terms.
  */
@@ -40,7 +42,12 @@ export interface OrderServiceDeps {
     hints: BlockhashCache;
     orderKey: KeyObject;
     claimKey: Buffer;
-    pay: (orderId: string, raw: unknown, signal: AbortSignal) => Promise<PayOutcome>;
+    pay: (
+        orderId: string,
+        raw: unknown,
+        signal: AbortSignal,
+        key: string | null,
+    ) => Promise<PayOutcome>;
     log: Log;
     now: () => Date;
 }
@@ -153,7 +160,7 @@ export async function handleOrderRequest(
             found = { order, idempotencyHit: true };
         }
     }
-    return answerFound(d, r, found, signal);
+    return answerFound(d, r, found, key, signal);
 }
 
 async function create(
@@ -191,6 +198,7 @@ async function answerFound(
     d: OrderServiceDeps,
     r: OrderRequest,
     { order, idempotencyHit }: Found,
+    key: string | null,
     signal: AbortSignal,
 ): Promise<OrderResult> {
     if (termsDiffer(r, order)) {
@@ -198,7 +206,7 @@ async function answerFound(
     }
     let authorized = false;
     if (r.payment !== undefined) {
-        const outcome = await d.pay(order.id, r.payment, signal);
+        const outcome = await d.pay(order.id, r.payment, signal, key);
         switch (outcome.kind) {
             case "refused":
                 return refused(outcome.reason, order.id, outcome.retryAfterSeconds);
@@ -208,7 +216,7 @@ async function answerFound(
                 authorized = true;
                 break;
             case "already_paid":
-                authorized = outcome.samePayment;
+                authorized = outcome.samePayment && outcome.sameKey;
                 break;
         }
     }

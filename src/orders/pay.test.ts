@@ -517,19 +517,26 @@ describe("payOrder", () => {
     it("answers already_paid to a second payment after the first returned", async () => {
         const p1 = p;
         const p2 = await signedPayment(req, payer2);
-        const first = await payOrder(d, order.id, p1, sig());
+        const key = "toolu_01SETTLINGREQUESTKEY";
+        const first = await payOrder(d, order.id, p1, sig(), key);
         expect(first).toMatchObject({ kind: "paid" });
-        expect(await payOrder(d, order.id, p2, sig())).toEqual({
+        expect(await payOrder(d, order.id, p2, sig(), key)).toEqual({
             kind: "already_paid",
             orderId: order.id,
             samePayment: false,
         });
-        expect(await payOrder(d, order.id, p1, sig())).toEqual({
+        const same = {
             kind: "already_paid",
             orderId: order.id,
             samePayment: true,
             signature: first.kind === "paid" ? first.signature : "",
             payer: payer.address,
+        };
+        expect(await payOrder(d, order.id, p1, sig(), key)).toEqual({ ...same, sameKey: true });
+        expect(await payOrder(d, order.id, p1, sig())).toEqual({ ...same, sameKey: false });
+        expect(await payOrder(d, order.id, p1, sig(), key + "x")).toEqual({
+            ...same,
+            sameKey: false,
         });
         expect(rpc.calls.sendTransaction).toBe(1);
     });

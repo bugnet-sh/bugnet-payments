@@ -1,5 +1,15 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { create, post, terms, testApp, type TestApp, until, withHints } from "../testing/app.ts";
+import { encodePaymentSignatureHeader } from "@x402/core/http";
+import {
+    create,
+    get,
+    post,
+    terms,
+    testApp,
+    type TestApp,
+    until,
+    withHints,
+} from "../testing/app.ts";
 import { seedOrder, seedPayment } from "../testing/orders.ts";
 import { signedPayment } from "../testing/payment.ts";
 import { claimHash, newClaim, sealClaim } from "./claim.ts";
@@ -475,13 +485,50 @@ describe("x402 payment from _meta", () => {
         const created = (await post(app, "/v1/orders", create())).body;
         const p = await signedPayment(withHints(created.paymentRequired.accepts[0]), app.payer);
         const sentBefore = app.rpc.calls.sendTransaction!;
-        const first = await post(app, "/v1/orders", create({ payment: p }));
-        const second = await post(app, "/v1/orders", create({ payment: p }));
+        const first = await post(app, "/v1/orders", create({ payment: p, idempotencyKey: KEY }));
+        const second = await post(app, "/v1/orders", create({ payment: p, idempotencyKey: KEY }));
         expect(first.body.status).toBe("paid");
         expect(second.body.status).toBe("paid");
         expect(second.body.orderToken).toBe(first.body.orderToken);
         expect(second.body.paymentResponse).toEqual(first.body.paymentResponse);
         expect(app.rpc.calls.sendTransaction! - sentBefore).toBe(1);
+    });
+
+    it.each([
+        ["no idempotency key", {}],
+        ["another idempotency key", { idempotencyKey: KEY + "x" }],
+    ])("never hands the token to a settled payment replayed with %s", async (_n, over) => {
+        const created = (await post(app, "/v1/orders", create())).body;
+        const p = await signedPayment(withHints(created.paymentRequired.accepts[0]), app.payer);
+        const first = await post(app, "/v1/orders", create({ payment: p, idempotencyKey: KEY }));
+        expect(first.body.status).toBe("paid");
+        const replay = await post(app, "/v1/orders", { ...create({ payment: p }), ...over });
+        expect(replay.body).toEqual({
+            status: "refused",
+            orderId: created.orderId,
+            reason: "paid_claim_required",
+        });
+    });
+
+    it("never redeems a link-paid order for whoever replays its public transaction", async () => {
+        const created = (await post(app, "/v1/orders", create())).body;
+        const p = await signedPayment(withHints(created.paymentRequired.accepts[0]), app.payer);
+        const paid = await get(app, `/o/${created.orderId}`, {
+            "payment-signature": encodePaymentSignatureHeader(p),
+        });
+        expect(paid.status).toBe(200);
+        const replay = await post(app, "/v1/orders", create({ payment: p, idempotencyKey: KEY }));
+        expect(replay.body).toEqual({
+            status: "refused",
+            orderId: created.orderId,
+            reason: "paid_claim_required",
+        });
+        expect(await stateOf(created.orderId)).toBe("paid");
+        const owner = await post(app, "/v1/orders", {
+            orderId: created.orderId,
+            claim: created.claim,
+        });
+        expect(owner.body.status).toBe("paid");
     });
 
     it("does not authorize a different payment for a paid order", async () => {

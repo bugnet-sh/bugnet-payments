@@ -197,8 +197,8 @@ export async function setOrderState(
 export async function insertPayment(c: Queryable, p: NewPayment): Promise<void> {
     await c.query(
         `insert into payments (order_id, tx_signature, message_hash, payer, source_token_account,
-            amount_micros, blockhash, last_valid_block_height, status, created_at)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, 'settling', $9)`,
+            amount_micros, blockhash, last_valid_block_height, status, created_at, key_sha256)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, 'settling', $9, $10)`,
         [
             p.orderId,
             p.txSignature,
@@ -209,8 +209,17 @@ export async function insertPayment(c: Queryable, p: NewPayment): Promise<void> 
             p.blockhash,
             p.lastValidBlockHeight.toString(),
             p.createdAt,
+            p.keySha256 ?? null,
         ],
     );
+}
+
+export async function paymentKeyHash(db: Queryable, orderId: string): Promise<Buffer | null> {
+    const res = await db.query<{ key_sha256: Buffer | null }>(
+        "select key_sha256 from payments where order_id = $1",
+        [orderId],
+    );
+    return res.rows[0]?.key_sha256 ?? null;
 }
 
 export async function findPaymentByOrder(

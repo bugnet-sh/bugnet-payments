@@ -70,7 +70,9 @@ export interface PaymentRow {
 }
 
 // createdAt comes from the injected clock, never from Postgres now(), so one clock decides every time rule.
-export type NewPayment = Omit<PaymentRow, "status" | "confirmedAt">;
+export type NewPayment = Omit<PaymentRow, "status" | "confirmedAt"> & {
+    keySha256?: Buffer | null;
+};
 
 export type OrderUpdate = Partial<
     Pick<
