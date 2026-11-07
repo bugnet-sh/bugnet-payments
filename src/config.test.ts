@@ -50,6 +50,8 @@ describe("parseSettings", () => {
         expect(s.limits.status_per_ip_per_minute).toBe(240);
         expect(s.router.check_payer).toBe(false);
         expect(s.router.get_order).toBe(false);
+        expect(s.http.public_listen).toBe("127.0.0.1:8450");
+        expect(s.http.internal_listen).toBe("127.0.0.1:8447");
     });
 
     it("dev.toml lowers the fee-payer thresholds to fit the funded test wallet", () => {
@@ -57,6 +59,7 @@ describe("parseSettings", () => {
         expect(s.solana.fee_payer_boot_min_lamports).toBe(20_000_000);
         expect(s.alarms.fee_payer_min_lamports).toBe(20_000_000);
         expect(s.solana.recipient).toBe("Bhhc3XNdjtCNr3pj2aZwhCt8pHwsU8wRL7dqJNDZEExw");
+        expect(s.http.public_url).toBe("http://127.0.0.1:8450");
     });
 
     it("refuses transaction versions other than [0]", () => {
@@ -92,7 +95,7 @@ describe("parseSettings", () => {
             parseSettings(`[http]\npublic_url = "http://pay.bugnet.sh"\n${solana}`, "t"),
         ).toThrow(/http.public_url/);
         expect(() =>
-            parseSettings(`[http]\npublic_url = "http://127.0.0.1:8446"\n${solana}`, "t"),
+            parseSettings(`[http]\npublic_url = "http://127.0.0.1:8450"\n${solana}`, "t"),
         ).not.toThrow();
     });
 

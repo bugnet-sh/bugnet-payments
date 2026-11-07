@@ -22,7 +22,7 @@ const duration = z
 
 const hostPort = z
     .string()
-    .regex(/^(\[[0-9a-fA-F:.]+\]|[^:[\]\s]+):\d{1,5}$/, "host:port such as 127.0.0.1:8446");
+    .regex(/^(\[[0-9a-fA-F:.]+\]|[^:[\]\s]+):\d{1,5}$/, "host:port such as 127.0.0.1:8450");
 
 const count = z.int().min(1);
 const amount = z.int().min(0);
@@ -35,7 +35,7 @@ const settingsSchema = z
     .object({
         http: z
             .object({
-                public_listen: hostPort.default("127.0.0.1:8446"),
+                public_listen: hostPort.default("127.0.0.1:8450"),
                 internal_listen: hostPort.default("127.0.0.1:8447"),
                 public_url: z
                     .url()

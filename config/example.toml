@@ -2,7 +2,7 @@
 # environment (see .env.example). Durations take ms, s, m or h.
 
 [http]
-public_listen = "127.0.0.1:8446"
+public_listen = "127.0.0.1:8450"
 internal_listen = "127.0.0.1:8447"
 public_url = "https://pay.bugnet.sh"
 trusted_proxies = ["127.0.0.1", "::1"]

@@ -1,7 +1,7 @@
 # Local run, the fee-payer floors fit the funded test fee payer, which holds 0.05 SOL
 
 [http]
-public_url = "http://127.0.0.1:8446"
+public_url = "http://127.0.0.1:8450"
 
 [database]
 url = "postgres://localhost:5432/bugnet_payments_dev?sslmode=disable"
