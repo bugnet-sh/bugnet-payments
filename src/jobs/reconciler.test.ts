@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { getBase58Decoder } from "@solana/kit";
 import { stringify } from "smol-toml";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { parseSettings } from "../config.ts";
 import { memoryLog, silentLog } from "../log.ts";
 import {
@@ -17,7 +17,9 @@ import { createRouterClient } from "../router/client.ts";
 import { until } from "../testing/app.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
 import { createFakeRpc, epochAt, type FakeRpc, neverAnswers } from "../testing/fake-rpc.ts";
-import { seedOrder, seedPayment } from "../testing/orders.ts";
+import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts";
+import { createAllowanceFunding } from "../x402/funding.ts";
+import { seedAccount } from "../testing/x402.ts";
 import { reconcileSettling, type ReconcileDeps, type ReconcileReport } from "./reconciler.ts";
 import { sweep } from "./sweeper.ts";
 
@@ -51,7 +53,14 @@ beforeEach(async () => {
 });
 
 function deps(rpc: FakeRpc, now: Date, log: ReconcileDeps["log"] = silentLog): ReconcileDeps {
-    return { pool: db.pool, rpc, rpcTimeoutMs: defaults.solana.rpc_timeout, log, now: () => now };
+    return {
+        pool: db.pool,
+        rpc,
+        rpcTimeoutMs: defaults.solana.rpc_timeout,
+        log,
+        now: () => now,
+        paid: null,
+    };
 }
 
 function newSignature(): string {
@@ -546,5 +555,88 @@ describe("racing payOrder", () => {
             status: "settling",
         });
         expect(await failedPayments(order.id)).toEqual([archivedAs(payment, "onchain_failed")]);
+    });
+});
+
+describe("a settling hot order", () => {
+    const X = defaults.x402;
+    const paidDeps = {
+        funding: createAllowanceFunding({ x402: X, log: silentLog }),
+        x402: X,
+        log: silentLog,
+    };
+    const landedRpc = () =>
+        createFakeRpc({
+            getSignatureStatuses: () => ({ value: [CONFIRMED] }),
+            getEpochInfo: () => epochAt(900n),
+        });
+    let hot: OrderRow;
+
+    beforeEach(async () => {
+        await db.pool.query(
+            "update x402_pool set committed_micros = 0, unpaid_micros = 1000000 where id = 1",
+        );
+        const account = await seedAccount(db.pool);
+        ({ order: hot } = await seedAllowanceOrder(db.pool, {
+            state: "settling",
+            payer: PAYER,
+            handleSha256: account.handleSha256,
+            createdAt: at(-2 * MIN),
+            expiresAt: at(13 * MIN),
+        }));
+        await seedPayment(db.pool, hot.id, {
+            txSignature: newSignature(),
+            payer: PAYER,
+            createdAt: at(-46_000),
+        });
+    });
+    afterEach(async () => {
+        await db.pool.query("update x402_pool set committed_micros = 0, unpaid_micros = 0");
+    });
+
+    const fundings = async () =>
+        (
+            await db.pool.query<{ n: number }>(
+                "select count(*)::int as n from x402_fundings where order_id = $1",
+                [hot.id],
+            )
+        ).rows[0]!.n;
+
+    it("funds a settling hot order whose payment landed", async () => {
+        expect(await reconcileSettling({ ...deps(landedRpc(), t0), paid: paidDeps })).toMatchObject(
+            { paid: 1 },
+        );
+        expect(await fundings()).toBe(1);
+        expect(await orderOf(hot.id)).toMatchObject({ state: "redeemed", paidAt: at(-46_000) });
+    });
+
+    it("rolls back when onOrderPaid throws and funds on the next run", async () => {
+        const broken = {
+            ...paidDeps,
+            funding: { ...paidDeps.funding, fund: () => Promise.reject(new Error("boom")) },
+        };
+        const rpc = landedRpc();
+        expect(await reconcileSettling({ ...deps(rpc, t0), paid: broken })).toMatchObject({
+            paid: 0,
+            waiting: 1,
+        });
+        expect((await orderOf(hot.id)).state).toBe("settling");
+        expect((await findPaymentByOrder(db.pool, hot.id))!.status).toBe("settling");
+        expect(await fundings()).toBe(0);
+        expect(await reconcileSettling({ ...deps(rpc, t0), paid: paidDeps })).toMatchObject({
+            paid: 1,
+        });
+    });
+
+    it("leaves a hot order settling when no PaidDeps are given", async () => {
+        const log = memoryLog();
+        expect(await reconcileSettling(deps(landedRpc(), t0, log))).toMatchObject({
+            paid: 0,
+            waiting: 1,
+        });
+        expect((await orderOf(hot.id)).state).toBe("settling");
+        expect(JSON.stringify(levels(log, "error"))).toContain(
+            `hot order ${hot.id} needs PaidDeps`,
+        );
     });
 });

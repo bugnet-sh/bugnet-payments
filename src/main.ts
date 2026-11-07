@@ -31,6 +31,7 @@ import { reconcileSettling } from "./jobs/reconciler.ts";
 import { sweep } from "./jobs/sweeper.ts";
 import { jsonLog, type Log } from "./log.ts";
 import { runRefunds } from "./refunds/executor.ts";
+import { createAllowanceFunding } from "./x402/funding.ts";
 import type { RouterClient } from "./router/client.ts";
 import { loadKeypair } from "./solana/keys.ts";
 import { createRpc, type SolanaRpc } from "./solana/rpc.ts";
@@ -163,7 +164,8 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
         return run;
     };
 
-    const reconcile = tracked(() => reconcileSettling({ pool, rpc, rpcTimeoutMs, log, now }));
+    const paid = { funding: createAllowanceFunding({ x402: s.x402, log }), x402: s.x402, log };
+    const reconcile = tracked(() => reconcileSettling({ pool, rpc, rpcTimeoutMs, log, now, paid }));
     const first = reconcile().catch((err: unknown) =>
         log.error("job failed", { job: "reconcile", err }),
     );

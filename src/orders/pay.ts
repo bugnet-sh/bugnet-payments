@@ -23,10 +23,12 @@ import {
     findPaymentByOrder,
     insertPayment,
     lockOrder,
+    lockPayment,
     paymentKeyHash,
     setOrderState,
     StaleStateError,
 } from "./store.ts";
+import { onOrderPaid, type PaidDeps } from "../x402/paid.ts";
 import type { SignerHealth } from "../x402/types.ts";
 import type { OrderRow } from "./types.ts";
 
@@ -60,7 +62,7 @@ export interface PayDeps {
     router: RouterClient;
     attempts: RateLimiter;
     challenge: ChallengeContext;
-    x402: { x402: Settings["x402"]; signer: SignerHealth };
+    x402: { x402: Settings["x402"]; signer: SignerHealth; paid: PaidDeps };
     log: Log;
     now: () => Date;
 }
@@ -388,8 +390,20 @@ async function markPaid(
     let confirmed: boolean;
     try {
         confirmed = await withTx(d.pool, async (c) => {
+            // Payment row before order row, the order the reconciler locks them in
+            const payment = await lockPayment(c, orderId);
+            const order = await lockOrder(c, orderId);
             if (!(await confirmPayment(c, orderId, d.now()))) return false;
             await setOrderState(c, orderId, "settling", "paid", { paidAt });
+            if (order?.payInto === "allowance" && payment !== null) {
+                await onOrderPaid(
+                    c,
+                    d.x402.paid,
+                    { ...order, state: "paid", paidAt },
+                    { ...payment, status: "confirmed" },
+                    d.now(),
+                );
+            }
             return true;
         });
     } catch (err) {

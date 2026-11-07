@@ -12,6 +12,7 @@ import type { SolanaRpc } from "../solana/rpc.ts";
 import { parseIndex, type IndexCopy } from "../x402/index-file.ts";
 import { bugnetAddresses } from "../x402/ids.ts";
 import type { BugnetAddresses, SignerHealth } from "../x402/types.ts";
+import { createAllowanceFunding } from "../x402/funding.ts";
 import { createSettler } from "../x402/settler.ts";
 import { createInternalHandler } from "./internal.ts";
 import { createPublicHandler } from "./public.ts";
@@ -92,7 +93,11 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
         router,
         attempts: perMinute(s.orders.attempts_per_order_per_minute),
         challenge,
-        x402: { x402: s.x402, signer: x402.signer },
+        x402: {
+            x402: s.x402,
+            signer: x402.signer,
+            paid: { funding: createAllowanceFunding({ x402: s.x402, log }), x402: s.x402, log },
+        },
         log,
         now,
     });

@@ -1040,3 +1040,119 @@ describe("x402 settle gate on the paid retry", () => {
         }
     });
 });
+
+describe("x402 orders at the paid transaction", () => {
+    const randomHandle = () => randomBytes(32).toString("hex");
+
+    function topUp(handleSha256: string, over: Partial<OrderRequest> = {}): OrderRequest {
+        return {
+            kind: "allowance",
+            packageId: "x402-allowance",
+            handleSha256,
+            amountMicros: 1_003_000,
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+            description: "ignored: Payments writes it",
+            ...over,
+        };
+    }
+
+    type Created = Awaited<ReturnType<typeof post>>["body"];
+
+    async function payLink(created: Created, terms: OrderRequest) {
+        const p = await signedPayment(withHints(created.paymentRequired.accepts[0]), app.payer);
+        // The allowance order answer is Task 26's, so the stored state is what proves the payment
+        await post(app, "/v1/orders", { ...terms, payment: p });
+        expect(await stateOf(created.orderId)).toBe("redeemed");
+    }
+
+    async function fundings(handle: string) {
+        const res = await app.pool.query(
+            `select f.order_id as "orderId", f.allowance_micros::int as "allowanceMicros",
+                f.fee_credited_micros::int as "credit", f.voided_at as "voidedAt"
+             from x402_fundings f join x402_accounts a on a.id = f.account_id
+             where a.handle_sha256 = $1 order by f.allowance_micros`,
+            [handle],
+        );
+        return res.rows;
+    }
+
+    async function refundRow(orderId: string) {
+        const res = await app.pool.query(
+            `select kind, reason, amount_micros::int as "amountMicros",
+                from_wallet as "fromWallet" from refunds where order_id = $1`,
+            [orderId],
+        );
+        return res.rows[0];
+    }
+
+    beforeEach(async () => {
+        await app.pool.query(
+            "update x402_pool set unpaid_micros = 0, committed_micros = 0 where id = 1",
+        );
+    });
+
+    it("credits the fee on two first orders", async () => {
+        const h = await seedAccount(app.pool, { handleSha256: randomHandle() });
+        const handle = h.handleSha256!;
+        const a = await post(app, "/v1/orders", topUp(handle));
+        const b = await post(app, "/v1/orders", topUp(handle));
+        await payLink(a.body, topUp(handle));
+        await payLink(b.body, topUp(handle));
+        expect(await fundings(handle)).toEqual([
+            expect.objectContaining({ allowanceMicros: 1_000_000, credit: 0 }),
+            expect.objectContaining({ allowanceMicros: 1_003_000, credit: 3_000 }),
+        ]);
+    });
+
+    it("refunds the second of two unpaid $3 top-ups x402_ceiling", async () => {
+        const h = await seedAccount(app.pool, { handleSha256: randomHandle() });
+        const handle = h.handleSha256!;
+        const terms = topUp(handle, { allowanceMicros: 3_000_000, amountMicros: 3_003_000 });
+        const a = await post(app, "/v1/orders", terms);
+        const b = await post(app, "/v1/orders", terms);
+        await payLink(a.body, terms);
+        const second = await signedPayment(withHints(b.body.paymentRequired.accepts[0]), app.payer);
+        await post(app, "/v1/orders", { ...terms, payment: second });
+        expect(await findOrder(app.pool, b.body.orderId)).toMatchObject({
+            state: "refunding",
+            x402Refusal: "allowance_ceiling",
+        });
+        expect(await refundRow(b.body.orderId)).toEqual({
+            kind: "full",
+            reason: "x402_ceiling",
+            amountMicros: 3_003_000,
+            fromWallet: "allowance",
+        });
+        expect(await fundings(handle)).toEqual([
+            expect.objectContaining({
+                orderId: a.body.orderId,
+                allowanceMicros: 3_000_000,
+                voidedAt: null,
+            }),
+        ]);
+    });
+
+    it("never moves the pool below zero", async () => {
+        const h = await seedAccount(app.pool, { handleSha256: randomHandle() });
+        const handle = h.handleSha256!;
+        const terms = topUp(handle);
+        const a = await post(app, "/v1/orders", terms);
+        expect(await readPool(app.pool)).toEqual({ committedMicros: 0, unpaidMicros: 1_000_000 });
+        await payLink(a.body, terms);
+        expect(await readPool(app.pool)).toEqual({
+            committedMicros: 1_000_000,
+            unpaidMicros: 0,
+        });
+        const noFee = { ...terms, feeMicros: 0, amountMicros: 1_000_000 };
+        const b = await post(app, "/v1/orders", noFee);
+        await app.pool.query("update x402_accounts set state = 'closing' where id = $1", [h.id]);
+        const p = await signedPayment(withHints(b.body.paymentRequired.accepts[0]), app.payer);
+        await post(app, "/v1/orders", { ...noFee, payment: p });
+        expect(await stateOf(b.body.orderId)).toBe("refunding");
+        expect(await readPool(app.pool)).toEqual({
+            committedMicros: 1_000_000,
+            unpaidMicros: 0,
+        });
+    });
+});

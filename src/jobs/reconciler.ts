@@ -11,6 +11,7 @@ import {
 } from "../orders/store.ts";
 import { type Landing, readLanding } from "../solana/landing.ts";
 import type { SolanaRpc } from "../solana/rpc.ts";
+import { onOrderPaid, type PaidDeps } from "../x402/paid.ts";
 
 export interface ReconcileDeps {
     pool: pg.Pool;
@@ -18,6 +19,7 @@ export interface ReconcileDeps {
     rpcTimeoutMs: number;
     log: Log;
     now: () => Date;
+    paid: PaidDeps | null;
 }
 
 export interface ReconcileReport {
@@ -153,7 +155,18 @@ async function apply(
         const now = d.now();
         if (verdict === "landed") {
             await confirmPayment(c, p.orderId, now);
-            await setOrderState(c, p.orderId, "settling", "paid", { paidAt: payment.createdAt });
+            const paidAt = payment.createdAt;
+            await setOrderState(c, p.orderId, "settling", "paid", { paidAt });
+            if (order.payInto === "allowance") {
+                if (d.paid === null) throw new Error(`hot order ${p.orderId} needs PaidDeps`);
+                await onOrderPaid(
+                    c,
+                    d.paid,
+                    { ...order, state: "paid", paidAt },
+                    { ...payment, status: "confirmed" },
+                    now,
+                );
+            }
             return { kind: "paid" };
         }
         if (!(await archivePayment(c, p.orderId, verdict))) {

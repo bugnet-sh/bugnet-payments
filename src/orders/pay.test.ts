@@ -22,6 +22,7 @@ import { LIGHTHOUSE_PROGRAM, SOLANA_MAINNET, TOKEN_PROGRAM } from "../solana/con
 import { testDb, type TestDb } from "../testing/db.ts";
 import {
     createFakeRpc,
+    epochAt,
     type FakeRpc,
     neverAnswers,
     TEST_BLOCKHASH,
@@ -36,6 +37,9 @@ import { seedAccount } from "../testing/x402.ts";
 import { randomBytes } from "node:crypto";
 import { type ChallengeContext, requirementsFor } from "../x402/challenge.ts";
 import { decodePayment } from "../x402/decode.ts";
+import { reconcileSettling } from "../jobs/reconciler.ts";
+import { readPool } from "../x402/ledger.ts";
+import { createAllowanceFunding } from "../x402/funding.ts";
 import { createSettler, type Settler } from "../x402/settler.ts";
 import { createPayDeps, type PayDeps, payOrder } from "./pay.ts";
 import {
@@ -59,7 +63,12 @@ const challenge: ChallengeContext = {
     transactionVersions: [0],
 };
 const X = parseSettings(stringify({ solana: { recipient: challenge.recipient } }), "t").x402;
-const open = { x402: X, signer: { open: () => true } };
+const paidDeps = {
+    funding: createAllowanceFunding({ x402: X, log: silentLog }),
+    x402: X,
+    log: silentLog,
+};
+const open = { x402: X, signer: { open: () => true }, paid: paidDeps };
 const caps = {
     maxComputeUnits: 50_000,
     maxPriorityFeeMicroLamports: 10_000,
@@ -169,6 +178,13 @@ function confirmingAfter(fn: () => Promise<void>): FakeRpc {
             }
             return CONFIRMED;
         },
+    });
+}
+
+function landedRpc(): FakeRpc {
+    return createFakeRpc({
+        getSignatureStatuses: () => CONFIRMED,
+        getEpochInfo: () => epochAt(900n),
     });
 }
 
@@ -929,6 +945,21 @@ describe("createPayDeps", () => {
     });
 });
 
+function setPool(committed: number, unpaid: number) {
+    return db.pool.query(
+        "update x402_pool set committed_micros = $1, unpaid_micros = $2 where id = 1",
+        [committed, unpaid],
+    );
+}
+
+async function fundingCount(orderId: string): Promise<number> {
+    const res = await db.pool.query<{ n: number }>(
+        "select count(*)::int as n from x402_fundings where order_id = $1",
+        [orderId],
+    );
+    return res.rows[0]!.n;
+}
+
 describe("allowance orders", () => {
     const EXPIRES_AT = EXPIRES;
     let hot: OrderRow;
@@ -940,6 +971,7 @@ describe("allowance orders", () => {
             x402: {
                 x402: { ...X, enabled: true, ...over.x402 },
                 signer: { open: () => over.open ?? true },
+                paid: { ...paidDeps, x402: { ...X, enabled: true, ...over.x402 } },
             },
         };
     }
@@ -949,6 +981,7 @@ describe("allowance orders", () => {
         await seedAccount(db.pool, { handleSha256: handle, packageId: "cpu-small" });
         hot = (await seedAllowanceOrder(db.pool, { handleSha256: handle, expiresAt: EXPIRES_AT }))
             .order;
+        await setPool(0, 5_000_000);
     });
     afterEach(async () => {
         await setControls(db.pool, { paused: false, disabled: false }, "test", NOW);
@@ -1136,6 +1169,57 @@ describe("allowance orders", () => {
                 orderId: lone.id,
             }),
         );
+    });
+
+    it("funds a hot order in markPaid and leaves payments.landed_slot null", async () => {
+        expect(await payOrder(hotDeps(), hot.id, await hotPayment(), sig())).toMatchObject({
+            kind: "paid",
+        });
+        expect(await fundingCount(hot.id)).toBe(1);
+        expect(await stateOf(hot.id)).toBe("redeemed");
+        expect((await findPaymentByOrder(db.pool, hot.id))!.landedSlot).toBeNull();
+        expect(await readPool(db.pool)).toEqual({
+            committedMicros: 1_000_000,
+            unpaidMicros: 4_000_000,
+        });
+    });
+
+    it("answers settling and rolls back when the funding throws", async () => {
+        const broken = hotDeps();
+        broken.x402.paid = {
+            ...paidDeps,
+            funding: { ...paidDeps.funding, fund: () => Promise.reject(new Error("boom")) },
+        };
+        quietConsole();
+        expect(await payOrder(broken, hot.id, await hotPayment(), sig())).toEqual({
+            kind: "settling",
+            orderId: hot.id,
+        });
+        expect(await stateOf(hot.id)).toBe("settling");
+        expect((await findPaymentByOrder(db.pool, hot.id))!.status).toBe("settling");
+        expect(await fundingCount(hot.id)).toBe(0);
+    });
+
+    it("answers paid when the reconciler finished the same hot payment first", async () => {
+        const r = confirmingAfter(() =>
+            reconcileSettling({
+                pool: db.pool,
+                rpc: landedRpc(),
+                rpcTimeoutMs: 1_000,
+                log: silentLog,
+                now: () => new Date(NOW.getTime() + 60_000),
+                paid: paidDeps,
+            }).then(() => {}),
+        );
+        expect(
+            await payOrder(
+                { ...hotDeps(), settler: settlerOn(r) },
+                hot.id,
+                await hotPayment(),
+                sig(),
+            ),
+        ).toMatchObject({ kind: "paid" });
+        expect(await fundingCount(hot.id)).toBe(1);
     });
 
     it("answers a refused funding with order_closed and its code", async () => {
