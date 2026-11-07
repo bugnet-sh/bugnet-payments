@@ -1,0 +1,32 @@
+# Payments as data-plane 15.1 runs services, one versioned directory per instance
+[Unit]
+Description=Bugnet Payments %i
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+User=bugnet-payments
+Group=bugnet-payments
+WorkingDirectory=/opt/bugnet/payments/%i
+ExecStart=/usr/bin/node /opt/bugnet/payments/%i/dist/main.js -config /etc/bugnet/payments.toml
+EnvironmentFile=/etc/bugnet/payments.env
+CapabilityBoundingSet=
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+# No MemoryDenyWriteExecute, which Node's JIT cannot run under
+LimitNOFILE=65536
+LimitCORE=0
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
