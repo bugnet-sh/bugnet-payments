@@ -197,6 +197,23 @@ describe("reserve", () => {
         });
     });
 
+    it("the outflow alarm remembers only the current and the previous day", async () => {
+        const days = ["2031-03-01", "2031-03-02", "2031-03-03"];
+        for (const d of days) {
+            await db.pool.query(
+                "insert into x402_outflow_days (day, micros) values ($1, 99995000)",
+                [d],
+            );
+        }
+        const at = (d: string) => new Date(`${d}T08:00:00Z`);
+        for (const d of days) await reserve(db.pool, input(), x402, log, at(d));
+        expect(alarms("x402_outflow_cap")).toHaveLength(3);
+        await reserve(db.pool, input(), x402, log, at(days[1]!));
+        expect(alarms("x402_outflow_cap")).toHaveLength(3);
+        await reserve(db.pool, input(), x402, log, at(days[0]!));
+        expect(alarms("x402_outflow_cap")).toHaveLength(4);
+    });
+
     it("account_closed for a closing account or no account", async () => {
         await db.pool.query("update x402_accounts set state = 'closing' where id = $1", [
             account.id,
@@ -238,6 +255,31 @@ describe("room changes", () => {
         expect(await runReleaseJob(db.pool, x402, log, later(35_000))).toBe(1);
         expect((await findX402Payment(db.pool, old.id))!.state).toBe("released");
         expect((await findX402Payment(db.pool, young.id))!.state).toBe("reserved");
+    });
+
+    it("a failing row is logged with its id and does not stop the batch", async () => {
+        const bad = input();
+        const good = input();
+        await reserve(db.pool, bad, x402, log, T0);
+        await reserve(db.pool, good, x402, log, later(1_000));
+        const flaky = new Proxy(db.pool, {
+            get(target, prop, recv) {
+                if (prop !== "query") return Reflect.get(target, prop, recv);
+                return (sql: unknown, params?: unknown[]) => {
+                    if (typeof sql === "string" && sql.startsWith("select account_id")) {
+                        if (params?.[0] === bad.id) return Promise.reject(new Error("boom"));
+                    }
+                    return (target.query as (...a: unknown[]) => unknown)(sql, params);
+                };
+            },
+        });
+        expect(await runReleaseJob(flaky, x402, log, later(60_000))).toBe(1);
+        expect((await findX402Payment(db.pool, bad.id))!.state).toBe("reserved");
+        expect((await findX402Payment(db.pool, good.id))!.state).toBe("released");
+        const errs = log.lines.filter((l) => l.level === "error");
+        expect(errs).toHaveLength(1);
+        expect(JSON.stringify(errs[0])).toContain(bad.id);
+        expect(await runReleaseJob(db.pool, x402, log, later(60_000))).toBe(1);
     });
 
     it("the job releases at most 50 per run", async () => {

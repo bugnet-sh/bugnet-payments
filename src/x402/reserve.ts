@@ -54,7 +54,16 @@ class ReserveRefused extends Error {
     }
 }
 
+// only the current and the previous UTC day are kept, so the set cannot grow without bound
 const outflowAlarmed = new Set<string>();
+
+function alarmOutflowOnce(day: string, log: Log, capMicros: number): void {
+    if (outflowAlarmed.has(day)) return;
+    const previous = utcDay(new Date(Date.parse(`${day}T00:00:00Z`) - 86_400_000));
+    for (const kept of outflowAlarmed) if (kept < previous) outflowAlarmed.delete(kept);
+    outflowAlarmed.add(day);
+    log.alarm("x402_outflow_cap", { day, capMicros });
+}
 
 export function utcDay(at: Date): string {
     return at.toISOString().slice(0, 10);
@@ -270,10 +279,7 @@ export async function reserve(
         if (reason === "account_closed" && account?.state === "open") {
             reason = left < amount ? "allowance_spent" : "rate_cap";
         }
-        if (reason === "outflow_cap" && !outflowAlarmed.has(day)) {
-            outflowAlarmed.add(day);
-            log.alarm("x402_outflow_cap", { day, capMicros: x402.outflow_daily_cap_micros });
-        }
+        if (reason === "outflow_cap") alarmOutflowOnce(day, log, x402.outflow_daily_cap_micros);
         return { ok: false, reason, leftMicros: left };
     }
 }
@@ -364,7 +370,7 @@ export async function resolveSigned(
 export async function runReleaseJob(
     pool: pg.Pool,
     x402: Settings["x402"],
-    _log: Log,
+    log: Log,
     now: Date,
 ): Promise<number> {
     const due = await pool.query<{ id: string }>(
@@ -375,7 +381,14 @@ export async function runReleaseJob(
     );
     let released = 0;
     for (const { id } of due.rows) {
-        if (await releaseReserved(pool, id, now)) released++;
+        try {
+            if (await releaseReserved(pool, id, now)) released++;
+        } catch (err) {
+            log.error("x402 release of a reserved payment failed", {
+                paymentId: id,
+                err: err instanceof Error ? err.message : String(err),
+            });
+        }
     }
     return released;
 }
