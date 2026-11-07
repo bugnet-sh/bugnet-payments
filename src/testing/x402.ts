@@ -1,4 +1,5 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { address } from "@solana/kit";
 import type pg from "pg";
 import { newOrderId } from "../orders/ids.ts";
 import { findOrder } from "../orders/store.ts";
@@ -12,8 +13,12 @@ import type {
     X402PaymentRow,
     X402ServicePin,
 } from "../x402/types.ts";
+import { usdcAta } from "../solana/accounts.ts";
 import { SOLANA_MAINNET, TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
+import { buildSellerPayment, randomSellerMemo, signSellerPayment } from "../x402/build.ts";
 import { parseIndex, type IndexCopy } from "../x402/index-file.ts";
+import type { FakeChain } from "./fake-chain.ts";
+import { testSigner } from "./keys.ts";
 import { seedOrder, seedPayment } from "./orders.ts";
 
 export const TEST_PAYTO = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi";
@@ -406,3 +411,102 @@ export const RECORDED_402 = {
     index: 12,
     recordedAt: "2026-11-07T07:08:55Z",
 };
+
+const SEED_NOW = new Date("2030-01-01T12:00:00Z");
+const SEED_DAY = "2030-01-01";
+
+// A seller payment from test signer 11's USDC account, landed through test signer 21 as fee payer
+export async function landPayment(
+    chain: FakeChain,
+    _pool: pg.Pool,
+    o: { amount?: bigint; memo?: Uint8Array; land?: boolean } = {},
+) {
+    const allowance = await testSigner(11);
+    const seller = await testSigner(21);
+    const { value } = await chain.rpc.getLatestBlockhash({ commitment: "confirmed" }).send();
+    const tx = buildSellerPayment({
+        feePayer: seller.address,
+        hotTokenAccount: await usdcAta(allowance.address),
+        destination: await usdcAta(address(TEST_PAYTO)),
+        authority: allowance.address,
+        amount: o.amount ?? 10_000n,
+        memo: o.memo ?? randomSellerMemo(),
+        computeUnitLimit: 20_000,
+        computeUnitPriceMicroLamports: 1n,
+        blockhash: value.blockhash,
+        lastValidBlockHeight: value.lastValidBlockHeight,
+    });
+    const signed = await signSellerPayment(tx, allowance);
+    const txSignature =
+        o.land === false ? "" : await chain.cosignAndSubmit(signed.wireBase64, seller);
+    return {
+        txSignature,
+        ourHash: createHash("sha256").update(signed.signature).digest(),
+        messageHash: signed.messageHash,
+        lastValidBlockHeight: value.lastValidBlockHeight,
+    };
+}
+
+// Without an accountId the row gets an account of its own, funded and held to match its pools
+export async function signedRow(
+    pool: pg.Pool,
+    o: Partial<X402PaymentRow> = {},
+): Promise<X402PaymentRow> {
+    const held = (o.state ?? "signed") === "signed" ? 10_000 : 0;
+    let accountId = o.accountId;
+    if (accountId === undefined) {
+        const account = await seedAccount(pool, {
+            handleSha256: randomBytes(32).toString("hex"),
+            fundedMicros: 1_000_000,
+            heldMicros: held,
+            spentMicros: 0,
+        });
+        accountId = account.id;
+        await pool.query("update x402_pool set committed_micros = 1000000 where id = 1");
+        await pool.query(
+            `insert into x402_payto_days (pay_to, day, micros) values ($1, $2::date, $3)
+             on conflict (pay_to, day) do update set micros = excluded.micros`,
+            [TEST_PAYTO, SEED_DAY, held],
+        );
+        await pool.query(
+            `insert into x402_outflow_days (day, micros) values ($1::date, $2)
+             on conflict (day) do update set micros = excluded.micros`,
+            [SEED_DAY, held],
+        );
+    } else {
+        await pool.query("update x402_accounts set held_micros = held_micros + $2 where id = $1", [
+            accountId,
+            held,
+        ]);
+    }
+    return seedX402Payment(pool, {
+        amountMicros: 10_000,
+        payTo: TEST_PAYTO,
+        payToTokenAccount: await usdcAta(address(TEST_PAYTO)),
+        listed: "indexed",
+        capDay: SEED_DAY,
+        state: "signed",
+        signedAt: SEED_NOW,
+        ...o,
+        accountId,
+    });
+}
+
+// A confirmed payment of an allowance order with no landed_slot yet
+export async function hotOrderPaidWith(pool: pg.Pool, sig: string, confirmedAt = SEED_NOW) {
+    const { order } = await seedOrder(pool, {
+        kind: "start",
+        state: "paid",
+        payInto: "allowance",
+        allowanceMicros: 1_000_000,
+        feeMicros: 3_000,
+        amountMicros: 1_013_000,
+    });
+    await seedPayment(pool, order.id, {
+        status: "confirmed",
+        txSignature: sig,
+        landedSlot: null,
+        confirmedAt,
+    });
+    return order;
+}

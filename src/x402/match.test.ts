@@ -1,4 +1,3 @@
-import { createHash, randomBytes } from "node:crypto";
 import {
     address,
     appendTransactionMessageInstructions,
@@ -27,13 +26,14 @@ import { testDb, type TestDb } from "../testing/db.ts";
 import { testSigner } from "../testing/keys.ts";
 import { seedOrder, seedPayment } from "../testing/orders.ts";
 import {
+    hotOrderPaidWith,
+    landPayment,
     resetLedger,
     seedAccount,
     seedFunding,
-    seedX402Payment,
+    signedRow,
     TEST_PAYTO,
 } from "../testing/x402.ts";
-import { buildSellerPayment, randomSellerMemo, signSellerPayment } from "./build.ts";
 import { readControls } from "./controls.ts";
 import { findAccount } from "./ledger.ts";
 import {
@@ -47,7 +47,6 @@ import {
 } from "./match.ts";
 import { findX402Payment } from "./reserve.ts";
 import { resignProof } from "./resign.ts";
-import type { X402PaymentRow } from "./types.ts";
 
 const NOW = new Date("2030-01-01T12:00:00Z");
 const DAY = "2030-01-01";
@@ -102,69 +101,6 @@ afterEach(async () => {
     await chain.close();
 });
 
-const sha256 = (b: Uint8Array) => createHash("sha256").update(b).digest();
-
-async function signedRow(o: Partial<X402PaymentRow> = {}): Promise<X402PaymentRow> {
-    const held = (o.state ?? "signed") === "signed" ? 10_000 : 0;
-    const account = await seedAccount(db.pool, {
-        handleSha256: randomBytes(32).toString("hex"),
-        fundedMicros: 1_000_000,
-        heldMicros: held,
-        spentMicros: 0,
-    });
-    await db.pool.query("update x402_pool set committed_micros = 1000000 where id = 1");
-    for (const [sql, args] of [
-        [
-            `insert into x402_payto_days (pay_to, day, micros) values ($1, $2::date, $3)
-             on conflict (pay_to, day) do update set micros = excluded.micros`,
-            [TEST_PAYTO, DAY, held],
-        ],
-        [
-            `insert into x402_outflow_days (day, micros) values ($1::date, $2)
-             on conflict (day) do update set micros = excluded.micros`,
-            [DAY, held],
-        ],
-    ] as const) {
-        await db.pool.query(sql, [...args]);
-    }
-    return seedX402Payment(db.pool, {
-        accountId: account.id,
-        amountMicros: 10_000,
-        payTo: TEST_PAYTO,
-        payToTokenAccount: payToAta,
-        listed: "indexed",
-        capDay: DAY,
-        state: "signed",
-        signedAt: NOW,
-        ...o,
-    });
-}
-
-async function landPayment(o: { amount?: bigint; memo?: Uint8Array; land?: boolean }) {
-    const { value } = await chain.rpc.getLatestBlockhash({ commitment: "confirmed" }).send();
-    const tx = buildSellerPayment({
-        feePayer: seller.address,
-        hotTokenAccount: address(hot),
-        destination: address(payToAta),
-        authority: allowance.address,
-        amount: o.amount ?? 10_000n,
-        memo: o.memo ?? randomSellerMemo(),
-        computeUnitLimit: 20_000,
-        computeUnitPriceMicroLamports: 1n,
-        blockhash: value.blockhash,
-        lastValidBlockHeight: value.lastValidBlockHeight,
-    });
-    const signed = await signSellerPayment(tx, allowance);
-    const txSignature =
-        o.land === false ? "" : await chain.cosignAndSubmit(signed.wireBase64, seller);
-    return {
-        txSignature,
-        ourHash: sha256(signed.signature),
-        messageHash: signed.messageHash,
-        lastValidBlockHeight: value.lastValidBlockHeight,
-    };
-}
-
 async function readTx(sig: string): Promise<ChainTx> {
     const raw = await chain.rpc
         .getTransaction(toSignature(sig), {
@@ -194,24 +130,6 @@ const dayMicros = async (table: string, day: string) =>
             .micros,
     );
 const alarms = (name: string) => log.lines.filter((l) => l.alarm === name);
-
-async function hotOrderPaidWith(sig: string) {
-    const { order } = await seedOrder(db.pool, {
-        kind: "start",
-        state: "paid",
-        payInto: "allowance",
-        allowanceMicros: 1_000_000,
-        feeMicros: 3_000,
-        amountMicros: 1_013_000,
-    });
-    await seedPayment(db.pool, order.id, {
-        status: "confirmed",
-        txSignature: sig,
-        landedSlot: null,
-        confirmedAt: NOW,
-    });
-    return order;
-}
 
 async function hotOrderWithFailedPayment(sig: string) {
     const { order } = await seedOrder(db.pool, {
@@ -284,7 +202,7 @@ async function coldRow(o: {
 
 describe("parseChainTx", () => {
     it("reads signatures in order, deltas and token instructions", async () => {
-        const p = await landPayment({});
+        const p = await landPayment(chain, db.pool, {});
         const tx = await readTx(p.txSignature);
         expect(tx.signatures[0]).toBe(p.txSignature);
         expect(tx.signatures).toHaveLength(2);
@@ -356,8 +274,11 @@ describe("parseChainTx", () => {
 
 describe("storeAndMatch: payments", () => {
     it("a payment match confirms by our signature, the message hash and exact amounts (R5)", async () => {
-        const p = await landPayment({});
-        const row = await signedRow({ ourSignatureSha256: p.ourHash, messageHash: p.messageHash });
+        const p = await landPayment(chain, db.pool, {});
+        const row = await signedRow(db.pool, {
+            ourSignatureSha256: p.ourHash,
+            messageHash: p.messageHash,
+        });
         const tx = await readTx(p.txSignature);
         expect(await match(tx)).toBe("payment");
         expect(await paymentRow(row.id)).toMatchObject({
@@ -385,8 +306,11 @@ describe("storeAndMatch: payments", () => {
 
     it("found with an error becomes failed_onchain", async () => {
         chain.failNext();
-        const p = await landPayment({});
-        const row = await signedRow({ ourSignatureSha256: p.ourHash, messageHash: p.messageHash });
+        const p = await landPayment(chain, db.pool, {});
+        const row = await signedRow(db.pool, {
+            ourSignatureSha256: p.ourHash,
+            messageHash: p.messageHash,
+        });
         expect(await match(await readTx(p.txSignature))).toBe("payment");
         expect((await paymentRow(row.id)).state).toBe("failed_onchain");
         expect(await findAccount(db.pool, row.accountId)).toMatchObject({
@@ -398,8 +322,11 @@ describe("storeAndMatch: payments", () => {
     });
 
     it("a failed R5 check is an unknown change", async () => {
-        const p = await landPayment({ amount: 10_001n });
-        const row = await signedRow({ ourSignatureSha256: p.ourHash, messageHash: p.messageHash });
+        const p = await landPayment(chain, db.pool, { amount: 10_001n });
+        const row = await signedRow(db.pool, {
+            ourSignatureSha256: p.ourHash,
+            messageHash: p.messageHash,
+        });
         expect(await match(await readTx(p.txSignature))).toBe("unknown");
         expect((await paymentRow(row.id)).state).toBe("signed");
         expect(await incidents()).toEqual([
@@ -414,8 +341,8 @@ describe("storeAndMatch: payments", () => {
     });
 
     it("a row that fails R5 is not released by a later expiry", async () => {
-        const p = await landPayment({ amount: 10_001n });
-        const row = await signedRow({
+        const p = await landPayment(chain, db.pool, { amount: 10_001n });
+        const row = await signedRow(db.pool, {
             ourSignatureSha256: p.ourHash,
             messageHash: p.messageHash,
             lastValidBlockHeight: 1_200n,
@@ -434,10 +361,13 @@ describe("storeAndMatch: payments", () => {
 
     it("memo collisions never match", async () => {
         const memo = new TextEncoder().encode("abc");
-        const p1 = await landPayment({ memo });
-        const p2 = await landPayment({ memo, amount: 20_000n, land: false });
-        const r1 = await signedRow({ ourSignatureSha256: p1.ourHash, messageHash: p1.messageHash });
-        const r2 = await signedRow({
+        const p1 = await landPayment(chain, db.pool, { memo });
+        const p2 = await landPayment(chain, db.pool, { memo, amount: 20_000n, land: false });
+        const r1 = await signedRow(db.pool, {
+            ourSignatureSha256: p1.ourHash,
+            messageHash: p1.messageHash,
+        });
+        const r2 = await signedRow(db.pool, {
             ourSignatureSha256: p2.ourHash,
             messageHash: p2.messageHash,
             amountMicros: 20_000,
@@ -448,8 +378,8 @@ describe("storeAndMatch: payments", () => {
     });
 
     it("a late landing is confirmed, not charged, and an incident", async () => {
-        const p = await landPayment({});
-        const row = await signedRow({
+        const p = await landPayment(chain, db.pool, {});
+        const row = await signedRow(db.pool, {
             ourSignatureSha256: p.ourHash,
             messageHash: p.messageHash,
             state: "expired_unlanded",
@@ -475,8 +405,8 @@ describe("storeAndMatch: payments", () => {
     });
 
     it("a late landing of an unlisted payee also counts the unlisted day", async () => {
-        const p = await landPayment({});
-        await signedRow({
+        const p = await landPayment(chain, db.pool, {});
+        await signedRow(db.pool, {
             ourSignatureSha256: p.ourHash,
             messageHash: p.messageHash,
             state: "expired_unlanded",
@@ -493,7 +423,7 @@ describe("storeAndMatch: payments", () => {
 describe("storeAndMatch: orders", () => {
     it("an order inflow stores payments.landed_slot", async () => {
         const s = chain.credit(hot, 1_013_000n);
-        const order = await hotOrderPaidWith(s);
+        const order = await hotOrderPaidWith(db.pool, s);
         const tx = await readTx(s);
         expect(await match(tx)).toBe("order");
         expect((await findPaymentByOrder(db.pool, order.id))!.landedSlot).toBe(tx.slot);
@@ -707,7 +637,7 @@ describe("storeAndMatch: unmatched changes", () => {
 
 describe("applyExpiry", () => {
     it("expires only after the height passed, the mirror verified through expiry_seen_slot + 300 and nothing found", async () => {
-        const row = await signedRow({ lastValidBlockHeight: 1_200n });
+        const row = await signedRow(db.pool, { lastValidBlockHeight: 1_200n });
         expect(
             await applyExpiry(
                 db.pool,
@@ -742,14 +672,14 @@ describe("applyExpiry", () => {
     });
 
     it("a hint failure row is never released by applyExpiry", async () => {
-        const row = await signedRow({ lastValidBlockHeight: 10_000n, hint: "failure" });
+        const row = await signedRow(db.pool, { lastValidBlockHeight: 10_000n, hint: "failure" });
         const run = { h0: 2_000n, c0: 2_000n, verifiedSlot: 5_000n };
         expect(await applyExpiry(db.pool, chain.rpc, run, deps)).toEqual({ seen: 0, expired: 0 });
         expect(await paymentRow(row.id)).toMatchObject({ state: "signed", hint: "failure" });
     });
 
     it("never marks a payment whose height has not passed", async () => {
-        const row = await signedRow({ lastValidBlockHeight: 1_200n });
+        const row = await signedRow(db.pool, { lastValidBlockHeight: 1_200n });
         expect(
             await applyExpiry(
                 db.pool,
@@ -796,7 +726,7 @@ describe("applyExpiry", () => {
 
     it("a row with landed_slot expires only on a dropped block", async () => {
         const statuses = (slot: bigint) => () => ({ context: { slot }, value: [null] });
-        const row = await signedRow({
+        const row = await signedRow(db.pool, {
             lastValidBlockHeight: 1_200n,
             landedSlot: 1_050n,
             txSignature: "1".repeat(63) + "2",
@@ -824,8 +754,8 @@ describe("applyExpiry", () => {
     });
 
     it("a row with landed_slot whose transaction is found is matched, not expired", async () => {
-        const p = await landPayment({});
-        const row = await signedRow({
+        const p = await landPayment(chain, db.pool, {});
+        const row = await signedRow(db.pool, {
             ourSignatureSha256: p.ourHash,
             messageHash: p.messageHash,
             lastValidBlockHeight: 1_200n,
@@ -840,7 +770,7 @@ describe("applyExpiry", () => {
     });
 
     it("an RPC error leaves a landed row signed", async () => {
-        const row = await signedRow({
+        const row = await signedRow(db.pool, {
             lastValidBlockHeight: 1_200n,
             landedSlot: 1_050n,
             txSignature: "1".repeat(63) + "2",
@@ -859,8 +789,8 @@ describe("applyExpiry", () => {
 
 describe("alarmUnresolved", () => {
     it("fires for a signed row 10 minutes after signing, once", async () => {
-        const old = await signedRow({ signedAt: new Date(NOW.getTime() - 600_001) });
-        await signedRow({ signedAt: new Date(NOW.getTime() - 599_000) });
+        const old = await signedRow(db.pool, { signedAt: new Date(NOW.getTime() - 600_001) });
+        await signedRow(db.pool, { signedAt: new Date(NOW.getTime() - 599_000) });
         expect(await alarmUnresolved(db.pool, deps)).toBe(1);
         expect(await alarmUnresolved(db.pool, deps)).toBe(0);
         expect(alarms("x402_unresolved")).toEqual([expect.objectContaining({ paymentId: old.id })]);

@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { address } from "@solana/kit";
 import { stringify } from "smol-toml";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -9,14 +9,14 @@ import { testDb, type TestDb } from "../testing/db.ts";
 import { startFakeChain, type FakeChain } from "../testing/fake-chain.ts";
 import { testSigner } from "../testing/keys.ts";
 import {
+    landPayment as landNow,
     resetLedger,
     seedAccount,
     seedFunding,
     seedService,
-    seedX402Payment,
+    signedRow as sharedSignedRow,
     TEST_PAYTO,
 } from "../testing/x402.ts";
-import { buildSellerPayment, randomSellerMemo, signSellerPayment } from "./build.ts";
 import { base32Lower, newX402PaymentId } from "./ids.ts";
 import { applyExpiry } from "./match.ts";
 import { fastPassNeeded, runFastPass, type FastPassDeps } from "./fastpass.ts";
@@ -24,7 +24,6 @@ import { reserve, findX402Payment } from "./reserve.ts";
 import type { X402PaymentRow } from "./types.ts";
 
 const NOW = new Date("2030-01-01T12:00:00Z");
-const DAY = "2030-01-01";
 
 let db: TestDb;
 let chain: FakeChain;
@@ -81,49 +80,9 @@ afterEach(async () => {
     await chain.close();
 });
 
-async function landPayment() {
-    const { value } = await chain.rpc.getLatestBlockhash({ commitment: "confirmed" }).send();
-    const tx = buildSellerPayment({
-        feePayer: seller.address,
-        hotTokenAccount: address(hot),
-        destination: address(payToAta),
-        authority: allowance.address,
-        amount: 10_000n,
-        memo: randomSellerMemo(),
-        computeUnitLimit: 20_000,
-        computeUnitPriceMicroLamports: 1n,
-        blockhash: value.blockhash,
-        lastValidBlockHeight: value.lastValidBlockHeight,
-    });
-    const signed = await signSellerPayment(tx, allowance);
-    const txSignature = await chain.cosignAndSubmit(signed.wireBase64, seller);
-    return {
-        txSignature,
-        ourHash: createHash("sha256").update(signed.signature).digest(),
-        messageHash: signed.messageHash,
-        lastValidBlockHeight: value.lastValidBlockHeight,
-    };
-}
-
-async function signedRow(o: Partial<X402PaymentRow> = {}): Promise<X402PaymentRow> {
-    await db.pool.query(
-        "update x402_accounts set held_micros = held_micros + 10000 where id = $1",
-        [accountId],
-    );
-    return seedX402Payment(db.pool, {
-        accountId,
-        placementId,
-        amountMicros: 10_000,
-        payTo: TEST_PAYTO,
-        payToTokenAccount: payToAta,
-        listed: "indexed",
-        capDay: DAY,
-        state: "signed",
-        signedAt: NOW,
-        signingSlot: 0n,
-        ...o,
-    });
-}
+const landPayment = () => landNow(chain, db.pool);
+const signedRow = (o: Partial<X402PaymentRow> = {}) =>
+    sharedSignedRow(db.pool, { accountId, placementId, signingSlot: 0n, ...o });
 
 const paymentRow = async (id: string) => (await findX402Payment(db.pool, id))!;
 const serviceFailures = async (row: X402PaymentRow) =>
