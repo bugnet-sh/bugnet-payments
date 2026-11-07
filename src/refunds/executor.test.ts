@@ -454,9 +454,49 @@ describe("runRefunds", () => {
         const tick = await runRefunds(deps(rpc, later(60_000)));
         expect(tick).toMatchObject({ confirmed: 1, resigned: 0, resent: 0 });
         expect(reads.at(-1)).toEqual([second.txSignature, first.txSignature]);
-        expect((await findRefund(db.pool, order.id))!.state).toBe("confirmed");
+        expect(await findRefund(db.pool, order.id)).toMatchObject({
+            state: "confirmed",
+            attempts: 2,
+            txSignature: first.txSignature,
+            previousSignatures: [second.txSignature],
+        });
+        expect(
+            log.lines.filter((l) => l.msg === "refund confirmed").map((l) => l.signature),
+        ).toEqual([first.txSignature]);
         expect((await findOrder(db.pool, order.id))!.state).toBe("refunded");
         expect(rpc.calls.getLatestBlockhash).toBe(1);
+    });
+
+    it("keeps the signatures that never landed when the second of three attempts lands", async () => {
+        const { order, refund: first } = await sentRefund({ max_attempts: 3 });
+        let signs = 0;
+        let landed: string | null = null;
+        const rpc = okRpc({
+            getSignatureStatuses: (sigs: string[]) => ({
+                value: sigs.map((s) => (s === landed ? CONFIRMED : null)),
+            }),
+            getEpochInfo: () => epochAt(3_000n),
+            getLatestBlockhash: () => ({
+                value: {
+                    blockhash: getBase58Decoder().decode(new Uint8Array(32).fill(10 + ++signs)),
+                    lastValidBlockHeight: 2_000n,
+                },
+            }),
+        });
+        await runRefunds(deps(rpc, later(30_000)));
+        const second = (await findRefund(db.pool, order.id))!;
+        await runRefunds(deps(rpc, later(60_000)));
+        const third = (await findRefund(db.pool, order.id))!;
+        expect(third.previousSignatures).toEqual([first.txSignature, second.txSignature]);
+
+        landed = second.txSignature;
+        expect((await runRefunds(deps(rpc, later(90_000)))).confirmed).toBe(1);
+        expect(await findRefund(db.pool, order.id)).toMatchObject({
+            state: "confirmed",
+            attempts: 3,
+            txSignature: second.txSignature,
+            previousSignatures: [first.txSignature, third.txSignature],
+        });
     });
 
     it("never re-signs on a missing status from a node behind the finalized slot", async () => {

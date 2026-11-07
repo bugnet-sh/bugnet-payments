@@ -345,12 +345,12 @@ async function waitForLanding(
     for (;;) {
         let landing: Landing;
         try {
-            landing = await readLanding(
+            ({ landing } = await readLanding(
                 rpc,
                 txSignature,
                 lastValidBlockHeight,
                 POLL_CALL_TIMEOUT_MS,
-            );
+            ));
         } catch (err) {
             if (++failures >= MAX_POLL_FAILURES) {
                 const why = err instanceof Error ? err.message : String(err);

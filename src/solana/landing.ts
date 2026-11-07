@@ -3,6 +3,9 @@ import { deadline, type SolanaRpc } from "./rpc.ts";
 
 export type Landing = "landed" | "onchain_failed" | "processed" | "not_found" | "blockhash_expired";
 
+export type LandingRead =
+    { landing: "landed"; signature: string } | { landing: Exclude<Landing, "landed"> };
+
 type Status = {
     confirmationStatus: string | null;
     err: unknown;
@@ -21,7 +24,8 @@ function settled(status: Status): status is NonNullable<Status> {
  * one answer, and the status counts as missing only from a node whose bank has reached that
  * finalized slot, so a lagging node never turns a landed transaction into an expired one.
  * `earlier` are signatures of earlier attempts at the same transfer: any of them landing counts
- * as landed, and any of them still processed only keeps the verdict open.
+ * as landed, and any of them still processed only keeps the verdict open. A landed verdict names
+ * the signature that landed.
  */
 export async function readLanding(
     rpc: SolanaRpc,
@@ -29,22 +33,20 @@ export async function readLanding(
     lastValidBlockHeight: bigint,
     timeoutMs: number,
     earlier: readonly string[] = [],
-): Promise<Landing> {
+): Promise<LandingRead> {
     const epoch = await rpc.getEpochInfo({ commitment: "finalized" }).send(deadline(timeoutMs));
-    const {
-        context,
-        value: [status = null, ...others],
-    } = await rpc
-        .getSignatureStatuses([txSignature, ...earlier].map(signature), {
-            searchTransactionHistory: true,
-        })
+    const signatures = [txSignature, ...earlier];
+    const { context, value } = await rpc
+        .getSignatureStatuses(signatures.map(signature), { searchTransactionHistory: true })
         .send(deadline(timeoutMs));
-    const earlierStatuses: Status[] = others;
-    if (earlierStatuses.some((s) => settled(s) && s.err === null)) return "landed";
-    if (settled(status)) return status.err === null ? "landed" : "onchain_failed";
+    const statuses: Status[] = signatures.map((_, i) => value[i] ?? null);
+    const landed = statuses.findIndex((s) => settled(s) && s.err === null);
+    if (landed !== -1) return { landing: "landed", signature: signatures[landed]! };
+    const [status = null, ...earlierStatuses] = statuses;
+    if (settled(status)) return { landing: "onchain_failed" };
     if (status !== null || earlierStatuses.some((s) => s !== null && !settled(s))) {
-        return "processed";
+        return { landing: "processed" };
     }
     const expired = epoch.blockHeight > lastValidBlockHeight && context.slot >= epoch.absoluteSlot;
-    return expired ? "blockhash_expired" : "not_found";
+    return { landing: expired ? "blockhash_expired" : "not_found" };
 }

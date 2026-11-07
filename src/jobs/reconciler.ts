@@ -129,7 +129,12 @@ function wellFormed(txSignature: string): boolean {
 }
 
 async function verdictFor(d: ReconcileDeps, p: Candidate): Promise<Verdict> {
-    const landing = await readLanding(d.rpc, p.txSignature, p.lastValidBlockHeight, d.rpcTimeoutMs);
+    const { landing } = await readLanding(
+        d.rpc,
+        p.txSignature,
+        p.lastValidBlockHeight,
+        d.rpcTimeoutMs,
+    );
     return landing === "processed" || landing === "not_found" ? "waiting" : landing;
 }
 

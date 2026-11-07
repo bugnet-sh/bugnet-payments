@@ -70,7 +70,7 @@ type ManualReason =
 type Step =
     | { kind: "send"; signed: SignedRefund; resigned: boolean }
     | { kind: "resend"; wire: string; signature: string }
-    | { kind: "confirmed" }
+    | { kind: "confirmed"; signature: string }
     | { kind: "manual"; reason: ManualReason }
     | { kind: "pause"; reason: "daily_cap" | "hourly_rate" }
     | { kind: "float_low"; balanceMicros: bigint; unconfirmedMicros: number }
@@ -250,7 +250,7 @@ async function checkInFlight(
         throw new Error(`refund ${r.id} is ${r.state} without a stored transaction`);
     }
     // An earlier attempt can still land after a re-sign, and then this refund is paid already
-    const landing = await viaRpc(() =>
+    const read = await viaRpc(() =>
         readLanding(
             d.rpc,
             r.txSignature,
@@ -259,13 +259,13 @@ async function checkInFlight(
             r.previousSignatures,
         ),
     );
-    switch (landing) {
+    switch (read.landing) {
         case "processed":
             return { kind: "wait" };
         case "onchain_failed":
             return toManual(c, r, "refund_failed_onchain");
         case "landed":
-            return confirm(c, r, now);
+            return confirm(c, r, read.signature, now);
         case "blockhash_expired":
             if (r.attempts >= d.cfg.max_attempts) {
                 return toManual(c, r, "refund_expired_repeatedly");
@@ -374,16 +374,20 @@ async function sign(
     return { kind: "send", signed, resigned };
 }
 
-async function confirm(c: pg.PoolClient, r: RefundRow, now: Date): Promise<Step> {
-    await c.query("update refunds set state = 'confirmed', confirmed_at = $2 where id = $1", [
-        r.id,
-        now,
-    ]);
+// tx_signature names the transfer that moved the money, the attempts that did not land are kept
+async function confirm(c: pg.PoolClient, r: RefundRow, landed: string, now: Date): Promise<Step> {
+    await c.query(
+        `update refunds set state = 'confirmed', confirmed_at = $2, tx_signature = $3,
+            previous_signatures = case when tx_signature = $3 then previous_signatures
+                else array_append(array_remove(previous_signatures, $3), tx_signature) end
+         where id = $1`,
+        [r.id, now, landed],
+    );
     const order = await lockOrder(c, r.orderId);
     if (order?.state === "refunding") {
         await setOrderState(c, r.orderId, "refunding", "refunded");
     }
-    return { kind: "confirmed" };
+    return { kind: "confirmed", signature: landed };
 }
 
 async function toManual(c: pg.PoolClient, r: RefundRow, reason: ManualReason): Promise<Step> {
@@ -424,7 +428,7 @@ async function finish(
             return;
         case "confirmed":
             tick.confirmed++;
-            d.log.info("refund confirmed", { ...ids, signature: r.txSignature });
+            d.log.info("refund confirmed", { ...ids, signature: step.signature });
             return;
         case "manual":
             tick.manual++;
