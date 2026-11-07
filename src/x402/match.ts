@@ -89,7 +89,7 @@ export function parseChainTx(
         getBase64Encoder().encode(raw.transaction[0] as string),
     );
     const compiled = getCompiledTransactionMessageDecoder().decode(tx.messageBytes);
-    if (compiled.version !== 0) throw new Error("only v0 transactions are read");
+    if (compiled.version === 1) throw new Error("version 1 transactions are not read");
     const loaded = isRecord(meta.loadedAddresses) ? meta.loadedAddresses : {};
     const loadedWritable = (loaded.writable ?? []) as string[];
     const loadedReadonly = (loaded.readonly ?? []) as string[];
@@ -248,7 +248,12 @@ async function lateLanding(
             subject: tx.signature,
             lossMicros: row.amountMicros,
             paymentId: row.id,
-            detail: { signature: tx.signature, slot: tx.slot.toString(), paymentId: row.id },
+            detail: {
+                signature: tx.signature,
+                slot: tx.slot.toString(),
+                deltaMicros: tx.deltaMicros.toString(),
+                paymentId: row.id,
+            },
         },
     ];
 }

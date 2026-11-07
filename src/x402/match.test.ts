@@ -1,5 +1,17 @@
 import { createHash, randomBytes } from "node:crypto";
-import { address, signature as toSignature } from "@solana/kit";
+import {
+    address,
+    appendTransactionMessageInstructions,
+    blockhash,
+    compileTransaction,
+    createTransactionMessage,
+    getBase64EncodedWireTransaction,
+    pipe,
+    setTransactionMessageFeePayer,
+    setTransactionMessageLifetimeUsingBlockhash,
+    signature as toSignature,
+} from "@solana/kit";
+import { getTransferCheckedInstruction } from "@solana-program/token";
 import { stringify } from "smol-toml";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { parseSettings, type Settings } from "../config.ts";
@@ -8,6 +20,7 @@ import { memoryLog } from "../log.ts";
 import { findPaymentByOrder } from "../orders/store.ts";
 import { findRefundById } from "../refunds/request.ts";
 import { usdcAta } from "../solana/accounts.ts";
+import { USDC_DECIMALS, USDC_MINT } from "../solana/constants.ts";
 import { startFakeChain, type FakeChain } from "../testing/fake-chain.ts";
 import { createFakeRpc } from "../testing/fake-rpc.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
@@ -282,6 +295,62 @@ describe("parseChainTx", () => {
         ]);
         expect(tx.failed).toBe(false);
     });
+
+    it("reads a legacy transaction that moves USDC into the hot account", async () => {
+        const message = pipe(
+            createTransactionMessage({ version: "legacy" }),
+            (m) => setTransactionMessageFeePayer(seller.address, m),
+            (m) =>
+                setTransactionMessageLifetimeUsingBlockhash(
+                    {
+                        blockhash: blockhash("11111111111111111111111111111111"),
+                        lastValidBlockHeight: 1n,
+                    },
+                    m,
+                ),
+            (m) =>
+                appendTransactionMessageInstructions(
+                    [
+                        getTransferCheckedInstruction({
+                            source: address(payToAta),
+                            mint: address(USDC_MINT),
+                            destination: address(hot),
+                            authority: seller.address,
+                            amount: 7n,
+                            decimals: USDC_DECIMALS,
+                        }),
+                    ],
+                    m,
+                ),
+        );
+        const wire = getBase64EncodedWireTransaction(compileTransaction(message));
+        const balance = (accountIndex: number, amount: string) => ({
+            accountIndex,
+            mint: USDC_MINT,
+            uiTokenAmount: { amount },
+        });
+        const sig = "5".repeat(88);
+        const tx = parseChainTx(
+            sig,
+            9n,
+            {
+                transaction: [wire, "base64"],
+                meta: {
+                    err: null,
+                    loadedAddresses: { writable: [], readonly: [] },
+                    preTokenBalances: [balance(1, "0"), balance(2, "100")],
+                    postTokenBalances: [balance(1, "7"), balance(2, "93")],
+                },
+            },
+            hot,
+        );
+        expect(tx.signatures).toHaveLength(1);
+        expect(tx.deltaMicros).toBe(7n);
+        expect(tx.tokenDeltas.get(payToAta)).toBe(-7n);
+        expect(tx.tokenInstructions).toEqual([
+            { name: "TransferChecked", writable: expect.arrayContaining([payToAta, hot]) },
+        ]);
+    });
 });
 
 describe("storeAndMatch: payments", () => {
@@ -398,6 +467,7 @@ describe("storeAndMatch: payments", () => {
                 kind: "late_landing",
                 loss_micros: "10000",
                 payment_id: row.id,
+                detail: expect.objectContaining({ deltaMicros: "-10000" }),
             }),
         ]);
         expect(await resolvedRows()).toEqual([]);
@@ -659,6 +729,13 @@ describe("applyExpiry", () => {
         });
         expect(await dayMicros("x402_outflow_days", DAY)).toBe(0);
         expect((await resolvedRows())[0]!.payload).toMatchObject({ status: "released", tx: "" });
+    });
+
+    it("a hint failure row is never released by applyExpiry", async () => {
+        const row = await signedRow({ lastValidBlockHeight: 10_000n, hint: "failure" });
+        const run = { h0: 2_000n, c0: 2_000n, verifiedSlot: 5_000n };
+        expect(await applyExpiry(db.pool, chain.rpc, run, deps)).toEqual({ seen: 0, expired: 0 });
+        expect(await paymentRow(row.id)).toMatchObject({ state: "signed", hint: "failure" });
     });
 
     it("never marks a payment whose height has not passed", async () => {
