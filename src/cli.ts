@@ -1,6 +1,7 @@
 import type pg from "pg";
 import { loadSettings } from "./config.ts";
 import { createPool, withTx } from "./db/pool.ts";
+import { isKeysCommand, KEYS_USAGE, runKeys } from "./keys/commands.ts";
 import { jsonLog } from "./log.ts";
 import { isOrderId } from "./orders/ids.ts";
 import { findOrder, lockOrder, setOrderState } from "./orders/store.ts";
@@ -28,6 +29,7 @@ const USAGE = [
     "  manual resolve <orderId>                 refund done by hand, mark the order refunded",
     "  refunds status",
     "  refunds resume",
+    KEYS_USAGE,
 ].join("\n");
 
 type Param = "orderId" | "amountMicros";
@@ -55,10 +57,11 @@ const DB_COMMANDS = new Map<string, DbCommand>([
     ["refunds resume", { params: [], run: refundsResume }],
 ]);
 
-export async function cliMain(argv: string[], _env: NodeJS.ProcessEnv, io: CliIo): Promise<number> {
+export async function cliMain(argv: string[], env: NodeJS.ProcessEnv, io: CliIo): Promise<number> {
     const args = splitConfig(argv);
     if (args === null) return usage(io, "-config needs a file");
     const [group, action, ...rest] = args.words;
+    if (isKeysCommand(group)) return runKeys(action, rest, args.config, env, io);
     const cmd = DB_COMMANDS.get(`${group} ${action}`);
     if (cmd === undefined || rest.length !== cmd.params.length) return usage(io);
     for (const [i, param] of cmd.params.entries()) {
