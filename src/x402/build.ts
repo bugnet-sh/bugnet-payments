@@ -6,7 +6,11 @@ import {
     compileTransaction,
     createNoopSigner,
     createTransactionMessage,
+    getBase64Decoder,
+    getBase64EncodedWireTransaction,
     type Instruction,
+    type KeyPairSigner,
+    partiallySignTransaction,
     pipe,
     setTransactionMessageFeePayer,
     setTransactionMessageLifetimeUsingBlockhash,
@@ -83,4 +87,78 @@ export async function buildPaymentTransaction(
             ),
     );
     return compileTransaction(message);
+}
+
+export interface SellerPaymentParts {
+    feePayer: Address;
+    hotTokenAccount: Address;
+    destination: Address;
+    authority: Address;
+    amount: bigint;
+    memo: Uint8Array;
+    computeUnitLimit: number;
+    computeUnitPriceMicroLamports: bigint;
+    blockhash: string;
+    lastValidBlockHeight: bigint;
+}
+
+export function buildSellerPayment(p: SellerPaymentParts): Transaction {
+    const message = pipe(
+        createTransactionMessage({ version: 0 }),
+        // An address, not a signer: the seller's facilitator signs the fee payer slot later
+        (m) => setTransactionMessageFeePayer(p.feePayer, m),
+        (m) =>
+            setTransactionMessageLifetimeUsingBlockhash(
+                {
+                    blockhash: blockhash(p.blockhash),
+                    lastValidBlockHeight: p.lastValidBlockHeight,
+                },
+                m,
+            ),
+        (m) =>
+            appendTransactionMessageInstructions(
+                [
+                    getSetComputeUnitLimitInstruction({ units: p.computeUnitLimit }),
+                    getSetComputeUnitPriceInstruction({
+                        microLamports: p.computeUnitPriceMicroLamports,
+                    }),
+                    getTransferCheckedInstruction({
+                        source: p.hotTokenAccount,
+                        mint: USDC_MINT,
+                        destination: p.destination,
+                        authority: createNoopSigner(p.authority),
+                        amount: p.amount,
+                        decimals: USDC_DECIMALS,
+                    }),
+                    { programAddress: MEMO_PROGRAM, data: p.memo },
+                ],
+                m,
+            ),
+    );
+    return compileTransaction(message);
+}
+
+// Same value as transactionMessageHash in @x402/svm, which cannot be imported here: it drags
+// the whole x402 client into the browser checkout bundle
+async function messageHash(tx: Transaction): Promise<string> {
+    const digest = await crypto.subtle.digest("SHA-256", Uint8Array.from(tx.messageBytes));
+    return getBase64Decoder().decode(new Uint8Array(digest));
+}
+
+export async function signSellerPayment(
+    tx: Transaction,
+    allowance: KeyPairSigner,
+): Promise<{ wireBase64: string; signature: Uint8Array; messageHash: string }> {
+    const signed = await partiallySignTransaction([allowance.keyPair], tx);
+    return {
+        wireBase64: getBase64EncodedWireTransaction(signed),
+        signature: signed.signatures[allowance.address] as Uint8Array,
+        messageHash: await messageHash(signed),
+    };
+}
+
+export function randomSellerMemo(): Uint8Array {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    return new TextEncoder().encode(hex);
 }
