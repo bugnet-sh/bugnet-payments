@@ -1,21 +1,32 @@
 import { randomBytes } from "node:crypto";
 import { connect } from "node:net";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { memoryLog } from "../log.ts";
 import { newOrderId } from "../orders/ids.ts";
 import { findOrder } from "../orders/store.ts";
 import { create, post, testApp, type TestApp, until } from "../testing/app.ts";
 import { seedAllowanceOrder, seedOrder } from "../testing/orders.ts";
-import { agentPin, seedAccount } from "../testing/x402.ts";
+import { agentPin, seedAccount, seedFunding } from "../testing/x402.ts";
 import { readPool } from "../x402/ledger.ts";
 import type { OrderServiceDeps } from "../orders/service.ts";
 import { createInternalHandler } from "./internal.ts";
 import { bearerOk, startServer } from "./server.ts";
 
 let app: TestApp;
+let lookup: "unknown" | "error" = "unknown";
 
 beforeAll(async () => {
-    app = await testApp();
+    app = await testApp({
+        routerImpl: {
+            lookupPlacement: () => {
+                throw new ConnectError(
+                    lookup === "error" ? "down" : "HANDLE_UNKNOWN",
+                    lookup === "error" ? Code.Unavailable : Code.NotFound,
+                );
+            },
+        },
+    });
 });
 afterAll(async () => {
     await app.close();
@@ -352,5 +363,90 @@ it("abandon on an allowance order answers 204 and records nothing", async () => 
     expect(await findOrder(app.pool, order.id)).toMatchObject({
         abandonAt: null,
         abandonReason: null,
+    });
+});
+
+describe("x402 routes", () => {
+    const iget = (path: string, auth = true) =>
+        fetch(`${app.internalUrl}${path}`, {
+            headers: auth ? { authorization: `Bearer ${app.secrets.paymentsToken}` } : {},
+        });
+
+    it("every route needs the bearer token", async () => {
+        for (const p of [
+            "/v1/x402/terms",
+            `/v1/x402/accounts/${"ab".repeat(32)}`,
+            "/v1/x402/sellers?hosts=a.example",
+        ]) {
+            const r = await iget(p, false);
+            expect(r.status).toBe(401);
+            expect(await r.json()).toEqual({ status: "refused", reason: "unauthorized" });
+        }
+        const r = await fetch(`${app.internalUrl}/v1/x402/configure`, {
+            method: "POST",
+            body: "{}",
+        });
+        expect(r.status).toBe(401);
+    });
+
+    it("the account route answers 200 and never 404", async () => {
+        lookup = "unknown";
+        try {
+            const none = await iget(`/v1/x402/accounts/${"cd".repeat(32)}`);
+            expect(none.status).toBe(200);
+            expect(await none.json()).toEqual({ x402: null, feeDue: true });
+            const handle = randomBytes(32).toString("hex");
+            const { order: start } = await seedOrder(app.pool, {
+                kind: "start",
+                payInto: "allowance",
+                amountMicros: 1_013_000,
+                allowanceMicros: 1_000_000,
+                feeMicros: 3_000,
+                state: "redeemed",
+            });
+            await seedAccount(app.pool, {
+                id: start.id,
+                handleSha256: handle,
+                fundedMicros: 1_000_000,
+            });
+            await seedFunding(app.pool, {
+                accountId: start.id,
+                orderId: start.id,
+                allowanceMicros: 1_000_000,
+            });
+            const found = await (await iget(`/v1/x402/accounts/${handle}`)).json();
+            expect(found).toMatchObject({ x402: { state: "open" }, feeDue: false });
+            lookup = "error";
+            const down = await iget(`/v1/x402/accounts/${"ef".repeat(32)}`);
+            expect(down.status).toBe(503);
+            expect(await down.json()).toEqual({ error: "router_unavailable" });
+            const bad = await iget("/v1/x402/accounts/ABC");
+            expect(bad.status).toBe(400);
+            expect(await bad.json()).toEqual({ status: "refused", reason: "bad_request" });
+        } finally {
+            lookup = "unknown";
+        }
+    });
+
+    it("serves terms, configure and sellers", async () => {
+        expect((await (await iget("/v1/x402/terms")).json()).bugnetAddresses).toHaveLength(4);
+        const bad = await post(app, "/v1/x402/configure", {
+            handleSha256: "ab".repeat(32),
+            requestId: "short",
+        });
+        expect(bad.status).toBe(400);
+        expect(bad.body).toEqual({ status: "refused", reason: "bad_request" });
+        const noAccount = await post(app, "/v1/x402/configure", {
+            handleSha256: "ab".repeat(32),
+            requestId: "req_0123456789abcdef",
+        });
+        expect(noAccount.status).toBe(200);
+        expect(noAccount.body).toEqual({ status: "refused", reason: "no_account" });
+        const hosts = Array.from({ length: 21 }, (_, i) => `h${i}.example`).join(",");
+        expect((await iget(`/v1/x402/sellers?hosts=${hosts}`)).status).toBe(400);
+        expect(await (await iget("/v1/x402/sellers?hosts=a.example")).json()).toEqual({
+            "a.example": { paidCalls30d: 0, failedPaid30d: 0 },
+        });
+        expect((await iget("/v1/x402/nothing")).status).toBe(404);
     });
 });

@@ -70,7 +70,7 @@ interface Found {
 }
 
 const CONTROL_CHARS = /\p{Cc}/u;
-const MAX_PINS = 64;
+export const MAX_PINS = 64;
 const ALLOWANCE_PACKAGE_ID = "x402-allowance";
 const REQUIRED_CREATE_FIELDS = ["kind", "packageId", "amountMicros", "description"] as const;
 
@@ -93,7 +93,7 @@ function urlMatchesHost(pin: { url: string; host: string }): boolean {
     }
 }
 
-const pinSchema = z
+export const x402PinSchema = z
     .strictObject({
         serviceId: z.string().regex(SERVICE_ID),
         method: z.enum(["GET", "POST"]),
@@ -109,7 +109,7 @@ const pinSchema = z
     .refine(urlMatchesHost);
 
 const x402Schema = z.strictObject({
-    services: z.array(pinSchema).max(MAX_PINS).optional(),
+    services: z.array(x402PinSchema).max(MAX_PINS).optional(),
     disable: z.array(z.string().regex(SERVICE_ID)).max(MAX_PINS).optional(),
     spendPerMinuteMicros: z.int().min(1).optional(),
 });

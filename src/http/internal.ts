@@ -1,7 +1,10 @@
-import type { IncomingHttpHeaders, IncomingMessage } from "node:http";
+import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import type { Log } from "../log.ts";
+import { accountAnswer, configure, RouterUnavailableError } from "../x402/configure.ts";
 import { RpcUnavailableError } from "../x402/create.ts";
+import { parseHosts, sellerStats } from "../x402/sellers.ts";
+import { x402Terms } from "../x402/terms.ts";
 import {
     abandonOrder,
     handleOrderRequest,
@@ -27,6 +30,8 @@ export interface InternalDeps {
 }
 
 const ABANDON = /^\/v1\/orders\/([^/]+)\/abandon$/;
+const X402_ACCOUNT = /^\/v1\/x402\/accounts\/([^/]+)$/;
+const HANDLE = /^[0-9a-f]{64}$/;
 const abandonBody = z.object({ reason: shortText(200) });
 
 const BAD_REQUEST = { status: "refused", reason: "bad_request" } as const;
@@ -41,6 +46,47 @@ async function readJson(req: IncomingMessage, maxBytes: number): Promise<unknown
 }
 
 export function createInternalHandler(d: InternalDeps): Handler {
+    const serveX402 = async (
+        req: IncomingMessage,
+        res: ServerResponse,
+        path: string,
+        handle: string | undefined,
+    ): Promise<void> => {
+        if (!bearerOk(req.headers.authorization, d.token)) {
+            sendJson(res, 401, { status: "refused", reason: "unauthorized" });
+            return;
+        }
+        const { pool, x402, now } = d.service;
+        if (path === "/v1/x402/terms") {
+            sendJson(res, 200, await x402Terms(pool, x402));
+        } else if (path === "/v1/x402/sellers") {
+            const url = new URL(req.url ?? "/", "http://local");
+            const hosts = parseHosts(url.searchParams.get("hosts"));
+            if (hosts === null) sendJson(res, 400, BAD_REQUEST);
+            else sendJson(res, 200, await sellerStats(pool, hosts, now()));
+        } else if (path === "/v1/x402/configure") {
+            let body: unknown;
+            try {
+                body = await readJson(req, d.maxBodyBytes);
+            } catch (err) {
+                if (!(err instanceof BodyTooLarge)) throw err;
+                sendJson(res, 413, BAD_REQUEST, { Connection: "close" });
+                return;
+            }
+            const out = await configure(pool, x402, body, hangupSignal(res));
+            const bad = out.status === "refused" && out.reason === "bad_request";
+            sendJson(res, bad ? 400 : 200, out);
+        } else if (handle === undefined || !HANDLE.test(handle)) {
+            sendJson(res, 400, BAD_REQUEST);
+        } else {
+            try {
+                sendJson(res, 200, await accountAnswer(pool, x402, handle, hangupSignal(res)));
+            } catch (err) {
+                if (!(err instanceof RouterUnavailableError)) throw err;
+                sendJson(res, 503, { error: "router_unavailable" });
+            }
+        }
+    };
     return async (req, res) => {
         const path = requestPath(req.url);
         if (req.method === "GET" && path === "/healthz") {
@@ -55,6 +101,15 @@ export function createInternalHandler(d: InternalDeps): Handler {
             }
             const out = await d.events(await readBody(req, d.maxBodyBytes), req.headers);
             sendJson(res, out.status, out.body);
+            return;
+        }
+        const x402Account = X402_ACCOUNT.exec(path);
+        const x402Get =
+            req.method === "GET" &&
+            (path === "/v1/x402/terms" || path === "/v1/x402/sellers" || x402Account !== null);
+        const x402Configure = req.method === "POST" && path === "/v1/x402/configure";
+        if (x402Get || x402Configure) {
+            await serveX402(req, res, path, x402Account?.[1]);
             return;
         }
         const abandon = ABANDON.exec(path);
