@@ -18,7 +18,13 @@ import { usdcAta } from "../solana/accounts.ts";
 import { BlockhashCache } from "../solana/blockhash.ts";
 import { LIGHTHOUSE_PROGRAM, SOLANA_MAINNET, TOKEN_PROGRAM } from "../solana/constants.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
-import { createFakeRpc, type FakeRpc, TEST_BLOCKHASH, TEST_LVBH } from "../testing/fake-rpc.ts";
+import {
+    createFakeRpc,
+    type FakeRpc,
+    neverAnswers,
+    TEST_BLOCKHASH,
+    TEST_LVBH,
+} from "../testing/fake-rpc.ts";
 import { type FakeRouter, startFakeRouter } from "../testing/fake-router.ts";
 import { testSigner } from "../testing/keys.ts";
 import { seedOrder, seedPayment } from "../testing/orders.ts";
@@ -73,13 +79,14 @@ function withHints(r: PaymentRequirements): PaymentRequirements {
     };
 }
 
-function settlerOn(rpc: FakeRpc, cache: BlockhashCache = hints): Settler {
+function settlerOn(rpc: FakeRpc, cache: BlockhashCache = hints, rpcTimeoutMs = 10_000): Settler {
     return createSettler({
         feePayer,
         rpc,
         hints: cache,
         caps,
         transactionVersions: [0],
+        rpcTimeoutMs,
         log: silentLog,
     });
 }
@@ -730,6 +737,35 @@ describe("payOrder", () => {
         );
         expect(await payOrder(d, order.id, p, sig())).toMatchObject({ kind: "paid" });
     });
+
+    it.each(["simulateTransaction", "getBlockHeight"] as const)(
+        "gives up on a stalled %s before the broadcast with 503 and frees the order",
+        async (method) => {
+            quietConsole();
+            const stalled = createFakeRpc({ [method]: neverAnswers });
+            const unhinted = new BlockhashCache(stalled, 8_000);
+            const started = performance.now();
+            const out = await payOrder(
+                { ...d, settler: settlerOn(stalled, unhinted, 300) },
+                order.id,
+                p,
+                sig(),
+            );
+            expect(performance.now() - started).toBeLessThan(2_000);
+            expect(out).toEqual({
+                kind: "refused",
+                orderId: order.id,
+                httpStatus: 503,
+                reason: "rpc_unavailable",
+            });
+            expect(stalled.calls.sendTransaction).toBe(0);
+            expect(await stateOf(order.id)).toBe("unpaid");
+            expect(await findPaymentByOrder(db.pool, order.id)).toBeNull();
+            expect(await within(1_000, payOrder(d, order.id, p, sig()))).toMatchObject({
+                kind: "paid",
+            });
+        },
+    );
 
     it("leaves the order settling when confirmation is pending", async () => {
         const consoleError = quietConsole();

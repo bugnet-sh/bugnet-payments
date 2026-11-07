@@ -80,7 +80,15 @@ function attempt(
 }
 
 function settler(rpc: FakeRpc, cache: BlockhashCache = hints, log: Log = silentLog) {
-    return createSettler({ feePayer, rpc, hints: cache, caps, transactionVersions: [0], log });
+    return createSettler({
+        feePayer,
+        rpc,
+        hints: cache,
+        caps,
+        transactionVersions: [0],
+        rpcTimeoutMs: 10_000,
+        log,
+    });
 }
 
 function innerStub(send: FacilitatorSvmSigner["sendTransaction"]): FacilitatorSvmSigner {
@@ -227,6 +235,7 @@ describe("settler", () => {
                 hints,
                 caps,
                 transactionVersions: [0],
+                rpcTimeoutMs: 10_000,
                 log: silentLog,
             });
             const res = await s.settle(attempt(msgHash), payload, requirements);

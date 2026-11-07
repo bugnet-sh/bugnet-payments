@@ -26,7 +26,8 @@ export interface BroadcastRecord {
     lastValidBlockHeight: bigint;
 }
 
-export type SettleFailure = "commit_conflict" | "block_height_unavailable" | "commit_failed";
+export type SettleFailure =
+    "commit_conflict" | "block_height_unavailable" | "commit_failed" | "rpc_unavailable";
 
 export interface SettleAttempt {
     messageHash: string;
@@ -139,18 +140,63 @@ export function recordingSigner(
     return { ...inner, sendTransaction };
 }
 
+interface PendingCall {
+    send(options?: { abortSignal?: AbortSignal }): Promise<unknown>;
+}
+
+/**
+ * Every call of a settle gets its own `solana.rpc_timeout`: the order's row lock and a pool client
+ * are held until the settling COMMIT, so a stalled RPC must fail rather than hold them. A failed
+ * call before that COMMIT marks the attempt, so the payer is told to retry, not that the payment
+ * is invalid.
+ */
+function deadlineRpc(
+    rpc: SolanaRpc,
+    timeoutMs: number,
+    als: AsyncLocalStorage<SettleAttempt>,
+): SolanaRpc {
+    return new Proxy(rpc, {
+        get(target, prop) {
+            const method: unknown = Reflect.get(target, prop);
+            if (typeof method !== "function") return method;
+            return (...args: unknown[]): PendingCall => {
+                const pending = (method as (...a: unknown[]) => PendingCall).apply(target, args);
+                return {
+                    async send(options = {}) {
+                        const timeout = AbortSignal.timeout(timeoutMs);
+                        const abortSignal = options.abortSignal
+                            ? AbortSignal.any([options.abortSignal, timeout])
+                            : timeout;
+                        try {
+                            return await pending.send({ ...options, abortSignal });
+                        } catch (err) {
+                            const attempt = als.getStore();
+                            if (attempt && !attempt.committed && attempt.failure === undefined) {
+                                attempt.failure = "rpc_unavailable";
+                            }
+                            throw err;
+                        }
+                    },
+                };
+            };
+        },
+    });
+}
+
 export function createSettler(o: {
     feePayer: KeyPairSigner;
     rpc: SolanaRpc;
     hints: BlockhashCache;
     caps: FeeCaps;
     transactionVersions: readonly (0 | 1)[];
+    rpcTimeoutMs: number;
     log: Log;
 }): Settler {
     const als = new AsyncLocalStorage<SettleAttempt>();
+    const rpc = deadlineRpc(o.rpc, o.rpcTimeoutMs, als);
     // A kit RPC is a Proxy without a has trap, so x402 would misread it as a per-network map
-    const inner = toFacilitatorSvmSigner(o.feePayer, { [SOLANA_MAINNET]: o.rpc });
-    const signer = recordingSigner(inner, { als, rpc: o.rpc, hints: o.hints, log: o.log });
+    const inner = toFacilitatorSvmSigner(o.feePayer, { [SOLANA_MAINNET]: rpc });
+    const signer = recordingSigner(inner, { als, rpc, hints: o.hints, log: o.log });
     const scheme = new ExactSvmScheme(signer, undefined, {
         ...o.caps,
         transactionVersions: o.transactionVersions,

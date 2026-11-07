@@ -53,6 +53,7 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
             maxRequiredSignatures: s.solana.max_required_signatures,
         },
         transactionVersions: s.solana.transaction_versions,
+        rpcTimeoutMs: s.solana.rpc_timeout,
         log,
     });
     const router = createRouterClient({

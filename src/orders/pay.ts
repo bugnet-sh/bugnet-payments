@@ -330,8 +330,9 @@ async function settle(
         res = await d.settler.settle(attempt, dec.payload, req);
     } catch (err) {
         d.log.error("settle threw", { orderId: order.id, committed: attempt.committed, err });
-        return attempt.committed
-            ? settling(order.id)
+        if (attempt.committed) return settling(order.id);
+        return attempt.failure === "rpc_unavailable"
+            ? refused(order.id, 503, "rpc_unavailable")
             : refused(order.id, 503, "settlement_unavailable");
     }
     if (res.success) return markPaid(d, order.id, dec.payer, res.transaction, t);
@@ -340,6 +341,7 @@ async function settle(
         case "commit_conflict":
             return refused(order.id, 409, "payment_replayed");
         case "block_height_unavailable":
+        case "rpc_unavailable":
             return refused(order.id, 503, "rpc_unavailable");
         case "commit_failed":
             return refused(order.id, 503, "settlement_unavailable");
