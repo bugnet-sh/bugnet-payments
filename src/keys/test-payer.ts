@@ -42,7 +42,7 @@ function accountIndex(raw: string | undefined): number {
     const text = (raw ?? "").trim();
     if (text === "") return 0;
     if (!/^[0-9]{1,9}$/.test(text)) {
-        throw new ConfigError(`${INDEX_VAR}: expected a whole number below 2147483648`);
+        throw new ConfigError(`${INDEX_VAR}: expected a whole number of at most 9 digits`);
     }
     return Number(text);
 }
@@ -59,9 +59,8 @@ export async function loadTestPayer(env: NodeJS.ProcessEnv): Promise<KeyPairSign
     const phrase = normalizeMnemonic(env[MNEMONIC_VAR] ?? "");
     if (phrase === "") return null;
     const index = accountIndex(env[INDEX_VAR]);
-    try {
-        return await deriveSolanaKey(phrase, index);
-    } catch {
+    if (!validateMnemonic(phrase, wordlist)) {
         throw new ConfigError(`${MNEMONIC_VAR}: failed the BIP39 checksum`);
     }
+    return deriveSolanaKey(phrase, index);
 }

@@ -74,6 +74,10 @@ export async function generateSecrets(
     for (const [variable, make] of SERVICE_SECRETS) {
         if ((current[variable] ?? "") === "") set(variable, make());
     }
+    const addresses: Record<string, string> = {};
+    const testPayer = await loadTestPayer(current);
+    if (testPayer !== null) addresses.test_payer = testPayer.address;
+    for (const { name, signer } of await walletAddresses(current)) addresses[name] = signer.address;
     if (added.length > 0) {
         // A rename keeps a crash from truncating a file that holds the only copy of the keys
         const temp = `${envPath}.${process.pid}.tmp`;
@@ -83,10 +87,6 @@ export async function generateSecrets(
     } else if (existsSync(envPath)) {
         chmodSync(envPath, 0o600);
     }
-    const addresses: Record<string, string> = {};
-    const testPayer = await loadTestPayer(current);
-    if (testPayer !== null) addresses.test_payer = testPayer.address;
-    for (const { name, signer } of await walletAddresses(current)) addresses[name] = signer.address;
     return { added, addresses };
 }
 

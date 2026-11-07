@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { getBase64Encoder, getTransactionDecoder } from "@solana/kit";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { cliMain } from "../cli.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { generateExportableKeypair } from "../solana/keys.ts";
@@ -19,6 +19,11 @@ let feePayer: Wallet;
 let refund: Wallet;
 let cold: Wallet;
 const sent: string[] = [];
+let statusReply: () => unknown = () => ({
+    context: { slot: 1 },
+    value: [{ confirmationStatus: "confirmed", err: null, slot: 1, confirmations: 1 }],
+});
+let blockHeight = 100;
 const lamports = new Map<string, number>();
 const usdc = new Map<string, number>();
 const tokenOwners = new Map<string, string>();
@@ -76,10 +81,9 @@ function result(method: string, params: unknown[]): unknown {
             sent.push(params[0] as string);
             return "5".repeat(87);
         case "getSignatureStatuses":
-            return {
-                context,
-                value: [{ confirmationStatus: "confirmed", err: null, slot: 1, confirmations: 1 }],
-            };
+            return statusReply();
+        case "getBlockHeight":
+            return blockHeight;
         default:
             throw new Error(`unscripted rpc method ${method}`);
     }
@@ -102,7 +106,12 @@ beforeAll(async () => {
                 params: unknown[];
             };
             res.setHeader("content-type", "application/json");
-            res.end(JSON.stringify({ jsonrpc: "2.0", id, result: result(method, params) }));
+            try {
+                res.end(JSON.stringify({ jsonrpc: "2.0", id, result: result(method, params) }));
+            } catch (err) {
+                const message = err instanceof Error ? err.message : "error";
+                res.end(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message } }));
+            }
         });
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -178,8 +187,24 @@ describe("keys over a stub RPC", () => {
         );
         expect(code).toBe(1);
         expect(sent).toHaveLength(0);
-        expect(io.errText()).toMatch(/short by 1493640/);
+        expect(io.errText()).toMatch(/short by 2143880/);
         expect(io.errText()).not.toContain("secret-api-key");
+    });
+
+    it("refuses a transfer that would leave the test payer below rent exemption", async () => {
+        sent.length = 0;
+        lamports.clear();
+        usdc.clear();
+        lamports.set(testPayer.address, 100_000_000 + 1_488_440 + 5_200 + 650_239);
+        const io = captureIo();
+        const code = await cliMain(
+            ["keys", "fund", "--fee-payer-lamports", "100000000", "--create-refund-ata"],
+            env(),
+            io,
+        );
+        expect(code).toBe(1);
+        expect(sent).toHaveLength(0);
+        expect(io.errText()).toMatch(/short by 1/);
     });
 
     it("refuses when the test payer holds too little USDC", async () => {
@@ -220,5 +245,90 @@ describe("keys over a stub RPC", () => {
         expect(await cliMain(["keys", "show"], env(), io)).toBe(0);
         expect(io.outText()).toContain(`fee_payer=${feePayer.address} sol=42 usdc=0`);
         expect(io.outText()).toContain(`recipient=${cold.address} sol=0 usdc=0`);
+    });
+
+    describe("confirmation by block height", () => {
+        const fundArgs = ["keys", "fund", "--fee-payer-lamports", "100000000"];
+
+        async function runFund() {
+            sent.length = 0;
+            lamports.clear();
+            usdc.clear();
+            lamports.set(testPayer.address, 5_000_000_000);
+            const io = captureIo();
+            const code = await cliMain([...fundArgs, "--create-refund-ata"], env(), io);
+            return { code, io };
+        }
+
+        afterEach(() => {
+            blockHeight = 100;
+            statusReply = () => ({
+                context: { slot: 1 },
+                value: [{ confirmationStatus: "confirmed", err: null, slot: 1, confirmations: 1 }],
+            });
+        });
+
+        it("waits through a late landing while the blockhash is still valid", async () => {
+            let polls = 0;
+            statusReply = () => ({
+                context: { slot: 1 },
+                value: [
+                    ++polls < 3
+                        ? null
+                        : {
+                              confirmationStatus: "finalized",
+                              err: null,
+                              slot: 1,
+                              confirmations: null,
+                          },
+                ],
+            });
+            const { code, io } = await runFund();
+            expect(code).toBe(0);
+            expect(polls).toBe(3);
+            expect(io.outText()).toMatch(/^confirmed /);
+        });
+
+        it("reports a transaction that failed on chain", async () => {
+            statusReply = () => ({
+                context: { slot: 1 },
+                value: [{ confirmationStatus: "confirmed", err: { InstructionError: [0, "x"] } }],
+            });
+            const { code, io } = await runFund();
+            expect(code).toBe(1);
+            expect(io.errText()).toContain("failed on chain");
+        });
+
+        it("says safe to retry only once the blockhash has expired with no status", async () => {
+            statusReply = () => ({ context: { slot: 1 }, value: [null] });
+            blockHeight = 901;
+            const { code, io } = await runFund();
+            expect(code).toBe(1);
+            expect(io.errText()).toContain("not landed, safe to retry");
+        });
+
+        it("retries transient polling errors and still confirms", async () => {
+            let polls = 0;
+            statusReply = () => {
+                if (++polls <= 2) throw new Error("rpc hiccup");
+                return {
+                    context: { slot: 1 },
+                    value: [{ confirmationStatus: "confirmed", err: null, slot: 1 }],
+                };
+            };
+            const { code } = await runFund();
+            expect(code).toBe(0);
+            expect(polls).toBe(3);
+        });
+
+        it("says unknown, check the explorer, when polling keeps failing", async () => {
+            statusReply = () => {
+                throw new Error("rpc down");
+            };
+            const { code, io } = await runFund();
+            expect(code).toBe(1);
+            expect(io.errText()).toContain("unknown, check the explorer before retrying");
+            expect(io.errText()).not.toContain("safe to retry");
+        }, 20_000);
     });
 });

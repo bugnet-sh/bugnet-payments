@@ -16,6 +16,7 @@ import { usdcAta } from "../solana/accounts.ts";
 import { generateExportableKeypair } from "../solana/keys.ts";
 import { TEST_RENT_EXEMPT_MIN_LAMPORTS } from "../testing/fake-rpc.ts";
 import { testSigner } from "../testing/keys.ts";
+import { KEYS_USAGE } from "./commands.ts";
 import { drainPlan, fundingPlan, type PlannedTx, parseEnvText } from "./tool.ts";
 
 const ABANDON =
@@ -207,9 +208,28 @@ describe("keys commands without settings", () => {
 
     it("names the variable when the test payer is missing and leaks no secret", async () => {
         const io = captureIo();
-        const env = { BUGNET_FEE_PAYER_KEY: "x", BUGNET_SOLANA_RPC_URL: "http://127.0.0.1:1/k" };
+        const key = (await generateExportableKeypair()).secretBase58;
+        const rpcUrl = "http://127.0.0.1:1/secret-api-key";
+        const env = { BUGNET_FEE_PAYER_KEY: key, BUGNET_SOLANA_RPC_URL: rpcUrl };
         expect(await cliMain(["keys", "drain"], env, io)).toBe(1);
         expect(io.errText()).toContain("BUGNET_TEST_PAYER_KEY");
+        for (const secret of [key, rpcUrl, "secret-api-key"]) {
+            expect(io.outText()).not.toContain(secret);
+            expect(io.errText()).not.toContain(secret);
+        }
+    });
+
+    it("lists --create-refund-ata in the usage text", () => {
+        expect(KEYS_USAGE).toContain("--create-refund-ata");
+    });
+
+    it("leaves the env file untouched when the mnemonic is bad", async () => {
+        const bad = ABANDON.replace("about", "abandon");
+        const text = `BUGNET_TEST_PAYER_MNEMONIC="${bad}"\n`;
+        const p = tmpEnv(text, 0o600);
+        const io = captureIo();
+        expect(await cliMain(["keys", "generate", "--env", p], {}, io)).toBe(1);
+        expect(readFileSync(p, "utf8")).toBe(text);
     });
 
     it("rejects an unknown keys command and an unknown option", async () => {

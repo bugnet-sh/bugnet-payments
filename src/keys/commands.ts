@@ -16,6 +16,7 @@ import { loadSettings, secretValues } from "../config.ts";
 import { jsonLog, type Log } from "../log.ts";
 import { orderPublicKeyBase64 } from "../orders/token.ts";
 import { inspectTokenAccount, usdcAta } from "../solana/accounts.ts";
+import { type Landing, readLanding } from "../solana/landing.ts";
 import { loadKeypair } from "../solana/keys.ts";
 import { createRpc, type SolanaRpc } from "../solana/rpc.ts";
 import { signV0Transaction } from "../solana/transfer.ts";
@@ -45,7 +46,9 @@ const COMPUTE_UNIT_PRICE = 10_000n;
 // One signature plus the priority fee of 20_000 units at 10_000 micro-lamports
 const FEE_ESTIMATE_PER_TX = 5_000n + 200n;
 const CONFIRM_POLL_MS = 500;
-const CONFIRM_TIMEOUT_MS = 90_000;
+const POLL_CALL_TIMEOUT_MS = 10_000;
+const MAX_POLL_FAILURES = 5;
+const POLL_BACKOFF_MS = 250;
 
 const COMMANDS: Record<string, { values: string[]; switches: string[] }> = {
     generate: { values: ["--env"], switches: [] },
@@ -61,6 +64,7 @@ const COMMANDS: Record<string, { values: string[]; switches: string[] }> = {
 export const KEYS_USAGE = [
     "  keys generate [--env FILE]               fill empty secrets in FILE (default .env)",
     "  keys fund [--fee-payer-lamports N] [--refund-usdc-micros M] [--create-recipient-ata]",
+    "            [--create-refund-ata]",
     "                                           send from the test payer, create the USDC accounts",
     "  keys show [--no-balances]                addresses, SOL and USDC balances",
     "  keys drain [--close-atas]                move everything back to the test payer",
@@ -233,12 +237,14 @@ async function fund(
     for (const owner of owners) {
         if ((await inspectTokenAccount(rpc, await usdcAta(owner))) === null) missing++;
     }
-    const need = lamports + missing * ataRent + FEE_ESTIMATE_PER_TX * BigInt(plan.length);
+    const need =
+        lamports + missing * ataRent + FEE_ESTIMATE_PER_TX * BigInt(plan.length) + rentExemptMin;
     const have = await lamportsOf(rpc, testPayer.address);
     if (have < need) {
         throw new Error(
             `test payer ${testPayer.address} holds ${have} lamports, needs ${need} ` +
-                `for the transfer, ${missing} new account(s) at ${ataRent} each and fees: ` +
+                `for the transfer, ${missing} new account(s) at ${ataRent} each, fees and the ` +
+                `${rentExemptMin} it must keep: ` +
                 `short by ${need - have}`,
         );
     }
@@ -321,18 +327,47 @@ async function sendAndConfirm(
             preflightCommitment: "confirmed",
         })
         .send();
-    const deadline = Date.now() + CONFIRM_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-        const { value } = await rpc.getSignatureStatuses([signature]).send();
-        const status = value[0];
-        if (status?.err) throw new Error(`transaction ${signature} failed on chain`);
-        if (
-            status?.confirmationStatus === "confirmed" ||
-            status?.confirmationStatus === "finalized"
-        ) {
-            return signature;
+    await waitForLanding(rpc, signature, latest.lastValidBlockHeight);
+    return signature;
+}
+
+// Waits by block height, not wall clock: a transaction can land any time before its blockhash
+// expires, so only an expired blockhash with no status proves it never will.
+async function waitForLanding(
+    rpc: SolanaRpc,
+    txSignature: string,
+    lastValidBlockHeight: bigint,
+): Promise<void> {
+    let failures = 0;
+    for (;;) {
+        let landing: Landing;
+        try {
+            landing = await readLanding(
+                rpc,
+                txSignature,
+                lastValidBlockHeight,
+                POLL_CALL_TIMEOUT_MS,
+            );
+        } catch (err) {
+            if (++failures >= MAX_POLL_FAILURES) {
+                const why = err instanceof Error ? err.message : String(err);
+                throw new Error(
+                    `transaction ${txSignature} unknown, check the explorer before retrying ` +
+                        `(polling kept failing: ${why})`,
+                    { cause: err },
+                );
+            }
+            await new Promise((r) => setTimeout(r, POLL_BACKOFF_MS * failures));
+            continue;
+        }
+        failures = 0;
+        if (landing === "landed") return;
+        if (landing === "onchain_failed") {
+            throw new Error(`transaction ${txSignature} failed on chain`);
+        }
+        if (landing === "blockhash_expired") {
+            throw new Error(`transaction ${txSignature} not landed, safe to retry`);
         }
         await new Promise((r) => setTimeout(r, CONFIRM_POLL_MS));
     }
-    throw new Error(`transaction ${signature} was not confirmed in time`);
 }
