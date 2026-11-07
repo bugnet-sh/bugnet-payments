@@ -196,6 +196,36 @@ describe("liabilitiesAt", () => {
         expect(await liabilitiesAt(pool, 200n, TAIL0)).toBe(500_000n);
     });
 
+    it("leaves a confirmed payment with no landed slot or a late landing out of the add-back", async () => {
+        const acct = await movedAccount();
+        await pool.query("update x402_payments set landed_slot = null where account_id = $1", [
+            acct.id,
+        ]);
+        expect(await liabilitiesAt(pool, 120n, TAIL0)).toBe(700_000n);
+        expect(await liabilitiesAt(pool, 200n, TAIL0)).toBe(700_000n);
+        await pool.query(
+            "update x402_payments set landed_slot = 150, late_landed = true where account_id = $1",
+            [acct.id],
+        );
+        expect(await liabilitiesAt(pool, 200n, TAIL0)).toBe(700_000n);
+    });
+
+    it("stops counting a confirmed hot refund once its confirmation is before the tail opened", async () => {
+        const tail = { ...TAIL0, openedAt: new Date("2030-01-05T00:00:00Z") };
+        const acct = await seedAccount(pool);
+        await allowanceRow({ orderId: acct.id, amountMicros: 9_000, state: "confirmed" });
+        await pool.query("update refunds set confirmed_at = $2 where order_id = $1", [
+            acct.id,
+            new Date("2030-01-04T00:00:00Z"),
+        ]);
+        expect(await liabilitiesAt(pool, 200n, tail)).toBe(0n);
+        await pool.query("update refunds set confirmed_at = $2 where order_id = $1", [
+            acct.id,
+            new Date("2030-01-06T00:00:00Z"),
+        ]);
+        expect(await liabilitiesAt(pool, 200n, tail)).toBe(9_000n);
+    });
+
     it("counts a hot full row once its order payment landed", async () => {
         const o = await hotStart({ landed: 300n, state: "refunding" });
         await pool.query("update orders set x402_refusal = 'allowance_ceiling' where id = $1", [
@@ -308,6 +338,31 @@ describe("transferable parts", () => {
         expect(parts.find((p) => p.kind === "share")!.since).toEqual(PAID);
         const sinces = parts.map((p) => p.since.getTime());
         expect(sinces).toEqual([...sinces].sort((a, b) => a - b));
+    });
+
+    it("keeps a share held when its terminal event has no refundable field", async () => {
+        const o = await hotStart({ landed: 100n });
+        await storeEvent("placement.terminated", { order_id: o.id });
+        expect(await transferableParts(pool, 200n, TAIL0)).toEqual([]);
+        const p = await hotStart({ landed: 100n });
+        await storeEvent("placement.failed", { order_id: p.id, refundable: false });
+        expect((await transferableParts(pool, 200n, TAIL0)).map((x) => x.orderId)).toEqual([p.id]);
+    });
+
+    it("counts a kept part only when the account closed after the tail opened", async () => {
+        const closed = await seedAccount(pool, {
+            state: "closed",
+            handleSha256: "cd".repeat(32),
+            fundedMicros: 4_000,
+            keptMicros: 4_000,
+            closedAt: new Date("2030-01-02T00:00:00Z"),
+        });
+        const g = await seedFunding(pool, { accountId: closed.id, allowanceMicros: 1_000_000 });
+        await setPaymentLandedSlot(pool, g.orderId, 100n);
+        const before = { ...TAIL0, openedAt: new Date("2030-01-03T00:00:00Z") };
+        expect(await transferableParts(pool, 200n, before)).toEqual([]);
+        const after = { ...TAIL0, openedAt: new Date("2030-01-01T00:00:00Z") };
+        expect((await transferableParts(pool, 200n, after)).map((p) => p.kind)).toEqual(["kept"]);
     });
 
     it("leaves out a share whose start order has a full refund row", async () => {

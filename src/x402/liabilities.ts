@@ -15,8 +15,8 @@ export async function liabilities(db: Queryable): Promise<bigint> {
     return BigInt(res.rows[0]!.micros);
 }
 
-// Money by when it moved: fundings by their order payment's landing, spending by the seller
-// payment's, and a hot refund until a stored transaction at or before C carries it.
+// Money by when it moved: fundings by their order payment's landing, spending as booked with the
+// seller payments that landed above C added back, and a hot refund until a stored transaction at or before C carries it.
 export async function liabilitiesAt(db: Queryable, slotC: bigint, tail: Tail): Promise<bigint> {
     const res = await db.query<{ micros: string }>(
         `with
@@ -25,12 +25,12 @@ export async function liabilitiesAt(db: Queryable, slotC: bigint, tail: Tail): P
             join x402_accounts a on a.id = f.account_id and a.state <> 'closed'
             join payments p on p.order_id = f.order_id
             where f.voided_at is null and p.landed_slot between $2 and $1),
-        spent as (select coalesce(sum(xp.amount_micros), 0) v
+        acct as (select coalesce(sum(spent_micros + refunded_micros + kept_micros), 0) v
+            from x402_accounts where state <> 'closed'),
+        above as (select coalesce(sum(xp.amount_micros), 0) v
             from x402_payments xp
             join x402_accounts a on a.id = xp.account_id and a.state <> 'closed'
-            where xp.state = 'confirmed' and not xp.late_landed and xp.landed_slot <= $1),
-        acct as (select coalesce(sum(refunded_micros + kept_micros), 0) v
-            from x402_accounts where state <> 'closed'),
+            where xp.state = 'confirmed' and xp.landed_slot > $1),
         hot as (select coalesce(sum(r.amount_micros), 0) v
             from refunds r
             where r.from_wallet = 'allowance'
@@ -41,7 +41,7 @@ export async function liabilitiesAt(db: Queryable, slotC: bigint, tail: Tail): P
               and not exists (select 1 from x402_chain_txs t
                     where not t.failed and t.slot <= $1
                       and t.signature = any(array_append(r.previous_signatures, r.tx_signature))))
-        select fund.v - spent.v - acct.v + hot.v as micros from fund, spent, acct, hot`,
+        select fund.v - acct.v + above.v + hot.v as micros from fund, acct, above, hot`,
         [slotC.toString(), tail.openingSlot.toString(), tail.openedAt],
     );
     return BigInt(res.rows[0]!.micros);
@@ -85,7 +85,7 @@ async function parts(
                     where e.payload->>'order_id' = o.id
                       and (e.type = 'placement.ready'
                            or (e.type in ('placement.terminated', 'placement.failed')
-                               and e.payload->'refundable' is distinct from 'true'::jsonb))))
+                               and e.payload->'refundable' = 'false'::jsonb))))
             union all
             select 'fee', o.id, null, o.fee_micros, f.created_at
             from orders o
