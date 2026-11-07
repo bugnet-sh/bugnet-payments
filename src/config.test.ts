@@ -113,6 +113,18 @@ describe("parseSettings", () => {
         expect(() => timeout("10")).toThrow(/solana.rpc_timeout: a duration/);
     });
 
+    it("bounds every jobs interval from 1ms to 24h", () => {
+        const every = (key: string, value: string) =>
+            parseSettings(`[solana]\nrecipient = "${ADDR}"\n[jobs]\n${key} = "${value}"`, "t").jobs;
+        for (const key of ["sweep_every", "reconcile_every", "refunds_every", "alarms_every"]) {
+            expect(every(key, "1ms")).toMatchObject({ [key]: 1 });
+            expect(every(key, "24h")).toMatchObject({ [key]: 86_400_000 });
+            for (const value of ["0s", "0ms", "1441m", "25h", "999999h"]) {
+                expect(() => every(key, value)).toThrow(`jobs.${key}: from 1ms to 24h`);
+            }
+        }
+    });
+
     it("accepts router.get_order = true", () => {
         const s = parseSettings(`[solana]\nrecipient = "${ADDR}"\n[router]\nget_order = true`, "t");
         expect(s.router.get_order).toBe(true);

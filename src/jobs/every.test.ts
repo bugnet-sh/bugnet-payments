@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { memoryLog } from "../log.ts";
+import { type Log, memoryLog } from "../log.ts";
 import { dailyAt, every } from "./every.ts";
 
 const MIN = 60_000;
@@ -11,6 +11,15 @@ function gate() {
         open = resolve;
     });
     return { opened, open };
+}
+
+function throwingLog(): Log {
+    return {
+        ...memoryLog(),
+        error: () => {
+            throw new Error("stderr closed");
+        },
+    };
 }
 
 beforeEach(() => {
@@ -77,6 +86,33 @@ describe("every", () => {
             { msg: "job failed", job: "sweep", err: { message: "database gone" } },
             { msg: "job failed", job: "sweep", err: { message: "database gone" } },
         ]);
+        stop();
+    });
+
+    it("keeps its schedule when the logger throws", async () => {
+        let calls = 0;
+        const stop = every(
+            1_000,
+            "sweep",
+            async () => {
+                calls++;
+                throw new Error("database gone");
+            },
+            throwingLog(),
+        );
+        await vi.advanceTimersByTimeAsync(3_000);
+        expect(calls).toBe(3);
+        stop();
+    });
+
+    it("refuses an interval Node cannot keep and starts no timer", () => {
+        for (const ms of [0, -1_000, 0.5, 1.5, NaN, Infinity, 2 ** 31]) {
+            expect(() => every(ms, "sweep", async () => {}, memoryLog())).toThrow(RangeError);
+        }
+        expect(() => every(0, "sweep", async () => {}, memoryLog())).toThrow(/sweep/);
+        expect(vi.getTimerCount()).toBe(0);
+        const stop = every(2 ** 31 - 1, "sweep", async () => {}, memoryLog());
+        expect(vi.getTimerCount()).toBe(1);
         stop();
     });
 
@@ -176,6 +212,30 @@ describe("dailyAt", () => {
         expect(log.lines.filter((l) => l.level === "error")).toHaveLength(2);
         expect(log.lines[0]).toMatchObject({ msg: "job failed", job: "audit" });
         stop();
+    });
+
+    it("still runs the next day when the logger throws", async () => {
+        let calls = 0;
+        const stop = dailyAt(
+            "03:30",
+            "audit",
+            async () => {
+                calls++;
+                throw new Error("rpc down");
+            },
+            throwingLog(),
+        );
+        await vi.advanceTimersByTimeAsync(MIN + DAY);
+        expect(calls).toBe(2);
+        stop();
+    });
+
+    it("refuses a time that is not HH:MM UTC and starts no timer", () => {
+        for (const hhmm of ["3:30", "24:00", "03:60", "0330", "03:30 ", "", "aa:bb", "03:30:00"]) {
+            expect(() => dailyAt(hhmm, "audit", async () => {}, memoryLog())).toThrow(RangeError);
+        }
+        expect(() => dailyAt("24:00", "audit", async () => {}, memoryLog())).toThrow(/audit/);
+        expect(vi.getTimerCount()).toBe(0);
     });
 
     it("runs nothing after stop", async () => {

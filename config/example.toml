@@ -57,7 +57,7 @@ fee_payer_min_lamports = 100000000
 max_lamports_per_order = 20000
 
 [jobs]
-sweep_every = "30s"
+sweep_every = "30s"                     # every *_every is from 1ms to 24h
 reconcile_every = "10s"
 refunds_every = "15s"
 alarms_every = "5m"

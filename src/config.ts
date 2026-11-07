@@ -24,6 +24,8 @@ const hostPort = z
     .string()
     .regex(/^(\[[0-9a-fA-F:.]+\]|[^:[\]\s]+):\d{1,5}$/, "host:port such as 127.0.0.1:8450");
 
+const jobEvery = duration.refine((ms) => ms >= 1 && ms <= 86_400_000, "from 1ms to 24h");
+
 const count = z.int().min(1);
 const amount = z.int().min(0);
 
@@ -148,10 +150,10 @@ const settingsSchema = z
             .prefault({}),
         jobs: z
             .object({
-                sweep_every: duration.prefault("30s"),
-                reconcile_every: duration.prefault("10s"),
-                refunds_every: duration.prefault("15s"),
-                alarms_every: duration.prefault("5m"),
+                sweep_every: jobEvery.prefault("30s"),
+                reconcile_every: jobEvery.prefault("10s"),
+                refunds_every: jobEvery.prefault("15s"),
+                alarms_every: jobEvery.prefault("5m"),
                 audit_at_utc: z
                     .string()
                     .regex(/^([01]\d|2[0-3]):[0-5]\d$/, "a UTC time such as 03:30")

@@ -1,23 +1,31 @@
 import type { Log } from "../log.ts";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+// Node runs a longer timer after 1 ms
+const MAX_TIMER_MS = 2 ** 31 - 1;
+const HHMM_UTC = /^([01]\d|2[0-3]):[0-5]\d$/;
 
+// Never rejects, a logger that throws has nowhere left to report
 function runLogged(name: string, fn: () => Promise<unknown>, log: Log): Promise<void> {
     return Promise.resolve()
         .then(fn)
         .then(
             () => undefined,
             (err: unknown) => log.error("job failed", { job: name, err }),
-        );
+        )
+        .catch(() => undefined);
 }
 
 // A tick that finds the previous run still going is skipped, so runs never overlap
 export function every(ms: number, name: string, fn: () => Promise<unknown>, log: Log): () => void {
+    if (!Number.isInteger(ms) || ms < 1 || ms > MAX_TIMER_MS) {
+        throw new RangeError(`job ${name}: interval ${ms} ms is not from 1 to ${MAX_TIMER_MS}`);
+    }
     let running = false;
     const timer = setInterval(() => {
         if (running) return;
         running = true;
-        void runLogged(name, fn, log).then(() => {
+        void runLogged(name, fn, log).finally(() => {
             running = false;
         });
     }, ms);
@@ -37,6 +45,11 @@ export function dailyAt(
     log: Log,
     now: () => Date = () => new Date(),
 ): () => void {
+    if (!HHMM_UTC.test(hhmmUtc)) {
+        throw new RangeError(
+            `job ${name}: ${JSON.stringify(hhmmUtc)} is not a UTC time like 03:30`,
+        );
+    }
     const [hour, minute] = hhmmUtc.split(":").map(Number) as [number, number];
     let timer: NodeJS.Timeout | undefined;
     let stopped = false;
@@ -45,7 +58,7 @@ export function dailyAt(
         const t = now().getTime();
         const at = nextAt(hour, minute, Math.max(t, last));
         timer = setTimeout(() => {
-            void runLogged(name, fn, log).then(() => {
+            void runLogged(name, fn, log).finally(() => {
                 if (!stopped) schedule(at);
             });
         }, at - t);
