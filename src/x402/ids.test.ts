@@ -22,7 +22,7 @@ describe("x402 ids", () => {
         );
         const { v, cases } = JSON.parse(readFileSync(file, "utf8")) as {
             v: number;
-            cases: { method: string; host: string; prefix: string; id: string }[];
+            cases: { method: "GET" | "POST"; host: string; prefix: string; id: string }[];
         };
         expect(v).toBe(1);
         expect(cases.length).toBeGreaterThan(0);
