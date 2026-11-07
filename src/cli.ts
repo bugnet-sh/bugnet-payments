@@ -7,7 +7,7 @@ import { isOrderId } from "./orders/ids.ts";
 import { findOrder, lockOrder, setOrderState } from "./orders/store.ts";
 import type { OrderRow } from "./orders/types.ts";
 import { refundsPaused, resumeRefunds } from "./refunds/executor.ts";
-import { findRefund, requestRefund, returnManualToRedeemed } from "./refunds/request.ts";
+import { findOrderRefund, requestRefund, returnManualToRedeemed } from "./refunds/request.ts";
 
 export interface CliIo {
     out: (s: string) => void;
@@ -157,7 +157,7 @@ async function retryManual(
                         `use manual refund ${orderId} <amount_micros>`,
                 };
             }
-            const refund = await findRefund(c, orderId);
+            const refund = await findOrderRefund(c, orderId);
             if (refund === null) return "no_refund";
             if (refund.state !== "manual") return { refused: `its refund is ${refund.state}` };
             await c.query(
@@ -232,7 +232,7 @@ async function resolveManual(
     const refused = await withTx(pool, async (c) => {
         const notInQueue = notManual(await lockOrder(c, orderId));
         if (notInQueue !== null) return notInQueue;
-        const refund = await findRefund(c, orderId);
+        const refund = await findOrderRefund(c, orderId);
         if (refund !== null && IN_FLIGHT.includes(refund.state)) {
             return `its refund is ${refund.state} and the executor still owns it`;
         }

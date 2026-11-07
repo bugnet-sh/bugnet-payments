@@ -5,7 +5,7 @@ import type { Settings } from "../config.ts";
 import { memoryLog, silentLog } from "../log.ts";
 import { findOrder, markEventSeen } from "../orders/store.ts";
 import type { OrderRow } from "../orders/types.ts";
-import { findRefund } from "../refunds/request.ts";
+import { findOrderRefund } from "../refunds/request.ts";
 import { createRouterClient } from "../router/client.ts";
 import { startFakeRouter, type FakeRouter } from "../testing/fake-router.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
@@ -136,7 +136,7 @@ describe("paid orders", () => {
             expect.objectContaining({ level: "error", orderId: order.id }),
         ]);
         expect((await stateOf(order.id)).state).toBe("refunding");
-        expect((await findRefund(db.pool, order.id))?.reason).toBe("late");
+        expect((await findOrderRefund(db.pool, order.id))?.reason).toBe("late");
     });
 
     it("refunds paid orders unredeemed for 30 minutes", async () => {
@@ -156,7 +156,7 @@ describe("paid orders", () => {
         const report = await sweep(deps(at(30 * MIN)));
         expect(report.refunds.unredeemed).toBe(1);
         expect((await stateOf(order.id)).state).toBe("refunding");
-        expect((await findRefund(db.pool, order.id))?.reason).toBe("unredeemed");
+        expect((await findOrderRefund(db.pool, order.id))?.reason).toBe("unredeemed");
 
         expect((await sweep(deps(at(31 * MIN)))).refunds.unredeemed).toBe(0);
     });
@@ -193,7 +193,7 @@ describe("redeemed orders with no event", () => {
         expect(report.routerChecks).toBe(1);
         const row = await stateOf(order.id);
         expect(row.state).toBe(state);
-        expect((await findRefund(db.pool, order.id))?.reason ?? null).toBe(reason);
+        expect((await findOrderRefund(db.pool, order.id))?.reason ?? null).toBe(reason);
         if (a === "disabled") {
             expect(row.manualReason).toBe("no_event_unverifiable");
             expect(report.manual).toBe(1);
@@ -238,7 +238,7 @@ describe("redeemed orders with no event", () => {
         for (const o of [order, other]) {
             const row = await stateOf(o.id);
             expect(row).toMatchObject({ state: "redeemed", routerConfirmedAt: null });
-            expect(await findRefund(db.pool, o.id)).toBeNull();
+            expect(await findOrderRefund(db.pool, o.id)).toBeNull();
         }
 
         await sweep(deps(at(61 * MIN), { log, alarmed: new Set() }));
@@ -258,7 +258,7 @@ describe("redeemed orders with no event", () => {
         const report = await sweep(deps(at(2 * MIN)));
         expect(report.refunds.router_refundable).toBe(1);
         expect((await stateOf(order.id)).state).toBe("refunding");
-        const refund = await findRefund(db.pool, order.id);
+        const refund = await findOrderRefund(db.pool, order.id);
         expect(refund?.kind).toBe("full");
         expect(refund?.reason).toBe("router_refundable");
     });
@@ -274,7 +274,7 @@ describe("redeemed orders with no event", () => {
             const row = await stateOf(order.id);
             expect(row.state).toBe("manual");
             expect(row.manualReason).toBe("refund_amount_pending");
-            expect(await findRefund(db.pool, order.id)).toBeNull();
+            expect(await findOrderRefund(db.pool, order.id)).toBeNull();
             expect(log.lines.some((l) => l.level === "alarm" && l.alarm === "manual_queue")).toBe(
                 true,
             );
@@ -313,7 +313,7 @@ describe("an order that changes between selection and action", () => {
         const report = await sweep(deps(at(2 * MIN)));
         expect(report.refunds.no_router_record).toBe(0);
         expect((await stateOf(order.id)).state).toBe("redeemed");
-        expect(await findRefund(db.pool, order.id)).toBeNull();
+        expect(await findOrderRefund(db.pool, order.id)).toBeNull();
     });
 
     it("skips a no_event_unverifiable park when an event arrives", async () => {
@@ -349,7 +349,7 @@ describe("abandon hints", () => {
         const report = await sweep(deps(at(2 * MIN)));
         expect(calls).toEqual([order.id]);
         expect(report.refunds.abandoned).toBe(1);
-        expect((await findRefund(db.pool, order.id))?.reason).toBe("abandoned");
+        expect((await findOrderRefund(db.pool, order.id))?.reason).toBe("abandoned");
     });
 
     it("asks the router even when an event arrived, as the hint overrides it", async () => {

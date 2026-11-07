@@ -8,7 +8,7 @@ import { silentLog } from "./log.ts";
 import { findOrder } from "./orders/store.ts";
 import type { OrderRow } from "./orders/types.ts";
 import { pauseRefunds, refundsPaused, resumeRefunds } from "./refunds/executor.ts";
-import { findRefund } from "./refunds/request.ts";
+import { findOrderRefund } from "./refunds/request.ts";
 import { testDb, type TestDb } from "./testing/db.ts";
 import { testSigner } from "./testing/keys.ts";
 import { seedOrder, seedPayment } from "./testing/orders.ts";
@@ -91,7 +91,7 @@ describe("cliMain", () => {
             state: "refunding",
             manualReason: null,
         });
-        expect(await findRefund(db.pool, manual.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, manual.id)).toMatchObject({
             state: "pending",
             attempts: 0,
             manualReason: null,
@@ -99,7 +99,7 @@ describe("cliMain", () => {
 
         expect(await cli(["manual", "resolve", byHand.id])).toBe(0);
         expect((await findOrder(db.pool, byHand.id))!.state).toBe("refunded");
-        expect(await findRefund(db.pool, byHand.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, byHand.id)).toMatchObject({
             state: "manual",
             manualReason: "resolved_by_hand",
         });
@@ -117,9 +117,9 @@ describe("cliMain", () => {
 
     it("manual retry creates the missing refund row for a parked order", async () => {
         const parked = await manualOrder("no_event_unverifiable", null, { amountMicros: 25_000 });
-        expect(await findRefund(db.pool, parked.id)).toBeNull();
+        expect(await findOrderRefund(db.pool, parked.id)).toBeNull();
         expect(await cli(["manual", "retry", parked.id])).toBe(0);
-        expect(await findRefund(db.pool, parked.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, parked.id)).toMatchObject({
             kind: "full",
             reason: "operator",
             amountMicros: 25_000,
@@ -143,7 +143,7 @@ describe("cliMain", () => {
                 state: "manual",
                 manualReason: reason,
             });
-            expect(await findRefund(db.pool, parked.id)).toBeNull();
+            expect(await findOrderRefund(db.pool, parked.id)).toBeNull();
         },
     );
 
@@ -172,7 +172,7 @@ describe("cliMain", () => {
         const io = captureIo();
         expect(await cli(["manual", "refund", parked.id, "7000"], io)).toBe(0);
         expect(io.outText()).toBe(`${parked.id}: refunding 7000 micros`);
-        expect(await findRefund(db.pool, parked.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, parked.id)).toMatchObject({
             kind: "partial",
             reason: "operator",
             amountMicros: 7_000,
@@ -187,7 +187,7 @@ describe("cliMain", () => {
 
         const whole = await manualOrder("refund_amount_invalid", null, { amountMicros: 25_000 });
         expect(await cli(["manual", "refund", whole.id, "25000"])).toBe(0);
-        expect((await findRefund(db.pool, whole.id))!.amountMicros).toBe(25_000);
+        expect((await findOrderRefund(db.pool, whole.id))!.amountMicros).toBe(25_000);
     });
 
     it("manual refund refuses an amount above the payment and orders it cannot refund", async () => {
@@ -195,20 +195,20 @@ describe("cliMain", () => {
         const over = captureIo();
         expect(await cli(["manual", "refund", parked.id, "25001"], over)).toBe(1);
         expect(over.errText()).toContain("more than the payment");
-        expect(await findRefund(db.pool, parked.id)).toBeNull();
+        expect(await findOrderRefund(db.pool, parked.id)).toBeNull();
         expect((await findOrder(db.pool, parked.id))!.state).toBe("manual");
 
         const withRow = await manualOrder("refund_destination_invalid", "manual");
         const exists = captureIo();
         expect(await cli(["manual", "refund", withRow.id, "5000"], exists)).toBe(1);
         expect(exists.errText()).toContain("manual retry");
-        expect((await findRefund(db.pool, withRow.id))!.amountMicros).toBe(10_000);
+        expect((await findOrderRefund(db.pool, withRow.id))!.amountMicros).toBe(10_000);
 
         const { order: paid } = await seedOrder(db.pool, { state: "paid" });
         const notQueued = captureIo();
         expect(await cli(["manual", "refund", paid.id, "5000"], notQueued)).toBe(1);
         expect(notQueued.errText()).toContain("not in the manual queue");
-        expect(await findRefund(db.pool, paid.id)).toBeNull();
+        expect(await findOrderRefund(db.pool, paid.id)).toBeNull();
     });
 
     it("manual dismiss returns a parked order to redeemed and refuses other reasons", async () => {
@@ -219,7 +219,7 @@ describe("cliMain", () => {
             routerConfirmedAt: expect.any(Date),
             manualReason: null,
         });
-        expect(await findRefund(db.pool, parked.id)).toBeNull();
+        expect(await findOrderRefund(db.pool, parked.id)).toBeNull();
 
         const abandoned = await manualOrder("abandon_unverifiable", null);
         expect(await cli(["manual", "dismiss", abandoned.id])).toBe(0);
@@ -270,7 +270,7 @@ describe("cliMain", () => {
         expect(await cli(["manual", "resolve", inFlight.id])).toBe(1);
         expect(await cli(["manual", "retry", inFlight.id])).toBe(1);
         expect((await findOrder(db.pool, inFlight.id))!.state).toBe("manual");
-        expect((await findRefund(db.pool, inFlight.id))!.state).toBe("sent");
+        expect((await findOrderRefund(db.pool, inFlight.id))!.state).toBe("sent");
     });
 
     it("answers bad usage with 2 before reading any config", async () => {

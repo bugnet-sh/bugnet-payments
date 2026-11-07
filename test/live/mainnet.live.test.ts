@@ -31,7 +31,7 @@ import { jsonLog, type Log } from "../../src/log.ts";
 import { routeConsole, type RunningService, startService } from "../../src/main.ts";
 import { findOrder, findPaymentByOrder } from "../../src/orders/store.ts";
 import { orderKey, orderPublicKeyBase64 } from "../../src/orders/token.ts";
-import { findRefund, type RefundRow } from "../../src/refunds/request.ts";
+import { findOrderRefund, type RefundRow } from "../../src/refunds/request.ts";
 import { usdcAta } from "../../src/solana/accounts.ts";
 import { MEMO_PROGRAM, SOLANA_MAINNET, USDC_MINT } from "../../src/solana/constants.ts";
 import { loadKeypair } from "../../src/solana/keys.ts";
@@ -427,7 +427,7 @@ describe("mainnet", () => {
 
         const payment = (await findPaymentByOrder(s.pool, created.orderId))!;
         expect(payment).toMatchObject({ status: "confirmed", txSignature: settle.transaction });
-        const refund = (await findRefund(s.pool, created.orderId))!;
+        const refund = (await findOrderRefund(s.pool, created.orderId))!;
         const rtx = await parsedTx(refund.txSignature!);
         expect(rtx.meta!.err).toBeNull();
         expect(rtx.transaction.message.accountKeys[0]!.pubkey).toBe(feePayer.address);

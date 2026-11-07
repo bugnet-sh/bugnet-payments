@@ -12,7 +12,7 @@ import {
     setOrderState,
 } from "../orders/store.ts";
 import type { OrderRow, PaymentRow } from "../orders/types.ts";
-import { findRefund } from "../refunds/request.ts";
+import { findOrderRefund } from "../refunds/request.ts";
 import { createRouterClient } from "../router/client.ts";
 import { until } from "../testing/app.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
@@ -420,7 +420,7 @@ describe("reconcileSettling", () => {
         });
         expect(Object.values(swept.refunds).every((n) => n === 0)).toBe(true);
         expect((await orderOf(order.id)).state).toBe("paid");
-        expect(await findRefund(db.pool, order.id)).toBeNull();
+        expect(await findOrderRefund(db.pool, order.id)).toBeNull();
     });
 });
 

@@ -19,7 +19,7 @@ import {
     setManualReason,
     setOrderState,
 } from "../orders/store.ts";
-import { findRefund, requestRefund, returnManualToRedeemed } from "../refunds/request.ts";
+import { findOrderRefund, requestRefund, returnManualToRedeemed } from "../refunds/request.ts";
 
 const SPKI_ED25519_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 const KEY_BYTES = 32;
@@ -278,7 +278,7 @@ async function parkManual(
             await setOrderState(c, orderId, order.state, "manual", { manualReason: reason });
             return true;
         }
-        if (order.state !== "manual" || (await findRefund(c, orderId)) !== null) return false;
+        if (order.state !== "manual" || (await findOrderRefund(c, orderId)) !== null) return false;
         if (order.manualReason === reason) return false;
         await setManualReason(c, orderId, reason);
         return true;

@@ -40,7 +40,7 @@ import {
     resumeRefunds,
     runRefunds,
 } from "./executor.ts";
-import { findRefund, type RefundRow, requestRefund } from "./request.ts";
+import { findOrderRefund, type RefundRow, requestRefund } from "./request.ts";
 
 const T0 = new Date("2030-01-01T12:00:00Z");
 const COMPUTE_BUDGET = "ComputeBudget111111111111111111111111111111";
@@ -230,7 +230,7 @@ async function sentRefund(
 ): Promise<{ order: OrderRow; refund: RefundRow }> {
     const order = await pendingRefund();
     expect((await runRefunds(deps(okRpc(), T0, cfg))).sent).toBe(1);
-    const refund = (await findRefund(db.pool, order.id))!;
+    const refund = (await findOrderRefund(db.pool, order.id))!;
     expect(refund).toMatchObject({ state: "sent", attempts: 1, sentAt: T0 });
     return { order, refund };
 }
@@ -281,7 +281,7 @@ describe("runRefunds", () => {
         const rpc = createFakeRpc({
             getAccountInfo: () => tokenAccount({}),
             sendTransaction: async (wire: string, config: unknown) => {
-                const row = (await findRefund(db.pool, order.id))!;
+                const row = (await findOrderRefund(db.pool, order.id))!;
                 expect(row).toMatchObject({
                     state: "signed",
                     wireTx: wire,
@@ -303,7 +303,7 @@ describe("runRefunds", () => {
             manual: 0,
             paused: null,
         });
-        const row = (await findRefund(db.pool, order.id))!;
+        const row = (await findOrderRefund(db.pool, order.id))!;
         expect(row).toMatchObject({ state: "sent", sentAt: T0 });
         expect(row.txSignature).toBe(signatureOf(row.wireTx!));
         expect(rpc.calls.sendTransaction).toBe(1);
@@ -338,14 +338,14 @@ describe("runRefunds", () => {
         const tick = await runRefunds({ ...deps(rpc), pool });
         expect(tick.sent).toBe(1);
         expect(connects).toBeGreaterThanOrEqual(3);
-        expect((await findRefund(db.pool, order.id))!.state).toBe("sent");
+        expect((await findOrderRefund(db.pool, order.id))!.state).toBe("sent");
     });
 
     it("confirms and marks the order refunded", async () => {
         const { order } = await sentRefund();
         const tick = await runRefunds(deps(okRpc(), later(30_000)));
         expect(tick.confirmed).toBe(1);
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             state: "confirmed",
             confirmedAt: later(30_000),
         });
@@ -360,7 +360,10 @@ describe("runRefunds", () => {
             }),
         });
         await runRefunds(deps(rpc, later(30_000)));
-        expect(await findRefund(db.pool, order.id)).toMatchObject({ state: "sent", attempts: 1 });
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
+            state: "sent",
+            attempts: 1,
+        });
         expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
         expect(rpc.calls.getLatestBlockhash).toBe(0);
         expect(rpc.calls.sendTransaction).toBe(0);
@@ -394,7 +397,7 @@ describe("runRefunds", () => {
             },
         ]);
         expect(rpc.calls.getLatestBlockhash).toBe(0);
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             state: "sent",
             attempts: 1,
             txSignature: refund.txSignature,
@@ -416,7 +419,7 @@ describe("runRefunds", () => {
         });
         const tick = await runRefunds(deps(rpc, later(30_000)));
         expect(tick.resigned).toBe(1);
-        const after = (await findRefund(db.pool, order.id))!;
+        const after = (await findOrderRefund(db.pool, order.id))!;
         expect(after.txSignature).not.toBe(first.txSignature);
         expect(after.txSignature).toBe(signatureOf(after.wireTx!));
         expect(after).toMatchObject({
@@ -449,7 +452,7 @@ describe("runRefunds", () => {
         });
         const tick = await runRefunds(deps(rpc, later(30_000)));
         expect(tick).toMatchObject({ confirmed: 1, resigned: 0, resent: 0 });
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             state: "confirmed",
             attempts: 1,
             txSignature: refund.txSignature,
@@ -479,14 +482,14 @@ describe("runRefunds", () => {
             }),
         });
         expect((await runRefunds(deps(rpc, later(30_000)))).resigned).toBe(1);
-        const second = (await findRefund(db.pool, order.id))!;
+        const second = (await findOrderRefund(db.pool, order.id))!;
         expect(second.previousSignatures).toEqual([first.txSignature]);
 
         firstLanded = true;
         const tick = await runRefunds(deps(rpc, later(60_000)));
         expect(tick).toMatchObject({ confirmed: 1, resigned: 0, resent: 0 });
         expect(reads.at(-1)).toEqual([second.txSignature, first.txSignature]);
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             state: "confirmed",
             attempts: 2,
             txSignature: first.txSignature,
@@ -516,14 +519,14 @@ describe("runRefunds", () => {
             }),
         });
         await runRefunds(deps(rpc, later(30_000)));
-        const second = (await findRefund(db.pool, order.id))!;
+        const second = (await findOrderRefund(db.pool, order.id))!;
         await runRefunds(deps(rpc, later(60_000)));
-        const third = (await findRefund(db.pool, order.id))!;
+        const third = (await findOrderRefund(db.pool, order.id))!;
         expect(third.previousSignatures).toEqual([first.txSignature, second.txSignature]);
 
         landed = second.txSignature;
         expect((await runRefunds(deps(rpc, later(90_000)))).confirmed).toBe(1);
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             state: "confirmed",
             attempts: 3,
             txSignature: second.txSignature,
@@ -540,7 +543,7 @@ describe("runRefunds", () => {
         const tick = await runRefunds(deps(rpc, later(30_000)));
         expect(tick).toMatchObject({ resigned: 0, resent: 1 });
         expect(rpc.sent).toEqual([refund.wireTx]);
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             attempts: 1,
             txSignature: refund.txSignature,
             previousSignatures: [],
@@ -556,7 +559,7 @@ describe("runRefunds", () => {
         });
         const tick = await runRefunds(deps(rpc, later(30_000), { max_attempts: 1 }));
         expect(tick.manual).toBe(1);
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             state: "manual",
             manualReason: "refund_expired_repeatedly",
             attempts: 1,
@@ -580,7 +583,7 @@ describe("runRefunds", () => {
             },
         });
         expect((await runRefunds(deps(failing))).sent).toBe(0);
-        const signed = (await findRefund(db.pool, order.id))!;
+        const signed = (await findOrderRefund(db.pool, order.id))!;
         expect(signed).toMatchObject({ state: "signed", attempts: 1, sentAt: null });
         expect(alarms("manual_queue")).toEqual([]);
 
@@ -590,7 +593,7 @@ describe("runRefunds", () => {
         });
         expect((await runRefunds(deps(rpc, later(30_000)))).resent).toBe(1);
         expect(rpc.sent).toEqual([signed.wireTx]);
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             state: "sent",
             attempts: 1,
             txSignature: signed.txSignature,
@@ -606,7 +609,7 @@ describe("runRefunds", () => {
             },
         });
         await runRefunds(deps(rpc));
-        expect((await findRefund(db.pool, order.id))!.state).toBe("pending");
+        expect((await findOrderRefund(db.pool, order.id))!.state).toBe("pending");
         expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
         expect(log.lines.some((l) => l.level === "alarm")).toBe(false);
         expect(rpc.calls.sendTransaction ?? 0).toBe(0);
@@ -642,7 +645,7 @@ describe("runRefunds", () => {
         ]);
         expect(levels("warn")).toEqual([]);
         expect(rpc.calls.getSignatureStatuses).toBe(0);
-        expect((await findRefund(db.pool, order.id))!.state).toBe("sent");
+        expect((await findOrderRefund(db.pool, order.id))!.state).toBe("sent");
     });
 
     it.each(["getTokenAccountBalance", "getLatestBlockhash"] as const)(
@@ -655,7 +658,7 @@ describe("runRefunds", () => {
                 },
             });
             await runRefunds(deps(rpc));
-            expect(await findRefund(db.pool, order.id)).toMatchObject({
+            expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
                 state: "pending",
                 attempts: 0,
                 txSignature: null,
@@ -678,7 +681,7 @@ describe("runRefunds", () => {
             },
         });
         await runRefunds(deps(rpc, later(30_000)));
-        expect(await findRefund(db.pool, order.id)).toEqual(refund);
+        expect(await findOrderRefund(db.pool, order.id)).toEqual(refund);
         expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
         expect(log.lines.some((l) => l.level === "alarm")).toBe(false);
         expect(rpc.calls.sendTransaction).toBe(0);
@@ -691,7 +694,7 @@ describe("runRefunds", () => {
         const rpc = okRpc({ getSignatureStatuses: () => ({ value: [LANDED_FAILED] }) });
         const tick = await runRefunds(deps(rpc, later(30_000)));
         expect(tick.manual).toBe(1);
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             state: "manual",
             manualReason: "refund_failed_onchain",
         });
@@ -717,7 +720,7 @@ describe("runRefunds", () => {
         const rpc = createFakeRpc({ getAccountInfo });
         const tick = await runRefunds(deps(rpc));
         expect(tick.manual).toBe(1);
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             state: "manual",
             manualReason: "refund_destination_invalid",
         });
@@ -741,7 +744,7 @@ describe("runRefunds", () => {
         );
         const rpc = okRpc();
         await runRefunds(deps(rpc));
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             state: "manual",
             manualReason: "refund_destination_invalid",
         });
@@ -755,7 +758,7 @@ describe("runRefunds", () => {
         const rpc = okRpc();
         const tick = await runRefunds(deps(rpc, T0, { daily_cap_micros: 20_000 }));
         expect(tick).toMatchObject({ sent: 1, manual: 1, paused: null });
-        expect(await findRefund(db.pool, large.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, large.id)).toMatchObject({
             state: "manual",
             manualReason: "refund_exceeds_cap",
             txSignature: null,
@@ -764,7 +767,7 @@ describe("runRefunds", () => {
             state: "manual",
             manualReason: "refund_exceeds_cap",
         });
-        expect((await findRefund(db.pool, small.id))!.state).toBe("sent");
+        expect((await findOrderRefund(db.pool, small.id))!.state).toBe("sent");
         expect(await refundsPaused(db.pool)).toBeNull();
         expect(alarms("manual_queue")).toEqual([
             expect.objectContaining({ orderId: large.id, reason: "refund_exceeds_cap" }),
@@ -782,8 +785,8 @@ describe("runRefunds", () => {
         const rpc = okRpc();
         const tick = await runRefunds(deps(rpc, T0, { daily_cap_micros: 20_000 }));
         expect(tick).toMatchObject({ sent: 1, paused: "daily_cap" });
-        expect((await findRefund(db.pool, first.id))!.state).toBe("sent");
-        expect((await findRefund(db.pool, second.id))!.state).toBe("pending");
+        expect((await findOrderRefund(db.pool, first.id))!.state).toBe("sent");
+        expect((await findOrderRefund(db.pool, second.id))!.state).toBe("pending");
         expect(await refundsPaused(db.pool)).toBe("daily_cap");
         expect(alarms("refunds_paused")).toEqual([
             expect.objectContaining({ reason: "daily_cap" }),
@@ -798,8 +801,8 @@ describe("runRefunds", () => {
             manual: 0,
             paused: "daily_cap",
         });
-        expect((await findRefund(db.pool, first.id))!.state).toBe("confirmed");
-        expect((await findRefund(db.pool, second.id))!.state).toBe("pending");
+        expect((await findOrderRefund(db.pool, first.id))!.state).toBe("confirmed");
+        expect((await findOrderRefund(db.pool, second.id))!.state).toBe("pending");
         expect(rpc.calls.sendTransaction).toBe(1);
         expect(rpc.calls.getLatestBlockhash).toBe(1);
         expect(alarms("refunds_paused")).toHaveLength(1);
@@ -815,8 +818,8 @@ describe("runRefunds", () => {
         await Promise.all([runRefunds(deps(rpc, T0, cfg)), runRefunds(deps(rpc, T0, cfg))]);
         expect(rpc.calls.sendTransaction).toBe(1);
         const states = [
-            (await findRefund(db.pool, first.id))!.state,
-            (await findRefund(db.pool, second.id))!.state,
+            (await findOrderRefund(db.pool, first.id))!.state,
+            (await findOrderRefund(db.pool, second.id))!.state,
         ];
         expect(states.sort()).toEqual(["pending", "sent"]);
         expect(await refundsPaused(db.pool)).toBe(reason);
@@ -828,8 +831,8 @@ describe("runRefunds", () => {
         const rpc = okRpc({ getTokenAccountBalance: () => usdcBalance(15_000) });
         const tick = await runRefunds(deps(rpc));
         expect(tick).toMatchObject({ sent: 1, paused: "float_low" });
-        expect((await findRefund(db.pool, first.id))!.state).toBe("sent");
-        expect(await findRefund(db.pool, second.id)).toMatchObject({
+        expect((await findOrderRefund(db.pool, first.id))!.state).toBe("sent");
+        expect(await findOrderRefund(db.pool, second.id)).toMatchObject({
             state: "pending",
             txSignature: null,
         });
@@ -850,8 +853,8 @@ describe("runRefunds", () => {
         const second = await pendingRefund();
         const tick = await runRefunds(deps(okRpc(), T0, { max_per_hour: 1 }));
         expect(tick).toMatchObject({ sent: 1, paused: "hourly_rate" });
-        expect((await findRefund(db.pool, first.id))!.state).toBe("sent");
-        expect((await findRefund(db.pool, second.id))!.state).toBe("pending");
+        expect((await findOrderRefund(db.pool, first.id))!.state).toBe("sent");
+        expect((await findOrderRefund(db.pool, second.id))!.state).toBe("pending");
         expect(await refundsPaused(db.pool)).toBe("hourly_rate");
 
         await resumeRefunds(db.pool);
@@ -867,7 +870,7 @@ describe("runRefunds", () => {
         });
         const later2h = await runRefunds(deps(low, later(7_200_000), { max_per_hour: 1 }));
         expect(later2h).toMatchObject({ confirmed: 1, sent: 0, paused: "float_low" });
-        expect((await findRefund(db.pool, second.id))!.state).toBe("pending");
+        expect((await findOrderRefund(db.pool, second.id))!.state).toBe("pending");
         expect(low.calls.sendTransaction).toBe(0);
         expect(await refundsPaused(db.pool)).toBe("float_low");
         expect(alarms("refund_float_low")).toEqual([
@@ -891,7 +894,7 @@ describe("runRefunds", () => {
         const rpc = okRpc();
         const tick = await runRefunds(deps(rpc));
         expect(tick.manual).toBe(1);
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             state: "manual",
             manualReason: "refund_exceeds_payment",
         });
@@ -912,7 +915,7 @@ describe("runRefunds", () => {
         await Promise.all([runRefunds(deps(rpc)), runRefunds(deps(rpc))]);
         expect(new Set(rpc.sent).size).toBe(1);
         expect(rpc.calls.sendTransaction).toBe(1);
-        expect((await findRefund(db.pool, order.id))!.attempts).toBe(1);
+        expect((await findOrderRefund(db.pool, order.id))!.attempts).toBe(1);
     });
 
     it("warns when the RPC answers another signature", async () => {
@@ -920,7 +923,7 @@ describe("runRefunds", () => {
         const other = getBase58Decoder().decode(new Uint8Array(64).fill(9));
         const rpc = okRpc({ sendTransaction: () => other });
         expect((await runRefunds(deps(rpc))).sent).toBe(1);
-        const row = (await findRefund(db.pool, order.id))!;
+        const row = (await findOrderRefund(db.pool, order.id))!;
         expect(row).toMatchObject({ state: "sent", txSignature: signatureOf(row.wireTx!) });
         expect(levels("warn")).toEqual([
             expect.objectContaining({
@@ -939,7 +942,7 @@ describe("runRefunds", () => {
         const tick = await runRefunds(deps(okRpc()));
         expect(tick.sent).toBe(5);
         const states = [];
-        for (const o of orders) states.push((await findRefund(db.pool, o.id))!.state);
+        for (const o of orders) states.push((await findOrderRefund(db.pool, o.id))!.state);
         expect(states).toEqual(["sent", "sent", "sent", "sent", "sent", "pending"]);
     });
 
@@ -947,8 +950,8 @@ describe("runRefunds", () => {
         const first = await pendingRefund();
         const twin = await pendingRefund();
         expect((await runRefunds(deps(okRpc()))).sent).toBe(1);
-        expect((await findRefund(db.pool, first.id))!.state).toBe("sent");
-        expect((await findRefund(db.pool, twin.id))!.state).toBe("pending");
+        expect((await findOrderRefund(db.pool, first.id))!.state).toBe("sent");
+        expect((await findOrderRefund(db.pool, twin.id))!.state).toBe("pending");
         expect(log.lines.some((l) => l.level === "alarm")).toBe(false);
 
         const fresh = okRpc({
@@ -960,8 +963,8 @@ describe("runRefunds", () => {
             confirmed: 1,
             sent: 1,
         });
-        const a = (await findRefund(db.pool, first.id))!;
-        const b = (await findRefund(db.pool, twin.id))!;
+        const a = (await findOrderRefund(db.pool, first.id))!;
+        const b = (await findOrderRefund(db.pool, twin.id))!;
         expect(b.state).toBe("sent");
         expect(b.txSignature).not.toBe(a.txSignature);
     });
@@ -986,11 +989,11 @@ describe("runRefunds against a stalled RPC", () => {
         "gives up on a stalled %s within solana.rpc_timeout and leaves the pending refund",
         async (method) => {
             const order = await pendingRefund();
-            const before = await findRefund(db.pool, order.id);
+            const before = await findOrderRefund(db.pool, order.id);
             const rpc = okRpc({ [method]: neverAnswers });
 
             expect(await stalledTick(rpc)).toMatchObject({ sent: 0, manual: 0, paused: null });
-            expect(await findRefund(db.pool, order.id)).toEqual(before);
+            expect(await findOrderRefund(db.pool, order.id)).toEqual(before);
             expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
             expect(rpc.calls.sendTransaction).toBe(0);
             expect(levels("warn")).toEqual([timedOut(order.id)]);
@@ -1019,7 +1022,7 @@ describe("runRefunds against a stalled RPC", () => {
                 confirmed: 0,
                 manual: 0,
             });
-            expect(await findRefund(db.pool, order.id)).toEqual(refund);
+            expect(await findOrderRefund(db.pool, order.id)).toEqual(refund);
             expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
             expect(levels("warn")).toEqual([timedOut(order.id)]);
             expect(levels("error")).toEqual([]);
@@ -1031,7 +1034,7 @@ describe("runRefunds against a stalled RPC", () => {
         const rpc = okRpc({ sendTransaction: neverAnswers });
 
         expect((await stalledTick(rpc)).sent).toBe(0);
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             state: "signed",
             attempts: 1,
             signedAt: T0,
@@ -1056,9 +1059,9 @@ describe("runRefunds while refunds are paused", () => {
             manual: 0,
             paused: "daily_cap",
         });
-        expect((await findRefund(db.pool, sent.id))!.state).toBe("confirmed");
+        expect((await findOrderRefund(db.pool, sent.id))!.state).toBe("confirmed");
         expect((await findOrder(db.pool, sent.id))!.state).toBe("refunded");
-        expect(await findRefund(db.pool, pending.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, pending.id)).toMatchObject({
             state: "pending",
             attempts: 0,
             txSignature: null,
@@ -1079,7 +1082,7 @@ describe("runRefunds while refunds are paused", () => {
         });
         const tick = await runRefunds(deps(rpc, later(30_000)));
         expect(tick).toMatchObject({ confirmed: 1, sent: 0, paused: "operator" });
-        expect((await findRefund(db.pool, pending.id))!.state).toBe("pending");
+        expect((await findOrderRefund(db.pool, pending.id))!.state).toBe("pending");
         expect(rpc.calls.getLatestBlockhash).toBe(0);
         expect(rpc.calls.sendTransaction).toBe(0);
     });
@@ -1093,7 +1096,7 @@ describe("runRefunds while refunds are paused", () => {
         const rpc = okRpc({ getSignatureStatuses: notFound, getEpochInfo: () => epochAt(height) });
         const tick = await runRefunds(deps(rpc, later(30_000)));
         expect(tick).toMatchObject({ resent: 0, resigned: 0, paused: "hourly_rate" });
-        expect(await findRefund(db.pool, order.id)).toEqual(refund);
+        expect(await findOrderRefund(db.pool, order.id)).toEqual(refund);
         expect(rpc.calls.getSignatureStatuses).toBe(1);
         expect(rpc.calls.getLatestBlockhash).toBe(0);
         expect(rpc.calls.sendTransaction).toBe(0);
@@ -1111,7 +1114,7 @@ describe("runRefunds while refunds are paused", () => {
         });
         const tick = await runRefunds(deps(rpc, later(30_000), { max_attempts: 1 }));
         expect(tick).toMatchObject({ manual: 1, paused: "daily_cap" });
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             state: "manual",
             manualReason: reason,
         });

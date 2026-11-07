@@ -5,7 +5,7 @@ import { usdcAta } from "../solana/accounts.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
 import { testSigner } from "../testing/keys.ts";
 import { seedOrder, seedPayment } from "../testing/orders.ts";
-import { findRefund, requestRefund, returnManualToRedeemed } from "./request.ts";
+import { findOrderRefund, requestRefund, returnManualToRedeemed } from "./request.ts";
 
 let db: TestDb;
 beforeAll(async () => {
@@ -39,13 +39,14 @@ describe("requestRefund", () => {
     it("refunds a paid order once, for the paid amount, to the payment source", async () => {
         const { order: paid, payment } = await paidOrder("paid");
         expect(await requestRefund(db.pool, paid.id, "unredeemed")).toBe("created");
-        expect(await findRefund(db.pool, paid.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, paid.id)).toMatchObject({
             kind: "full",
             reason: "unredeemed",
             amountMicros: 10_000,
             destination: payment.sourceTokenAccount,
             payer: payment.payer,
             state: "pending",
+            fromWallet: "refund",
             signedAt: null,
             txSignature: null,
             attempts: 0,
@@ -61,7 +62,7 @@ describe("requestRefund", () => {
             sourceTokenAccount: await usdcAta(stranger.address),
         });
         await requestRefund(db.pool, order.id, "router_refundable");
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             payer: stranger.address,
             destination: await usdcAta(stranger.address),
         });
@@ -122,7 +123,7 @@ describe("requestRefund", () => {
         expect(
             await requestRefund(db.pool, order.id, "router_refundable", { amountMicros: 4_000 }),
         ).toBe("created");
-        expect(await findRefund(db.pool, order.id)).toMatchObject({
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
             kind: "partial",
             amountMicros: 4_000,
             destination: payment.sourceTokenAccount,

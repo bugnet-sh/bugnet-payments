@@ -4,7 +4,7 @@ import { memoryLog } from "../log.ts";
 import { orderKey, orderPublicKeyBase64 } from "../orders/token.ts";
 import { findOrder } from "../orders/store.ts";
 import type { OrderRow } from "../orders/types.ts";
-import { findRefund } from "../refunds/request.ts";
+import { findOrderRefund } from "../refunds/request.ts";
 import { type TestApp, testApp } from "../testing/app.ts";
 import { seedOrder, seedPayment } from "../testing/orders.ts";
 import { eventPublicKey, handleEvent, verifyEventSignature } from "./handler.ts";
@@ -134,7 +134,7 @@ describe("events", () => {
             body: { ok: true },
         });
         expect((await findOrder(app.pool, redeemed.id))!.state).toBe("refunding");
-        expect(await findRefund(app.pool, redeemed.id)).toMatchObject({
+        expect(await findOrderRefund(app.pool, redeemed.id)).toMatchObject({
             kind: "full",
             reason: "router_refundable",
             amountMicros: 10_000,
@@ -364,14 +364,14 @@ describe("placement.terminated refunds", () => {
             ],
         });
         expect((await send(body)).status).toBe(200);
-        expect(await findRefund(app.pool, start.id)).toMatchObject({
+        expect(await findOrderRefund(app.pool, start.id)).toMatchObject({
             kind: "partial",
             reason: "router_refundable",
             amountMicros: 6_000,
             destination: "src-1",
             payer: "payer-1",
         });
-        expect(await findRefund(app.pool, extend.id)).toMatchObject({
+        expect(await findOrderRefund(app.pool, extend.id)).toMatchObject({
             kind: "partial",
             amountMicros: 2_500,
             destination: "src-2",
@@ -514,7 +514,7 @@ describe("placement.terminated refunds", () => {
                 refunds: entries,
             }),
         );
-        expect(await findRefund(app.pool, extend.id)).toMatchObject({ amountMicros: 2_000 });
+        expect(await findOrderRefund(app.pool, extend.id)).toMatchObject({ amountMicros: 2_000 });
         expect(
             app.log.lines
                 .slice(log)
@@ -533,7 +533,7 @@ describe("placement.terminated refunds", () => {
                 },
             }),
         );
-        expect(await findRefund(app.pool, other.id)).toMatchObject({ amountMicros: 500 });
+        expect(await findOrderRefund(app.pool, other.id)).toMatchObject({ amountMicros: 500 });
         expect(
             app.log.lines
                 .slice(mark)
@@ -559,7 +559,7 @@ describe("placement.terminated refunds", () => {
             }),
         );
         expect((await findOrder(app.pool, parked.id))!.state).toBe("refunding");
-        expect(await findRefund(app.pool, parked.id)).toMatchObject({
+        expect(await findOrderRefund(app.pool, parked.id)).toMatchObject({
             kind: "partial",
             amountMicros: 7_000,
         });
@@ -580,7 +580,7 @@ describe("placement.terminated refunds", () => {
     it("still refunds a refundable failure in full", async () => {
         const start = await seeded("redeemed");
         await send(failed(start.id, eid()));
-        expect(await findRefund(app.pool, start.id)).toMatchObject({
+        expect(await findOrderRefund(app.pool, start.id)).toMatchObject({
             kind: "full",
             amountMicros: 10_000,
         });
