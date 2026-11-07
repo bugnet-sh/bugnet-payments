@@ -108,6 +108,18 @@ describe("describeOrder", () => {
         ).toBe(true);
     });
 
+    it("throws on an unlisted pin with no paid path", () => {
+        expect(() =>
+            describeOrder({
+                kind: "allowance",
+                packageText: "",
+                allowanceMicros: 1_000_000,
+                feeMicros: 3_000,
+                pins: [stored({ listed: "unlisted", paidPath: null })],
+            }),
+        ).toThrow(/no paid path/);
+    });
+
     it("joins pins with '; ', names only new pins and never cuts", () => {
         const pins = [1, 2, 3, 4, 5].map((n) =>
             stored({

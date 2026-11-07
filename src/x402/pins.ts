@@ -19,7 +19,7 @@ export type PinCheck =
     | { ok: true; listed: Listed; paidPath: string | null }
     | { ok: false; pinReason: PinReason }
     // an RPC error at the token-account check: 503, nothing charged
-    | { ok: false; unavailable: true };
+    | { ok: false; unavailable: true; cause: string };
 
 type Decidable = Pick<X402ServicePin, "method" | "host" | "prefix" | "payTo" | "url" | "listed">;
 
@@ -64,8 +64,9 @@ export async function checkPin(pin: X402ServicePin, d: PinDeps): Promise<PinChec
         ) {
             return refuse("payee_no_usdc_account");
         }
-    } catch {
-        return { ok: false, unavailable: true };
+    } catch (err) {
+        // Class name only: an RPC error message can carry the URL and its API key
+        return { ok: false, unavailable: true, cause: err instanceof Error ? err.name : "unknown" };
     }
     return { ok: true, ...decideListed(pin, d.index) };
 }

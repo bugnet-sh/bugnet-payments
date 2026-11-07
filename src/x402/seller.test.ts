@@ -201,7 +201,45 @@ describe("rawMembers", () => {
     });
 });
 
+describe("rawMembers truncation", () => {
+    it("throws on text that ends inside a value instead of looping", () => {
+        for (const text of [
+            '{"resource":{"a":1',
+            '{"resource":"abc',
+            '{"resource":"a\\',
+            '{"accepts":[1,2',
+            '{"accepts":[{"a":[1',
+            '{"resource":1,',
+            '{"resource"',
+            "{",
+        ]) {
+            expect(() => rawMembers(text), text).toThrow(/ended/);
+        }
+    });
+});
+
 describe("chooseEntry", () => {
+    it("clamps an amount above int64 to int64 max and keeps price_above_max", () => {
+        const INT64_MAX = 9223372036854775807n;
+        for (const amount of ["9223372036854775808", "99999999999999999999"]) {
+            expect(chooseEntry(decoded([{ ...BASE, amount }]), terms(), RULES)).toEqual({
+                ok: false,
+                code: "price_above_max",
+                askedMicros: INT64_MAX,
+            });
+        }
+    });
+
+    it("pairs each accepts entry with its own source slice", () => {
+        const entries = [
+            { ...BASE, amount: "1" },
+            { ...BASE, amount: "2", extra: { feePayer: "x", memo: '}",' } },
+            { ...BASE, amount: "3" },
+        ];
+        const d = decoded(entries);
+        expect(d.accepts.map((a) => a.json)).toEqual(entries.map((e) => JSON.stringify(e)));
+    });
+
     it("picks the price tier that fits", () => {
         const c = decoded([
             { ...BASE, amount: "20000" },

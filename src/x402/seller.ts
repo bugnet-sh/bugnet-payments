@@ -81,6 +81,8 @@ export function checkEntry(raw: unknown, json: string, rules: SellerRules): Entr
     };
 }
 
+const truncated = () => new Error("rawMembers: text ended inside a value");
+
 // Reads only text that JSON.parse accepted, so it never validates
 export function rawMembers(json: string): { resource: string | null; accepts: string[] } {
     let i = 0;
@@ -89,7 +91,10 @@ export function rawMembers(json: string): { resource: string | null; accepts: st
     };
     const skipString = () => {
         i++;
-        while (json[i] !== '"') i += json[i] === "\\" ? 2 : 1;
+        while (json[i] !== '"') {
+            if (i >= json.length) throw truncated();
+            i += json[i] === "\\" ? 2 : 1;
+        }
         i++;
     };
     const skipValue = () => {
@@ -98,6 +103,7 @@ export function rawMembers(json: string): { resource: string | null; accepts: st
         if (c === "{" || c === "[") {
             let depth = 0;
             do {
+                if (i >= json.length) throw truncated();
                 const d = json[i];
                 if (d === '"') {
                     skipString();
@@ -117,6 +123,7 @@ export function rawMembers(json: string): { resource: string | null; accepts: st
     i++;
     ws();
     while (json[i] !== "}") {
+        if (i >= json.length) throw truncated();
         const keyStart = i;
         skipString();
         const key = JSON.parse(json.slice(keyStart, i)) as string;
@@ -130,6 +137,7 @@ export function rawMembers(json: string): { resource: string | null; accepts: st
                 i++;
                 ws();
                 while (json[i] !== "]") {
+                    if (i >= json.length) throw truncated();
                     const elStart = i;
                     skipValue();
                     accepts.push(json.slice(elStart, i));
@@ -204,6 +212,9 @@ export type Choice =
     // askedMicros is 0n when no amount was read
     | { ok: false; code: SignerRefusal; askedMicros: bigint };
 
+const INT64_MAX = 9223372036854775807n;
+const clampInt64 = (n: bigint) => (n > INT64_MAX ? INT64_MAX : n);
+
 export function chooseEntry(c: DecodedChallenge, pin: PinTerms, rules: SellerRules): Choice {
     const ceiling = BigInt(Math.min(pin.maxPriceMicros, pin.maxPricePerCallMicros));
     let best: { code: SignerRefusal; passed: number; asked: bigint } | null = null;
@@ -214,10 +225,10 @@ export function chooseEntry(c: DecodedChallenge, pin: PinTerms, rules: SellerRul
         let asked = 0n;
         if (!r.ok) {
             ({ code, passed } = r);
-            if (passed > 3) asked = BigInt((value as Obj).amount as string);
+            if (passed > 3) asked = clampInt64(BigInt((value as Obj).amount as string));
         } else {
             const { entry } = r;
-            asked = entry.amountMicros;
+            asked = clampInt64(entry.amountMicros);
             if (entry.payTo !== pin.payTo) {
                 [code, passed] = ["payee_changed", 12];
             } else if (pin.blocked.has(entry.payTo)) {

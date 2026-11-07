@@ -9,7 +9,10 @@ export function usd(micros: number): string {
 }
 
 function pinText(p: StoredPin): string {
-    const where = p.listed === "unlisted" ? `${p.host}${p.paidPath ?? ""}` : `${p.host}${p.prefix}`;
+    if (p.listed === "unlisted" && p.paidPath === null) {
+        throw new Error("describeOrder: an unlisted pin has no paid path");
+    }
+    const where = p.listed === "unlisted" ? `${p.host}${p.paidPath}` : `${p.host}${p.prefix}`;
     const payee = `${p.payTo.slice(0, 4)}...${p.payTo.slice(-4)}`;
     const text = `${where} up to ${usd(p.maxPriceMicros)} pays ${payee}`;
     return p.listed === "unlisted" ? `${text} (unreviewed)` : text;

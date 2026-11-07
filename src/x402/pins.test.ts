@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { address } from "@solana/kit";
+import { usdcAta } from "../solana/accounts.ts";
 import { createFakeRpc } from "../testing/fake-rpc.ts";
 import { testSigner } from "../testing/keys.ts";
 import { TEST_PAYTO, testIndex, usdcAccountAnswer } from "../testing/x402.ts";
@@ -140,7 +142,33 @@ describe("checkPin", () => {
             await r(() => {
                 throw new Error("rpc down");
             }),
-        ).toEqual({ ok: false, unavailable: true });
+        ).toEqual({ ok: false, unavailable: true, cause: "Error" });
+    });
+
+    it("carries only the error class name, never its message", async () => {
+        const r = await checkPin(
+            pin(),
+            deps(
+                createFakeRpc({
+                    getAccountInfo: () => {
+                        throw new TypeError("https://rpc.example/?api-key=SECRET");
+                    },
+                }),
+            ),
+        );
+        expect(r).toEqual({ ok: false, unavailable: true, cause: "TypeError" });
+    });
+
+    it("reads the USDC token account of the payee", async () => {
+        const seen: unknown[] = [];
+        const rpc = createFakeRpc({
+            getAccountInfo: (addr: unknown) => {
+                seen.push(addr);
+                return usdcAccountAnswer(TEST_PAYTO);
+            },
+        });
+        expect(await checkPin(pin(), deps(rpc))).toMatchObject({ ok: true });
+        expect(seen).toEqual([await usdcAta(address(TEST_PAYTO))]);
     });
 });
 
