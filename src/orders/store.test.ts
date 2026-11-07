@@ -12,6 +12,7 @@ import {
     insertOrder,
     insertPayment,
     lockOrder,
+    lockPayment,
     markEventSeen,
     setOrderState,
     StaleStateError,
@@ -135,6 +136,29 @@ describe("order store", () => {
         }
         await withTx(db.pool, async (c) => {
             expect(await lockOrder(c, "ord_zzzzzzzzzzzzzzzzzzzzzzzzzz")).toBeNull();
+        });
+    });
+
+    it("lockPayment returns the payment and blocks a second locker", async () => {
+        const { order } = await seedOrder(db.pool, { state: "settling" });
+        const payment = await seedPayment(db.pool, order.id);
+        const a = await db.pool.connect();
+        const b = await db.pool.connect();
+        try {
+            await a.query("begin");
+            expect(await lockPayment(a, order.id)).toEqual(payment);
+            await b.query("begin");
+            await b.query("set local lock_timeout = '200ms'");
+            await expect(lockPayment(b, order.id)).rejects.toMatchObject({ code: "55P03" });
+        } finally {
+            await b.query("rollback").catch(() => undefined);
+            await a.query("rollback").catch(() => undefined);
+            a.release();
+            b.release();
+        }
+        const unpaid = await seedOrder(db.pool);
+        await withTx(db.pool, async (c) => {
+            expect(await lockPayment(c, unpaid.order.id)).toBeNull();
         });
     });
 
