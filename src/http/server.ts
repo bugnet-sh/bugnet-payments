@@ -15,7 +15,7 @@ export class BodyTooLarge extends Error {
 // nginx's status for a client that hung up before any answer
 const CLIENT_CLOSED = 499;
 
-function splitListen(listen: string): { host: string; port: number } {
+export function splitListen(listen: string): { host: string; port: number } {
     const at = listen.lastIndexOf(":");
     return {
         host: listen.slice(0, at).replace(/^\[|\]$/g, ""),
