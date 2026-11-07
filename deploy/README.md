@@ -67,7 +67,13 @@ event_public_key = "<see section 5>"
 
 The listeners keep their defaults, `127.0.0.1:8447` and `127.0.0.1:8450`, and `public_url` stays
 `https://pay.bugnet.sh`. The database URL names the role because the service's Unix user,
-`bugnet-payments`, is not a role name.
+`bugnet-payments`, is not a role name. `router.url` must be https unless its host is loopback,
+since every router call carries `BUGNET_PAYMENTS_ROUTER_TOKEN`.
+
+Boot logs a warn line while `orders.max_amount_micros` (100 USDC by default) is above
+`refunds.daily_cap_micros` (20 USDC by default): a refund above the cap always goes to the manual
+queue as `refund_exceeds_cap`. Set the cap at or above the largest package price to refund every
+order automatically.
 
 ## 3. Secrets: `/etc/bugnet/payments.env`
 
@@ -78,9 +84,9 @@ systemd keeps a `# comment` written after a value as part of that value, so ever
 on its own line:
 
 ```sh
-# Shared with the gateway, which sends it as a bearer token
+# Shared with the gateway, which sends it as a bearer token, at least 32 characters
 BUGNET_PAYMENTS_TOKEN=
-# Shared with the router (section 5)
+# Shared with the router (section 5), at least 32 characters
 BUGNET_PAYMENTS_ROUTER_TOKEN=
 # openssl rand -base64 32
 BUGNET_ORDER_PRIVATE_KEY=
@@ -98,6 +104,10 @@ BUGNET_SOLANA_RPC_URL=
 sudo install -o root -g root -m 0600 /dev/null /etc/bugnet/payments.env
 sudoedit /etc/bugnet/payments.env
 ```
+
+Boot refuses a `BUGNET_PAYMENTS_TOKEN` shorter than 32 characters, and a shorter
+`BUGNET_PAYMENTS_ROUTER_TOKEN` while `router.get_order` or `router.check_payer` is on;
+`openssl rand -base64 32` makes one of 44.
 
 ## 4. Postgres
 
@@ -122,22 +132,41 @@ alone would refuse `bugnet-payments`; the router's `bugnet` map gives that one u
 The service creates its tables itself at start (`migrations/`).
 
 Data-plane 15.1's rule that only `bugnet-router` opens the Postgres socket gains this one
-exception. The deploy check of 15.3 gains an entry next to the router's, which fails the deploy
-if any other user reaches `bugnet_payments`, if Payments reaches the router's database, or if
-Payments cannot reach its own:
+exception. The router runs as the Unix user `bugnet-router` (15.1) with the role `bugnet_router`
+and the database `bugnet` (15.3).
+
+**Check after setup, and after every deploy.** Neither service may read the other's data. Run
+this as root once both databases exist; it exits 1 if any login it expects to fail succeeds, or
+fails for a reason other than Postgres refusing it (Postgres down, a missing socket), and exits 1
+if Payments cannot open its own database. The deploy check of 15.3 runs it next to the router's
+entry:
 
 ```sh
-for u in haproxy bugnet-edge bugnet-secrets bugnet-certs bugnet-ssh bugnet-egress bugnet-router \
+# The login must fail because Postgres or the socket refuses it, never because nothing listens
+refused() {
+  out=$(sudo -u "$1" psql -h /var/run/postgresql -U "$2" -d "$3" -c 'select 1' 2>&1) && exit 1
+  printf '%s\n' "$out" |
+    grep -Eiq 'no pg_hba.conf entry|peer authentication failed|permission denied' || exit 1
+}
+# Payments cannot open the router's database, under its own role or the router's
+refused bugnet-payments bugnet_payments bugnet
+refused bugnet-payments bugnet_router bugnet
+# The router cannot open bugnet_payments, under its own role or Payments'
+refused bugnet-router bugnet_router bugnet_payments
+refused bugnet-router bugnet_payments bugnet_payments
+# No other user reaches bugnet_payments
+for u in haproxy bugnet-edge bugnet-secrets bugnet-certs bugnet-ssh bugnet-egress \
     bugnet-website $GATEWAY_USERS; do
-  sudo -u "$u" psql -h /var/run/postgresql -U bugnet_payments -d bugnet_payments \
-      -c 'select 1' && exit 1
+  refused "$u" bugnet_payments bugnet_payments
 done
-sudo -u bugnet-payments psql -h /var/run/postgresql -U bugnet_router -d bugnet \
-    -c 'select 1' && exit 1
 psql -h 127.0.0.1 -U bugnet_payments -d bugnet_payments -c 'select 1' && exit 1
 sudo -u bugnet-payments psql -h /var/run/postgresql -U bugnet_payments -d bugnet_payments \
     -c 'select 1' || exit 1
 ```
+
+Each refused login prints `no pg_hba.conf entry for host "[local]", user ..., database ...` or
+`Peer authentication failed for user ...`: the `pg_hba.conf` and `pg_ident.conf` lines let each
+Unix user reach only its own role and database.
 
 ## 5. Router handover
 
@@ -148,7 +177,8 @@ Run the `pnpm cli` commands in a checkout whose `.env` holds the production keys
 - Router `events_url = "http://127.0.0.1:8447/v1/events"`.
 - Payments `router.event_public_key` = the output of
   `go run ./cmd/bugnet-dev pubkey --priv "$BUGNET_EVENT_SIGNING_KEY"` in bugnet-router, with the
-  router's environment loaded.
+  router's environment loaded. Dev only: the key appears in argv and shell history; use
+  `pubkey --event` once router Task 39 ships.
 - `BUGNET_PAYMENTS_ROUTER_TOKEN` is shared with the router session's new variable: the same name
   and value in both environments (`bugnet-dev keys` prints one).
 - Once the router ships it, router
@@ -208,3 +238,19 @@ Either also needs a DNS record. **Recommendation: A**, because it keeps ACME and
 of the process that holds the fee-payer key. Task 26 has a pre-TLS variant. The founder approved A
 on 2026-11-06; what remains is the `pay.bugnet.sh` line in `names.toml` (data-plane 15.2), the
 terminator itself and the DNS record.
+
+What the terminator must do, because Payments limits requests per client address:
+
+- **Take HAProxy's PROXY v2 header itself.** The SNI split's `pay.bugnet.sh` backend points at
+  the terminator with `send-proxy-v2`, never at `127.0.0.1:8450`. The header ends at the
+  terminator, which reads the client address from it (Caddy: the `proxy_protocol` listener
+  wrapper, allowing `127.0.0.1/32`; HAProxy `mode http`: `accept-proxy` on its `bind`). Payments'
+  public listener speaks plain HTTP and never sees a PROXY header.
+- **Set `X-Forwarded-For` to that client address, as its last entry.** Caddy's `reverse_proxy`
+  does this by default; HAProxy needs `option forwardfor`. Payments takes the last entry, and only
+  from a peer in `http.trusted_proxies`. Without the header, every visitor shares the terminator's
+  address and one per-IP limit (60 requests a minute by default).
+- **Connect from loopback**, so `http.trusted_proxies` keeps its default
+  `["127.0.0.1", "::1"]`. If the terminator connects from another address, list exactly that
+  address and nothing a client can reach Payments from directly, or a client could choose its own
+  rate-limit key.
