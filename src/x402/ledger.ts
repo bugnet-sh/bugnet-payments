@@ -113,7 +113,7 @@ export async function storePlacement(
 ): Promise<void> {
     await db.query(
         `update x402_accounts set handle_sha256 = coalesce(handle_sha256, $2),
-            placement_id = $3, deadline = $4
+            placement_id = $3, deadline = greatest(deadline, $4)
          where id = $1`,
         [id, p.handleSha256 ?? null, p.placementId, p.deadline],
     );

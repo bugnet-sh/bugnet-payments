@@ -87,6 +87,7 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
         feePayer: feePayer.address,
         transactionVersions: s.solana.transaction_versions,
     };
+    const allowanceFunding = createAllowanceFunding({ x402: s.x402, log });
     const pay = createPayDeps({
         pool,
         settler,
@@ -96,13 +97,12 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
         x402: {
             x402: s.x402,
             signer: x402.signer,
-            paid: { funding: createAllowanceFunding({ x402: s.x402, log }), x402: s.x402, log },
+            paid: { funding: allowanceFunding, x402: s.x402, log },
         },
         log,
         now,
     });
-    const funding =
-        s.x402.allowance_wallet === "" ? null : createAllowanceFunding({ x402: s.x402, log });
+    const funding = s.x402.allowance_wallet === "" ? null : allowanceFunding;
     const eventKey =
         s.router.event_public_key === "" ? null : eventPublicKey(s.router.event_public_key);
     const internalHandler = createInternalHandler({

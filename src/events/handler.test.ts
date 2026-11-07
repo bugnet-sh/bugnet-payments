@@ -673,6 +673,40 @@ describe("x402 accounts", () => {
         );
     });
 
+    it("never moves the deadline backwards", async () => {
+        const { account } = await hot("redeemed");
+        await send(
+            placement("placement.extended", account.id, { deadline: "2030-01-01T02:00:00Z" }),
+        );
+        await ready(account.id);
+        expect((await findAccount(app.pool, account.id))!.deadline).toEqual(
+            new Date("2030-01-01T02:00:00Z"),
+        );
+    });
+
+    it("skips the placement for an invalid placement_id", async () => {
+        const { account } = await hot("redeemed");
+        await send(
+            placement("placement.ready", account.id, {
+                placement_id: "not-a-uuid",
+                deadline: "2030-01-01T01:00:00Z",
+            }),
+        );
+        expect(await findAccount(app.pool, account.id)).toMatchObject({
+            placementId: null,
+            deadline: null,
+        });
+    });
+
+    it("stores a null deadline when the deadline is unparseable", async () => {
+        const { account } = await hot("redeemed");
+        await send(placement("placement.ready", account.id, { deadline: "soon" }));
+        expect(await findAccount(app.pool, account.id)).toMatchObject({
+            placementId: P,
+            deadline: null,
+        });
+    });
+
     it("matches the account by payload.order_id on placement.extended", async () => {
         const { account } = await hot("redeemed");
         const extend = await seeded("redeemed", {
@@ -796,10 +830,11 @@ describe("x402 accounts", () => {
         expect((await findOrder(app.pool, listed.order.id))!.routerConfirmedAt).not.toBeNull();
 
         const absent = await hot("redeemed");
+        const otherOrder = (await hot("redeemed")).order.id;
         await send(
             placement("placement.terminated", absent.order.id, {
                 refundable: true,
-                refunds: [{ order_id: listed.order.id, refund_micros: 5_000 }],
+                refunds: [{ order_id: otherOrder, refund_micros: 5_000 }],
             }),
         );
         expect(await refundRows(absent.order.id)).toBe(0);
