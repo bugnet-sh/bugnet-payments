@@ -180,6 +180,22 @@ describe("runMirror", () => {
         expect(await runMirror(d)).toMatchObject({ verified: true, stored: 1 });
     });
 
+    it("a run that throws on an unparseable transaction still raises x402_tail_lag", async () => {
+        chain.credit(hot, 5_000n);
+        const rpc = new Proxy(chain.rpc, {
+            get: (target, prop, recv) =>
+                prop === "getTransaction"
+                    ? () => ({ send: async () => ({ slot: 1n, transaction: [], meta: null }) })
+                    : Reflect.get(target, prop, recv),
+        });
+        const broken = { ...d, rpc };
+        await expect(runMirror(broken)).rejects.toThrow();
+        expect(alarms("x402_tail_lag")).toHaveLength(0);
+        clock = new Date(NOW.getTime() + 60_001);
+        await expect(runMirror(broken)).rejects.toThrow();
+        expect(alarms("x402_tail_lag")).toHaveLength(1);
+    });
+
     it("a known order payment with a null landed_slot is looked up by status first", async () => {
         const s = chain.credit(hot, 1_013_000n);
         const at = chain.slot();

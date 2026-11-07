@@ -433,7 +433,10 @@ export async function runMirror(d: MirrorDeps): Promise<MirrorRun> {
         try {
             run = await mirror(d, md, tail, p);
         } catch (err) {
-            if (!(err instanceof RpcFailure)) throw err;
+            if (!(err instanceof RpcFailure)) {
+                await noteLag(d, tail);
+                throw err;
+            }
             run = { verified: false, ...p, reason: "rpc" };
         }
     }
