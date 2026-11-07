@@ -10,18 +10,21 @@
  * order, never from the request's terms.
  */
 import type { KeyObject } from "node:crypto";
+import type { SettleResponse } from "@x402/core/types";
 import type pg from "pg";
 import { z } from "zod";
 import type { Settings } from "../config.ts";
 import { withTx, type Queryable } from "../db/pool.ts";
 import { isRecord } from "../is-record.ts";
 import type { Log } from "../log.ts";
+import { findOrderRefund } from "../refunds/request.ts";
 import type { BlockhashCache } from "../solana/blockhash.ts";
 import { SOLANA_MAINNET } from "../solana/constants.ts";
 import { type ChallengeContext, challengeFor, payUrlFor } from "../x402/challenge.ts";
 import { planOrder, sameSetupTerms, type ValidCreate, type X402OrderDeps } from "../x402/create.ts";
-import { reserveUnpaid } from "../x402/ledger.ts";
+import { findAccountByHandle, isFirstUse, reserveUnpaid } from "../x402/ledger.ts";
 import { SERVICE_ID } from "../x402/ids.ts";
+import { accountView } from "../x402/view.ts";
 import { claimHash, claimMatches, newClaim, openClaim, sealClaim } from "./claim.ts";
 import { isOrderId, newOrderId } from "./ids.ts";
 import type { PayOutcome } from "./pay.ts";
@@ -58,6 +61,7 @@ export interface OrderServiceDeps {
 
 type Refused = Extract<OrderResult, { status: "refused" }>;
 type Paid = Extract<OrderResult, { status: "paid"; kind: "start" | "extend" }>;
+type AllowancePaid = Extract<OrderResult, { status: "paid"; kind: "allowance" }>;
 type PaymentRequiredResult = Extract<OrderResult, { status: "payment_required" }>;
 
 interface Found {
@@ -139,7 +143,7 @@ function requestSchema(maxAmountMicros: number): z.ZodType<OrderRequest> {
             feeMicros: z.int().min(0).optional(),
             x402: x402Schema.optional(),
         })
-        .refine((r) => (r.orderId !== undefined && r.claim !== undefined) || hasTerms(r))
+        .refine((r) => isPaidRetry(r) || hasTerms(r))
         .refine(
             (r) => r.kind === undefined || (r.kind !== "start") === (r.handleSha256 !== undefined),
         )
@@ -171,6 +175,13 @@ function requestSchema(maxAmountMicros: number): z.ZodType<OrderRequest> {
         );
     schemas.set(maxAmountMicros, schema);
     return schema;
+}
+
+function isPaidRetry(r: OrderRequest): boolean {
+    return (
+        (r.orderId !== undefined && (r.claim !== undefined || r.payment !== undefined)) ||
+        memoOf(r.payment) !== undefined
+    );
 }
 
 function hasTerms(r: OrderRequest): boolean {
@@ -296,7 +307,12 @@ async function answerFound(
         const outcome = await d.pay(order.id, r.payment, signal, key);
         switch (outcome.kind) {
             case "refused":
-                return refused(outcome.reason, order.id, outcome.retryAfterSeconds);
+                return outcome.charged === false
+                    ? {
+                          ...refused(outcome.reason, order.id, outcome.retryAfterSeconds),
+                          charged: false,
+                      }
+                    : refused(outcome.reason, order.id, outcome.retryAfterSeconds);
             case "settling":
                 return refused("settling", order.id);
             case "paid":
@@ -335,7 +351,12 @@ function lapsed(o: OrderRow, now: Date): boolean {
     return now.getTime() >= o.expiresAt.getTime();
 }
 
-function closed(o: OrderRow): Refused {
+async function closedAnswer(db: Queryable, o: OrderRow): Promise<Refused> {
+    if (o.x402Refusal !== null && ["refunding", "refunded", "manual"].includes(o.state)) {
+        const row = await findOrderRefund(db, o.id);
+        const done = row?.state === "confirmed" || row?.manualReason === "resolved_by_hand";
+        return { ...refused(o.x402Refusal, o.id), refundPending: !done };
+    }
     return refused(o.state === "expired" ? "order_expired" : "order_closed", o.id);
 }
 
@@ -358,7 +379,7 @@ async function answerUnauthorized(
         case "redeemed":
             return refused("paid_claim_required", o.id);
         default:
-            return closed(o);
+            return closedAnswer(d.pool, o);
     }
 }
 
@@ -374,9 +395,11 @@ async function answerAuthorized(
             return refused("settling", o.id);
         case "paid":
         case "redeemed":
-            return redeem(d, o.id, retryStale);
+            return o.kind === "allowance"
+                ? allowancePaid(d, d.pool, o)
+                : redeem(d, o.id, retryStale);
         default:
-            return closed(o);
+            return closedAnswer(d.pool, o);
     }
 }
 
@@ -409,7 +432,7 @@ async function redeem(d: OrderServiceDeps, id: string, retryStale: boolean): Pro
                         : refused("token_expired", id);
                 default:
                     // Paid and redeemed orders only move on to refunding, refunded or manual
-                    return closed(o);
+                    return closedAnswer(c, o);
             }
         });
         if (justRedeemed) d.log.info("order redeemed", { orderId: id });
@@ -444,15 +467,48 @@ async function paid(
         amountMicros: o.amountMicros,
     };
     if (o.handleSha256 !== null) out.handleSha256 = o.handleSha256;
-    if (payment !== null) {
-        out.paymentResponse = {
-            success: true,
-            transaction: payment.txSignature,
-            network: SOLANA_MAINNET,
-            payer: payment.payer,
-        };
+    if (payment !== null) out.paymentResponse = settleResponse(payment);
+    if (o.allowanceMicros > 0) {
+        out.allowanceMicros = o.allowanceMicros;
+        out.firstUse = await isFirstUse(db, payer, o.id);
+        out.x402 = await accountView(db, o.id, d.x402.x402);
     }
     return out;
+}
+
+function settleResponse(payment: { txSignature: string; payer: string }): SettleResponse {
+    return {
+        success: true,
+        transaction: payment.txSignature,
+        network: SOLANA_MAINNET,
+        payer: payment.payer,
+    };
+}
+
+export async function allowancePaid(
+    d: OrderServiceDeps,
+    db: Queryable,
+    o: OrderRow,
+): Promise<AllowancePaid> {
+    const payment = await findPaymentByOrder(db, o.id);
+    const payer = o.payer ?? payment?.payer;
+    if (payer === undefined || payment === null) {
+        throw new Error(`paid order ${o.id} has no payer or payment`);
+    }
+    const account = o.handleSha256 === null ? null : await findAccountByHandle(db, o.handleSha256);
+    if (account === null) throw new Error(`allowance order ${o.id} has no account`);
+    return {
+        status: "paid",
+        orderId: o.id,
+        kind: "allowance",
+        handleSha256: o.handleSha256!,
+        payer,
+        amountMicros: o.amountMicros,
+        allowanceMicros: o.allowanceMicros,
+        firstUse: await isFirstUse(db, payer, o.id),
+        x402: await accountView(db, account.id, d.x402.x402),
+        paymentResponse: settleResponse(payment),
+    };
 }
 
 async function paymentRequired(
@@ -474,8 +530,11 @@ export async function abandonOrder(
     id: string,
     reason: string,
     now: Date,
-): Promise<"recorded" | "unknown"> {
+): Promise<"recorded" | "ignored" | "unknown"> {
     if (!isOrderId(id)) return "unknown";
+    const order = await findOrder(pool, id);
+    if (order === null) return "unknown";
+    if (order.kind === "allowance") return "ignored";
     const found = await updateOrderFields(pool, id, { abandonReason: reason, abandonAt: now });
     return found ? "recorded" : "unknown";
 }

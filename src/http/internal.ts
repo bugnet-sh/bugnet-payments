@@ -83,8 +83,10 @@ export function createInternalHandler(d: InternalDeps): Handler {
             const id = abandon[1]!;
             const { reason } = parsed.data;
             const out = await abandonOrder(d.service.pool, id, reason, d.service.now());
-            if (out === "recorded") {
-                d.log.info("abandon hint recorded", { orderId: id, reason });
+            if (out === "recorded" || out === "ignored") {
+                if (out === "recorded") {
+                    d.log.info("abandon hint recorded", { orderId: id, reason });
+                }
                 res.writeHead(204).end();
             } else {
                 sendJson(res, 404, { status: "refused", reason: "order_unknown" });

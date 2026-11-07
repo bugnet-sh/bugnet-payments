@@ -1,10 +1,11 @@
+import { randomBytes } from "node:crypto";
 import { connect } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { memoryLog } from "../log.ts";
 import { newOrderId } from "../orders/ids.ts";
 import { findOrder } from "../orders/store.ts";
 import { create, post, testApp, type TestApp, until } from "../testing/app.ts";
-import { seedOrder } from "../testing/orders.ts";
+import { seedAllowanceOrder, seedOrder } from "../testing/orders.ts";
 import { agentPin, seedAccount } from "../testing/x402.ts";
 import { readPool } from "../x402/ledger.ts";
 import type { OrderServiceDeps } from "../orders/service.ts";
@@ -338,5 +339,18 @@ describe("internal API with x402", () => {
         } finally {
             await down.close();
         }
+    });
+});
+
+it("abandon on an allowance order answers 204 and records nothing", async () => {
+    const { order } = await seedAllowanceOrder(app.pool, {
+        handleSha256: randomBytes(32).toString("hex"),
+        state: "redeemed",
+    });
+    const r = await post(app, `/v1/orders/${order.id}/abandon`, { reason: "denied" });
+    expect(r.status).toBe(204);
+    expect(await findOrder(app.pool, order.id)).toMatchObject({
+        abandonAt: null,
+        abandonReason: null,
     });
 });
