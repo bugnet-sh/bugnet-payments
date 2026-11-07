@@ -7,6 +7,7 @@ export type AlarmName =
     | "refunds_paused"
     | "inflow_mismatch"
     | "payment_missing_inflow"
+    | "audit_unreadable_tx"
     | "manual_queue";
 
 type Fields = Record<string, unknown>;

@@ -30,6 +30,7 @@ interface Inflow {
     amount: string;
     pre?: string | null;
     err?: unknown;
+    blockTime?: Date;
 }
 const inflow = (i: Inflow): Inflow => i;
 
@@ -80,6 +81,7 @@ function rpcWith(
                 err: i.err ?? null,
                 memo: i.memo,
                 slot: 1n,
+                blockTime: i.blockTime ? BigInt(i.blockTime.getTime() / 1000) : null,
             }));
         },
         getTransaction: (s: string, config: unknown) => {
@@ -235,44 +237,128 @@ describe("auditInflows", () => {
         expect((await auditInflows(deps(rpcWith([])))).missing).toEqual([]);
     });
 
-    it("pages with before and resumes from the checkpoint", async () => {
+    it("pages with before until it reaches the checkpoint and resumes from the newest", async () => {
         const page1 = Array.from({ length: 1000 }, (_, k) =>
             inflow({ name: `P${k}`, memo: null, amount: "0" }),
         );
-        const page2 = [inflow({ name: "S1", memo: order.id, amount: "10000" })];
+        const page2 = [
+            inflow({ name: "S1", memo: order.id, amount: "10000" }),
+            inflow({ name: "CP", memo: null, amount: "0" }),
+        ];
         const seen: Seen = { sigConfigs: [], txConfigs: [] };
         await db.pool.query(
-            `insert into audit_checkpoints (name, signature) values ('recipient_inflows', $1)`,
-            [sigOf()],
+            `insert into audit_checkpoints (name, signature, updated_at)
+             values ('recipient_inflows', $1, $2)`,
+            [sig("CP"), new Date(t0.getTime() - 30 * MIN)],
         );
-        const stored = (await db.pool.query("select signature from audit_checkpoints")).rows[0]
-            .signature;
-        const r = await auditInflows(deps(rpcWith([], seen, [page1, page2])));
+        const rpc = rpcWith([], seen, [page1, page2]);
+        const r = await auditInflows(deps(rpc));
         expect(seen.sigConfigs).toHaveLength(2);
-        expect(seen.sigConfigs[0]).toMatchObject({
-            limit: 1000,
-            until: stored,
-            commitment: "finalized",
-        });
-        expect(seen.sigConfigs[1]).toMatchObject({ before: sig("P999"), until: stored });
+        expect(seen.sigConfigs[0]).toMatchObject({ limit: 1000, commitment: "finalized" });
+        expect(seen.sigConfigs[1]).toMatchObject({ before: sig("P999") });
+        expect(rpc.calls.getTransaction).toBe(1001);
         expect(r).toMatchObject({ scanned: 1001, matched: 1, checkpoint: sig("P0") });
 
         const seen2: Seen = { sigConfigs: [], txConfigs: [] };
-        await auditInflows(deps(rpcWith([], seen2)));
+        const second = await auditInflows(deps(rpcWith([], seen2)));
         expect(seen2.sigConfigs).toHaveLength(1);
-        expect(seen2.sigConfigs[0]).toMatchObject({ until: sig("P0") });
+        expect(second.checkpoint).toBe(sig("P0"));
     });
 
-    it("scans one page on the first run even when it is full", async () => {
+    it("stops paging once a full page reaches back before the window start", async () => {
+        const old = new Date(t0.getTime() - 3 * 24 * 60 * MIN);
         const page1 = Array.from({ length: 1000 }, (_, k) =>
-            inflow({ name: `P${k}`, memo: null, amount: "0" }),
+            inflow({ name: `P${k}`, memo: null, amount: "0", blockTime: old }),
         );
         const seen: Seen = { sigConfigs: [], txConfigs: [] };
         await auditInflows(
             deps(rpcWith([], seen, [page1, [inflow({ name: "X", memo: null, amount: "0" })]])),
         );
         expect(seen.sigConfigs).toHaveLength(1);
-        expect(seen.sigConfigs[0]).not.toHaveProperty("until");
+    });
+
+    it("audits a payment confirmed two minutes before a run in the next run", async () => {
+        const late = (await seedOrder(db.pool, { state: "paid" })).order;
+        await seedPayment(db.pool, late.id, {
+            txSignature: sig("LATE"),
+            status: "confirmed",
+            confirmedAt: new Date(t0.getTime() - 2 * MIN),
+        });
+        await db.pool.query("update payments set confirmed_at = $1 where order_id = $2", [
+            new Date(t0.getTime() - 40 * MIN),
+            order.id,
+        ]);
+        const first = await auditInflows(deps(rpcWith([])));
+        expect(first.missing).toEqual([order.id]);
+        const next = await auditInflows(deps(rpcWith([]), new Date(t0.getTime() + 10 * MIN)));
+        expect(next.missing).toEqual([late.id]);
+        const covered = await auditInflows(
+            deps(
+                rpcWith([inflow({ name: "LATE", memo: late.id, amount: "10000" })]),
+                new Date(t0.getTime() + 20 * MIN),
+            ),
+        );
+        expect(covered.missing).toEqual([]);
+    });
+
+    it("does not call a payment missing when its transfer is older than this run's new rows", async () => {
+        await db.pool.query(
+            `insert into audit_checkpoints (name, signature, updated_at)
+             values ('recipient_inflows', $1, $2)`,
+            [sig("CP"), new Date(t0.getTime() - 60 * MIN)],
+        );
+        const r = await auditInflows(
+            deps(
+                rpcWith([
+                    inflow({ name: "NEW", memo: null, amount: "0" }),
+                    inflow({ name: "CP", memo: null, amount: "0" }),
+                    inflow({ name: "S1", memo: order.id, amount: "10000" }),
+                ]),
+            ),
+        );
+        expect(r.missing).toEqual([]);
+        expect(r.scanned).toBe(1);
+    });
+
+    it("saves a checkpoint even when the first scan finds nothing", async () => {
+        await db.pool.query("update payments set confirmed_at = $1", [
+            new Date(t0.getTime() - 3 * 24 * 60 * MIN),
+        ]);
+        const r = await auditInflows(deps(rpcWith([])));
+        expect(r.checkpoint).toBeNull();
+        const saved = await db.pool.query("select * from audit_checkpoints");
+        expect(saved.rows).toHaveLength(1);
+        const again = await auditInflows(deps(rpcWith([]), new Date(t0.getTime() + 60 * MIN)));
+        expect(again.missing).toEqual([]);
+    });
+
+    it("alarms once on a signature that stays unreadable for three runs and moves on", async () => {
+        const rpc = () =>
+            createFakeRpc({
+                getSignaturesForAddress: () => [
+                    { signature: sig("S1"), err: null, memo: null, slot: 1n },
+                    { signature: sig("U"), err: null, memo: null, slot: 1n },
+                ],
+                getTransaction: (s: string) =>
+                    s === sig("U")
+                        ? null
+                        : parsedTx(inflow({ name: "S1", memo: order.id, amount: "10000" })),
+            });
+        const at = (k: number) => new Date(t0.getTime() + k * 60 * MIN);
+        await expect(auditInflows(deps(rpc(), at(0)))).rejects.toThrow(/unavailable/);
+        await expect(auditInflows(deps(rpc(), at(1)))).rejects.toThrow(/unavailable/);
+        expect(alarms("audit_unreadable_tx")).toHaveLength(0);
+        const third = await auditInflows(deps(rpc(), at(2)));
+        expect(alarms("audit_unreadable_tx")).toEqual([
+            expect.objectContaining({ signature: sig("U") }),
+        ]);
+        expect(third.checkpoint).toBe(sig("S1"));
+        await db.pool.query("update audit_checkpoints set signature = $1 where name = $2", [
+            sig("U"),
+            "recipient_inflows",
+        ]);
+        await auditInflows(deps(rpc(), at(3)));
+        expect(alarms("audit_unreadable_tx")).toHaveLength(1);
     });
 
     it("keeps the checkpoint when the scan finds nothing new", async () => {

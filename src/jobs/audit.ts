@@ -46,10 +46,21 @@ interface TokenBalance {
     uiTokenAmount: { amount: string };
 }
 
+const UNREADABLE_RUNS = 3;
+const SCAN_MARGIN = 10 * MIN;
+
+interface SigRow {
+    signature: string;
+    err: unknown;
+    blockTime: number | null;
+}
+
 export async function auditInflows(d: AuditDeps): Promise<AuditReport> {
     const now = d.now();
     const ata = await usdcAta(d.recipient);
     const previous = await loadCheckpoint(d.pool);
+    const to = new Date(now.getTime() - CONFIRMATION_LAG);
+    const from = previous?.updatedAt ?? new Date(to.getTime() - FIRST_RUN_LOOKBACK);
     const report: AuditReport = {
         scanned: 0,
         matched: 0,
@@ -58,9 +69,11 @@ export async function auditInflows(d: AuditDeps): Promise<AuditReport> {
         checkpoint: previous?.signature ?? null,
     };
 
-    const rows = await listSignatures(d, ata, previous?.signature ?? null);
+    const rows = await listSignatures(d, ata, from.getTime() - SCAN_MARGIN);
     const seen = new Set(rows.map((r) => r.signature));
-    for (const row of rows) {
+    const stop = rows.findIndex((r) => r.signature === previous?.signature);
+    const fresh = stop < 0 ? rows : rows.slice(0, stop);
+    for (const row of fresh) {
         if (row.err !== null) continue;
         const tx = (await d.rpc
             .getTransaction(signature(row.signature), {
@@ -70,7 +83,8 @@ export async function auditInflows(d: AuditDeps): Promise<AuditReport> {
             })
             .send(deadline(d.rpcTimeoutMs))) as ParsedTx | null;
         if (tx === null) {
-            throw new Error(`finalized transaction ${row.signature} is unavailable`);
+            await skipUnreadable(d, row.signature, now);
+            continue;
         }
         report.scanned++;
         const amount = inflowOf(tx, ata);
@@ -88,8 +102,6 @@ export async function auditInflows(d: AuditDeps): Promise<AuditReport> {
         });
     }
 
-    const from = previous?.updatedAt ?? new Date(now.getTime() - FIRST_RUN_LOOKBACK);
-    const to = new Date(now.getTime() - CONFIRMATION_LAG);
     for (const p of await confirmedBetween(d.pool, from, to)) {
         if (seen.has(p.signature)) continue;
         report.missing.push(p.orderId);
@@ -97,37 +109,60 @@ export async function auditInflows(d: AuditDeps): Promise<AuditReport> {
     }
 
     const newest = rows[0]?.signature ?? previous?.signature ?? null;
-    if (newest !== null) {
-        await saveCheckpoint(d.pool, newest, now);
-    }
+    await saveCheckpoint(d.pool, newest ?? "", to);
     report.checkpoint = newest;
     return report;
+}
+
+async function skipUnreadable(d: AuditDeps, sig: string, now: Date): Promise<void> {
+    const prefix = `unreadable:${sig}:`;
+    const rows = await d.pool.query<{ name: string }>(
+        "select name from audit_checkpoints where name like $1",
+        [`${prefix}%`],
+    );
+    if (rows.rows.some((r) => r.name === `${prefix}alarmed`)) return;
+    if (rows.rowCount! + 1 < UNREADABLE_RUNS) {
+        await saveCheckpoint(d.pool, sig, now, `${prefix}${now.getTime()}`);
+        throw new Error(`finalized transaction ${sig} is unavailable`);
+    }
+    await saveCheckpoint(d.pool, sig, now, `${prefix}alarmed`);
+    d.log.alarm("audit_unreadable_tx", { signature: sig, runs: rows.rowCount! + 1 });
 }
 
 async function listSignatures(
     d: Pick<AuditDeps, "rpc" | "rpcTimeoutMs">,
     ata: Address,
-    until: string | null,
-): Promise<{ signature: string; err: unknown }[]> {
-    const out: { signature: string; err: unknown }[] = [];
+    oldestMs: number,
+): Promise<SigRow[]> {
+    const out: SigRow[] = [];
     const seen = new Set<string>();
     let before: string | null = null;
     for (;;) {
-        const page = await d.rpc
+        const page: readonly {
+            signature: string;
+            err: unknown;
+            blockTime?: bigint | number | null;
+        }[] = await d.rpc
             .getSignaturesForAddress(ata, {
                 limit: PAGE,
                 commitment: "finalized",
                 ...(before === null ? {} : { before: signature(before) }),
-                ...(until === null ? {} : { until: signature(until) }),
             })
             .send(deadline(d.rpcTimeoutMs));
         for (const r of page) {
             if (seen.has(r.signature)) continue;
             seen.add(r.signature);
-            out.push({ signature: r.signature, err: r.err });
+            out.push({
+                signature: r.signature,
+                err: r.err,
+                blockTime: r.blockTime == null ? null : Number(r.blockTime) * 1000,
+            });
         }
-        if (page.length < PAGE || until === null) return out;
-        before = page[page.length - 1]!.signature;
+        const last = page[page.length - 1];
+        if (page.length < PAGE || last === undefined) return out;
+        const lastTime = out[out.length - 1]!.blockTime;
+        if (lastTime !== null && lastTime < oldestMs) return out;
+        before = last.signature;
     }
 }
 
@@ -175,19 +210,28 @@ async function confirmedBetween(
     return res.rows.map((r) => ({ orderId: r.order_id, signature: r.tx_signature }));
 }
 
-async function loadCheckpoint(db: pg.Pool): Promise<{ signature: string; updatedAt: Date } | null> {
+async function loadCheckpoint(
+    db: pg.Pool,
+): Promise<{ signature: string | null; updatedAt: Date } | null> {
     const res = await db.query<{ signature: string; updated_at: Date }>(
         "select signature, updated_at from audit_checkpoints where name = $1",
         [CHECKPOINT],
     );
     const row = res.rows[0];
-    return row ? { signature: row.signature, updatedAt: row.updated_at } : null;
+    return row
+        ? { signature: row.signature === "" ? null : row.signature, updatedAt: row.updated_at }
+        : null;
 }
 
-async function saveCheckpoint(db: pg.Pool, sig: string, now: Date): Promise<void> {
+async function saveCheckpoint(
+    db: pg.Pool,
+    sig: string,
+    at: Date,
+    name = CHECKPOINT,
+): Promise<void> {
     await db.query(
         `insert into audit_checkpoints (name, signature, updated_at) values ($1, $2, $3)
          on conflict (name) do update set signature = $2, updated_at = $3`,
-        [CHECKPOINT, sig, now],
+        [name, sig, at],
     );
 }
