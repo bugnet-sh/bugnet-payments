@@ -250,8 +250,17 @@ describe("runFastPass", () => {
     });
 
     it("a hint failure row stays signed after the fast pass and the expiry", async () => {
-        const row = await signedRow({ hint: "failure", lastValidBlockHeight: 10_000n });
-        await runFastPass(fastDeps);
+        chain.failNext();
+        const p = await landPayment();
+        const row = await signedRow({
+            hint: "failure",
+            hintTx: p.txSignature,
+            ourSignatureSha256: p.ourHash,
+            messageHash: p.messageHash,
+            lastValidBlockHeight: 1_000n,
+        });
+        expect(await runFastPass(fastDeps)).toEqual({ landed: 1, ignoredHints: 0 });
+        expect((await paymentRow(row.id)).landedSlot).toBe(chain.slot());
         const matchDeps = {
             x402,
             hotTokenAccount: hot,
@@ -266,6 +275,8 @@ describe("runFastPass", () => {
             { h0: 2_000n, c0: 2_000n, verifiedSlot: 5_000n },
             matchDeps,
         );
-        expect((await paymentRow(row.id)).state).toBe("signed");
+        const after = await paymentRow(row.id);
+        expect(after.expirySeenSlot).not.toBeNull();
+        expect(after.state).toBe("signed");
     });
 });
