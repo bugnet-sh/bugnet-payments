@@ -395,4 +395,37 @@ describe("runCloseJob", () => {
         expect(rows.rowCount).toBe(1);
         expect((await findAccount(db.pool, a.id))!.refundedMicros).toBe(300_000);
     });
+
+    it("one account that throws does not stop the later ones", async () => {
+        const x = await closing({ spentMicros: 1_000_000, handleSha256: null });
+        const y = await closing({ spentMicros: 1_000_000, handleSha256: null });
+        const [first, second] = [x.id, y.id].sort();
+        const d = deps(nobody, T0);
+        const real = d.funding;
+        d.funding = {
+            ...real,
+            refund: (c, account, at) => {
+                if (account.id === first) throw new Error("unrefundable money");
+                return real.refund(c, account, at);
+            },
+        };
+        const counts = await runCloseJob(d);
+        expect(counts.closed).toBe(1);
+        expect((await findAccount(db.pool, first!))!.state).toBe("closing");
+        expect((await findAccount(db.pool, second!))!.state).toBe("closed");
+        expect(log.lines.some((l) => l.accountId === first && l.level === "error")).toBe(true);
+    });
+
+    it("a close check that throws for one account still checks the later ones", async () => {
+        const x = await seedAccount(db.pool, { state: "open", ...due });
+        const y = await seedAccount(db.pool, { state: "open", ...due });
+        const [first, second] = [x.id, y.id].sort();
+        const { router, keys } = lookups((key) => {
+            if ("startOrderId" in key && key.startOrderId === first) throw new Error("boom");
+            return { kind: "unknown" };
+        });
+        await expect(runCloseCheck(deps(router, T0))).resolves.toBeDefined();
+        expect(log.lines.some((l) => l.accountId === first && l.level === "error")).toBe(true);
+        expect(keys.map((k) => ("startOrderId" in k ? k.startOrderId : null))).toContain(second);
+    });
 });

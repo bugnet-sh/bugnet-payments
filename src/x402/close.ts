@@ -43,6 +43,15 @@ export async function runCloseCheck(
     );
     const counts = { closing: 0, waiting: 0, failing: 0 };
     for (const { id } of due.rows) {
+        try {
+            await checkOne(id);
+        } catch (err) {
+            d.log.error("x402 close check failed for account", { accountId: id, err: String(err) });
+        }
+    }
+    return counts;
+
+    async function checkOne(id: string): Promise<void> {
         const answer = await d.router.lookupPlacement({ startOrderId: id });
         const alarms: (() => void)[] = [];
         const verdict = await withTx(d.pool, async (c): Promise<Verdict> => {
@@ -102,7 +111,6 @@ export async function runCloseCheck(
         for (const alarm of alarms) alarm();
         if (verdict !== "skipped") counts[verdict] += 1;
     }
-    return counts;
 }
 
 // Each closing account is settled under its lock, taken before its rows are read: the unspent rest
@@ -116,7 +124,17 @@ export async function runCloseJob(
     );
     const counts = { refunded: 0, kept: 0, closed: 0, waiting: 0 };
     for (const { id } of ids.rows) {
+        try {
+            await closeOne(id);
+        } catch (err) {
+            d.log.error("x402 close failed for account", { accountId: id, err: String(err) });
+        }
+    }
+    return counts;
+
+    async function closeOne(id: string): Promise<void> {
         const alarms: (() => void)[] = [];
+        const tally = { refunded: 0, kept: 0, closed: 0, waiting: 0 };
         await withTx(d.pool, async (c) => {
             const account = await lockAccount(c, id);
             if (account === null || account.state !== "closing") return;
@@ -126,7 +144,7 @@ export async function runCloseJob(
                 [id],
             );
             if (Number(open.rows[0]!.n) > 0) {
-                counts.waiting += 1;
+                tally.waiting += 1;
                 const since = account.closingAt ?? now;
                 if (
                     now.getTime() - since.getTime() > d.x402.close_slow_alarm_after &&
@@ -141,14 +159,14 @@ export async function runCloseJob(
             }
             const outcome = await d.funding.refund(c, account, now);
             if (outcome.kind === "not_ready") {
-                counts.waiting += 1;
+                tally.waiting += 1;
                 return;
             }
             if (outcome.kind === "refund") {
-                counts.refunded += 1;
+                tally.refunded += 1;
                 return;
             }
-            if (outcome.kind === "kept") counts.kept += 1;
+            if (outcome.kind === "kept") tally.kept += 1;
             if (outcome.kind === "already") {
                 const rows = await c.query<{ open: string }>(
                     `select count(*) filter (where r.state not in ('confirmed', 'manual')) as open
@@ -163,10 +181,10 @@ export async function runCloseJob(
                  where id = $1 and state = 'closing'`,
                 [id, now],
             );
-            counts.closed += closed.rowCount ?? 0;
+            tally.closed += closed.rowCount ?? 0;
             slowAlarmed.delete(id);
         });
+        for (const key of Object.keys(tally) as (keyof typeof tally)[]) counts[key] += tally[key];
         for (const alarm of alarms) alarm();
     }
-    return counts;
 }
