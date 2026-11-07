@@ -3,8 +3,8 @@
  *
  * Each run reads the fee payer's SOL balance and compares it with the previous run's snapshot:
  * the SOL spent since then, divided by the payments confirmed since then (refunds are not
- * counted), is the cost per paid order. A balance that rose (a top-up) raises no ratio alarm. Refund float and refund rate are
- * checked on every run.
+ * counted), is the cost per paid order. A balance that rose (a top-up) raises no ratio alarm.
+ * Refund float and refund rate are checked on every run.
  */
 import type { Address } from "@solana/kit";
 import type pg from "pg";
