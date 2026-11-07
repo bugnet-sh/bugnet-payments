@@ -1,5 +1,12 @@
 import {
     address,
+    appendTransactionMessageInstruction,
+    createTransactionMessage,
+    getBase64EncodedWireTransaction,
+    pipe,
+    setTransactionMessageFeePayerSigner,
+    setTransactionMessageLifetimeUsingBlockhash,
+    signTransactionMessageWithSigners,
     getBase58Decoder,
     getBase64Encoder,
     getTransactionDecoder,
@@ -9,6 +16,7 @@ import {
     SOLANA_ERROR__JSON_RPC__SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED,
     SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE,
 } from "@solana/kit";
+import { getApproveInstruction } from "@solana-program/token";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { usdcAta } from "../solana/accounts.ts";
 import { USDC_MINT } from "../solana/constants.ts";
@@ -177,5 +185,82 @@ describe("fake chain", () => {
         expect(await getTx(s)).toBeNull();
         expect(await getTx(s)).not.toBeNull();
         expect(chain.calls().filter((c) => c.method === "getTransaction")).toHaveLength(2);
+    });
+    it("getSignaturesStatuses reports a landed signature and null for an unknown one", async () => {
+        const s = await send(10_000n);
+        const unknown = getBase58Decoder().decode(new Uint8Array(64).fill(7));
+        const { value } = await chain.rpc
+            .getSignatureStatuses([signature(s), signature(unknown)])
+            .send();
+        expect(value[0]?.err).toBeNull();
+        expect(value[0]?.slot).toBe(1_000n);
+        expect(value[0]?.confirmationStatus).toBe("confirmed");
+        expect(value[1]).toBeNull();
+    });
+    it("a transaction with a bad signature is rejected", async () => {
+        const s = await send(10_000n);
+        const raw = Buffer.from((await getTx(s))!.transaction[0], "base64");
+        raw[1 + 3] = ~raw[1 + 3]! & 0xff;
+        let caught: unknown;
+        try {
+            await chain.rpc
+                .sendTransaction(raw.toString("base64") as never, { encoding: "base64" })
+                .send();
+        } catch (e) {
+            caught = e;
+        }
+        expect(isSolanaError(caught)).toBe(true);
+        expect(chain.submitted()).toHaveLength(1);
+    });
+    it("a transfer above the balance lands failed and moves nothing", async () => {
+        const s = await send(2_000_000n);
+        expect((await getTx(s))?.meta?.err).not.toBeNull();
+        expect(chain.balance(a)).toBe(1_000_000n);
+        expect(chain.balance(b)).toBe(0n);
+    });
+    it("the same signed transaction sent twice lands once", async () => {
+        const s = await send(10_000n);
+        const wire = (await getTx(s))!.transaction[0];
+        const again = await chain.rpc.sendTransaction(wire as never, { encoding: "base64" }).send();
+        expect(again).toBe(s);
+        expect(chain.submitted()).toHaveLength(1);
+        expect(chain.balance(b)).toBe(10_000n);
+    });
+    it("only the owner may approve, a delegate may not", async () => {
+        chain.approve(a, other.address);
+        const { value } = await chain.rpc.getLatestBlockhash().send();
+        const message = pipe(
+            createTransactionMessage({ version: 0 }),
+            (m) => setTransactionMessageFeePayerSigner(payer, m),
+            (m) => setTransactionMessageLifetimeUsingBlockhash(value, m),
+            (m) =>
+                appendTransactionMessageInstruction(
+                    getApproveInstruction({
+                        source: address(a),
+                        delegate: payer.address,
+                        owner: other,
+                        amount: 1n,
+                    }),
+                    m,
+                ),
+        );
+        const signed = await signTransactionMessageWithSigners(message);
+        const s = await chain.rpc
+            .sendTransaction(getBase64EncodedWireTransaction(signed), { encoding: "base64" })
+            .send();
+        const tx = await getTx(s);
+        expect(tx?.meta?.err).not.toBeNull();
+        const info = await chain.rpc.getAccountInfo(address(a), { encoding: "jsonParsed" }).send();
+        expect(
+            (info.value?.data as { parsed: { info: { delegate?: string } } }).parsed.info.delegate,
+        ).toBe(other.address);
+    });
+    it("a malformed body gets a JSON-RPC error and the server keeps answering", async () => {
+        for (const body of ["{not json", "[]", '{"id":1,"method":5}']) {
+            const res = await fetch(chain.url, { method: "POST", body });
+            const json = (await res.json()) as { error?: { code: number } };
+            expect(json.error?.code).toBeLessThan(0);
+        }
+        expect(await chain.rpc.getSlot().send()).toBe(1_000n);
     });
 });

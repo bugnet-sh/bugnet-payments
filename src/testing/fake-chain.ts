@@ -294,7 +294,7 @@ export async function startFakeChain(
                 if (
                     src === undefined ||
                     delegate === undefined ||
-                    !authorised(src.acct, src.w, owner)
+                    !(signed(owner) && owner === src.acct.owner)
                 ) {
                     return { err: fail(index), working };
                 }
@@ -721,36 +721,39 @@ export async function startFakeChain(
         }
     }
 
+    const rpcError = (id: unknown, code: number, message: string, data?: unknown) => ({
+        jsonrpc: "2.0",
+        id,
+        error: { code, message, ...(data === undefined ? {} : { data }) },
+    });
     const server = createServer((req, res) => {
-        void readBody(req).then((body) => {
-            const { id, method, params } = JSON.parse(body) as {
-                id: unknown;
-                method: string;
-                params?: unknown[];
-            };
-            requests.push({ method, params: params ?? [] });
-            let payload: unknown;
-            try {
-                payload = { jsonrpc: "2.0", id, result: answer(method, params ?? []) };
-            } catch (e) {
-                if (!(e instanceof RpcError)) throw e;
-                payload = {
-                    jsonrpc: "2.0",
-                    id,
-                    error: {
-                        code: e.code,
-                        message: e.message,
-                        ...(e.data === undefined ? {} : { data: e.data }),
-                    },
-                };
-            }
-            res.setHeader("content-type", "application/json");
-            res.end(
-                JSON.stringify(payload, (_k, v: unknown) =>
-                    typeof v === "bigint" ? Number(v) : v,
-                ),
-            );
-        });
+        void readBody(req)
+            .then((body): unknown => {
+                let id: unknown = null;
+                try {
+                    const parsed: unknown = JSON.parse(body);
+                    if (!isRecord(parsed) || typeof parsed.method !== "string") {
+                        return rpcError(null, -32600, "Invalid request");
+                    }
+                    id = parsed.id ?? null;
+                    const params = Array.isArray(parsed.params) ? (parsed.params as unknown[]) : [];
+                    requests.push({ method: parsed.method, params });
+                    return { jsonrpc: "2.0", id, result: answer(parsed.method, params) };
+                } catch (e) {
+                    if (e instanceof RpcError) return rpcError(id, e.code, e.message, e.data);
+                    if (e instanceof SyntaxError) return rpcError(null, -32700, "Parse error");
+                    return rpcError(id, -32603, "Internal error");
+                }
+            })
+            .catch(() => rpcError(null, -32603, "Internal error"))
+            .then((payload) => {
+                res.setHeader("content-type", "application/json");
+                res.end(
+                    JSON.stringify(payload, (_k, v: unknown) =>
+                        typeof v === "bigint" ? Number(v) : v,
+                    ),
+                );
+            });
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
