@@ -174,7 +174,8 @@ export async function requestRefund(
         if (funding === undefined) throw new Error("hot order refund needs AllowanceFunding");
         if (log === undefined) throw new Error("hot order refund needs a Log");
     }
-    return withTx(pool, async (c) => {
+    const afterCommit: (() => void)[] = [];
+    const result = await withTx(pool, async (c) => {
         const order = await lockOrder(c, orderId);
         if (order === null) return "unknown";
         if (eligible !== undefined && !eligible(order)) return "not_refundable";
@@ -210,6 +211,7 @@ export async function requestRefund(
                 log!,
                 triggerDeadline,
                 budgetWaived,
+                afterCommit,
             );
         }
         if (
@@ -246,6 +248,8 @@ export async function requestRefund(
         );
         return "created";
     });
+    for (const f of afterCommit) f();
+    return result;
 }
 
 // Shared by the router event handler and the operator's dismiss: a manual order with no refund

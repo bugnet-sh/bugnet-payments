@@ -282,6 +282,32 @@ describe("writeHotPartial", () => {
         });
     });
 
+    it("answers zero_share for a router entry equal to the allowance (row 4)", async () => {
+        const { order } = await hotStart("redeemed");
+        await db.pool.query(
+            "update orders set amount_micros = allowance_micros, fee_micros = 0 where id = $1",
+            [order.id],
+        );
+        await storedEvent("placement.ready", {
+            order_id: order.id,
+            deadline: "2030-01-01T01:00:00Z",
+        });
+        expect(await requestRefund(db.pool, order.id, "router_refundable", opts)).toBe(
+            "zero_share",
+        );
+        expect(await findOrderRefund(db.pool, order.id)).toBeNull();
+    });
+
+    it("refuses a hot partial for an order that does not pay into the allowance", async () => {
+        const { order } = await hotStart("redeemed");
+        await db.pool.query(
+            "update orders set pay_into = 'cold', allowance_micros = 0, fee_micros = 0 where id = $1",
+            [order.id],
+        );
+        await expect(writeHotPartial(db.pool, order.id, 10_000, AT)).rejects.toThrow();
+        expect(await findOrderRefund(db.pool, order.id)).toBeNull();
+    });
+
     it("pays a share from the refund wallet once the share went to cold", async () => {
         const { order } = await hotStart("redeemed", { coldTransferId: 5 });
         expect(await writeHotPartial(db.pool, order.id, 10_000, AT)).toBe("created");
@@ -386,13 +412,33 @@ describe("confirmHotRefund", () => {
 
     it("confirms only signed or sent rows", async () => {
         const { order } = await hotStart("redeemed");
-        const id = await rawAllowanceRow(order.id, { amountMicros: 300_000, state: "pending" });
+        const id = await rawAllowanceRow(order.id, {
+            amountMicros: 300_000,
+            state: "pending",
+            txSignature: SIG,
+        });
+        await setPool(1_000_000, 0);
         expect(await confirm(id, SIG, 9n)).toBe(false);
         expect(await findRefundById(db.pool, id)).toMatchObject({
             state: "pending",
             landedSlot: null,
         });
         expect(await routerEvents(order.id)).toEqual([]);
+        expect((await readPool(db.pool)).committedMicros).toBe(1_000_000);
+    });
+
+    it("answers false for a second confirm and leaves the pool unchanged", async () => {
+        const { order } = await hotStart("redeemed");
+        const id = await rawAllowanceRow(order.id, {
+            amountMicros: 300_000,
+            state: "sent",
+            txSignature: SIG,
+        });
+        await setPool(1_000_000, 0);
+        expect(await confirm(id, SIG)).toBe(true);
+        const pool = await readPool(db.pool);
+        expect(await confirm(id, SIG)).toBe(false);
+        expect(await readPool(db.pool)).toEqual(pool);
     });
 
     it("refuses a signature the row never had", async () => {
@@ -449,6 +495,14 @@ describe("resolveHotRefundByHand", () => {
         );
         expect((await readPool(db.pool)).committedMicros).toBe(700_000);
         expect(await resolve(id, HAND)).toBe(false);
+    });
+
+    it("refuses a row paid from the refund wallet", async () => {
+        const { order } = await hotStart("redeemed");
+        const id = await rawAllowanceRow(order.id, { amountMicros: 300_000, state: "manual" });
+        await db.pool.query("update refunds set from_wallet = 'refund' where id = $1", [id]);
+        expect(await resolve(id, HAND)).toBe(false);
+        expect((await findRefundById(db.pool, id))!.handTx).toBeNull();
     });
 
     it("moves a full row's order to refunded", async () => {

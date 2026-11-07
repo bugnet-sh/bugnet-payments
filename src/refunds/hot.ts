@@ -2,7 +2,7 @@ import type pg from "pg";
 import type { Settings } from "../config.ts";
 import { withTx } from "../db/pool.ts";
 import type { Log } from "../log.ts";
-import { findPaymentByOrder, lockOrder, setOrderState } from "../orders/store.ts";
+import { findPaymentByOrder, lockOrder, setManualReason, setOrderState } from "../orders/store.ts";
 import type { OrderRow } from "../orders/types.ts";
 import { isCanonicalSignature } from "../solana/base58.ts";
 import type { AllowanceFunding } from "../x402/funding.ts";
@@ -125,8 +125,9 @@ export async function decideHotFullRefund(
     funding: AllowanceFunding,
     at: Date,
     log: Log,
-    triggerDeadline?: Date | null,
-    budgetWaived = false,
+    triggerDeadline: Date | null | undefined,
+    budgetWaived: boolean,
+    afterCommit: (() => void)[],
 ): Promise<RefundRequest> {
     const funded = await c.query("select 1 from x402_fundings where order_id = $1", [order.id]);
     if (funded.rows.length === 0) return insertFullRow(c, order, reason, at, budgetWaived);
@@ -151,11 +152,11 @@ export async function decideHotFullRefund(
     } else if (order.manualReason === "refund_amount_pending") {
         return "parked";
     } else {
-        await c.query("update orders set manual_reason = 'refund_amount_pending' where id = $1", [
-            order.id,
-        ]);
+        await setManualReason(c, order.id, "refund_amount_pending");
     }
-    log.alarm("manual_queue", { orderId: order.id, reason: "refund_amount_pending" });
+    afterCommit.push(() =>
+        log.alarm("manual_queue", { orderId: order.id, reason: "refund_amount_pending" }),
+    );
     return "parked";
 }
 
@@ -170,6 +171,9 @@ export async function writeHotPartial(
     return withTx(pool, async (c) => {
         const order = await lockOrder(c, orderId);
         if (order === null) return "unknown";
+        if (order.payInto !== "allowance") {
+            throw new Error(`order ${orderId} does not pay into the allowance`);
+        }
         return hotPartial(c, order, shareMicros, at, { budgetWaived: opts.budgetWaived ?? false });
     });
 }
