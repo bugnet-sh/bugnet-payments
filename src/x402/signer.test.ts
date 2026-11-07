@@ -357,6 +357,41 @@ describe("ReserveAndSign", () => {
         expect((await money()).held).toBe(0);
     });
 
+    it("a kill while signing releases the row and answers x402_disabled", async () => {
+        const req = request();
+        const killing = deps({
+            hooks: { beforeSign: async () => setControls(db.pool, { disabled: true }, "test", T0) },
+        });
+        expect(refusedOf(await reserveAndSign(killing, req)).reason).toBe("x402_disabled");
+        expect((await rowByRef(req.ref)).state).toBe("released");
+        expect((await money()).held).toBe(0);
+    });
+
+    it("a unique violation on the signature hash retries at the next price", async () => {
+        const fixed = challenge({
+            accepts: [entryJson({ extra: `{"feePayer":"${sellerFeePayer}","memo":"abc"}` })],
+        });
+        const one = request({ paymentRequired: fixed });
+        const two = request({ paymentRequired: fixed, targetSha256: new Uint8Array(32).fill(3) });
+        signedOf(await reserveAndSign(deps(), one));
+        await db.pool.query("update x402_payments set message_hash = $1 where ref = $2", [
+            "other-hash",
+            one.ref,
+        ]);
+        signedOf(await reserveAndSign(deps(), two));
+        expect((await rowByRef(two.ref)).computeUnitPriceMicroLamports).toBe(2n);
+    });
+
+    it("a repeated ref of a released row answers ref_conflict without an alarm", async () => {
+        const req = request();
+        signedOf(await reserveAndSign(deps(), req));
+        await db.pool.query("update x402_payments set state = 'released' where ref = $1", [
+            req.ref,
+        ]);
+        expect(refusedOf(await reserveAndSign(deps(), req)).reason).toBe("ref_conflict");
+        expect(alarms("x402_ref_conflict")).toHaveLength(0);
+    });
+
     it("sign_timeout releases", async () => {
         const req = request();
         const slow = deps(
@@ -722,6 +757,25 @@ describe("ReportOutcome", () => {
             hintTx: SIG,
             hintError: "insufficient_funds",
         });
+    });
+
+    it("a resend report without a hint_tx keeps the stored one", async () => {
+        const a = await paid(1);
+        await reportOutcome(deps(), report(a, { hintTx: SIG }));
+        await reportOutcome(deps(), report(a, { resend: true, hint: SellerHint.FAILURE }));
+        expect(await rowByRef(a.ref)).toMatchObject({ hintTx: SIG, hint: "failure" });
+    });
+
+    it("an unknown payment_id answers NotFound without details or an alarm", async () => {
+        const a = await paid(1);
+        const err = await reportOutcome(
+            deps(),
+            report({ ...a, paymentId: newX402PaymentId() }),
+        ).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(ConnectError);
+        expect((err as ConnectError).code).toBe(Code.NotFound);
+        expect((err as ConnectError).details).toHaveLength(0);
+        expect(log.lines.filter((l) => l.alarm !== undefined)).toHaveLength(0);
     });
 
     it("a hint_tx wakes the fast pass", async () => {

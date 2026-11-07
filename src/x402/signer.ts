@@ -281,15 +281,10 @@ export async function reserveAndSign(d: SignerDeps, req: ReserveAndSignRequest):
     allowanceLeft = BigInt(leftMicros(account));
     let placementId = account.placementId;
     if (placementId === null) {
-        let found;
-        try {
-            found = await d.router.lookupPlacement(
-                { startOrderId: account.id },
-                AbortSignal.timeout(x402.lookup_timeout),
-            );
-        } catch {
-            return refuse("payments_unavailable");
-        }
+        const found = await d.router.lookupPlacement(
+            { startOrderId: account.id },
+            AbortSignal.timeout(x402.lookup_timeout),
+        );
         if (found.kind === "unavailable") return refuse("payments_unavailable");
         if (found.kind === "unknown") return refuse("service_not_enabled");
         await storePlacement(pool, account.id, {
@@ -412,7 +407,7 @@ export async function reserveAndSign(d: SignerDeps, req: ReserveAndSignRequest):
     } catch (err) {
         log.warn("x402 signing failed", {
             paymentId: id,
-            err: err instanceof Error ? err.message : String(err),
+            err: err instanceof Error ? err.name : "unknown",
         });
         return failed("payments_unavailable");
     }
@@ -555,7 +550,7 @@ export async function reportOutcome(
         async (c) => {
             await c.query(
                 `update x402_payments set hint = $2, http_status = $3, stream_cut = $4,
-                    hint_tx = $5, hint_error = $6, ended_clean = ended_clean or $7
+                    hint_tx = coalesce($5, hint_tx), hint_error = $6, ended_clean = ended_clean or $7
                  where id = $1`,
                 [row.id, hint, req.httpStatus, req.streamCut, hintTx, hintError, clean],
             );
