@@ -1494,6 +1494,58 @@ describe("runRefunds allowance", () => {
         expect(alarms("manual_queue")).toHaveLength(1);
     });
 
+    it("two refunds in one tick cannot both pass on a balance that covers one", async () => {
+        const [a, b] = [await hotRow(), await hotRow()];
+        const rpc = hotRpc({ getTokenAccountBalance: () => usdcBalance(400_000) });
+        expect(await runRefunds(deps(rpc), "allowance")).toMatchObject({ sent: 1, manual: 1 });
+        expect((await findRefundById(db.pool, a.id))!.state).toBe("sent");
+        expect(await findRefundById(db.pool, b.id)).toMatchObject({
+            state: "manual",
+            manualReason: "refund_balance_short",
+        });
+    });
+
+    it("a cold transfer in flight is taken off the hot balance", async () => {
+        await db.pool.query(
+            "insert into x402_cold_transfers (amount_micros, state) values (200000, 'sent')",
+        );
+        const r = await hotRow();
+        const rpc = hotRpc({ getTokenAccountBalance: () => usdcBalance(400_000) });
+        await runRefunds(deps(rpc), "allowance");
+        expect(await findRefundById(db.pool, r.id)).toMatchObject({
+            state: "manual",
+            manualReason: "refund_balance_short",
+        });
+    });
+
+    it("a hot row that landed with an error goes to manual", async () => {
+        const r = await hotRow();
+        await runRefunds(deps(hotRpc()), "allowance");
+        const rpc = hotRpc({ getSignatureStatuses: () => ({ value: [LANDED_FAILED] }) });
+        expect(await runRefunds(deps(rpc, later(30_000)), "allowance")).toMatchObject({
+            manual: 1,
+        });
+        expect(await findRefundById(db.pool, r.id)).toMatchObject({
+            state: "manual",
+            manualReason: "refund_failed_onchain",
+        });
+        expect(rpc.calls.sendTransaction ?? 0).toBe(0);
+    });
+
+    it("a hot row that is only processed waits", async () => {
+        const r = await hotRow();
+        await runRefunds(deps(hotRpc()), "allowance");
+        const rpc = hotRpc({
+            getSignatureStatuses: () => ({
+                value: [{ confirmationStatus: "processed", err: null, slot: 1n }],
+            }),
+        });
+        await runRefunds(deps(rpc, later(30_000)), "allowance");
+        expect(await findRefundById(db.pool, r.id)).toMatchObject({ state: "sent", attempts: 1 });
+        expect(rpc.calls.sendTransaction ?? 0).toBe(0);
+        expect(rpc.calls.getLatestBlockhash ?? 0).toBe(0);
+    });
+
     it("two hot refunds of one amount to one payer with one blockhash build two messages", async () => {
         const [a, b] = [await hotRow(), await hotRow()];
         expect((await runRefunds(deps(hotRpc()), "allowance")).sent).toBe(2);

@@ -242,10 +242,10 @@ async function pickRefund(
          where id <> all($1::bigint[]) and from_wallet = $4
            and ((state = 'pending' and $3::boolean)
                 or (state in ('signed', 'sent')
-                    and coalesce(sent_at, signed_at) <= $2::timestamptz - interval '20 seconds'))
+                    and coalesce(sent_at, signed_at) <= $2::timestamptz - $5::bigint * interval '1 millisecond'))
          order by created_at, id
          limit 1`,
-        [taken, now, withPending, wallet],
+        [taken, now, withPending, wallet, REFUND_AGE_MS],
     );
     const row = res.rows[0];
     return row ? { id: Number(row.id), orderId: row.order_id, kind: row.kind } : null;
@@ -283,7 +283,8 @@ async function checkHotPending(
     if (!(await viaRpc(() => destinationValid(d, r)))) {
         return toManual(c, r, "refund_destination_invalid");
     }
-    if ((await viaRpc(() => hotBalance(d))) < BigInt(r.amountMicros)) {
+    const balance = (await viaRpc(() => hotBalance(d))) - (await hotUnconfirmed(c));
+    if (balance < BigInt(r.amountMicros)) {
         return toManual(c, r, "refund_balance_short");
     }
     return sign(d, c, r, now, false);
@@ -312,6 +313,19 @@ async function hotBalance(d: RefundDeps): Promise<bigint> {
         .getTokenAccountBalance(d.hotTokenAccount!, { commitment: "confirmed" })
         .send(deadline(d.rpcTimeoutMs));
     return BigInt(value.amount);
+}
+
+// The confirmed balance does not show what is signed and still on its way out
+async function hotUnconfirmed(c: pg.PoolClient): Promise<bigint> {
+    const res = await c.query<{ total: string }>(
+        `select (
+            (select coalesce(sum(amount_micros), 0) from refunds
+             where state in ('signed', 'sent') and from_wallet = 'allowance')
+          + (select coalesce(sum(amount_micros), 0) from x402_cold_transfers
+             where state in ('signed', 'sent'))
+         )::text as total`,
+    );
+    return BigInt(res.rows[0]?.total ?? 0);
 }
 
 async function checkColdPending(
