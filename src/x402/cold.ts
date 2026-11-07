@@ -18,7 +18,9 @@ import {
     FRESH_SEND,
     noteResignWait,
     RESEND,
+    RpcUnavailable,
     type SignedRefund,
+    viaRpc,
 } from "../refunds/executor.ts";
 import { readLanding } from "../solana/landing.ts";
 import { deadline, type SolanaRpc } from "../solana/rpc.ts";
@@ -71,9 +73,9 @@ async function sign(
     id: number,
     amountMicros: number,
 ): Promise<{ signed: SignedRefund; signingSlot: bigint }> {
-    const { context, value } = await d.rpc
-        .getLatestBlockhash({ commitment: "confirmed" })
-        .send(deadline(d.rpcTimeoutMs));
+    const { context, value } = await viaRpc(() =>
+        d.rpc.getLatestBlockhash({ commitment: "confirmed" }).send(deadline(d.rpcTimeoutMs)),
+    );
     const signed = await buildRefundTransaction(
         { feePayer: d.feePayer, cfg: d.refunds },
         {
@@ -215,7 +217,8 @@ export async function runColdTransfer(d: ColdDeps): Promise<{
     return { sent: true, amountMicros: row.amountMicros, parts: row.parts };
 }
 
-// A send error leaves the row signed, and advanceColdTransfers reads its landing next run
+// A send error or a pause leaves the row as it is, and advanceColdTransfers reads its landing next
+// run. The pause is read again here because it may have been raised since the run began.
 async function broadcast(
     d: ColdDeps,
     id: number,
@@ -223,6 +226,7 @@ async function broadcast(
     signature: string,
     config: typeof FRESH_SEND | typeof RESEND,
 ): Promise<boolean> {
+    if ((await readControls(d.pool)).paused) return false;
     try {
         await d.rpc
             .sendTransaction(wire as Base64EncodedWireTransaction, config)
@@ -261,10 +265,15 @@ export async function advanceColdTransfers(
         try {
             await advanceOne(d, Number(id), tick);
         } catch (err) {
-            d.log.warn("cold transfer check failed", {
-                coldTransferId: Number(id),
-                err: String(err),
-            });
+            const ids = { coldTransferId: Number(id) };
+            if (err instanceof RpcUnavailable) {
+                d.log.warn("cold transfer rpc call failed, retrying next tick", {
+                    ...ids,
+                    err: err.cause,
+                });
+            } else {
+                d.log.error("cold transfer step failed, retrying next tick", { ...ids, err });
+            }
         }
     }
     return tick;
@@ -284,12 +293,14 @@ async function advanceOne(
     const r = res.rows[0];
     if (r === undefined) return;
     const now = d.now();
-    const read = await readLanding(
-        d.rpc,
-        r.tx_signature,
-        BigInt(r.last_valid_block_height),
-        d.rpcTimeoutMs,
-        r.previous_signatures,
+    const read = await viaRpc(() =>
+        readLanding(
+            d.rpc,
+            r.tx_signature,
+            BigInt(r.last_valid_block_height),
+            d.rpcTimeoutMs,
+            r.previous_signatures,
+        ),
     );
     const key = `cold:${id}`;
     switch (read.landing) {
@@ -308,8 +319,7 @@ async function advanceOne(
         }
         case "onchain_failed":
             clearResignWait(key);
-            await withTx(d.pool, (c) => failColdTransfer(c, id, now, d.log), d.log);
-            tick.failed++;
+            if (await failAndAlarm(d, id, Number(r.amount_micros))) tick.failed++;
             return;
         case "not_found":
             if (await broadcast(d, id, r.wire_tx, r.tx_signature, RESEND)) tick.resent++;
@@ -322,7 +332,7 @@ async function advanceOne(
         d.pool,
         d.rpc,
         {
-            signatures: [...new Set([r.tx_signature, ...r.previous_signatures])],
+            signatures: [r.tx_signature, ...r.previous_signatures],
             expirySeenSlot: r.expiry_seen_slot === null ? null : BigInt(r.expiry_seen_slot),
         },
         d.x402,
@@ -335,8 +345,7 @@ async function advanceOne(
     }
     clearResignWait(key);
     if (r.attempts >= d.refunds.max_attempts) {
-        await withTx(d.pool, (c) => failColdTransfer(c, id, now, d.log), d.log);
-        tick.failed++;
+        if (await failAndAlarm(d, id, Number(r.amount_micros))) tick.failed++;
         return;
     }
     if ((await readControls(d.pool)).paused) return;
@@ -384,13 +393,15 @@ async function advanceOne(
     await broadcast(d, id, signed.wire, signed.signature, FRESH_SEND);
 }
 
-// Orders first, then accounts (the order every other path takes), then the row itself
-export async function failColdTransfer(
-    c: pg.PoolClient,
-    id: number,
-    _at: Date,
-    log: Log,
-): Promise<void> {
+async function failAndAlarm(d: ColdDeps, id: number, amountMicros: number): Promise<boolean> {
+    const failed = await withTx(d.pool, (c) => failColdTransfer(c, id), d.log);
+    if (failed) d.log.alarm("x402_cold_transfer_failed", { coldTransferId: id, amountMicros });
+    return failed;
+}
+
+// Orders first, then accounts (the order every other path takes), then the row itself. True when
+// this call failed the row; the caller raises the alarm once the transaction has committed.
+export async function failColdTransfer(c: pg.PoolClient, id: number): Promise<boolean> {
     await c.query(
         "select id from orders where cold_transfer_id = $1 order by id for no key update",
         [id],
@@ -399,20 +410,17 @@ export async function failColdTransfer(
         "select id from x402_accounts where kept_cold_transfer_id = $1 order by id for no key update",
         [id],
     );
-    const res = await c.query<{ state: string; amount_micros: string }>(
-        "select state, amount_micros from x402_cold_transfers where id = $1 for no key update",
+    const res = await c.query<{ state: string }>(
+        "select state from x402_cold_transfers where id = $1 for no key update",
         [id],
     );
     const row = res.rows[0];
-    if (row === undefined || (row.state !== "signed" && row.state !== "sent")) return;
+    if (row === undefined || (row.state !== "signed" && row.state !== "sent")) return false;
     await c.query("update x402_cold_transfers set state = 'failed' where id = $1", [id]);
     await c.query("update orders set cold_transfer_id = null where cold_transfer_id = $1", [id]);
     await c.query(
         "update x402_accounts set kept_cold_transfer_id = null where kept_cold_transfer_id = $1",
         [id],
     );
-    log.alarm("x402_cold_transfer_failed", {
-        coldTransferId: id,
-        amountMicros: Number(row.amount_micros),
-    });
+    return true;
 }

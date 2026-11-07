@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import {
     type Address,
+    getBase58Decoder,
     getBase64Encoder,
     getCompiledTransactionMessageDecoder,
     getTransactionDecoder,
@@ -49,7 +50,7 @@ import {
 } from "../testing/x402.ts";
 import { advanceColdTransfers, balanceAt, type ColdDeps, runColdTransfer } from "./cold.ts";
 import { type CloseDeps, runCloseJob } from "./close.ts";
-import { readControls } from "./controls.ts";
+import { readControls, setControls } from "./controls.ts";
 import { recordIncident, openIncidents } from "./incidents.ts";
 import { createAllowanceFunding } from "./funding.ts";
 import { findAccount } from "./ledger.ts";
@@ -478,12 +479,30 @@ describe("runColdTransfer", () => {
         await verified(T0);
         await share(20_000_000, later(-60_000));
         await runColdTransfer(deps(T0));
-        const first = (await db.pool.query("select id, tx_signature from x402_cold_transfers"))
-            .rows[0];
+        const first = (
+            await db.pool.query("select id, tx_signature, wire_tx from x402_cold_transfers")
+        ).rows[0];
         await db.pool.query("update x402_cold_transfers set expiry_seen_slot = 1000");
+        let blockhashes = 1;
+        const atSend: Record<string, unknown>[] = [];
         const expired = rpc({
             getEpochInfo: () => epochAt(1_000n, 2_000n),
-            getSignatureStatuses: () => ({ context: { slot: 2_000n }, value: [null] }),
+            getSignatureStatuses: (signatures: string[]) => ({
+                context: { slot: 2_000n },
+                value: signatures.map(() => null),
+            }),
+            getLatestBlockhash: () => ({
+                context: { slot: 888n },
+                value: {
+                    blockhash: getBase58Decoder().decode(new Uint8Array(32).fill(++blockhashes)),
+                    lastValidBlockHeight: TEST_LVBH + 50n,
+                },
+            }),
+            sendTransaction: async (wire: string) => {
+                const row = (await db.pool.query("select * from x402_cold_transfers")).rows[0];
+                atSend.push({ ...row, sentWire: wire });
+                return row.tx_signature;
+            },
         });
         await advanceVerified(db.pool, 1_299n, T0);
         expect(await advanceColdTransfers(deps(later(30_000), { rpc: expired }))).toMatchObject({
@@ -504,12 +523,114 @@ describe("runColdTransfer", () => {
             previous_signatures: [first.tx_signature],
             expiry_seen_slot: null,
         });
+        expect(atSend).toHaveLength(1);
+        expect(atSend[0]).toMatchObject({ state: "signed", attempts: 2, signing_slot: "888" });
+        expect(atSend[0]!.tx_signature).not.toBe(first.tx_signature);
+        expect(atSend[0]!.wire_tx).not.toBe(first.wire_tx);
+        expect(atSend[0]!.wire_tx).toBe(atSend[0]!.sentWire);
         await db.pool.query("update x402_cold_transfers set attempts = 3, expiry_seen_slot = 1000");
         expect(await advanceColdTransfers(deps(later(90_000), { rpc: expired }))).toMatchObject({
             failed: 1,
         });
     });
 
+    it("a pause raised during the run stops the send, the row stays signed", async () => {
+        await verified(T0);
+        await share(20_000_000, later(-60_000));
+        const pausing = rpc({
+            getLatestBlockhash: async () => {
+                await setControls(db.pool, { paused: true }, "test", T0);
+                return {
+                    context: { slot: 777n },
+                    value: { blockhash: TEST_BLOCKHASH, lastValidBlockHeight: TEST_LVBH },
+                };
+            },
+        });
+        await runColdTransfer(deps(T0, { rpc: pausing }));
+        expect(pausing.calls.sendTransaction).toBe(0);
+        expect((await db.pool.query("select state from x402_cold_transfers")).rows).toEqual([
+            { state: "signed" },
+        ]);
+    });
+
+    it("a pause blocks a re-sign", async () => {
+        await verified(T0);
+        await share(20_000_000, later(-60_000));
+        await runColdTransfer(deps(T0));
+        await db.pool.query("update x402_cold_transfers set expiry_seen_slot = 1000");
+        await advanceVerified(db.pool, 1_300n, T0);
+        await setControls(db.pool, { paused: true }, "test", T0);
+        const expired = rpc({
+            getEpochInfo: () => epochAt(1_000n, 2_000n),
+            getSignatureStatuses: () => ({ context: { slot: 2_000n }, value: [null] }),
+        });
+        expect(await advanceColdTransfers(deps(later(60_000), { rpc: expired }))).toMatchObject({
+            resigned: 0,
+            failed: 0,
+        });
+        expect(expired.calls.getLatestBlockhash).toBe(0);
+        expect(
+            (await db.pool.query("select attempts from x402_cold_transfers")).rows[0].attempts,
+        ).toBe(1);
+    });
+});
+
+describe("advanceColdTransfers", () => {
+    it("a landed transfer is confirmed", async () => {
+        await verified(T0);
+        await share(20_000_000, later(-60_000));
+        await runColdTransfer(deps(T0));
+        const landed = rpc({
+            getSignatureStatuses: () => ({
+                value: [{ confirmationStatus: "finalized", err: null, slot: 321n }],
+            }),
+        });
+        expect(await advanceColdTransfers(deps(later(30_000), { rpc: landed }))).toMatchObject({
+            confirmed: 1,
+            failed: 0,
+        });
+        expect(
+            (await db.pool.query("select state, landed_slot from x402_cold_transfers")).rows,
+        ).toEqual([{ state: "confirmed", landed_slot: "321" }]);
+    });
+
+    it("a transfer not found before its blockhash expires is sent again as stored", async () => {
+        await verified(T0);
+        await share(20_000_000, later(-60_000));
+        await runColdTransfer(deps(T0));
+        const stored = (await db.pool.query("select wire_tx from x402_cold_transfers")).rows[0];
+        const missing = rpc({
+            getEpochInfo: () => epochAt(800n),
+            getSignatureStatuses: () => ({ value: [null] }),
+        });
+        expect(await advanceColdTransfers(deps(later(30_000), { rpc: missing }))).toMatchObject({
+            resent: 1,
+            resigned: 0,
+        });
+        expect(missing.sent).toEqual([stored.wire_tx]);
+        expect(
+            (await db.pool.query("select state, attempts from x402_cold_transfers")).rows,
+        ).toEqual([{ state: "sent", attempts: 1 }]);
+    });
+
+    it("a row another run already failed is not counted or alarmed", async () => {
+        await verified(T0);
+        await share(20_000_000, later(-60_000));
+        await runColdTransfer(deps(T0));
+        const failing = rpc({
+            getSignatureStatuses: async () => {
+                await db.pool.query("update x402_cold_transfers set state = 'failed'");
+                return { value: [LANDED_FAILED] };
+            },
+        });
+        expect(await advanceColdTransfers(deps(later(30_000), { rpc: failing }))).toMatchObject({
+            failed: 0,
+        });
+        expect(alarms("x402_cold_transfer_failed")).toHaveLength(0);
+    });
+});
+
+describe("runColdTransfer, races", () => {
     it("a refund and the transfer never both use one share", async () => {
         for (let i = 0; i < 20; i++) {
             await reset();

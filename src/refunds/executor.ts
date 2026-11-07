@@ -106,9 +106,9 @@ const SPEND_BUDGET = `insert into x402_refund_days as d (day, micros)
 const SELECT_CONTROLS = "select paused, reason from refund_controls where id = 1";
 
 // An RPC failure is routine and retried, every other failure in a step needs an operator's eye
-class RpcUnavailable extends Error {}
+export class RpcUnavailable extends Error {}
 
-async function viaRpc<T>(call: () => Promise<T>): Promise<T> {
+export async function viaRpc<T>(call: () => Promise<T>): Promise<T> {
     try {
         return await call();
     } catch (err) {
