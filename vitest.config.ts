@@ -4,8 +4,9 @@ export default defineConfig({
     test: {
         include: ["src/**/*.test.ts", "test/**/*.test.ts"],
         exclude: ["test/live/**", "node_modules/**"],
-        testTimeout: 20_000,
-        // Dropping a test database waits for a forced checkpoint, seconds long under parallel files
+        // Dropping a test database waits for a forced checkpoint, seconds long under parallel files,
+        // and some tests create and drop their own database inside the test body
+        testTimeout: 60_000,
         hookTimeout: 60_000,
     },
 });
