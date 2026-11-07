@@ -109,16 +109,25 @@ export async function runFastPass(
     let ignoredHints = 0;
     for (const sig of candidates) {
         if (open.length === 0) break;
-        const raw = await d.rpc
-            .getTransaction(toSignature(sig), {
-                commitment: "confirmed",
-                encoding: "base64",
-                maxSupportedTransactionVersion: 0,
-            })
-            .send(deadline(d.rpcTimeoutMs));
         const isHint = hintSet.has(sig);
-        if (raw === null) continue;
-        const tx = parseChainTx(sig, raw.slot, raw, d.hotTokenAccount);
+        let tx: ReturnType<typeof parseChainTx>;
+        try {
+            const raw = await d.rpc
+                .getTransaction(toSignature(sig), {
+                    commitment: "confirmed",
+                    encoding: "base64",
+                    maxSupportedTransactionVersion: 0,
+                })
+                .send(deadline(d.rpcTimeoutMs));
+            if (raw === null) continue;
+            tx = parseChainTx(sig, raw.slot, raw, d.hotTokenAccount);
+        } catch (err) {
+            d.log.warn("x402 fast pass skipped a transaction it could not read", {
+                signature: sig,
+                err: err instanceof Error ? err.name : "error",
+            });
+            continue;
+        }
         const hashes = new Set(tx.signatures.map(sha256Hex));
         const matched = open.filter((r) => hashes.has(r.signatureHash));
         for (const row of matched) {

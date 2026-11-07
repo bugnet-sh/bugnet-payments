@@ -46,6 +46,7 @@ import {
     type MatchDeps,
 } from "./match.ts";
 import { findX402Payment } from "./reserve.ts";
+import { resignProof } from "./resign.ts";
 import type { X402PaymentRow } from "./types.ts";
 
 const NOW = new Date("2030-01-01T12:00:00Z");
@@ -552,6 +553,15 @@ describe("storeAndMatch: refunds and cold transfers", () => {
         expect(await match(await readTx(s))).toBe("refund");
         expect((await findRefundById(db.pool, r.id))!.state).toBe("sent");
         expect(await chainRow(s)).toMatchObject({ failed: true });
+        expect(
+            await resignProof(
+                db.pool,
+                chain.rpc,
+                { signatures: [s], expirySeenSlot: 1_000n },
+                x402,
+                2_000,
+            ),
+        ).toBe("absent");
         expect(await incidents()).toEqual([]);
     });
 

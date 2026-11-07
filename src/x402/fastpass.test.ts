@@ -18,6 +18,7 @@ import {
 } from "../testing/x402.ts";
 import { buildSellerPayment, randomSellerMemo, signSellerPayment } from "./build.ts";
 import { base32Lower, newX402PaymentId } from "./ids.ts";
+import { applyExpiry } from "./match.ts";
 import { fastPassNeeded, runFastPass, type FastPassDeps } from "./fastpass.ts";
 import { reserve, findX402Payment } from "./reserve.ts";
 import type { X402PaymentRow } from "./types.ts";
@@ -220,5 +221,51 @@ describe("runFastPass", () => {
         const before = chain.calls().length;
         expect(await runFastPass(fastDeps)).toEqual({ landed: 0, ignoredHints: 0 });
         expect(chain.calls()).toHaveLength(before);
+    });
+
+    it("skips a candidate it cannot read and goes on to the next", async () => {
+        const bad = "1".repeat(63) + "2";
+        const p = await landPayment();
+        await signedRow({ hintTx: bad });
+        const good = await signedRow({
+            ourSignatureSha256: p.ourHash,
+            messageHash: p.messageHash,
+        });
+        const rpc = new Proxy(chain.rpc, {
+            get(target, prop, receiver) {
+                if (prop !== "getTransaction") return Reflect.get(target, prop, receiver);
+                return (sig: string, cfg: never) =>
+                    sig === bad
+                        ? {
+                              send: async () => {
+                                  throw new Error("unsupported transaction version");
+                              },
+                          }
+                        : target.getTransaction(sig as never, cfg);
+            },
+        });
+        expect(await runFastPass({ ...fastDeps, rpc })).toEqual({ landed: 1, ignoredHints: 0 });
+        expect((await paymentRow(good.id)).landedSlot).toBe(chain.slot());
+        expect(log.lines.some((l) => String(l.msg).includes("could not read"))).toBe(true);
+    });
+
+    it("a hint failure row stays signed after the fast pass and the expiry", async () => {
+        const row = await signedRow({ hint: "failure", lastValidBlockHeight: 10_000n });
+        await runFastPass(fastDeps);
+        const matchDeps = {
+            x402,
+            hotTokenAccount: hot,
+            coldTokenAccount: hot,
+            log,
+            now: () => NOW,
+            rpcTimeoutMs: 2_000,
+        };
+        await applyExpiry(
+            db.pool,
+            chain.rpc,
+            { h0: 2_000n, c0: 2_000n, verifiedSlot: 5_000n },
+            matchDeps,
+        );
+        expect((await paymentRow(row.id)).state).toBe("signed");
     });
 });
