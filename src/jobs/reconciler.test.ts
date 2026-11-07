@@ -1,7 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { getBase58Decoder } from "@solana/kit";
+import { stringify } from "smol-toml";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import type { Settings } from "../config.ts";
+import { parseSettings } from "../config.ts";
 import { memoryLog, silentLog } from "../log.ts";
 import {
     archivePayment,
@@ -15,15 +16,18 @@ import { findRefund } from "../refunds/request.ts";
 import { createRouterClient } from "../router/client.ts";
 import { until } from "../testing/app.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
-import { createFakeRpc, type FakeRpc } from "../testing/fake-rpc.ts";
+import { createFakeRpc, type FakeRpc, neverAnswers } from "../testing/fake-rpc.ts";
 import { seedOrder, seedPayment } from "../testing/orders.ts";
-import { reconcileSettling, type ReconcileDeps } from "./reconciler.ts";
+import { reconcileSettling, type ReconcileDeps, type ReconcileReport } from "./reconciler.ts";
 import { sweep } from "./sweeper.ts";
 
 const MIN = 60_000;
 const t0 = new Date("2030-01-01T00:00:00Z");
 const at = (ms: number) => new Date(t0.getTime() + ms);
 const PAYER = "6s69A41N2jAn8AymLgczY3TfrDQiHYc32MdQAw7RvtoB";
+const RECIPIENT = "Bhhc3XNdjtCNr3pj2aZwhCt8pHwsU8wRL7dqJNDZEExw";
+const defaults = parseSettings(stringify({ solana: { recipient: RECIPIENT } }), "defaults");
+const STALL_MS = 100;
 
 const CONFIRMED = { confirmationStatus: "confirmed", err: null, slot: 1n, confirmations: 1n };
 const LANDED_FAILED = {
@@ -47,7 +51,7 @@ beforeEach(async () => {
 });
 
 function deps(rpc: FakeRpc, now: Date, log: ReconcileDeps["log"] = silentLog): ReconcileDeps {
-    return { pool: db.pool, rpc, log, now: () => now };
+    return { pool: db.pool, rpc, rpcTimeoutMs: defaults.solana.rpc_timeout, log, now: () => now };
 }
 
 function newSignature(): string {
@@ -57,7 +61,7 @@ function newSignature(): string {
 // A settling order whose payment was recorded at recordedAt, before broadcast
 async function settling(
     recordedAt: Date,
-    over: { expiresAt?: Date; lastValidBlockHeight?: bigint } = {},
+    over: { expiresAt?: Date; lastValidBlockHeight?: bigint; txSignature?: string } = {},
 ): Promise<{ order: OrderRow; payment: PaymentRow }> {
     const { order } = await seedOrder(db.pool, {
         state: "settling",
@@ -66,7 +70,7 @@ async function settling(
         expiresAt: over.expiresAt ?? new Date(recordedAt.getTime() + 14 * MIN),
     });
     const payment = await seedPayment(db.pool, order.id, {
-        txSignature: newSignature(),
+        txSignature: over.txSignature ?? newSignature(),
         payer: PAYER,
         createdAt: recordedAt,
         lastValidBlockHeight: over.lastValidBlockHeight ?? 1_000n,
@@ -107,6 +111,13 @@ async function lockWaiters(): Promise<number> {
 const levels = (log: ReturnType<typeof memoryLog>, level: string) =>
     log.lines.filter((l) => l.level === level);
 
+const changedLine = (orderId: string, signature: string) =>
+    expect.objectContaining({
+        msg: "settling order changed while its status was read, left as is",
+        orderId,
+        signature,
+    });
+
 describe("reconcileSettling", () => {
     it("finishes a payment that landed while the process was down", async () => {
         const { order, payment } = await settling(at(-60_000));
@@ -127,6 +138,7 @@ describe("reconcileSettling", () => {
             paid: 1,
             reverted: 0,
             waiting: 0,
+            changed: 0,
         });
         expect(statusCalls).toEqual([[[payment.txSignature], { searchTransactionHistory: true }]]);
         expect(heightCalls).toEqual([[{ commitment: "finalized" }]]);
@@ -151,6 +163,7 @@ describe("reconcileSettling", () => {
                 paid: 0,
                 reverted: 0,
                 waiting: 0,
+                changed: 0,
             });
         }
         expect(rpc.calls.getSignatureStatuses).toBe(0);
@@ -172,6 +185,7 @@ describe("reconcileSettling", () => {
             paid: 0,
             reverted: 1,
             waiting: 0,
+            changed: 0,
         });
         expect(await failedPayments(order.id)).toEqual([archivedAs(payment, "onchain_failed")]);
         expect(await orderOf(order.id)).toMatchObject({ state: "unpaid", paidAt: null });
@@ -190,6 +204,7 @@ describe("reconcileSettling", () => {
             paid: 0,
             reverted: 0,
             waiting: 1,
+            changed: 0,
         });
         expect((await orderOf(order.id)).state).toBe("settling");
         expect(await findPaymentByOrder(db.pool, order.id)).toMatchObject({ status: "settling" });
@@ -200,6 +215,7 @@ describe("reconcileSettling", () => {
             paid: 0,
             reverted: 1,
             waiting: 0,
+            changed: 0,
         });
         expect((await orderOf(order.id)).state).toBe("unpaid");
         expect(await failedPayments(order.id)).toEqual([archivedAs(payment, "blockhash_expired")]);
@@ -240,6 +256,7 @@ describe("reconcileSettling", () => {
             paid: 0,
             reverted: 2,
             waiting: 0,
+            changed: 0,
         });
         expect((await orderOf(failed.order.id)).state).toBe("expired");
         expect((await orderOf(vanished.order.id)).state).toBe("expired");
@@ -266,6 +283,7 @@ describe("reconcileSettling", () => {
                 paid: 0,
                 reverted: 0,
                 waiting: 1,
+                changed: 0,
             });
             expect((await orderOf(order.id)).state).toBe("settling");
             expect(await findPaymentByOrder(db.pool, order.id)).toMatchObject({
@@ -275,6 +293,63 @@ describe("reconcileSettling", () => {
             expect(levels(log, "error")).toEqual([]);
         },
     );
+
+    it.each(["getBlockHeight", "getSignatureStatuses"] as const)(
+        "gives up on a stalled %s within solana.rpc_timeout and changes nothing",
+        async (method) => {
+            const { order, payment } = await settling(at(-60_000));
+            const rpc = createFakeRpc({ [method]: neverAnswers });
+            const log = memoryLog();
+
+            const started = performance.now();
+            const report = await reconcileSettling({
+                ...deps(rpc, t0, log),
+                rpcTimeoutMs: STALL_MS,
+            });
+            expect(performance.now() - started).toBeLessThan(STALL_MS + 900);
+            expect(report).toEqual({ paid: 0, reverted: 0, waiting: 1, changed: 0 });
+            expect(await orderOf(order.id)).toEqual(order);
+            expect(await findPaymentByOrder(db.pool, order.id)).toEqual(payment);
+            expect(await failedPayments(order.id)).toEqual([]);
+            expect(levels(log, "warn")).toEqual([
+                expect.objectContaining({
+                    msg: "signature status unavailable, retrying next run",
+                    orderId: order.id,
+                    err: expect.objectContaining({ name: "TimeoutError" }),
+                }),
+            ]);
+        },
+    );
+
+    it.each([
+        ["characters outside base58", "not-a-signature"],
+        ["an address, which decodes to 32 bytes", PAYER],
+    ])("reports a stored signature with %s once and leaves the order settling", async (_, bad) => {
+        const { order, payment } = await settling(at(-60_000), { txSignature: bad });
+        const rpc = createFakeRpc();
+        const log = memoryLog();
+
+        for (const now of [t0, at(10_000)]) {
+            expect(await reconcileSettling(deps(rpc, now, log))).toEqual({
+                paid: 0,
+                reverted: 0,
+                waiting: 1,
+                changed: 0,
+            });
+        }
+        expect(levels(log, "error")).toEqual([
+            expect.objectContaining({
+                msg: "stored payment signature is malformed, order left settling",
+                orderId: order.id,
+            }),
+        ]);
+        expect(levels(log, "warn")).toEqual([]);
+        expect(rpc.calls.getBlockHeight).toBe(0);
+        expect(rpc.calls.getSignatureStatuses).toBe(0);
+        expect(await orderOf(order.id)).toEqual(order);
+        expect(await findPaymentByOrder(db.pool, order.id)).toEqual(payment);
+        expect(await failedPayments(order.id)).toEqual([]);
+    });
 
     it.each([
         ["no error", null],
@@ -292,6 +367,7 @@ describe("reconcileSettling", () => {
             paid: 0,
             reverted: 0,
             waiting: 1,
+            changed: 0,
         });
         expect((await orderOf(order.id)).state).toBe("settling");
         expect(await failedPayments(order.id)).toEqual([]);
@@ -306,15 +382,6 @@ describe("reconcileSettling", () => {
         expect(paid.paidAt).toEqual(payment.createdAt);
         expect(paid.paidAt!.getTime()).toBeLessThanOrEqual(paid.expiresAt.getTime());
 
-        const orders: Settings["orders"] = {
-            unpaid_ttl: 15 * MIN,
-            unredeemed_refund_after: 30 * MIN,
-            token_ttl: 10 * MIN,
-            router_grace: 2 * MIN,
-            max_amount_micros: 100_000_000,
-            attempts_per_order_per_minute: 5,
-            min_idempotency_key_length: 16,
-        };
         const swept = await sweep({
             pool: db.pool,
             router: createRouterClient({
@@ -325,7 +392,7 @@ describe("reconcileSettling", () => {
                 getOrder: false,
                 log: silentLog,
             }),
-            orders,
+            orders: defaults.orders,
             log: silentLog,
             now: () => later,
         });
@@ -364,6 +431,7 @@ describe("a confirmed payment under a settling order", () => {
             paid: 0,
             reverted: 0,
             waiting: 1,
+            changed: 0,
         });
         expect((await orderOf(order.id)).state).toBe("settling");
         expect(await findPaymentByOrder(db.pool, order.id)).toMatchObject({ status: "confirmed" });
@@ -391,6 +459,7 @@ describe("racing payOrder", () => {
             paid: 0,
             reverted: 0,
             waiting: 0,
+            changed: 1,
         });
         expect(await orderOf(order.id)).toMatchObject({
             state: "paid",
@@ -401,6 +470,7 @@ describe("racing payOrder", () => {
             confirmedAt,
         });
         expect(levels(log, "error")).toEqual([]);
+        expect(levels(log, "info")).toEqual([changedLine(order.id, payment.txSignature)]);
     });
 
     it("waits for payOrder's confirmation on the payment row without a deadlock", async () => {
@@ -408,22 +478,26 @@ describe("racing payOrder", () => {
         const confirmedAt = at(-1_000);
         const log = memoryLog();
         const other = await db.pool.connect();
+        let running: Promise<ReconcileReport> | undefined;
         try {
             await other.query("begin");
             await confirmPayment(other, order.id, confirmedAt);
-            const running = reconcileSettling(deps(createFakeRpc(), t0, log));
+            running = reconcileSettling(deps(createFakeRpc(), t0, log));
             await until(async () => (await lockWaiters()) === 1, 5_000);
             await setOrderState(other, order.id, "settling", "paid", {
                 paidAt: payment.createdAt,
             });
             await other.query("commit");
-
-            expect(await running).toEqual({ paid: 0, reverted: 0, waiting: 0 });
-        } finally {
+        } catch (err) {
             await other.query("rollback").catch(() => undefined);
+            throw err;
+        } finally {
             other.release();
         }
+
+        expect(await running).toEqual({ paid: 0, reverted: 0, waiting: 0, changed: 1 });
         expect(levels(log, "error")).toEqual([]);
+        expect(levels(log, "info")).toEqual([changedLine(order.id, payment.txSignature)]);
         expect(await orderOf(order.id)).toMatchObject({
             state: "paid",
             paidAt: payment.createdAt,
@@ -444,12 +518,15 @@ describe("racing payOrder", () => {
                 return { value: [LANDED_FAILED] };
             },
         });
+        const log = memoryLog();
 
-        expect(await reconcileSettling(deps(rpc, t0))).toEqual({
+        expect(await reconcileSettling(deps(rpc, t0, log))).toEqual({
             paid: 0,
             reverted: 0,
             waiting: 0,
+            changed: 1,
         });
+        expect(levels(log, "info")).toEqual([changedLine(order.id, payment.txSignature)]);
         expect((await orderOf(order.id)).state).toBe("settling");
         expect(await findPaymentByOrder(db.pool, order.id)).toMatchObject({
             txSignature: next,

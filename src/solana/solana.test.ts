@@ -154,7 +154,7 @@ describe("readLanding", () => {
         ["missing past the last valid height", missing, 1_001n, "blockhash_expired"],
     ])("answers %s", async (_n, getSignatureStatuses, height, want) => {
         const rpc = createFakeRpc({ getSignatureStatuses, getBlockHeight: () => height });
-        expect(await readLanding(rpc, sig, 1_000n)).toBe(want);
+        expect(await readLanding(rpc, sig, 1_000n, 10_000)).toBe(want);
     });
 
     it("reads the finalized height before the signature status", async () => {
@@ -169,7 +169,7 @@ describe("readLanding", () => {
                 return missing();
             },
         });
-        await readLanding(rpc, sig, 1_000n);
+        await readLanding(rpc, sig, 1_000n, 10_000);
         expect(reads).toEqual([
             ["height", { commitment: "finalized" }],
             ["status", [sig], { searchTransactionHistory: true }],

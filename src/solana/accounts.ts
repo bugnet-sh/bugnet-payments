@@ -37,10 +37,11 @@ interface ParsedTokenAccount {
 export async function inspectTokenAccount(
     rpc: SolanaRpc,
     account: Address,
+    send: { abortSignal?: AbortSignal } = {},
 ): Promise<TokenAccountInfo | null> {
     const { value } = await rpc
         .getAccountInfo(account, { encoding: "jsonParsed", commitment: "confirmed" })
-        .send();
+        .send(send);
     if (value === null) return null;
     const acct = value as unknown as ParsedTokenAccount;
     const info = acct.data?.parsed?.info;

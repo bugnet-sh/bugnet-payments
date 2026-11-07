@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { address } from "@solana/kit";
 import type { Settings } from "../config.ts";
 import { memoryLog } from "../log.ts";
-import { createFakeRpc } from "../testing/fake-rpc.ts";
+import { createFakeRpc, type FakeRpcScript, neverAnswers } from "../testing/fake-rpc.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
 import { seedOrder, seedPayment } from "../testing/orders.ts";
 import { checkAlarms, type AlarmSnapshot } from "./alarms.ts";
@@ -12,6 +12,8 @@ const t0 = new Date("2026-11-06T12:00:00Z");
 const at = (ms: number) => new Date(t0.getTime() + ms);
 const FEE_PAYER = address("11111111111111111111111111111112");
 const REFUND_WALLET = address("11111111111111111111111111111113");
+const RPC_TIMEOUT_MS = 10_000;
+const STALL_MS = 100;
 
 const defaults: Settings["alarms"] = {
     fee_payer_min_lamports: 100_000_000,
@@ -38,6 +40,8 @@ function run(
         floatMicros?: string;
         prev?: AlarmSnapshot | null;
         alarms?: Settings["alarms"];
+        script?: Partial<FakeRpcScript>;
+        rpcTimeoutMs?: number;
     } = {},
 ) {
     const log = memoryLog();
@@ -51,6 +55,7 @@ function run(
                 uiAmountString: "0",
             },
         }),
+        ...opts.script,
     });
     const result = checkAlarms(
         {
@@ -60,6 +65,7 @@ function run(
             refundWallet: REFUND_WALLET,
             alarms: opts.alarms ?? defaults,
             refunds,
+            rpcTimeoutMs: opts.rpcTimeoutMs ?? RPC_TIMEOUT_MS,
             log,
             now: () => t0,
         },
@@ -86,6 +92,20 @@ async function confirmedPayments(n: number) {
 }
 
 describe("checkAlarms", () => {
+    it.each(["getBalance", "getTokenAccountBalance"] as const)(
+        "gives up on a stalled %s within solana.rpc_timeout and raises nothing",
+        async (method) => {
+            const started = performance.now();
+            const { result, log } = run({
+                script: { [method]: neverAnswers },
+                rpcTimeoutMs: STALL_MS,
+            });
+            await expect(result).rejects.toMatchObject({ name: "TimeoutError" });
+            expect(performance.now() - started).toBeLessThan(STALL_MS + 900);
+            expect(log.lines).toEqual([]);
+        },
+    );
+
     it("alarms below alarms.fee_payer_min_lamports", async () => {
         expect(await run({ lamports: 99_999_999n }).names()).toEqual(["fee_payer_sol_low"]);
         expect(await run({ lamports: 100_000_000n }).names()).toEqual([]);

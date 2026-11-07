@@ -1,5 +1,5 @@
 import { signature } from "@solana/kit";
-import type { SolanaRpc } from "./rpc.ts";
+import { deadline, type SolanaRpc } from "./rpc.ts";
 
 export type Landing = "landed" | "onchain_failed" | "processed" | "not_found" | "blockhash_expired";
 
@@ -8,13 +8,14 @@ export async function readLanding(
     rpc: SolanaRpc,
     txSignature: string,
     lastValidBlockHeight: bigint,
+    timeoutMs: number,
 ): Promise<Landing> {
-    const height = await rpc.getBlockHeight({ commitment: "finalized" }).send();
+    const height = await rpc.getBlockHeight({ commitment: "finalized" }).send(deadline(timeoutMs));
     const {
         value: [status],
     } = await rpc
         .getSignatureStatuses([signature(txSignature)], { searchTransactionHistory: true })
-        .send();
+        .send(deadline(timeoutMs));
     if (status) {
         // A processed-only result can still be dropped with its fork, so it decides nothing
         if (

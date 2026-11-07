@@ -5,7 +5,7 @@ import { memoryLog } from "../log.ts";
 import { MEMO_PROGRAM } from "../solana/constants.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
-import { createFakeRpc, type FakeRpc } from "../testing/fake-rpc.ts";
+import { createFakeRpc, type FakeRpc, neverAnswers } from "../testing/fake-rpc.ts";
 import { seedOrder, seedPayment } from "../testing/orders.ts";
 import type { OrderRow } from "../orders/types.ts";
 import { auditInflows } from "./audit.ts";
@@ -14,6 +14,8 @@ const MIN = 60_000;
 const t0 = new Date("2030-01-01T12:00:00Z");
 const RECIPIENT = address("Bhhc3XNdjtCNr3pj2aZwhCt8pHwsU8wRL7dqJNDZEExw");
 const sigOf = () => getBase58Decoder().decode(randomBytes(64));
+const RPC_TIMEOUT_MS = 10_000;
+const STALL_MS = 100;
 
 let db: TestDb;
 let log: ReturnType<typeof memoryLog>;
@@ -92,6 +94,7 @@ const deps = (rpc: FakeRpc, now = t0) => ({
     pool: db.pool,
     rpc,
     recipient: RECIPIENT,
+    rpcTimeoutMs: RPC_TIMEOUT_MS,
     log,
     now: () => now,
 });
@@ -279,6 +282,34 @@ describe("auditInflows", () => {
         const r = await auditInflows(deps(rpcWith([]), new Date(t0.getTime() + 60 * MIN)));
         expect(r.checkpoint).toBe(sig("S1"));
     });
+
+    it.each([
+        ["getSignaturesForAddress", { getSignaturesForAddress: neverAnswers }],
+        [
+            "getTransaction",
+            {
+                getSignaturesForAddress: () => [
+                    { signature: sig("S1"), err: null, memo: null, slot: 1n },
+                ],
+                getTransaction: neverAnswers,
+            },
+        ],
+    ] as const)(
+        "gives up on a stalled %s within solana.rpc_timeout and saves nothing",
+        async (_, script) => {
+            const payments = await db.pool.query("select * from payments order by order_id");
+            const started = performance.now();
+            await expect(
+                auditInflows({ ...deps(createFakeRpc(script)), rpcTimeoutMs: STALL_MS }),
+            ).rejects.toMatchObject({ name: "TimeoutError" });
+            expect(performance.now() - started).toBeLessThan(STALL_MS + 900);
+            expect((await db.pool.query("select * from audit_checkpoints")).rows).toEqual([]);
+            expect((await db.pool.query("select * from payments order by order_id")).rows).toEqual(
+                payments.rows,
+            );
+            expect(log.lines.filter((l) => l.alarm)).toEqual([]);
+        },
+    );
 
     it("asks for version-1 transactions in jsonParsed", async () => {
         const seen: Seen = { sigConfigs: [], txConfigs: [] };

@@ -20,6 +20,7 @@ max_compute_units = 50000
 max_priority_fee_micro_lamports = 10000
 max_required_signatures = 2
 blockhash_cache_ttl = "8s"
+rpc_timeout = "10s"                     # each RPC call of the jobs, from 1s to 60s
 fee_payer_boot_min_lamports = 100000000
 
 [orders]

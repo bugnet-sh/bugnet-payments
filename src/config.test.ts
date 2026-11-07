@@ -38,6 +38,7 @@ describe("parseSettings", () => {
         expect(s.solana.max_required_signatures).toBe(2);
         expect(s.solana.transaction_versions).toEqual([0]);
         expect(s.solana.blockhash_cache_ttl).toBe(8_000);
+        expect(s.solana.rpc_timeout).toBe(10_000);
         expect(s.orders.unpaid_ttl).toBe(900_000);
         expect(s.orders.unredeemed_refund_after).toBe(1_800_000);
         expect(s.orders.token_ttl).toBe(600_000);
@@ -93,6 +94,20 @@ describe("parseSettings", () => {
         expect(() =>
             parseSettings(`[http]\npublic_url = "http://127.0.0.1:8446"\n${solana}`, "t"),
         ).not.toThrow();
+    });
+
+    it("bounds solana.rpc_timeout from 1s to 60s", () => {
+        const timeout = (value: string) =>
+            parseSettings(`[solana]\nrecipient = "${ADDR}"\nrpc_timeout = "${value}"`, "t").solana
+                .rpc_timeout;
+        expect(timeout("1s")).toBe(1_000);
+        expect(timeout("1000ms")).toBe(1_000);
+        expect(timeout("60s")).toBe(60_000);
+        expect(timeout("1m")).toBe(60_000);
+        for (const value of ["999ms", "61s", "0s", "2m"]) {
+            expect(() => timeout(value)).toThrow(/solana.rpc_timeout: from 1s to 60s/);
+        }
+        expect(() => timeout("10")).toThrow(/solana.rpc_timeout: a duration/);
     });
 
     it("accepts router.get_order = true", () => {

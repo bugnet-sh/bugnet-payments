@@ -1,3 +1,4 @@
+import { signature } from "@solana/kit";
 import type pg from "pg";
 import { withTx } from "../db/pool.ts";
 import type { Log } from "../log.ts";
@@ -14,6 +15,7 @@ import type { SolanaRpc } from "../solana/rpc.ts";
 export interface ReconcileDeps {
     pool: pg.Pool;
     rpc: SolanaRpc;
+    rpcTimeoutMs: number;
     log: Log;
     now: () => Date;
 }
@@ -22,6 +24,7 @@ export interface ReconcileReport {
     paid: number;
     reverted: number;
     waiting: number;
+    changed: number;
 }
 
 interface Candidate {
@@ -35,12 +38,25 @@ type Verdict = Exclude<Landing, "processed" | "not_found"> | "waiting";
 type Outcome =
     { kind: "paid" } | { kind: "reverted"; state: "unpaid" | "expired" } | { kind: "changed" };
 
+const reportedMalformed = new Set<string>();
+
 export async function reconcileSettling(d: ReconcileDeps): Promise<ReconcileReport> {
-    const report: ReconcileReport = { paid: 0, reverted: 0, waiting: 0 };
+    const report: ReconcileReport = { paid: 0, reverted: 0, waiting: 0, changed: 0 };
     for (const p of await candidates(d.pool, d.now())) {
+        if (!wellFormed(p.txSignature)) {
+            // Only an operator can repair a stored signature, so one error line per order is enough
+            if (!reportedMalformed.has(p.orderId)) {
+                reportedMalformed.add(p.orderId);
+                d.log.error("stored payment signature is malformed, order left settling", {
+                    orderId: p.orderId,
+                });
+            }
+            report.waiting++;
+            continue;
+        }
         let verdict: Verdict;
         try {
-            verdict = await verdictFor(d.rpc, p);
+            verdict = await verdictFor(d, p);
         } catch (err) {
             d.log.warn("signature status unavailable, retrying next run", {
                 orderId: p.orderId,
@@ -61,16 +77,23 @@ export async function reconcileSettling(d: ReconcileDeps): Promise<ReconcileRepo
             continue;
         }
         const fields = { orderId: p.orderId, signature: p.txSignature };
-        if (outcome.kind === "paid") {
-            report.paid++;
-            d.log.info("settling payment landed, order paid", fields);
-        } else if (outcome.kind === "reverted") {
-            report.reverted++;
-            d.log.info("settling payment did not land", {
-                ...fields,
-                reason: verdict,
-                state: outcome.state,
-            });
+        switch (outcome.kind) {
+            case "paid":
+                report.paid++;
+                d.log.info("settling payment landed, order paid", fields);
+                break;
+            case "reverted":
+                report.reverted++;
+                d.log.info("settling payment did not land", {
+                    ...fields,
+                    reason: verdict,
+                    state: outcome.state,
+                });
+                break;
+            case "changed":
+                report.changed++;
+                d.log.info("settling order changed while its status was read, left as is", fields);
+                break;
         }
     }
     return report;
@@ -96,8 +119,17 @@ async function candidates(db: pg.Pool, now: Date): Promise<Candidate[]> {
     }));
 }
 
-async function verdictFor(rpc: SolanaRpc, p: Candidate): Promise<Verdict> {
-    const landing = await readLanding(rpc, p.txSignature, p.lastValidBlockHeight);
+function wellFormed(txSignature: string): boolean {
+    try {
+        signature(txSignature);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function verdictFor(d: ReconcileDeps, p: Candidate): Promise<Verdict> {
+    const landing = await readLanding(d.rpc, p.txSignature, p.lastValidBlockHeight, d.rpcTimeoutMs);
     return landing === "processed" || landing === "not_found" ? "waiting" : landing;
 }
 

@@ -91,6 +91,9 @@ const settingsSchema = z
                 max_priority_fee_micro_lamports: amount.default(10_000),
                 max_required_signatures: count.default(2),
                 blockhash_cache_ttl: duration.prefault("8s"),
+                rpc_timeout: duration
+                    .refine((ms) => ms >= 1_000 && ms <= 60_000, "from 1s to 60s")
+                    .prefault("10s"),
                 fee_payer_boot_min_lamports: amount.default(100_000_000),
             })
             .strict()

@@ -29,6 +29,9 @@ export interface FakeRpcScript {
 
 export type FakeRpc = SolanaRpc & { calls: Record<string, number>; sent: string[] };
 
+// Only the caller's abort signal ends a call answered by this
+export const neverAnswers = (): Promise<never> => new Promise(() => {});
+
 export function createFakeRpc(script: Partial<FakeRpcScript> = {}): FakeRpc {
     const calls: Record<string, number> = {};
     const sent: string[] = [];

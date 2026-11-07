@@ -8,8 +8,8 @@
  * checked once it is 20 s old, finalized height first and signature status second. It is then
  * confirmed, sent to the manual queue when it failed, signed again when its blockhash expired and
  * the signature is not found (up to max_attempts), or else resent unchanged. While refunds are
- * paused a tick only records what the chain decided and signs or sends nothing. An RPC error
- * leaves the refund as it was for the next tick.
+ * paused a tick only records what the chain decided and signs or sends nothing. An RPC error, or
+ * an RPC call past `solana.rpc_timeout`, leaves the refund as it was for the next tick.
  */
 import {
     address,
@@ -41,7 +41,7 @@ import { inspectTokenAccount, usdcAta } from "../solana/accounts.ts";
 import type { BlockhashHint } from "../solana/blockhash.ts";
 import { TOKEN_PROGRAM, USDC_DECIMALS, USDC_MINT } from "../solana/constants.ts";
 import { readLanding } from "../solana/landing.ts";
-import type { SolanaRpc } from "../solana/rpc.ts";
+import { deadline, type SolanaRpc } from "../solana/rpc.ts";
 import { type RefundDbRow, type RefundRow, toRefund } from "./request.ts";
 
 export interface RefundDeps {
@@ -50,6 +50,7 @@ export interface RefundDeps {
     feePayer: KeyPairSigner;
     refundSigner: KeyPairSigner;
     cfg: Settings["refunds"];
+    rpcTimeoutMs: number;
     log: Log;
     now: () => Date;
 }
@@ -249,7 +250,7 @@ async function checkPending(
     if (payment === null || r.amountMicros > payment.amountMicros) {
         return toManual(c, r, "refund_exceeds_payment");
     }
-    if (!(await viaRpc(() => destinationValid(d.rpc, r)))) {
+    if (!(await viaRpc(() => destinationValid(d, r)))) {
         return toManual(c, r, "refund_destination_invalid");
     }
     if ((await signedToday(c, now)) + r.amountMicros > d.cfg.daily_cap_micros) {
@@ -275,7 +276,9 @@ async function checkInFlight(
     if (!isInFlight(r)) {
         throw new Error(`refund ${r.id} is ${r.state} without a stored transaction`);
     }
-    const landing = await viaRpc(() => readLanding(d.rpc, r.txSignature, r.lastValidBlockHeight));
+    const landing = await viaRpc(() =>
+        readLanding(d.rpc, r.txSignature, r.lastValidBlockHeight, d.rpcTimeoutMs),
+    );
     switch (landing) {
         case "processed":
             return { kind: "wait" };
@@ -308,9 +311,9 @@ function isInFlight(r: RefundRow): r is InFlight {
 }
 
 // Only a successful answer showing the account missing or wrong counts, an RPC throw propagates
-async function destinationValid(rpc: SolanaRpc, r: RefundRow): Promise<boolean> {
+async function destinationValid(d: RefundDeps, r: RefundRow): Promise<boolean> {
     if (!isAddress(r.destination)) return false;
-    const account = await inspectTokenAccount(rpc, r.destination);
+    const account = await inspectTokenAccount(d.rpc, r.destination, deadline(d.rpcTimeoutMs));
     return (
         account !== null &&
         account.programOwner === TOKEN_PROGRAM &&
@@ -323,7 +326,7 @@ async function destinationValid(rpc: SolanaRpc, r: RefundRow): Promise<boolean> 
 async function floatBalance(d: RefundDeps): Promise<bigint> {
     const { value } = await d.rpc
         .getTokenAccountBalance(await usdcAta(d.refundSigner.address), { commitment: "confirmed" })
-        .send();
+        .send(deadline(d.rpcTimeoutMs));
     return BigInt(value.amount);
 }
 
@@ -364,7 +367,7 @@ async function sign(
     resigned: boolean,
 ): Promise<Step> {
     const { value } = await viaRpc(() =>
-        d.rpc.getLatestBlockhash({ commitment: "confirmed" }).send(),
+        d.rpc.getLatestBlockhash({ commitment: "confirmed" }).send(deadline(d.rpcTimeoutMs)),
     );
     const signed = await buildRefundTransaction(
         d,
@@ -478,7 +481,9 @@ async function send(
     now: Date,
 ): Promise<void> {
     const answered = await viaRpc(() =>
-        d.rpc.sendTransaction(wire as Base64EncodedWireTransaction, config).send(),
+        d.rpc
+            .sendTransaction(wire as Base64EncodedWireTransaction, config)
+            .send(deadline(d.rpcTimeoutMs)),
     );
     if (answered !== sig) {
         d.log.warn("rpc answered another signature", {

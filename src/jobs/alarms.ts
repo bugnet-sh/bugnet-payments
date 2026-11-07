@@ -11,7 +11,7 @@ import type pg from "pg";
 import type { Settings } from "../config.ts";
 import type { Log } from "../log.ts";
 import { usdcAta } from "../solana/accounts.ts";
-import type { SolanaRpc } from "../solana/rpc.ts";
+import { deadline, type SolanaRpc } from "../solana/rpc.ts";
 
 export interface AlarmSnapshot {
     at: Date;
@@ -26,6 +26,7 @@ export interface AlarmDeps {
     refundWallet: Address;
     alarms: Settings["alarms"];
     refunds: Settings["refunds"];
+    rpcTimeoutMs: number;
     log: Log;
     now: () => Date;
 }
@@ -37,7 +38,7 @@ export async function checkAlarms(
     const now = d.now();
     const { value: lamports } = await d.rpc
         .getBalance(d.feePayer, { commitment: "confirmed" })
-        .send();
+        .send(deadline(d.rpcTimeoutMs));
     const txs = prev ? await confirmedPayments(d.pool, prev.at, now) : 0;
 
     if (lamports < BigInt(d.alarms.fee_payer_min_lamports)) {
@@ -63,7 +64,7 @@ export async function checkAlarms(
 
     const { value: float } = await d.rpc
         .getTokenAccountBalance(await usdcAta(d.refundWallet), { commitment: "confirmed" })
-        .send();
+        .send(deadline(d.rpcTimeoutMs));
     if (BigInt(float.amount) < BigInt(d.refunds.float_low_micros)) {
         d.log.alarm("refund_float_low", {
             balanceMicros: BigInt(float.amount),

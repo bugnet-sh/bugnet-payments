@@ -3,7 +3,7 @@ import type pg from "pg";
 import type { Log } from "../log.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { MEMO_PROGRAM } from "../solana/constants.ts";
-import type { SolanaRpc } from "../solana/rpc.ts";
+import { deadline, type SolanaRpc } from "../solana/rpc.ts";
 
 const CHECKPOINT = "recipient_inflows";
 const PAGE = 1000;
@@ -23,6 +23,7 @@ export interface AuditDeps {
     pool: pg.Pool;
     rpc: SolanaRpc;
     recipient: Address;
+    rpcTimeoutMs: number;
     log: Log;
     now: () => Date;
 }
@@ -57,7 +58,7 @@ export async function auditInflows(d: AuditDeps): Promise<AuditReport> {
         checkpoint: previous?.signature ?? null,
     };
 
-    const rows = await listSignatures(d.rpc, ata, previous?.signature ?? null);
+    const rows = await listSignatures(d, ata, previous?.signature ?? null);
     const seen = new Set(rows.map((r) => r.signature));
     for (const row of rows) {
         if (row.err !== null) continue;
@@ -67,7 +68,7 @@ export async function auditInflows(d: AuditDeps): Promise<AuditReport> {
                 maxSupportedTransactionVersion: 1,
                 commitment: "finalized",
             })
-            .send()) as ParsedTx | null;
+            .send(deadline(d.rpcTimeoutMs))) as ParsedTx | null;
         if (tx === null) {
             throw new Error(`finalized transaction ${row.signature} is unavailable`);
         }
@@ -104,7 +105,7 @@ export async function auditInflows(d: AuditDeps): Promise<AuditReport> {
 }
 
 async function listSignatures(
-    rpc: SolanaRpc,
+    d: Pick<AuditDeps, "rpc" | "rpcTimeoutMs">,
     ata: Address,
     until: string | null,
 ): Promise<{ signature: string; err: unknown }[]> {
@@ -112,14 +113,14 @@ async function listSignatures(
     const seen = new Set<string>();
     let before: string | null = null;
     for (;;) {
-        const page = await rpc
+        const page = await d.rpc
             .getSignaturesForAddress(ata, {
                 limit: PAGE,
                 commitment: "finalized",
                 ...(before === null ? {} : { before: signature(before) }),
                 ...(until === null ? {} : { until: signature(until) }),
             })
-            .send();
+            .send(deadline(d.rpcTimeoutMs));
         for (const r of page) {
             if (seen.has(r.signature)) continue;
             seen.add(r.signature);

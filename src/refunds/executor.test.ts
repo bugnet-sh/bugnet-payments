@@ -25,6 +25,7 @@ import {
     createFakeRpc,
     type FakeRpc,
     type FakeRpcScript,
+    neverAnswers,
     TEST_BLOCKHASH,
     TEST_LVBH,
 } from "../testing/fake-rpc.ts";
@@ -43,6 +44,7 @@ import { findRefund, type RefundRow, requestRefund } from "./request.ts";
 const T0 = new Date("2030-01-01T12:00:00Z");
 const COMPUTE_BUDGET = "ComputeBudget111111111111111111111111111111";
 const FRESH_BLOCKHASH = getBase58Decoder().decode(new Uint8Array(32).fill(2));
+const STALL_MS = 100;
 
 let db: TestDb;
 let feePayer: KeyPairSigner;
@@ -50,6 +52,7 @@ let refundSigner: KeyPairSigner;
 let payer: KeyPairSigner;
 let SOURCE: Address;
 let defaults: Settings["refunds"];
+let rpcTimeoutMs: number;
 let log: ReturnType<typeof memoryLog>;
 
 beforeAll(async () => {
@@ -59,7 +62,9 @@ beforeAll(async () => {
     payer = await testSigner(6);
     SOURCE = await usdcAta(payer.address);
     const recipient = (await testSigner(1)).address;
-    defaults = parseSettings(stringify({ solana: { recipient } }), "test").refunds;
+    const settings = parseSettings(stringify({ solana: { recipient } }), "test");
+    defaults = settings.refunds;
+    rpcTimeoutMs = settings.solana.rpc_timeout;
 });
 afterAll(async () => {
     await db.close();
@@ -82,6 +87,7 @@ function deps(rpc: FakeRpc, at: Date = T0, cfg: Partial<Settings["refunds"]> = {
         feePayer,
         refundSigner,
         cfg: { ...defaults, ...cfg },
+        rpcTimeoutMs,
         log,
         now: () => at,
     };
@@ -809,6 +815,77 @@ describe("runRefunds", () => {
         const b = (await findRefund(db.pool, twin.id))!;
         expect(b.state).toBe("sent");
         expect(b.txSignature).not.toBe(a.txSignature);
+    });
+});
+
+describe("runRefunds against a stalled RPC", () => {
+    const timedOut = (orderId: string) =>
+        expect.objectContaining({
+            msg: "refund rpc call failed, retrying next tick",
+            orderId,
+            err: expect.objectContaining({ name: "TimeoutError" }),
+        });
+
+    async function stalledTick(rpc: FakeRpc, at: Date = T0) {
+        const started = performance.now();
+        const tick = await runRefunds({ ...deps(rpc, at), rpcTimeoutMs: STALL_MS });
+        expect(performance.now() - started).toBeLessThan(STALL_MS + 900);
+        return tick;
+    }
+
+    it.each(["getAccountInfo", "getTokenAccountBalance", "getLatestBlockhash"] as const)(
+        "gives up on a stalled %s within solana.rpc_timeout and leaves the pending refund",
+        async (method) => {
+            const order = await pendingRefund();
+            const before = await findRefund(db.pool, order.id);
+            const rpc = okRpc({ [method]: neverAnswers });
+
+            expect(await stalledTick(rpc)).toMatchObject({ sent: 0, manual: 0, paused: null });
+            expect(await findRefund(db.pool, order.id)).toEqual(before);
+            expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
+            expect(rpc.calls.sendTransaction).toBe(0);
+            expect(levels("warn")).toEqual([timedOut(order.id)]);
+            expect(levels("error")).toEqual([]);
+            expect(log.lines.some((l) => l.level === "alarm")).toBe(false);
+        },
+    );
+
+    it.each([
+        ["getBlockHeight", {}],
+        ["getSignatureStatuses", {}],
+        ["sendTransaction", { getSignatureStatuses: notFound, getBlockHeight: () => TEST_LVBH }],
+    ] as const)(
+        "gives up on a stalled %s within solana.rpc_timeout and leaves the sent refund",
+        async (method, script) => {
+            const { order, refund } = await sentRefund();
+            log = memoryLog();
+            const rpc = okRpc({ ...script, [method]: neverAnswers });
+
+            expect(await stalledTick(rpc, later(30_000))).toMatchObject({
+                resent: 0,
+                resigned: 0,
+                confirmed: 0,
+                manual: 0,
+            });
+            expect(await findRefund(db.pool, order.id)).toEqual(refund);
+            expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
+            expect(levels("warn")).toEqual([timedOut(order.id)]);
+            expect(levels("error")).toEqual([]);
+        },
+    );
+
+    it("keeps a refund signed, not sent, when its first send stalls", async () => {
+        const order = await pendingRefund();
+        const rpc = okRpc({ sendTransaction: neverAnswers });
+
+        expect((await stalledTick(rpc)).sent).toBe(0);
+        expect(await findRefund(db.pool, order.id)).toMatchObject({
+            state: "signed",
+            attempts: 1,
+            signedAt: T0,
+            sentAt: null,
+        });
+        expect(levels("warn")).toEqual([timedOut(order.id)]);
     });
 });
 
