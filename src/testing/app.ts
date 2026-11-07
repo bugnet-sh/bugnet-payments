@@ -6,19 +6,11 @@ import type pg from "pg";
 import { stringify } from "smol-toml";
 import { parseSettings, type Secrets, type Settings } from "../config.ts";
 import type { PaymentsService } from "../gen/bugnet/router/v1/payments_pb.ts";
-import { eventPublicKey, handleEvent } from "../events/handler.ts";
-import { createInternalHandler } from "../http/internal.ts";
-import { createPublicHandler } from "../http/public.ts";
+import { createHttpApp } from "../http/app.ts";
 import { startServer } from "../http/server.ts";
 import { memoryLog } from "../log.ts";
-import { createPayDeps, payOrder } from "../orders/pay.ts";
-import type { OrderServiceDeps } from "../orders/service.ts";
-import { orderKey, orderPublicKeyBase64 } from "../orders/token.ts";
+import { orderPublicKeyBase64 } from "../orders/token.ts";
 import type { OrderRequest, OrderRow } from "../orders/types.ts";
-import { RateLimiter } from "../ratelimit.ts";
-import { createRouterClient } from "../router/client.ts";
-import { BlockhashCache } from "../solana/blockhash.ts";
-import { createSettler } from "../x402/settler.ts";
 import { testDb } from "./db.ts";
 import { createFakeRpc, type FakeRpc, TEST_BLOCKHASH, TEST_LVBH } from "./fake-rpc.ts";
 import { startFakeRouter } from "./fake-router.ts";
@@ -110,99 +102,13 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
         rpcUrl: "",
     };
     const rpc = createFakeRpc();
-    const hints = new BlockhashCache(rpc, settings.solana.blockhash_cache_ttl, () =>
-        clock.getTime(),
+    const http = createHttpApp(
+        { settings, secrets, pool: db.pool, rpc, feePayer, log, now: appNow },
+        { limiterClock: () => clock.getTime(), checkoutJsPath: over.checkoutJsPath },
     );
-    const challenge = {
-        publicUrl: settings.http.public_url,
-        recipient: settings.solana.recipient,
-        feePayer: feePayer.address,
-        transactionVersions: settings.solana.transaction_versions,
-    };
-    const settler = createSettler({
-        feePayer,
-        rpc,
-        hints,
-        caps: {
-            maxComputeUnits: settings.solana.max_compute_units,
-            maxPriorityFeeMicroLamports: settings.solana.max_priority_fee_micro_lamports,
-            maxRequiredSignatures: settings.solana.max_required_signatures,
-        },
-        transactionVersions: settings.solana.transaction_versions,
-        log,
-    });
-    const pay = createPayDeps({
-        pool: db.pool,
-        settler,
-        router: createRouterClient({
-            url: settings.router.url,
-            token: secrets.routerToken,
-            timeoutMs: settings.router.timeout,
-            checkPayer: settings.router.check_payer,
-            getOrder: settings.router.get_order,
-            log,
-        }),
-        attempts: new RateLimiter(settings.orders.attempts_per_order_per_minute, 60_000, () =>
-            clock.getTime(),
-        ),
-        challenge,
-        log,
-        now: appNow,
-    });
-    const service: OrderServiceDeps = {
-        pool: db.pool,
-        settings,
-        challenge,
-        hints,
-        orderKey: orderKey(secrets.orderSeed),
-        claimKey: secrets.claimKey,
-        pay: (orderId, raw, signal) => payOrder(pay, orderId, raw, signal),
-        log,
-        now: appNow,
-    };
-    const internal = await startServer(
-        settings.http.internal_listen,
-        createInternalHandler({
-            service,
-            token: secrets.paymentsToken,
-            events: (raw, headers) =>
-                handleEvent(
-                    {
-                        pool: db.pool,
-                        key: eventPublicKey(settings.router.event_public_key),
-                        log,
-                        now: appNow,
-                    },
-                    raw,
-                    headers,
-                ),
-            maxBodyBytes: settings.http.max_body_bytes,
-            log,
-        }),
-        log,
-    );
+    const internal = await startServer(settings.http.internal_listen, http.internalHandler, log);
     stops.push(() => internal.close());
-    const publicServer = await startServer(
-        settings.http.public_listen,
-        createPublicHandler({
-            pool: db.pool,
-            challenge,
-            hints,
-            pay,
-            perIp: new RateLimiter(settings.limits.public_per_ip_per_minute, 60_000, () =>
-                clock.getTime(),
-            ),
-            statusPerIp: new RateLimiter(settings.limits.status_per_ip_per_minute, 60_000, () =>
-                clock.getTime(),
-            ),
-            trustedProxies: settings.http.trusted_proxies,
-            maxBodyBytes: settings.http.max_body_bytes,
-            checkoutJsPath: over.checkoutJsPath ?? "dist/checkout.js",
-            log,
-            now: appNow,
-        }),
-        log,
-    );
+    const publicServer = await startServer(settings.http.public_listen, http.publicHandler, log);
     return {
         publicOrigin: `http://127.0.0.1:${publicServer.port}`,
         internalUrl: `http://127.0.0.1:${internal.port}`,

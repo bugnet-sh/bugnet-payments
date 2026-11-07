@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { type Address, getAddressEncoder, getBase58Decoder, type KeyPairSigner } from "@solana/kit";
+import { decodePaymentRequiredHeader } from "@x402/core/http";
 import { stringify } from "smol-toml";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { BootCheckError } from "./boot.ts";
@@ -15,7 +16,7 @@ import { findOrder } from "./orders/store.ts";
 import { orderPublicKeyBase64 } from "./orders/token.ts";
 import { usdcAta } from "./solana/accounts.ts";
 import { TOKEN_PROGRAM, USDC_MINT } from "./solana/constants.ts";
-import { until } from "./testing/app.ts";
+import { create, until } from "./testing/app.ts";
 import { testDb, type TestDb } from "./testing/db.ts";
 import { createFakeRpc, type FakeRpcScript } from "./testing/fake-rpc.ts";
 import { testSigner } from "./testing/keys.ts";
@@ -260,6 +261,34 @@ describe("startService", () => {
         expect(openDuringCheck).toEqual([false]);
         await expect(fetch(`http://${failing.http.internal_listen}/healthz`)).rejects.toThrow();
         await expect(fetch(`http://${failing.http.public_listen}/healthz`)).rejects.toThrow();
+    });
+
+    it("takes orders on the internal listener and challenges them on the public one", async () => {
+        const s = await startService({ settings, secrets, rpc: okRpc(), log: silentLog });
+        try {
+            const created = await fetch(`http://127.0.0.1:${s.internalPort}/v1/orders`, {
+                method: "POST",
+                headers: {
+                    authorization: `Bearer ${secrets.paymentsToken}`,
+                    "content-type": "application/json",
+                },
+                body: JSON.stringify(create()),
+            });
+            expect(created.status).toBe(200);
+            const { orderId } = (await created.json()) as { orderId: string };
+            const res = await fetch(`http://127.0.0.1:${s.publicPort}/o/${orderId}`, {
+                headers: { accept: "application/json" },
+            });
+            expect(res.status).toBe(402);
+            const pr = decodePaymentRequiredHeader(res.headers.get("payment-required")!);
+            expect(pr.resource.url).toBe(`${settings.http.public_url}/o/${orderId}`);
+            expect(pr.accepts[0]).toMatchObject({
+                payTo: recipient.address,
+                extra: { feePayer: (await testSigner(5)).address, memo: orderId },
+            });
+        } finally {
+            await s.stop();
+        }
     });
 
     it("checks router event signatures with the configured key", async () => {

@@ -14,9 +14,7 @@ import { BootCheckError, bootChecks } from "./boot.ts";
 import { ConfigError, loadSettings, readSecrets, type Secrets, type Settings } from "./config.ts";
 import { migrate } from "./db/migrate.ts";
 import { createPool } from "./db/pool.ts";
-import { eventPublicKey, handleEvent } from "./events/handler.ts";
-import { createInternalHandler } from "./http/internal.ts";
-import { createPublicHandler } from "./http/public.ts";
+import { createHttpApp } from "./http/app.ts";
 import { startServer } from "./http/server.ts";
 import { type AlarmSnapshot, checkAlarms } from "./jobs/alarms.ts";
 import { auditInflows } from "./jobs/audit.ts";
@@ -24,15 +22,10 @@ import { dailyAt, every } from "./jobs/every.ts";
 import { reconcileSettling } from "./jobs/reconciler.ts";
 import { sweep } from "./jobs/sweeper.ts";
 import { jsonLog, type Log } from "./log.ts";
-import { createPayDeps, payOrder } from "./orders/pay.ts";
-import { orderKey } from "./orders/token.ts";
-import { RateLimiter } from "./ratelimit.ts";
 import { runRefunds } from "./refunds/executor.ts";
-import { createRouterClient, type RouterClient } from "./router/client.ts";
-import { BlockhashCache } from "./solana/blockhash.ts";
+import type { RouterClient } from "./router/client.ts";
 import { loadKeypair } from "./solana/keys.ts";
 import { createRpc, type SolanaRpc } from "./solana/rpc.ts";
-import { createSettler } from "./x402/settler.ts";
 
 export interface StartOptions {
     settings: Settings;
@@ -49,8 +42,6 @@ export interface RunningService {
     stop(): Promise<void>;
 }
 
-const MINUTE_MS = 60_000;
-const CHECKOUT_JS = "dist/checkout.js";
 const USAGE = "usage: main.js -config FILE";
 const SECRET_VARS = [
     "BUGNET_SOLANA_RPC_URL",
@@ -87,28 +78,7 @@ export async function startService(o: StartOptions): Promise<RunningService> {
         const feePayer = await loadKeypair(secrets.feePayerKey, "BUGNET_FEE_PAYER_KEY");
         const refundSigner = await loadKeypair(secrets.refundKey, "BUGNET_REFUND_KEY");
         const rpc = o.rpc ?? createRpc(secrets.rpcUrl);
-        const hints = new BlockhashCache(rpc, s.solana.blockhash_cache_ttl, () => now().getTime());
-        const settler = createSettler({
-            feePayer,
-            rpc,
-            hints,
-            caps: {
-                maxComputeUnits: s.solana.max_compute_units,
-                maxPriorityFeeMicroLamports: s.solana.max_priority_fee_micro_lamports,
-                maxRequiredSignatures: s.solana.max_required_signatures,
-            },
-            transactionVersions: s.solana.transaction_versions,
-            log,
-        });
-        const router = createRouterClient({
-            url: s.router.url,
-            token: secrets.routerToken,
-            timeoutMs: s.router.timeout,
-            checkPayer: s.router.check_payer,
-            getOrder: s.router.get_order,
-            log,
-        });
-        const key = orderKey(secrets.orderSeed);
+        const http = createHttpApp({ settings: s, secrets, pool, rpc, feePayer, log, now });
         const recipient = address(s.solana.recipient);
 
         const boot = await bootChecks({
@@ -121,70 +91,16 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             eventPublicKey: s.router.event_public_key,
         });
 
-        const challenge = {
-            publicUrl: s.http.public_url,
-            recipient: s.solana.recipient,
-            feePayer: feePayer.address,
-            transactionVersions: s.solana.transaction_versions,
-        };
-        const pay = createPayDeps({
-            pool,
-            settler,
-            router,
-            attempts: new RateLimiter(s.orders.attempts_per_order_per_minute, MINUTE_MS),
-            challenge,
-            log,
-            now,
-        });
-        const eventKey =
-            s.router.event_public_key === "" ? null : eventPublicKey(s.router.event_public_key);
-        const internal = await startServer(
-            s.http.internal_listen,
-            createInternalHandler({
-                service: {
-                    pool,
-                    settings: s,
-                    challenge,
-                    hints,
-                    orderKey: key,
-                    claimKey: secrets.claimKey,
-                    pay: (orderId, raw, signal) => payOrder(pay, orderId, raw, signal),
-                    log,
-                    now,
-                },
-                token: secrets.paymentsToken,
-                events: (raw, headers) =>
-                    handleEvent({ pool, key: eventKey, log, now }, raw, headers),
-                maxBodyBytes: s.http.max_body_bytes,
-                log,
-            }),
-            log,
-        );
+        const internal = await startServer(s.http.internal_listen, http.internalHandler, log);
         closers.push(internal.close);
-        const publicServer = await startServer(
-            s.http.public_listen,
-            createPublicHandler({
-                pool,
-                challenge,
-                hints,
-                pay,
-                perIp: new RateLimiter(s.limits.public_per_ip_per_minute, MINUTE_MS),
-                statusPerIp: new RateLimiter(s.limits.status_per_ip_per_minute, MINUTE_MS),
-                trustedProxies: s.http.trusted_proxies,
-                maxBodyBytes: s.http.max_body_bytes,
-                checkoutJsPath: CHECKOUT_JS,
-                log,
-                now,
-            }),
-            log,
-        );
+        const publicServer = await startServer(s.http.public_listen, http.publicHandler, log);
         closers.push(publicServer.close);
 
         const jobs = startJobs({
             s,
             pool,
             rpc,
-            router,
+            router: http.router,
             feePayer,
             refundSigner,
             recipient,
