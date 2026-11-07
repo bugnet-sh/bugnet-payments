@@ -69,6 +69,10 @@ export interface X402ResolvedInput {
     payTo: string;
 }
 
+function validMicros(...values: number[]): boolean {
+    return values.every((v) => Number.isSafeInteger(v) && v >= 0);
+}
+
 export type AppendResult = "ok" | "order_unknown" | "invalid" | "retry";
 
 const PLACEMENT_STATES: readonly string[] = [
@@ -227,6 +231,7 @@ export function createRouterClient(o: RouterClientOptions): RouterClient {
         },
 
         async appendAllowanceEvent(e, signal) {
+            if (!validMicros(e.amountMicros, e.keptMicros)) return "invalid";
             try {
                 await client.appendAllowanceEvent(
                     {
@@ -250,6 +255,7 @@ export function createRouterClient(o: RouterClientOptions): RouterClient {
         },
 
         async appendX402Resolved(e, signal) {
+            if (!validMicros(e.amountMicros)) return "invalid";
             try {
                 await client.appendX402Resolved(
                     {

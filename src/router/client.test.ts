@@ -448,6 +448,23 @@ describe("appends", () => {
         },
     );
 
+    it.each([1.5, NaN, Infinity, -1, Number.MAX_SAFE_INTEGER + 2])(
+        "malformed micros %s is invalid without calling the router",
+        async (bad) => {
+            let calls = 0;
+            const count = () => {
+                calls++;
+                return {};
+            };
+            const r = await router({ appendAllowanceEvent: count, appendX402Resolved: count });
+            const c = createRouterClient(xopts(r.url));
+            expect(await c.appendAllowanceEvent({ ...EVENT, amountMicros: bad })).toBe("invalid");
+            expect(await c.appendAllowanceEvent({ ...EVENT, keptMicros: bad })).toBe("invalid");
+            expect(await c.appendX402Resolved({ ...RESOLVED, amountMicros: bad })).toBe("invalid");
+            expect(calls).toBe(0);
+        },
+    );
+
     it("a dead router is retry", async () => {
         const c = createRouterClient(xopts("http://127.0.0.1:1"));
         expect(await c.appendAllowanceEvent(EVENT)).toBe("retry");
