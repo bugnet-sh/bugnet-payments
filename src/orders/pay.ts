@@ -65,6 +65,8 @@ export interface PayDeps {
     now: () => Date;
 }
 
+const UNAVAILABLE_RETRY = { charged: false, retryAfterSeconds: 30 } as const;
+
 // The settler signs as fee payer for exactly the terms the challenge advertises
 export function createPayDeps(d: PayDeps): PayDeps {
     if (d.settler.feePayer !== d.challenge.feePayer) {
@@ -174,10 +176,10 @@ export async function payOrder(
             const gate = await settleGate(c, d.x402);
             if (gate === "x402_disabled") return refused(order.id, 403, gate, { charged: false });
             if (gate !== null) {
-                return refused(order.id, 503, gate, { charged: false, retryAfterSeconds: 30 });
+                return refused(order.id, 503, gate, UNAVAILABLE_RETRY);
             }
         }
-        const checked = await checkPayment(d, order, raw, signal);
+        const checked = await checkPayment(d, c, order, raw, signal);
         if ("kind" in checked) return checked;
         return await settle(d, c, tx, order, checked, key, t);
     } finally {
@@ -247,6 +249,7 @@ async function alreadyPaid(
 
 async function checkPayment(
     d: PayDeps,
+    c: pg.PoolClient,
     order: OrderRow,
     raw: unknown,
     signal: AbortSignal,
@@ -277,13 +280,10 @@ async function checkPayment(
     let packageId = order.packageId;
     let kind = order.kind;
     if (order.kind === "allowance") {
-        const account = await findAccountByHandle(d.pool, order.handleSha256 ?? "");
+        const account = await findAccountByHandle(c, order.handleSha256 ?? "");
         if (account === null) {
             d.log.error("allowance order has no account", { orderId: order.id });
-            return refused(order.id, 503, "x402_unavailable", {
-                charged: false,
-                retryAfterSeconds: 30,
-            });
+            return refused(order.id, 503, "x402_unavailable", UNAVAILABLE_RETRY);
         }
         packageId = account.packageId;
         kind = "extend";

@@ -797,6 +797,12 @@ describe("x402 orders", () => {
         expect(await readPool(app.pool)).toEqual({ committedMicros: 0, unpaidMicros: 9_500_000 });
     });
 
+    it("names the hot wallet as payTo in an allowance order's challenge", async () => {
+        const h = await account();
+        const r = await post(app, "/v1/orders", topUp(h.handleSha256));
+        expect(r.body.paymentRequired.accepts[0].payTo).toBe(app.allowance.address);
+    });
+
     it("expires an unpaid allowance order after 5 minutes", async () => {
         const h = await account();
         const r = await post(app, "/v1/orders", topUp(h.handleSha256));

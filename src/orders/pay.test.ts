@@ -960,7 +960,17 @@ describe("allowance orders", () => {
 
     it("refuses an allowance payment while paused, before verify", async () => {
         await setControls(db.pool, { paused: true }, "test", NOW);
-        expect(await payOrder(hotDeps(), hot.id, await hotPayment(), sig())).toEqual({
+        const asked: unknown[] = [];
+        const fake = await startFakeRouter({
+            checkPayer: (r) => {
+                asked.push(r);
+                return { verdict: PayerVerdict.OK };
+            },
+        });
+        routers.push(fake);
+        const deps = { ...hotDeps(), router: clientFor(fake) };
+        const take = vi.spyOn(deps.attempts, "take");
+        expect(await payOrder(deps, hot.id, await hotPayment(), sig())).toEqual({
             kind: "refused",
             orderId: hot.id,
             httpStatus: 503,
@@ -968,10 +978,80 @@ describe("allowance orders", () => {
             charged: false,
             retryAfterSeconds: 30,
         });
+        expect(asked).toHaveLength(0);
+        expect(take).not.toHaveBeenCalled();
         expect(rpc.calls.sendTransaction).toBe(0);
         expect(rpc.calls.simulateTransaction).toBe(0);
         expect(await stateOf(hot.id)).toBe("unpaid");
         expect(await findPaymentByOrder(db.pool, hot.id)).toBeNull();
+    });
+
+    describe("a start order that carries an allowance", () => {
+        let start: OrderRow;
+        beforeEach(async () => {
+            start = (
+                await seedAllowanceOrder(db.pool, {
+                    kind: "start",
+                    packageId: "cpu-small",
+                    handleSha256: null,
+                    expiresAt: EXPIRES_AT,
+                })
+            ).order;
+        });
+
+        it("is stopped by pause and by the kill switch like an allowance order", async () => {
+            await setControls(db.pool, { paused: true }, "test", NOW);
+            expect(await payOrder(hotDeps(), start.id, await hotPayment(start), sig())).toEqual({
+                kind: "refused",
+                orderId: start.id,
+                httpStatus: 503,
+                reason: "x402_paused",
+                charged: false,
+                retryAfterSeconds: 30,
+            });
+            await setControls(db.pool, { paused: false, disabled: true }, "test", NOW);
+            expect(await payOrder(hotDeps(), start.id, await hotPayment(start), sig())).toEqual({
+                kind: "refused",
+                orderId: start.id,
+                httpStatus: 403,
+                reason: "x402_disabled",
+                charged: false,
+            });
+            expect(await stateOf(start.id)).toBe("unpaid");
+        });
+
+        it("keeps CheckPayer kind start", async () => {
+            const seen: unknown[] = [];
+            const fake = await startFakeRouter({
+                checkPayer: (r) => {
+                    seen.push(r);
+                    return { verdict: PayerVerdict.OK };
+                },
+            });
+            routers.push(fake);
+            expect(
+                await payOrder(
+                    { ...hotDeps(), router: clientFor(fake) },
+                    start.id,
+                    await hotPayment(start),
+                    sig(),
+                ),
+            ).toMatchObject({ kind: "paid" });
+            expect(seen[0]).toMatchObject({ kind: "start", packageId: "cpu-small" });
+        });
+    });
+
+    it("completes an allowance payment on a pool of one connection", async () => {
+        const one = new pg.Pool({ connectionString: db.url, max: 1 });
+        try {
+            const out = await within(
+                10_000,
+                payOrder({ ...hotDeps(), pool: one }, hot.id, await hotPayment(), sig()),
+            );
+            expect(out).toMatchObject({ kind: "paid" });
+        } finally {
+            await one.end();
+        }
     });
 
     it("answers x402_disabled with 403", async () => {
@@ -1008,8 +1088,10 @@ describe("allowance orders", () => {
     });
 
     it("lets package-only orders skip the gate", async () => {
-        await setControls(db.pool, { paused: true }, "test", NOW);
-        expect(await payOrder(hotDeps(), order.id, p, sig())).toMatchObject({ kind: "paid" });
+        await setControls(db.pool, { paused: true, disabled: true }, "test", NOW);
+        expect(
+            await payOrder(hotDeps({ x402: { enabled: false }, open: false }), order.id, p, sig()),
+        ).toMatchObject({ kind: "paid" });
     });
 
     it("asks CheckPayer about an allowance order as an extend of the account's package", async () => {
