@@ -15,11 +15,7 @@ export function createPool(url: string, log: Log = defaultLog()): pg.Pool {
     return pool;
 }
 
-export async function withTx<T>(
-    pool: pg.Pool,
-    fn: (c: pg.PoolClient) => Promise<T>,
-    log: Log = defaultLog(),
-): Promise<T> {
+async function once<T>(pool: pg.Pool, fn: (c: pg.PoolClient) => Promise<T>, log: Log): Promise<T> {
     const client = await pool.connect();
     let broken: Error | undefined;
     try {
@@ -38,5 +34,22 @@ export async function withTx<T>(
         throw err;
     } finally {
         client.release(broken);
+    }
+}
+
+// Every lock follows the 7.4 order, so a deadlock is a rare cross-job race and fn only touches
+// Postgres: re-running it once is safe.
+export async function withTx<T>(
+    pool: pg.Pool,
+    fn: (c: pg.PoolClient) => Promise<T>,
+    log: Log = defaultLog(),
+    opts: { retryDeadlock?: boolean } = {},
+): Promise<T> {
+    try {
+        return await once(pool, fn, log);
+    } catch (err) {
+        if ((err as { code?: string }).code !== "40P01" || opts.retryDeadlock === false) throw err;
+        log.warn("deadlock, re-running the transaction once");
+        return once(pool, fn, log);
     }
 }

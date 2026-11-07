@@ -52,10 +52,13 @@ describe("schema", () => {
         const fresh = await testDb();
         try {
             expect(await migrate(fresh.pool)).toBe(0);
-            const r = await fresh.pool.query("select version from schema_migrations");
+            const r = await fresh.pool.query(
+                "select version from schema_migrations order by version",
+            );
             expect(r.rows).toEqual([
                 { version: "00001_init.sql" },
                 { version: "00002_payment_key.sql" },
+                { version: "00003_x402.sql" },
             ]);
         } finally {
             await fresh.close();
