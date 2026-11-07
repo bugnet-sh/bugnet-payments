@@ -64,7 +64,7 @@ describe("bootChecks", () => {
     it("refuses a missing recipient USDC account", async () => {
         const rpc = createFakeRpc({ getAccountInfo: () => ({ value: null }) });
         await expect(bootChecks(deps(rpc))).rejects.toThrow(
-            /recipient USDC account \w+ does not exist.*keys fund --create-recipient-ata/,
+            /recipient USDC account \w+ does not exist.*keys fund --create-recipient-ata \w{32,44}$/,
         );
     });
 

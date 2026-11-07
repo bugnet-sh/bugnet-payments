@@ -61,7 +61,7 @@ export async function cliMain(argv: string[], env: NodeJS.ProcessEnv, io: CliIo)
     const args = splitConfig(argv);
     if (args === null) return usage(io, "-config needs a file");
     const [group, action, ...rest] = args.words;
-    if (isKeysCommand(group)) return runKeys(action, rest, args.config, env, io);
+    if (isKeysCommand(group)) return runKeys(action, rest, env, io);
     const cmd = DB_COMMANDS.get(`${group} ${action}`);
     if (cmd === undefined || rest.length !== cmd.params.length) return usage(io);
     for (const [i, param] of cmd.params.entries()) {

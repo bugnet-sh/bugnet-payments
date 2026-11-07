@@ -171,7 +171,8 @@ it lives only in the secrets file and the logs redact it.
 - **Refund wallet:** a $25-50 USDC float. Its USDC account must exist while refunds are on
   (`pnpm cli keys fund --create-refund-ata`).
 - **Recipient:** a cold address whose USDC account exists
-  (`pnpm cli keys fund --create-recipient-ata`). Its key never sits on the server.
+  (`pnpm cli keys fund --create-recipient-ata <recipient address>`, which prints the owner whose
+  account it creates). Its key never sits on the server.
 
 ## 8. Start, check, upgrade
 

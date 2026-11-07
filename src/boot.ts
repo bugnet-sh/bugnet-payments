@@ -75,7 +75,7 @@ export async function bootChecks(
         d.rpc,
         "recipient",
         d.recipient,
-        "create it once with: pnpm cli keys fund --create-recipient-ata",
+        `create it once with: pnpm cli keys fund --create-recipient-ata ${d.recipient}`,
     );
 
     const { value: feePayerLamports } = await d.rpc.getBalance(d.feePayer).send();

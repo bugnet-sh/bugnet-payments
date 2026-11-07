@@ -1,6 +1,10 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { getBase64Encoder, getTransactionDecoder } from "@solana/kit";
+import {
+    getBase64Encoder,
+    getCompiledTransactionMessageDecoder,
+    getTransactionDecoder,
+} from "@solana/kit";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { cliMain } from "../cli.ts";
 import { usdcAta } from "../solana/accounts.ts";
@@ -179,6 +183,39 @@ describe("keys over a stub RPC", () => {
         const [tx] = decodeSent();
         expect(Object.keys(tx!.signatures)).toEqual([testPayer.address]);
         expect(io.outText()).toMatch(/^confirmed [1-9A-HJ-NP-Za-km-z]{86,88}$/);
+    });
+
+    it("creates the USDC account of the recipient address it is given, not the config's", async () => {
+        sent.length = 0;
+        lamports.clear();
+        usdc.clear();
+        lamports.set(testPayer.address, 5_000_000_000);
+        const io = captureIo();
+        const code = await cliMain(
+            ["keys", "fund", "--create-recipient-ata", cold.address],
+            env(),
+            io,
+        );
+        expect(io.errText()).not.toContain('"level":"error"');
+        expect(code).toBe(0);
+        const ata = String(await usdcAta(cold.address as never));
+        const [tx] = decodeSent();
+        const accounts = getCompiledTransactionMessageDecoder().decode(
+            tx!.messageBytes,
+        ).staticAccounts;
+        expect(accounts).toContain(ata);
+        expect(io.outText()).toContain(`recipient USDC account ${ata} of owner ${cold.address}`);
+    });
+
+    it.each([
+        [["--create-recipient-ata"], "--create-recipient-ata needs a value"],
+        [["--create-recipient-ata", "not-an-address"], "--create-recipient-ata needs"],
+    ])("refuses %j without a recipient address", async (flags, want) => {
+        sent.length = 0;
+        const io = captureIo();
+        expect(await cliMain(["keys", "fund", ...flags], env(), io)).toBe(2);
+        expect(io.errText()).toContain(want);
+        expect(sent).toHaveLength(0);
     });
 
     it("refuses, naming the shortfall, when the test payer cannot cover the rents", async () => {

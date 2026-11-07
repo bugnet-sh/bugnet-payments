@@ -3,16 +3,18 @@
  * payer, show addresses and balances, drain the wallets back, and print the order public key.
  *
  * Only `generate` reads an env file; every other command reads the process environment. None parses
- * the TOML settings except `fund --create-recipient-ata`, which needs `solana.recipient`. The test
- * payer pays every fee and every ATA rent, so no other wallet needs SOL for these commands.
+ * the TOML settings: `fund --create-recipient-ata` takes the recipient address itself, so it never
+ * reads a config that names another wallet. The test payer pays every fee and every ATA rent, so no
+ * other wallet needs SOL for these commands.
  */
 import {
     type Address,
     getBase64EncodedWireTransaction,
     getSignatureFromTransaction,
+    isAddress,
     type KeyPairSigner,
 } from "@solana/kit";
-import { loadSettings, secretValues } from "../config.ts";
+import { secretValues } from "../config.ts";
 import { jsonLog, type Log } from "../log.ts";
 import { orderPublicKeyBase64 } from "../orders/token.ts";
 import { inspectTokenAccount, usdcAta } from "../solana/accounts.ts";
@@ -53,8 +55,8 @@ const POLL_BACKOFF_MS = 250;
 const COMMANDS: Record<string, { values: string[]; switches: string[] }> = {
     generate: { values: ["--env"], switches: [] },
     fund: {
-        values: ["--fee-payer-lamports", "--refund-usdc-micros"],
-        switches: ["--create-recipient-ata", "--create-refund-ata"],
+        values: ["--fee-payer-lamports", "--refund-usdc-micros", "--create-recipient-ata"],
+        switches: ["--create-refund-ata"],
     },
     show: { values: [], switches: ["--no-balances"] },
     drain: { values: [], switches: ["--close-atas"] },
@@ -63,8 +65,8 @@ const COMMANDS: Record<string, { values: string[]; switches: string[] }> = {
 
 export const KEYS_USAGE = [
     "  keys generate [--env FILE]               fill empty secrets in FILE (default .env)",
-    "  keys fund [--fee-payer-lamports N] [--refund-usdc-micros M] [--create-recipient-ata]",
-    "            [--create-refund-ata]",
+    "  keys fund [--fee-payer-lamports N] [--refund-usdc-micros M]",
+    "            [--create-recipient-ata RECIPIENT_ADDRESS] [--create-refund-ata]",
     "                                           send from the test payer, create the USDC accounts",
     "  keys show [--no-balances]                addresses, SOL and USDC balances",
     "  keys drain [--close-atas]                move everything back to the test payer",
@@ -116,7 +118,6 @@ export function isKeysCommand(group: string | undefined): boolean {
 export async function runKeys(
     action: string | undefined,
     words: readonly string[],
-    config: string,
     env: NodeJS.ProcessEnv,
     io: Io,
 ): Promise<number> {
@@ -141,7 +142,7 @@ export async function runKeys(
             case "show":
                 return await show(env, flags, io);
             case "fund":
-                return await fund(env, config, flags, io, log);
+                return await fund(env, flags, io, log);
             default:
                 return await drain(env, flags, io, log);
         }
@@ -194,17 +195,17 @@ async function usdcOf(rpc: SolanaRpc, owner: Address): Promise<bigint> {
     return (await inspectTokenAccount(rpc, await usdcAta(owner)))?.amount ?? 0n;
 }
 
-async function fund(
-    env: NodeJS.ProcessEnv,
-    config: string,
-    flags: Flags,
-    io: Io,
-    log: Log,
-): Promise<number> {
+async function fund(env: NodeJS.ProcessEnv, flags: Flags, io: Io, log: Log): Promise<number> {
     const lamports = whole(flags, "--fee-payer-lamports");
     const micros = whole(flags, "--refund-usdc-micros");
     if (typeof lamports === "string" || typeof micros === "string") {
         io.err(`${typeof lamports === "string" ? lamports : micros}`);
+        return 2;
+    }
+    const recipient = flags.values.get("--create-recipient-ata") ?? "";
+    const createRecipientAta = recipient !== "";
+    if (flags.values.has("--create-recipient-ata") && !isAddress(recipient)) {
+        io.err("--create-recipient-ata needs the recipient's base58 address");
         return 2;
     }
     const testPayer = await testPayerOf(env);
@@ -213,9 +214,6 @@ async function fund(
         "BUGNET_FEE_PAYER_KEY",
     );
     const refund = await loadKeypair(required(env, "BUGNET_REFUND_KEY"), "BUGNET_REFUND_KEY");
-    const createRecipientAta = flags.switches.has("--create-recipient-ata");
-    const recipient = createRecipientAta ? loadSettings(config).solana.recipient : "";
-    if (createRecipientAta && recipient === "") throw new Error("solana.recipient is empty");
     const rpc = createRpc(required(env, "BUGNET_SOLANA_RPC_URL"));
 
     const rentExemptMin = await rpc.getMinimumBalanceForRentExemption(0n).send();
@@ -251,6 +249,11 @@ async function fund(
     const usdcHave = await usdcOf(rpc, testPayer.address);
     if (usdcHave < micros) {
         throw new Error(`test payer holds ${usdcHave} USDC micros, short by ${micros - usdcHave}`);
+    }
+    if (createRecipientAta) {
+        io.out(
+            `recipient USDC account ${await usdcAta(recipient as Address)} of owner ${recipient}`,
+        );
     }
     await sendAll(rpc, testPayer, plan, io, log);
     return 0;
