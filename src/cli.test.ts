@@ -11,11 +11,21 @@ import type { OrderRow } from "./orders/types.ts";
 import { pauseRefunds, refundsPaused, resumeRefunds } from "./refunds/executor.ts";
 import { findOrderRefund, findRefundById } from "./refunds/request.ts";
 import { testDb, type TestDb } from "./testing/db.ts";
+import { startFakeChain } from "./testing/fake-chain.ts";
 import { createFakeRpc } from "./testing/fake-rpc.ts";
 import { testSigner } from "./testing/keys.ts";
 import { seedOrder, seedPayment } from "./testing/orders.ts";
 import { withTx } from "./db/pool.ts";
-import { resetLedger, seedAccount, seedFunding, seedService, TEST_PAYTO } from "./testing/x402.ts";
+import { usdcAta } from "./solana/accounts.ts";
+import {
+    resetLedger,
+    seedAccount,
+    seedAllowanceRefundRow,
+    seedFunding,
+    seedService,
+    seedX402Payment,
+    TEST_PAYTO,
+} from "./testing/x402.ts";
 import { isPayToBlocked, readControls, setControls } from "./x402/controls.ts";
 import { openIncidents, recordIncident } from "./x402/incidents.ts";
 import { readPool } from "./x402/ledger.ts";
@@ -1014,5 +1024,89 @@ describe("the x402 operator commands", () => {
         const io = captureIo();
         expect(await cli(["x402", "status"], io)).toBe(0);
         expect(io.outText()).toContain("chain balance: unavailable");
+    });
+
+    describe("ledger-check", () => {
+        async function fixture(chainMicros: bigint, refunded: number) {
+            const chain = await startFakeChain();
+            const payTo = await usdcAta((await testSigner(41)).address);
+            chain.setTokenAccount({
+                address: payTo,
+                owner: (await testSigner(41)).address,
+                amount: 0n,
+            });
+            const account = await seedAccount(db.pool, {
+                state: "closed",
+                fundedMicros: 1_000_000,
+                spentMicros: 10_000,
+                refundedMicros: refunded,
+            });
+            const funding = await seedFunding(db.pool, {
+                accountId: account.id,
+                allowanceMicros: 1_000_000,
+            });
+            await db.pool.query("update x402_accounts set funded_micros = 1000000 where id = $1", [
+                account.id,
+            ]);
+            await seedX402Payment(db.pool, {
+                accountId: account.id,
+                state: "confirmed",
+                amountMicros: 10_000,
+                payToTokenAccount: payTo,
+                txSignature: chain.credit(payTo, chainMicros),
+            });
+            await seedAllowanceRefundRow(db.pool, funding.orderId, {
+                amountMicros: 990_000,
+                destination: "dest-test",
+                state: "manual",
+                manualReason: "resolved_by_hand",
+                handTx: "3".repeat(64),
+            });
+            return { chain, account };
+        }
+
+        it("exits 1 on a mismatch and 0 when the ledger matches", async () => {
+            const bad = await fixture(10_001n, 990_000);
+            try {
+                const io = captureIo();
+                const env = { BUGNET_SOLANA_RPC_URL: bad.chain.url };
+                expect(
+                    await cliMain(
+                        ["-config", config, "x402", "ledger-check", bad.account.id],
+                        env,
+                        io,
+                    ),
+                ).toBe(1);
+                expect(io.outText()).toMatch(/payment \S+ MISMATCH ledger=10000 chain=10001/);
+            } finally {
+                await bad.chain.close();
+            }
+            await resetLedger(db.pool);
+            const good = await fixture(10_000n, 990_000);
+            try {
+                const io = captureIo();
+                const env = { BUGNET_SOLANA_RPC_URL: good.chain.url };
+                expect(
+                    await cliMain(
+                        ["-config", config, "x402", "ledger-check", good.account.id],
+                        env,
+                        io,
+                    ),
+                ).toBe(0);
+                expect(io.outText()).toContain(
+                    `account ${good.account.id} funded=1000000 spent=10000 refunded=990000 kept=0 ok`,
+                );
+            } finally {
+                await good.chain.close();
+            }
+        });
+
+        it("exits 2 for a non account id and 1 without an RPC URL", async () => {
+            expect(await cli(["x402", "ledger-check", "nope"])).toBe(2);
+            const account = await seedAccount(db.pool, {});
+            const io = captureIo();
+            expect(await cli(["x402", "ledger-check", account.id], io)).toBe(1);
+            expect(io.errText()).toContain("BUGNET_SOLANA_RPC_URL must be set");
+        });
     });
 });

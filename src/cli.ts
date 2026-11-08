@@ -24,6 +24,7 @@ import { type AllowanceFunding, createAllowanceFunding } from "./x402/funding.ts
 import { openIncidents, resolveIncident } from "./x402/incidents.ts";
 import { SERVICE_ID } from "./x402/ids.ts";
 import { type ResignProof, resignProof } from "./x402/resign.ts";
+import { ledgerCheck } from "./x402/ledger-check.ts";
 import { x402Status } from "./x402/status.ts";
 
 export interface CliIo {
@@ -64,6 +65,7 @@ const USAGE = [
     "  x402 incident list                       the open incidents",
     "  x402 incident resolve <id> <finding>     close an incident with what was found",
     "  x402 status                              controls, pool, balances and open facts",
+    "  x402 ledger-check <accountId>            check an account's rows against the chain",
     KEYS_USAGE,
 ].join("\n");
 
@@ -144,6 +146,7 @@ const DB_COMMANDS = new Map<string, DbCommand>([
     ["x402 incident list", { params: [], run: x402IncidentList }],
     ["x402 incident resolve", { params: ["incidentId", "text"], run: x402IncidentResolve }],
     ["x402 status", { params: [], run: x402StatusCommand }],
+    ["x402 ledger-check", { params: ["accountId"], run: x402LedgerCheck }],
 ]);
 
 export async function cliMain(
@@ -797,6 +800,21 @@ async function x402StatusCommand(ctx: CliContext, io: CliIo): Promise<number> {
         io.out(line);
     }
     return 0;
+}
+
+async function x402LedgerCheck(
+    ctx: CliContext,
+    io: CliIo,
+    [accountId = ""]: readonly string[],
+): Promise<number> {
+    const result = await ledgerCheck(
+        ctx.pool,
+        ctx.rpc(),
+        accountId,
+        ctx.settings.solana.rpc_timeout,
+    );
+    for (const line of result.lines) io.out(line);
+    return result.ok ? 0 : 1;
 }
 
 if (import.meta.main) {

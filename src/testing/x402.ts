@@ -313,6 +313,37 @@ export async function seedX402Payment(
     return p;
 }
 
+export async function seedAllowanceRefundRow(
+    pool: pg.Pool,
+    orderId: string,
+    over: {
+        amountMicros: number;
+        destination: string;
+        state: "pending" | "confirmed" | "manual";
+        txSignature?: string | null;
+        manualReason?: string | null;
+        handTx?: string | null;
+    },
+): Promise<number> {
+    const res = await pool.query<{ id: string }>(
+        `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
+            from_wallet, tx_signature, manual_reason, hand_tx, created_at)
+         values ($1, 'allowance', 'x402_unspent', $2, $3, 'payer-test', $4, 'allowance', $5, $6,
+            $7, now())
+         returning id`,
+        [
+            orderId,
+            over.amountMicros,
+            over.destination,
+            over.state,
+            over.txSignature ?? null,
+            over.manualReason ?? null,
+            over.handTx ?? null,
+        ],
+    );
+    return Number(res.rows[0]!.id);
+}
+
 export async function resetLedger(pool: pg.Pool): Promise<void> {
     await pool.query("truncate orders, events cascade");
     await pool.query("update x402_pool set committed_micros = 0, unpaid_micros = 0 where id = 1");
