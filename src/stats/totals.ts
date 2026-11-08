@@ -30,18 +30,32 @@ const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 
 // The four money kinds by UTC day, a null day for a row without its time
 const DAILY_SQL = `
+    with refunded as (
+        select to_char(r.confirmed_at at time zone 'UTC', 'YYYY-MM-DD') as day, r.amount_micros,
+            r.kind <> 'allowance' as counted,
+            -- a full refund gives back the earned part first, the rest is the unspent allowance
+            case r.kind
+                when 'allowance' then 0
+                when 'partial' then r.amount_micros
+                else least(r.amount_micros, o.amount_micros - o.allowance_micros)
+            end as earned_part
+          from refunds r join orders o on o.id = r.order_id
+         where r.state = 'confirmed'
+    )
     select 'earnedMicros' as what, to_char(p.confirmed_at at time zone 'UTC', 'YYYY-MM-DD') as day,
         count(*)::text as n, sum(o.amount_micros - o.allowance_micros)::text as micros
       from payments p join orders o on o.id = p.order_id
      where p.status = 'confirmed'
      group by 2
     union all
-    select case from_wallet when 'refund' then 'refundedMicros' else 'allowanceReturnedMicros' end,
-        to_char(confirmed_at at time zone 'UTC', 'YYYY-MM-DD'), count(*)::text,
-        sum(amount_micros)::text
-      from refunds
-     where state = 'confirmed'
-     group by 1, 2
+    select 'refundedMicros', day, (count(*) filter (where counted))::text,
+        sum(earned_part)::text
+      from refunded
+     group by 2
+    union all
+    select 'allowanceReturnedMicros', day, '0', sum(amount_micros - earned_part)::text
+      from refunded
+     group by 2
     union all
     select 'x402SpentMicros', to_char(resolved_at at time zone 'UTC', 'YYYY-MM-DD'),
         count(*)::text, sum(amount_micros)::text
@@ -70,9 +84,10 @@ const BY_METHOD_SQL = `
      group by 1
      order by 1`;
 
-function safe(v: string | null, what: string): number {
+// The router takes whole numbers from 0 to 2^53 - 1 only
+export function safeMicros(v: string | null, what: string): number {
     const n = BigInt(v ?? "0");
-    if (n > MAX_SAFE || n < -MAX_SAFE) throw new Error(`stats ${what} is not a safe integer: ${n}`);
+    if (n > MAX_SAFE || n < 0n) throw new Error(`stats ${what} is not a safe integer: ${n}`);
     return Number(n);
 }
 
@@ -131,9 +146,9 @@ export async function statsTotals(pool: pg.Pool, s: Settings, now: Date): Promis
     const byDay = new Map<string, StatsMoney>();
     const refunds = { count: 0 };
     for (const r of daily) {
-        const micros = safe(r.micros, r.what);
+        const micros = safeMicros(r.micros, r.what);
         addTo(totals, r.what, micros);
-        if (r.what === "refundedMicros") refunds.count += safe(r.n, "refund count");
+        if (r.what === "refundedMicros") refunds.count += safeMicros(r.n, "refund count");
         // A day past today is clock skew, its money stays in the totals only
         if (r.day === null || r.day > today) continue;
         let m = byDay.get(r.day);
@@ -158,30 +173,30 @@ export async function statsTotals(pool: pg.Pool, s: Settings, now: Date): Promis
         byKind: [
             {
                 kind: "sandbox",
-                count: safe(kinds.sandbox_n, "count"),
-                micros: safe(kinds.sandbox_m, "sandbox"),
+                count: safeMicros(kinds.sandbox_n, "count"),
+                micros: safeMicros(kinds.sandbox_m, "sandbox"),
             },
             {
                 kind: "extend",
-                count: safe(kinds.extend_n, "count"),
-                micros: safe(kinds.extend_m, "extend"),
+                count: safeMicros(kinds.extend_n, "count"),
+                micros: safeMicros(kinds.extend_m, "extend"),
             },
             {
                 kind: "x402_allowance",
-                count: safe(kinds.allowance_n, "count"),
-                micros: safe(kinds.allowance_m, "x402_allowance"),
+                count: safeMicros(kinds.allowance_n, "count"),
+                micros: safeMicros(kinds.allowance_m, "x402_allowance"),
             },
             {
                 kind: "x402_fee",
-                count: safe(kinds.fee_n, "count"),
-                micros: safe(kinds.fee_m, "x402_fee"),
+                count: safeMicros(kinds.fee_n, "count"),
+                micros: safeMicros(kinds.fee_m, "x402_fee"),
             },
         ],
         refunds: { count: refunds.count, micros: totals.refundedMicros },
         byMethod: methods.map((m) => ({
             method: m.method,
-            count: safe(m.n, "count"),
-            micros: safe(m.micros, m.method),
+            count: safeMicros(m.n, "count"),
+            micros: safeMicros(m.micros, m.method),
         })),
         limits: {
             "order.max_micros": s.orders.max_amount_micros,

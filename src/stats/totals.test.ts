@@ -4,7 +4,7 @@ import type { OrderRow, PaidVia } from "../orders/types.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
 import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts";
 import { seedAccount, seedX402Payment } from "../testing/x402.ts";
-import { statsTotals } from "./totals.ts";
+import { safeMicros, statsTotals } from "./totals.ts";
 
 const NOW = new Date("2030-01-10T12:00:00Z");
 const RECIPIENT = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi";
@@ -49,20 +49,23 @@ let refundSeq = 0;
 
 async function refund(
     orderId: string,
-    from: "refund" | "allowance",
+    kind: "full" | "partial" | "allowance",
     amountMicros: number,
     confirmedAt: Date,
-    state = "confirmed",
+    {
+        state = "confirmed",
+        from = "refund",
+    }: { state?: string; from?: "refund" | "allowance" } = {},
 ): Promise<void> {
     refundSeq += 1;
-    const allowance = from === "allowance";
+    const allowance = kind === "allowance";
     await db.pool.query(
         `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
             tx_signature, confirmed_at, from_wallet)
          values ($1, $2, $3, $4, 'dest', 'payer', $5, $6, $7, $8)`,
         [
             orderId,
-            allowance ? "allowance" : "full",
+            kind,
             allowance ? "x402_unspent" : "late",
             amountMicros,
             state,
@@ -134,7 +137,7 @@ describe("statsTotals", () => {
 
     it("leaves out an unconfirmed payment and an unconfirmed refund", async () => {
         const o = await paidOrder(at("2030-01-10T01:00:00"), {}, "checkout", "settling");
-        await refund(o.id, "refund", 5_000, at("2030-01-10T02:00:00"), "sent");
+        await refund(o.id, "full", 5_000, at("2030-01-10T02:00:00"), { state: "sent" });
         const t = await statsTotals(db.pool, settings, NOW);
         expect(t.totals).toEqual(ZERO);
         expect(t.byKind.every((k) => k.count === 0 && k.micros === 0)).toBe(true);
@@ -145,9 +148,9 @@ describe("statsTotals", () => {
 
     it("puts a refund-wallet refund in refunded and an allowance return only in allowance returned", async () => {
         const o = await paidOrder(at("2030-01-10T01:00:00"), { amountMicros: 50_000 });
-        await refund(o.id, "refund", 50_000, at("2030-01-10T03:00:00"));
+        await refund(o.id, "full", 50_000, at("2030-01-10T03:00:00"));
         const a = await paidOrder(at("2030-01-10T01:00:00"), { kind: "allowance" });
-        await refund(a.id, "allowance", 400_000, at("2030-01-10T04:00:00"));
+        await refund(a.id, "allowance", 400_000, at("2030-01-10T04:00:00"), { from: "allowance" });
         const t = await statsTotals(db.pool, settings, NOW);
         expect(t.totals).toEqual({
             earnedMicros: 53_000,
@@ -157,6 +160,50 @@ describe("statsTotals", () => {
         });
         expect(t.refunds).toEqual({ count: 1, micros: 50_000 });
         expect(t.daily).toEqual([{ day: "2030-01-10", ...t.totals }]);
+    });
+
+    it("counts a hot-wallet partial refund as refunded", async () => {
+        const o = await paidOrder(at("2030-01-10T01:00:00"), { amountMicros: 50_000 });
+        await refund(o.id, "partial", 20_000, at("2030-01-10T02:00:00"), { from: "allowance" });
+        const t = await statsTotals(db.pool, settings, NOW);
+        expect(t.totals).toEqual({ ...ZERO, earnedMicros: 50_000, refundedMicros: 20_000 });
+        expect(t.refunds).toEqual({ count: 1, micros: 20_000 });
+    });
+
+    it("splits a full refund of an x402 start order into refunded earnings and returned allowance", async () => {
+        const x402Start = {
+            amountMicros: 1_063_000,
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+            payInto: "allowance" as const,
+        };
+        const whole = await paidOrder(at("2030-01-10T01:00:00"), x402Start);
+        await refund(whole.id, "full", 1_063_000, at("2030-01-10T02:00:00"), {
+            from: "allowance",
+        });
+        const small = await paidOrder(at("2030-01-10T01:00:00"), x402Start);
+        await refund(small.id, "full", 40_000, at("2030-01-10T03:00:00"));
+        const t = await statsTotals(db.pool, settings, NOW);
+        expect(t.totals).toEqual({
+            earnedMicros: 126_000,
+            refundedMicros: 103_000,
+            allowanceReturnedMicros: 1_000_000,
+            x402SpentMicros: 0,
+        });
+        expect(t.refunds).toEqual({ count: 2, micros: 103_000 });
+        expect(t.daily).toEqual([{ day: "2030-01-10", ...t.totals }]);
+    });
+
+    it("counts an allowance refund from the hot wallet as allowance returned only", async () => {
+        const a = await paidOrder(at("2030-01-10T01:00:00"), { kind: "allowance" });
+        await refund(a.id, "allowance", 300_000, at("2030-01-10T02:00:00"), { from: "allowance" });
+        const t = await statsTotals(db.pool, settings, NOW);
+        expect(t.totals).toEqual({
+            ...ZERO,
+            earnedMicros: 3_000,
+            allowanceReturnedMicros: 300_000,
+        });
+        expect(t.refunds).toEqual({ count: 0, micros: 0 });
     });
 
     it("counts x402 spend from confirmed rows that did not land late, on their resolve day", async () => {
@@ -193,7 +240,7 @@ describe("statsTotals", () => {
 
     it("zero-fills a gap day and ends at today", async () => {
         const o = await paidOrder(at("2030-01-07T10:00:00"), { amountMicros: 30_000 });
-        await refund(o.id, "refund", 30_000, at("2030-01-09T10:00:00"));
+        await refund(o.id, "full", 30_000, at("2030-01-09T10:00:00"));
         const t = await statsTotals(db.pool, settings, NOW);
         expect(t.daily).toEqual([
             { day: "2030-01-07", ...ZERO, earnedMicros: 30_000 },
@@ -229,5 +276,15 @@ describe("statsTotals", () => {
         await paidOrder(when, { amountMicros: Number.MAX_SAFE_INTEGER });
         await paidOrder(when, { amountMicros: 1 });
         await expect(statsTotals(db.pool, settings, NOW)).rejects.toThrow(/safe integer/);
+    });
+});
+
+describe("safeMicros", () => {
+    it("takes whole numbers from 0 to 2^53 - 1 and refuses the rest", () => {
+        expect(safeMicros("0", "x")).toBe(0);
+        expect(safeMicros(null, "x")).toBe(0);
+        expect(safeMicros(String(Number.MAX_SAFE_INTEGER), "x")).toBe(Number.MAX_SAFE_INTEGER);
+        expect(() => safeMicros("-1", "x")).toThrow(/safe integer/);
+        expect(() => safeMicros(String(2 ** 53), "x")).toThrow(/safe integer/);
     });
 });
