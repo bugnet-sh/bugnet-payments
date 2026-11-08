@@ -213,6 +213,8 @@ export async function payWithWallet(d: PayFlowDeps): Promise<PayFlowResult> {
             headers: {
                 ...JSON_ACCEPT,
                 "PAYMENT-SIGNATURE": safeBase64Encode(JSON.stringify(payment)),
+                // Payments records it as orders.paid_via for the public stats
+                "Bugnet-Client": "checkout",
             },
         });
     } catch {

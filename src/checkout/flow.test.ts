@@ -74,6 +74,7 @@ function harness(script: Script = {}) {
     const calls: string[] = [];
     const sleeps: number[] = [];
     const submitted: string[] = [];
+    const clients: string[] = [];
     const signInputs: Parameters<WalletPort["signTransaction"]>[0][] = [];
     const statuses = [...(script.statuses ?? [])];
     const account = { address: payer.address };
@@ -107,6 +108,9 @@ function harness(script: Script = {}) {
         const url = String(input);
         const headers = new Headers(init?.headers);
         const method = init?.method ?? "GET";
+        clients.push(
+            `${url.endsWith("/status") ? "status" : "order"}:${headers.get("bugnet-client")}`,
+        );
         if (url === `${orderUrl}/status`) {
             calls.push(`${method} status`);
             const next = statuses.shift();
@@ -130,7 +134,7 @@ function harness(script: Script = {}) {
     const sleep = async (ms: number) => {
         sleeps.push(ms);
     };
-    return { calls, sleeps, submitted, signInputs, w, f, sleep };
+    return { calls, sleeps, submitted, clients, signInputs, w, f, sleep };
 }
 
 describe("payWithWallet", () => {
@@ -143,6 +147,15 @@ describe("payWithWallet", () => {
             "signTransaction",
             "GET payment-signature",
         ]);
+    });
+
+    it("names itself with Bugnet-Client: checkout on the payment request only", async () => {
+        const { clients, w, f, sleep } = harness({
+            submit: () => json(202, { state: "settling" }),
+            statuses: [() => json(200, { state: "paid" })],
+        });
+        expect(await payWithWallet({ fetch: f, wallet: w, orderUrl, sleep })).toBe("paid");
+        expect(clients).toEqual(["order:null", "order:checkout", "status:null"]);
     });
 
     it("asks the wallet to sign the payment built from the refetched challenge", async () => {
