@@ -245,7 +245,12 @@ export async function testSellerPlan(o: {
 
 export async function testSellerDrainPlan(
     o: { testPayer: KeyPairSigner; feePayer: KeyPairSigner; payTo: KeyPairSigner },
-    balances: { feePayerLamports: bigint; payToLamports: bigint; payToUsdc: bigint },
+    balances: {
+        feePayerLamports: bigint;
+        payToLamports: bigint;
+        payToUsdc: bigint;
+        payToAtaExists?: boolean;
+    },
 ): Promise<PlannedTx[]> {
     const txs: PlannedTx[] = [];
     const plan = (instructions: Instruction[]) =>
@@ -260,17 +265,19 @@ export async function testSellerDrainPlan(
             ),
         );
     }
-    instructions.push(
-        getCloseAccountInstruction(
-            {
-                account: await usdcAta(o.payTo.address),
-                destination: o.testPayer.address,
-                owner: o.payTo,
-            },
-            { programAddress: TOKEN_PROGRAM },
-        ),
-    );
-    plan(instructions);
+    if (balances.payToAtaExists ?? true) {
+        instructions.push(
+            getCloseAccountInstruction(
+                {
+                    account: await usdcAta(o.payTo.address),
+                    destination: o.testPayer.address,
+                    owner: o.payTo,
+                },
+                { programAddress: TOKEN_PROGRAM },
+            ),
+        );
+    }
+    if (instructions.length > 0) plan(instructions);
     for (const [signer, lamports] of [
         [o.feePayer, balances.feePayerLamports],
         [o.payTo, balances.payToLamports],

@@ -167,9 +167,20 @@ export async function runKeys(
                 return await fund(env, flags, io, log);
             case "testseller":
                 return await testSeller(env, flags, io, log);
-            default:
+            default: {
                 if (flags.switches.has("--allowance") && flags.switches.has("--testseller")) {
                     io.err("--allowance and --testseller cannot be combined");
+                    return 2;
+                }
+                const drainOnly = ["--allowance", "--testseller"].filter((w) =>
+                    flags.switches.has(w),
+                );
+                if (flags.switches.has("--close-atas") && drainOnly.length > 0) {
+                    io.err(`--close-atas cannot be combined with ${drainOnly[0]}`);
+                    return 2;
+                }
+                if (flags.values.has("--env") && !flags.switches.has("--testseller")) {
+                    io.err("--env is only used by keys drain --testseller");
                     return 2;
                 }
                 if (flags.switches.has("--allowance")) {
@@ -179,6 +190,7 @@ export async function runKeys(
                     return await drainTestSeller(env, flags, io, log);
                 }
                 return await drain(env, flags, io, log);
+            }
         }
     } catch (err) {
         log.error(`keys ${action} failed`, { err });
@@ -243,8 +255,13 @@ async function drainTestSeller(
             feePayerLamports: await lamportsOf(rpc, feePayer.address),
             payToLamports: await lamportsOf(rpc, payTo.address),
             payToUsdc: await usdcOf(rpc, payTo.address),
+            payToAtaExists: (await inspectTokenAccount(rpc, await usdcAta(payTo.address))) !== null,
         },
     );
+    if (plan.length === 0) {
+        io.out("nothing to drain");
+        return 0;
+    }
     await sendAll(rpc, testPayer, plan, io, log);
     return 0;
 }

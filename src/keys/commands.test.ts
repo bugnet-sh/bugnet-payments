@@ -505,6 +505,37 @@ describe("keys over a stub RPC", () => {
                 expect(io.outText() + io.errText()).not.toContain(v);
             }
         });
+
+        it("drain --testseller leaves out the close of a missing ATA and says when nothing is left", async () => {
+            const file = join(dir, "seller-missing-ata.env");
+            const made = captureIo();
+            lamports.clear();
+            usdc.clear();
+            tokenOwners.clear();
+            lamports.set(testPayer.address, 5_000_000_000);
+            await cliMain(["keys", "testseller", "--env", file], env(), made);
+            const feeAddress = /testseller_fee_payer=(\S+)/.exec(made.outText())![1]!;
+            const ata = String(
+                await usdcAta(/testseller_payto=(\S+)/.exec(made.outText())![1]! as never),
+            );
+            tokenOwners.delete(ata);
+            usdc.delete(ata);
+            sent.length = 0;
+            lamports.set(feeAddress, 9_000_000);
+            const io = captureIo();
+            expect(await cliMain(["keys", "drain", "--testseller", "--env", file], env(), io)).toBe(
+                0,
+            );
+            expect(decodeSent()).toHaveLength(1);
+            lamports.set(feeAddress, 0);
+            sent.length = 0;
+            const again = captureIo();
+            expect(
+                await cliMain(["keys", "drain", "--testseller", "--env", file], env(), again),
+            ).toBe(0);
+            expect(again.outText()).toContain("nothing to drain");
+            expect(sent).toHaveLength(0);
+        });
     });
 
     it.each([
@@ -513,6 +544,10 @@ describe("keys over a stub RPC", () => {
         [["drain", "--allowance", "--testseller"], 2],
         [["testseller"], 2],
         [["drain", "--testseller"], 2],
+        [["drain", "--env", "x.env"], 2],
+        [["drain", "--allowance", "--env", "x.env"], 2],
+        [["drain", "--close-atas", "--allowance"], 2],
+        [["drain", "--close-atas", "--testseller", "--env", "x.env"], 2],
     ])("keys %j exits %i before reaching a command", async (words, want) => {
         sent.length = 0;
         expect(await cliMain(["keys", ...words], env(), captureIo())).toBe(want);
