@@ -1327,6 +1327,22 @@ describe("deploy notes", () => {
         }
     });
 
+    it("x402 setup names the enabled switch, the key copy and the TLS files", () => {
+        const text = readFileSync(
+            path.join(import.meta.dirname, "..", "deploy", "README.md"),
+            "utf8",
+        );
+        const setup = text
+            .slice(text.indexOf("## 10."), text.indexOf("## 11."))
+            .replace(/\s+/g, " ");
+        expect(setup).not.toContain("the key it prints");
+        expect(setup).toContain("[x402] enabled = true");
+        expect(setup).toContain("bugnet-dev mtls init --out");
+        expect(setup).toContain("/etc/bugnet/payments/x402-server.pem");
+        expect(setup).toContain("BUGNET_X402_TLS_KEY=");
+        expect(setup).toContain("kill -s HUP");
+    });
+
     it("run every database command against the deploy settings, never the dev default", () => {
         for (const file of ["README.md", "x402-mainnet-tests.md"]) {
             const text = readFileSync(path.join(import.meta.dirname, "..", "deploy", file), "utf8");

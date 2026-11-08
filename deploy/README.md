@@ -296,12 +296,29 @@ the port, a deploy stops the old process before it starts the new one; egress an
 `payments_unavailable` meanwhile and `signed` rows resolve from the chain. The jobs run under
 database locks, so a second process never runs the same job twice.
 
-**The allowance wallet**, once:
+**The allowance wallet and the TLS files**, once:
 
-1. `pnpm cli keys generate`, and put the key it prints in `BUGNET_ALLOWANCE_KEY`.
-2. Set `[x402] allowance_wallet` to its address.
+1. In the checkout, `pnpm cli keys generate` writes a new `BUGNET_ALLOWANCE_KEY` into the
+   checkout's `.env` and prints only addresses, among them `allowance=<address>`. Copy the value
+   of the `BUGNET_ALLOWANCE_KEY=` line from that `.env` into `/etc/bugnet/payments.env`
+   (`sudoedit`), as the line `BUGNET_ALLOWANCE_KEY=<value>`.
+2. In `/etc/bugnet/payments.toml`, set `[x402] allowance_wallet` to the printed `allowance`
+   address and `[x402] enabled = true`. Without `enabled`, terms answer `enabled: false` and
+   allowance orders are refused `x402_disabled`.
 3. `pnpm cli keys fund --create-allowance-ata` creates its USDC account.
-4. Restart. Boot refuses an allowance wallet that is also another Bugnet wallet.
+4. The TLS files. The router owner, who keeps the internal CA key on their Mac, runs
+   `bugnet-dev mtls init --out <staging>` there. It writes, laid out as on the VPS,
+   `etc/bugnet/internal-ca.pem`, `etc/bugnet/payments/x402-server.pem`, egress's client pair and
+   `payments.env.add`. Install `internal-ca.pem` as `/etc/bugnet/internal-ca.pem` and
+   `x402-server.pem` as `/etc/bugnet/payments/x402-server.pem` with the modes in the table above.
+   Append `payments.env.add` to `/etc/bugnet/payments.env`: its one line is
+   `BUGNET_X402_TLS_KEY=` and the server key PEM in base64 on one line (from a key file:
+   `base64 < x402-server.key | tr -d '\n'`). Then delete the staging copies of both keys.
+5. Restart: `sudo systemctl restart bugnet-payments@<version>`. The env file is read only at
+   start, so a changed `BUGNET_ALLOWANCE_KEY` or `BUGNET_X402_TLS_KEY` needs the restart; when only
+   the two `.pem` files changed, `sudo systemctl kill -s HUP bugnet-payments@<version>` is enough.
+   Until then no listener runs and terms answer `enabled: false`. Boot refuses an allowance wallet
+   that is also another Bugnet wallet.
 
 **The index copy**, whenever the indexed services change, in this order (5.1, 7.16): write
 Payments' `x402-index.json`; run `sudo systemctl kill -s HUP bugnet-payments@<version>` (the unit
