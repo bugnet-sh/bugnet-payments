@@ -2,14 +2,14 @@
  * One real paid x402 call to each seller in docs/mcp-gateway/x402-index-test-calls.json, paid from
  * the test payer, so each seller can go into the gateway's x402 index.
  *
- *   node --import { homedir } from "node:os";
-import tsx test/live/index-calls.ts [--probe]   unpaid requests only (the default)
+ *   node --import tsx test/live/index-calls.ts [--probe]   unpaid requests only (the default)
  *   set -a; . ./.env; set +a
  *   BUGNET_INDEX_CALLS_PAY=yes node --import tsx test/live/index-calls.ts --pay
  *
- * --out-dir <dir> moves the JSON results (default: the session scratchpad folder below).
+ * --out-dir <dir> moves the JSON results (default: ~/.local/state/bugnet-paid/index-calls).
  * The journal stays in that default folder: --pay skips every URL it lists as sent.
  */
+import { homedir } from "node:os";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { address, type Address } from "@solana/kit";
