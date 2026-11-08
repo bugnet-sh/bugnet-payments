@@ -148,6 +148,9 @@ export type OrderResult =
           status: "payment_required";
           orderId: string;
           claim?: string;
+          // Lets a caller that holds only the order id tell an x402 allowance from sandbox time
+          kind: OrderKind;
+          allowanceMicros: number;
           payUrl: string;
           paymentRequired: PaymentRequired;
       }

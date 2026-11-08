@@ -527,6 +527,8 @@ async function paymentRequired(
     const out: PaymentRequiredResult = {
         status: "payment_required",
         orderId: o.id,
+        kind: o.kind,
+        allowanceMicros: o.allowanceMicros,
         payUrl: payUrlFor(d.challenge.publicUrl, o.id),
         paymentRequired: await challengeFor(o, d.challenge, d.hints, d.log),
     };

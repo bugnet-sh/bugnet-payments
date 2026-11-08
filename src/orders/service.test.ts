@@ -88,6 +88,8 @@ describe("create and replay", () => {
             status: "payment_required",
             orderId: expect.stringMatching(/^ord_[a-z2-7]{26}$/),
             claim: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+            kind: "start",
+            allowanceMicros: 0,
         });
         expect(r.body.payUrl).toBe(`${app.settings.http.public_url}/o/${r.body.orderId}`);
         expect(r.body.paymentRequired.accepts[0].extra.memo).toBe(r.body.orderId);
@@ -809,7 +811,11 @@ describe("x402 orders", () => {
         });
         const h = await account();
         const due = await post(app, "/v1/orders", topUp(h.handleSha256));
-        expect(due.body.status).toBe("payment_required");
+        expect(due.body).toMatchObject({
+            status: "payment_required",
+            kind: "allowance",
+            allowanceMicros: 1_000_000,
+        });
         expect(await findOrder(app.pool, due.body.orderId)).toMatchObject({
             kind: "allowance",
             payInto: "allowance",
