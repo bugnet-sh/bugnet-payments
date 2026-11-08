@@ -1044,6 +1044,36 @@ describe("x402 wiring", () => {
         }
     });
 
+    it("TLS files fixed without a SIGHUP keep terms disabled while no listener is open", async () => {
+        const certPath = path.join(mkdtempSync(path.join(tmpdir(), "bn-tls-")), "server.crt");
+        writeFileSync(certPath, "not a certificate");
+        const s = await startService({
+            settings: x402Settings({
+                x402: { tls_cert_file: certPath },
+                jobs: { alarms_every: "20ms" },
+            }),
+            secrets: x402Secrets,
+            rpc: withBalance(chain.rpc),
+            log: silentLog,
+        });
+        const terms = async () => {
+            const res = await fetch(`http://127.0.0.1:${s.internalPort}/v1/x402/terms`, {
+                headers: { authorization: `Bearer ${x402Secrets.paymentsToken}` },
+            });
+            return (await res.json()) as { enabled: boolean };
+        };
+        try {
+            expect(s.x402Port).toBeNull();
+            writeFileSync(certPath, readFileSync(pki.serverCert));
+            await new Promise((r) => setTimeout(r, 200)); // the TLS check runs every 20ms
+            expect((await terms()).enabled).toBe(false);
+            process.emit("SIGHUP");
+            await until(async () => (await terms()).enabled, 2_000);
+        } finally {
+            await s.stop();
+        }
+    });
+
     it("stop waits for a listener still opening and closes it", async () => {
         const probe = createServer();
         await new Promise<void>((r) => probe.listen(0, "127.0.0.1", r));

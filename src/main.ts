@@ -681,6 +681,11 @@ function startX402Jobs(
             s.jobs.alarms_every,
             "x402_tls_check",
             tracked(async () => {
+                // Files fixed on disk do not open the listener, only a SIGHUP does
+                if (x.listener() === null) {
+                    x.gate.record("tls", "fail", "listener not open: send SIGHUP");
+                    return;
+                }
                 const tls = checkTlsFiles(x.readTls(), SERVER_NAME, now());
                 x.gate.record("tls", tls.ok ? "pass" : "fail", tls.ok ? undefined : tls.problem);
             }),
