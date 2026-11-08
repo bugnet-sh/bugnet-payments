@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { getBase58Decoder } from "@solana/kit";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { encodePaymentSignatureHeader } from "@x402/core/http";
 import {
@@ -350,6 +351,98 @@ describe("redeem", () => {
         } finally {
             flag.allowance_claim = was;
         }
+    });
+
+    describe("payer claims", () => {
+        const b58 = (n: number, len: 32 | 64) => getBase58Decoder().decode(Buffer.alloc(len, n));
+        const PAYER = b58(9, 32);
+        let seq = 1;
+        const nextTx = () => b58(seq++, 64);
+        const BASE_KEYS = ["order_id", "kind", "package_id", "amount_micros", "expires_at"];
+
+        async function redeemWith(
+            on: boolean,
+            order: Partial<OrderRow>,
+            payment: { payer: string; txSignature: string } | null,
+        ): Promise<Record<string, unknown>> {
+            const flag = app.settings.router;
+            const was = flag.token_payer_claims;
+            try {
+                flag.token_payer_claims = on;
+                const seeded = await seedPaid(order);
+                if (payment !== null) await seedPayment(app.pool, seeded.order.id, payment);
+                const r = await post(app, "/v1/orders", {
+                    orderId: seeded.order.id,
+                    claim: seeded.claim,
+                });
+                expect(r.body.status).toBe("paid");
+                return tokenClaims(r.body.orderToken) as Record<string, unknown>;
+            } finally {
+                flag.token_payer_claims = was;
+            }
+        }
+
+        it("is off by default and leaves the claim set unchanged", async () => {
+            expect(app.settings.router.token_payer_claims).toBe(false);
+            const tx = nextTx();
+            const claims = await redeemWith(
+                false,
+                { payer: PAYER },
+                { payer: PAYER, txSignature: tx },
+            );
+            expect(Object.keys(claims)).toEqual(BASE_KEYS);
+        });
+
+        it("adds payer, fee_payer and tx to a start token", async () => {
+            const tx = nextTx();
+            const claims = await redeemWith(
+                true,
+                { payer: PAYER },
+                { payer: PAYER, txSignature: tx },
+            );
+            expect(Object.keys(claims)).toEqual([...BASE_KEYS, "payer", "fee_payer", "tx"]);
+            expect(claims).toMatchObject({
+                payer: PAYER,
+                fee_payer: app.feePayer.address,
+                tx,
+            });
+        });
+
+        it("adds them to an extend token", async () => {
+            const tx = nextTx();
+            const claims = await redeemWith(
+                true,
+                { kind: "extend", packageId: "ext-10m", handleSha256: HANDLE, payer: PAYER },
+                { payer: PAYER, txSignature: tx },
+            );
+            expect(Object.keys(claims)).toEqual([
+                ...BASE_KEYS,
+                "handle_sha256",
+                "payer",
+                "fee_payer",
+                "tx",
+            ]);
+            expect(claims).toMatchObject({ payer: PAYER, tx });
+        });
+
+        it("drops all three and warns once when the stored payer is not canonical", async () => {
+            const before = app.log.lines.length;
+            const claims = await redeemWith(
+                true,
+                { payer: "P" },
+                { payer: "P", txSignature: nextTx() },
+            );
+            expect(Object.keys(claims)).toEqual(BASE_KEYS);
+            const warns = app.log.lines
+                .slice(before)
+                .filter((l) => l.msg === "order token payer claims dropped");
+            expect(warns).toHaveLength(1);
+        });
+
+        it("drops all three when the order has no payment row", async () => {
+            const claims = await redeemWith(true, { payer: PAYER }, null);
+            expect(Object.keys(claims)).toEqual(BASE_KEYS);
+        });
     });
 
     it("fails an allowance order that has no payment row, and issues no token", async () => {

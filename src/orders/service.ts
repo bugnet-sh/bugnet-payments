@@ -38,7 +38,7 @@ import {
     StaleStateError,
     updateOrderFields,
 } from "./store.ts";
-import { claimsFor, signOrderToken } from "./token.ts";
+import { claimsFor, paymentProof, signOrderToken } from "./token.ts";
 import type { OrderRequest, OrderResult, OrderRow, RefusalReason } from "./types.ts";
 
 export interface OrderServiceDeps {
@@ -454,12 +454,17 @@ async function paid(
     const payment = await findPaymentByOrder(db, o.id);
     const payer = o.payer ?? payment?.payer;
     if (payer === undefined) throw new Error(`paid order ${o.id} has no payer`);
+    let proof;
+    if (d.settings.router.token_payer_claims) {
+        proof = paymentProof(payment?.payer, d.challenge.feePayer, payment?.txSignature);
+        if (proof === undefined) d.log.warn("order token payer claims dropped", { orderId: o.id });
+    }
     const out: Paid = {
         status: "paid",
         orderId: o.id,
         orderToken: signOrderToken(
             d.orderKey,
-            claimsFor(o, tokenExpiresAt, d.settings.router.allowance_claim),
+            claimsFor(o, tokenExpiresAt, d.settings.router.allowance_claim, proof),
         ),
         payer,
         kind: o.kind,

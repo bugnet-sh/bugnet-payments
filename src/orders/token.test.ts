@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { getBase58Decoder } from "@solana/kit";
 import { describe, expect, it } from "vitest";
 import { orderRow } from "../testing/orders.ts";
 import type { OrderRow } from "./types.ts";
@@ -8,11 +9,15 @@ import {
     claimsFor,
     orderKey,
     orderPublicKeyBase64,
+    paymentProof,
     signOrderToken,
     type OrderClaims,
 } from "./token.ts";
 
 const seed = Buffer.alloc(32, 7);
+const PAYER = getBase58Decoder().decode(Buffer.alloc(32, 9));
+const FEE_PAYER = getBase58Decoder().decode(Buffer.alloc(32, 5));
+const TX = getBase58Decoder().decode(Buffer.alloc(64, 3));
 const at = new Date("2026-11-06T12:10:00.000Z");
 const START =
     "v1.eyJvcmRlcl9pZCI6Im9yZF9hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImtpbmQiOiJzdGFydCIsInBhY2thZ2VfaWQiOiJjcHUtMi0yZy0xMG0iLCJhbW91bnRfbWljcm9zIjo1MDAwMCwiZXhwaXJlc19hdCI6IjIwMjYtMTEtMDZUMTI6MTA6MDAuMDAwWiJ9.xcufODyq28K0XzJqmS-uoAimARPU5c1e1hTXeCs3OHM7BojnuUSSuH0SYFTaRwkc2C4gfNrsSOdGAM5q8CU4Ag";
@@ -106,6 +111,56 @@ describe("allowance_micros claim", () => {
             "expires_at",
             "allowance_micros",
         ]);
+    });
+
+    it("adds payer, fee_payer and tx after the existing claims when given", () => {
+        const proof = { payer: PAYER, feePayer: FEE_PAYER, tx: TX };
+        expect(Object.keys(claimsFor(start(), at, true, proof))).toEqual([
+            "order_id",
+            "kind",
+            "package_id",
+            "amount_micros",
+            "expires_at",
+            "allowance_micros",
+            "payer",
+            "fee_payer",
+            "tx",
+        ]);
+        expect(claimsFor(start(), at, false, proof)).toMatchObject({
+            payer: PAYER,
+            fee_payer: FEE_PAYER,
+            tx: TX,
+        });
+    });
+
+    it("keeps the claim set unchanged when no proof is given", () => {
+        expect(Object.keys(claimsFor(start(), at, false))).toEqual([
+            "order_id",
+            "kind",
+            "package_id",
+            "amount_micros",
+            "expires_at",
+        ]);
+        expect(Object.keys(claimsFor(start(), at, false, undefined))).toHaveLength(5);
+    });
+});
+
+describe("paymentProof", () => {
+    it("returns the three values when all are canonical", () => {
+        expect(paymentProof(PAYER, FEE_PAYER, TX)).toEqual({
+            payer: PAYER,
+            feePayer: FEE_PAYER,
+            tx: TX,
+        });
+    });
+
+    it("returns undefined when any one is missing or not canonical", () => {
+        expect(paymentProof(undefined, FEE_PAYER, TX)).toBeUndefined();
+        expect(paymentProof(PAYER, "", TX)).toBeUndefined();
+        expect(paymentProof(PAYER, FEE_PAYER, undefined)).toBeUndefined();
+        expect(paymentProof("P", FEE_PAYER, TX)).toBeUndefined();
+        expect(paymentProof(PAYER, "not base58!", TX)).toBeUndefined();
+        expect(paymentProof(PAYER, FEE_PAYER, PAYER)).toBeUndefined();
     });
 });
 

@@ -1,4 +1,5 @@
 import { createPrivateKey, createPublicKey, sign, type KeyObject } from "node:crypto";
+import { isCanonicalAddress, isCanonicalSignature } from "../solana/base58.ts";
 import type { OrderRow } from "./types.ts";
 
 // Matches bugnet-router/internal/ordertoken, which decodes these claims strictly
@@ -10,6 +11,15 @@ export interface OrderClaims {
     expires_at: string;
     handle_sha256?: string;
     allowance_micros?: number;
+    payer?: string;
+    fee_payer?: string;
+    tx?: string;
+}
+
+export interface PaymentProof {
+    payer: string;
+    feePayer: string;
+    tx: string;
 }
 
 const pkcs8Ed25519Prefix = Buffer.from("302e020100300506032b657004220420", "hex");
@@ -31,7 +41,12 @@ export function signOrderToken(key: KeyObject, claims: OrderClaims): string {
 }
 
 // Claims come from the stored order, never from the request, so a replayed or tampered request cannot change what the token grants.
-export function claimsFor(order: OrderRow, expiresAt: Date, allowanceClaim: boolean): OrderClaims {
+export function claimsFor(
+    order: OrderRow,
+    expiresAt: Date,
+    allowanceClaim: boolean,
+    proof?: PaymentProof,
+): OrderClaims {
     if (order.kind === "allowance") throw new Error("allowance orders carry no token");
     const claims: OrderClaims = {
         order_id: order.id,
@@ -47,7 +62,24 @@ export function claimsFor(order: OrderRow, expiresAt: Date, allowanceClaim: bool
     if (order.kind === "start" && order.allowanceMicros > 0 && allowanceClaim) {
         claims.allowance_micros = order.allowanceMicros;
     }
+    if (proof !== undefined) {
+        claims.payer = proof.payer;
+        claims.fee_payer = proof.feePayer;
+        claims.tx = proof.tx;
+    }
     return claims;
+}
+
+// All three or none: a partial set would give the router a half-checkable record
+export function paymentProof(
+    payer: string | undefined,
+    feePayer: string | undefined,
+    tx: string | undefined,
+): PaymentProof | undefined {
+    if (!isCanonicalAddress(payer) || !isCanonicalAddress(feePayer) || !isCanonicalSignature(tx)) {
+        return undefined;
+    }
+    return { payer, feePayer, tx };
 }
 
 export function orderPublicKeyBase64(seed: Buffer): string {
