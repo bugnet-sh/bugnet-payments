@@ -43,6 +43,7 @@ timeout = "3s"
 check_payer = false                     # true once router Task 28 serves PaymentsService.CheckPayer
 get_order = false                       # true once the router serves GetOrder
 allowance_claim = false                 # true once router Task 28 accepts allowance_micros
+token_payer_claims = false              # true once router Task 28 accepts payer, fee_payer and tx
 event_public_key = ""                   # standard base64 of the router's 32-byte event key
 
 [refunds]

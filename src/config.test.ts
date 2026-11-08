@@ -67,6 +67,7 @@ describe("parseSettings", () => {
         expect(s.limits.status_per_ip_per_minute).toBe(240);
         expect(s.router.check_payer).toBe(false);
         expect(s.router.get_order).toBe(false);
+        expect(s.router.token_payer_claims).toBe(false);
         expect(s.http.public_listen).toBe("127.0.0.1:8450");
         expect(s.http.internal_listen).toBe("127.0.0.1:8447");
     });
