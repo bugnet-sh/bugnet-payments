@@ -337,7 +337,7 @@ h2 {
     :root { --box-pad: var(--pad); }
     code { font-size: var(--fine-size); }
     .box, .foot { width: 100%; max-width: none; }
-    .box { margin-top: var(--space-5); padding: var(--space-5) var(--box-pad); border-inline: 0; }
+    .box { margin-top: 0; padding: var(--space-5) var(--box-pad); border-inline: 0; border-top: 0; }
     .foot { padding: 0 var(--box-pad); }
     .mobile-links { display: flex; }
 }
