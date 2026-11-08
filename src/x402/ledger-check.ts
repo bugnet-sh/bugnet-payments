@@ -104,7 +104,13 @@ export async function ledgerCheck(
             result.lines.push(`refund ${row.id} resolved by hand ${row.handTx}`);
             continue;
         }
-        if (row.state !== "confirmed") continue;
+        if (row.state !== "confirmed") {
+            // The closed-account totals count a refund from the moment its row exists, so only
+            // the row's state shows that the money has not moved
+            result.lines.push(`refund ${row.id} ${row.state}`);
+            if (account.state === "closed") result.ok = false;
+            continue;
+        }
         const chain = await chainChange(rpc, rpcTimeoutMs, row.txSignature, row.destination);
         verdict("refund", row.id, row.amountMicros, chain);
     }

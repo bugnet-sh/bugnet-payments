@@ -141,6 +141,38 @@ describe("ledgerCheck", () => {
         expect(chain.calls().filter((c) => c.method === "getTransaction")).toHaveLength(0);
     });
 
+    it("fails a closed account whose refund has not been confirmed", async () => {
+        const { account, funding } = await closedAccount({ refundedMicros: 970_000 });
+        const pending = await seedAllowanceRefundRow(db.pool, funding.orderId, {
+            amountMicros: 970_000,
+            destination: payerAta,
+            state: "pending",
+        });
+        const r = await ledgerCheck(db.pool, chain.rpc, account.id, 5_000);
+        expect(r.ok).toBe(false);
+        expect(r.lines).toContain(`refund ${pending} pending`);
+        await db.pool.query(
+            "update refunds set state = 'manual', manual_reason = $2 where id = $1",
+            [pending, "refund_destination_invalid"],
+        );
+        const again = await ledgerCheck(db.pool, chain.rpc, account.id, 5_000);
+        expect(again.ok).toBe(false);
+        expect(again.lines).toContain(`refund ${pending} manual`);
+    });
+
+    it("lists but does not fail an unconfirmed refund on an open account", async () => {
+        const { account, funding } = await closedAccount({ refundedMicros: 970_000 });
+        await db.pool.query("update x402_accounts set state = 'open' where id = $1", [account.id]);
+        const id = await seedAllowanceRefundRow(db.pool, funding.orderId, {
+            amountMicros: 970_000,
+            destination: payerAta,
+            state: "pending",
+        });
+        const r = await ledgerCheck(db.pool, chain.rpc, account.id, 5_000);
+        expect(r.ok).toBe(true);
+        expect(r.lines).toContain(`refund ${id} pending`);
+    });
+
     it("names a closed account whose totals do not add up", async () => {
         const { account } = await closedAccount({ refundedMicros: 960_000 });
         const r = await ledgerCheck(db.pool, chain.rpc, account.id, 5_000);

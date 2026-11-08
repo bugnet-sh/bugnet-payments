@@ -115,6 +115,11 @@ Each test runs on the live stack in a real sandbox at a provider. Conventions us
     It checks every confirmed payment and every confirmed allowance refund of the account against
     the chain, to the micro-dollar, and that a closed account has `funded = spent + refunded +
 kept`. A refund resolved by hand is listed, not checked. Any `MISMATCH` line stops the run.
+    A line `refund <id> pending`, `signed`, `sent` or `manual` means the refund has not reached the
+    chain: on a closed account the check exits 1. Wait until the refund is confirmed and run the
+    check again; a `manual` refund is an incident, not a wait. The output also has a
+    `payment` line per confirmed payment and an `account` line with `spent=`; the per-test checks read payments and spend from these lines,
+    since `pnpm cli x402 status` does not print them.
 
 - Between tests: `pnpm cli x402 status` shows `paused: false`, and `pnpm cli x402 incident list`
   and `pnpm cli manual list` print nothing new. A new incident or manual row stops the run.
@@ -151,8 +156,9 @@ Checks: S4. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
 1. founder: `bugnet_start` with `GET https://SELLER_A/cents/ max=0.02` and `allowanceUsd: "0.10"`.
 2. bugnet-ea: `bugnet_exec`: 32 parallel `curl -s -X POST -d "call-$i" https://SELLER_A/cents/`,
    each with a different body.
-3. bugnet-22: at most 5 payments are confirmed, and spend never passes $0.10
-   (`pnpm cli x402 status`); the rest were refused `allowance_spent`.
+3. bugnet-22: after the stop, `pnpm cli x402 ledger-check <accountId>` prints at most 5 `payment`
+   lines and `spent=` at most 100000 on its `account` line; the rest were refused
+   `allowance_spent`.
 4. bugnet-ea: `bugnet_stop`.
 
 Checks: S5. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
@@ -162,7 +168,8 @@ Checks: S5. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
 1. founder: `bugnet_start` as in T3.
 2. bugnet-ea: `bugnet_exec`: 32 parallel `curl -s -X POST -d same https://SELLER_A/cents/`, one
    identical body.
-3. bugnet-22: exactly 5 payments confirmed, and 27 calls answered `allowance_spent` (egress log).
+3. bugnet-22: after the stop, `pnpm cli x402 ledger-check <accountId>` prints exactly 5 `payment`
+   lines; 27 calls were answered `allowance_spent` (egress log).
 4. bugnet-ea: `bugnet_stop`.
 
 Checks: S5. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
@@ -172,7 +179,8 @@ Checks: S5. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
 1. founder: `bugnet_start` with a service line for `SELLER_A` only.
 2. bugnet-ea: `bugnet_exec`: `curl -si https://SELLER_B/ok/`. The seller's own 402 comes back and
    nothing is paid.
-3. bugnet-22: `pnpm cli x402 status` and the account show no payment to SELLER_B.
+3. bugnet-22: after the stop, `pnpm cli x402 ledger-check <accountId>` prints no `payment` line
+   for SELLER_B's token account and `spent=0` on its `account` line.
 4. bugnet-ea: `bugnet_stop`.
 
 Checks: S7. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
@@ -181,8 +189,9 @@ Checks: S7. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
 
 1. founder: `bugnet_start` with a service line for `GET https://SELLER_A/bait/ max=0.01`.
 2. bugnet-ea: `bugnet_exec`: `curl -si https://SELLER_A/bait/`. The seller asks $10, above the pinned max.
-3. bugnet-22: the call is refused and nothing is paid: `pnpm cli x402 status` shows no confirmed
-   payment, and `pnpm cli x402 incident list` prints nothing.
+3. bugnet-22: the call is refused and nothing is paid: after the stop, the ledger check
+   (`pnpm cli x402 ledger-check <accountId>`) prints no `payment` line and `spent=0` on its
+   `account` line, and `pnpm cli x402 incident list` prints nothing.
 4. bugnet-ea: `bugnet_stop`.
 
 Checks: S8. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
@@ -191,8 +200,9 @@ Checks: S8. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
 
 1. founder: `bugnet_start` with a service line for `GET https://SELLER_A/switch/ max=0.01`.
 2. bugnet-ea: `bugnet_exec`: `curl -si https://SELLER_A/switch/`. The seller names a different payTo on every 402.
-3. bugnet-22: the call is refused and nothing is paid: `pnpm cli x402 status` shows no confirmed
-   payment, and `pnpm cli x402 incident list` prints nothing.
+3. bugnet-22: the call is refused and nothing is paid: after the stop, the ledger check
+   (`pnpm cli x402 ledger-check <accountId>`) prints no `payment` line and `spent=0` on its
+   `account` line, and `pnpm cli x402 incident list` prints nothing.
 4. bugnet-ea: `bugnet_stop`.
 
 Checks: S8. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
@@ -201,8 +211,9 @@ Checks: S8. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
 
 1. founder: `bugnet_start` with a service line for `GET https://SELLER_A/splits/ max=0.01`.
 2. bugnet-ea: `bugnet_exec`: `curl -si https://SELLER_A/splits/`. The seller sets a splits field.
-3. bugnet-22: the call is refused and nothing is paid: `pnpm cli x402 status` shows no confirmed
-   payment, and `pnpm cli x402 incident list` prints nothing.
+3. bugnet-22: the call is refused and nothing is paid: after the stop, the ledger check
+   (`pnpm cli x402 ledger-check <accountId>`) prints no `payment` line and `spent=0` on its
+   `account` line, and `pnpm cli x402 incident list` prints nothing.
 4. bugnet-ea: `bugnet_stop`.
 
 Checks: S8. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
@@ -211,8 +222,9 @@ Checks: S8. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
 
 1. founder: `bugnet_start` with a service line for `GET https://SELLER_A/upto/ max=0.01`.
 2. bugnet-ea: `bugnet_exec`: `curl -si https://SELLER_A/upto/`. The seller uses the upto scheme (repeat with /escrow/, the escrow scheme).
-3. bugnet-22: the call is refused and nothing is paid: `pnpm cli x402 status` shows no confirmed
-   payment, and `pnpm cli x402 incident list` prints nothing.
+3. bugnet-22: the call is refused and nothing is paid: after the stop, the ledger check
+   (`pnpm cli x402 ledger-check <accountId>`) prints no `payment` line and `spent=0` on its
+   `account` line, and `pnpm cli x402 incident list` prints nothing.
 4. bugnet-ea: `bugnet_stop`.
 
 Checks: S8. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
@@ -221,8 +233,9 @@ Checks: S8. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
 
 1. founder: `bugnet_start` with a service line for `GET https://SELLER_A/ata/ max=0.01`.
 2. bugnet-ea: `bugnet_exec`: `curl -si https://SELLER_A/ata/`. The seller asks us to create an associated token account.
-3. bugnet-22: the call is refused and nothing is paid: `pnpm cli x402 status` shows no confirmed
-   payment, and `pnpm cli x402 incident list` prints nothing.
+3. bugnet-22: the call is refused and nothing is paid: after the stop, the ledger check
+   (`pnpm cli x402 ledger-check <accountId>`) prints no `payment` line and `spent=0` on its
+   `account` line, and `pnpm cli x402 incident list` prints nothing.
 4. bugnet-ea: `bugnet_stop`.
 
 Checks: S8. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
@@ -231,8 +244,9 @@ Checks: S8. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
 
 1. founder: `bugnet_start` with a service line for `GET https://SELLER_A/feepayer-bugnet/ max=0.01`.
 2. bugnet-ea: `bugnet_exec`: `curl -si https://SELLER_A/feepayer-bugnet/`. The seller names a Bugnet address as its fee payer (R3).
-3. bugnet-22: the call is refused and nothing is paid: `pnpm cli x402 status` shows no confirmed
-   payment, and `pnpm cli x402 incident list` prints nothing.
+3. bugnet-22: the call is refused and nothing is paid: after the stop, the ledger check
+   (`pnpm cli x402 ledger-check <accountId>`) prints no `payment` line and `spent=0` on its
+   `account` line, and `pnpm cli x402 incident list` prints nothing.
 4. bugnet-ea: `bugnet_stop`.
 
 Checks: S8. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
@@ -242,8 +256,9 @@ Checks: S8. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
 1. founder: `bugnet_start` with `GET https://SELLER_A/late/ max=0.01` and an allowance of $0.05.
 2. bugnet-ea: `bugnet_exec`: 20 parallel `curl -s https://SELLER_A/late/`. The seller answers
    `success: false` and submits 20 s later.
-3. bugnet-22: at most 5 payments are signed, and spend never passes $0.05. Watch
-   `pnpm cli x402 status` for `signed` lines; a late-landed row ends confirmed, never twice.
+3. bugnet-22: at most 5 payments are signed. Watch `pnpm cli x402 status` for `signed` lines; a
+   late-landed row ends confirmed, never twice. After the stop, `pnpm cli x402 ledger-check
+<accountId>` prints at most 5 `payment` lines and `spent=` at most 50000.
 4. bugnet-ea: `bugnet_stop`.
 
 Checks: S9. Last: `pnpm cli x402 ledger-check <accountId>` exits 0.
