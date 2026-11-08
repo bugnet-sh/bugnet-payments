@@ -888,6 +888,19 @@ describe("the x402 operator commands", () => {
         expect(await controls()).toMatchObject({ disabled: false, reason: null });
     });
 
+    it("unkill keeps the pause reason while the pause stays set", async () => {
+        expect(await cli(["x402", "pause", "audit"])).toBe(0);
+        expect(await cli(["x402", "kill"])).toBe(0);
+        expect(await cli(["x402", "unkill"])).toBe(0);
+        expect(await controls()).toMatchObject({ paused: true, disabled: false, reason: "audit" });
+        expect(await cli(["x402", "refunds", "hold"])).toBe(0);
+        expect(await cli(["x402", "resume"])).toBe(0);
+        expect(await controls()).toMatchObject({ paused: false, refundsHeld: true });
+        expect((await controls()).reason).not.toBeNull();
+        expect(await cli(["x402", "refunds", "release"])).toBe(0);
+        expect((await controls()).reason).toBeNull();
+    });
+
     it("pause rejects an empty or control-character reason", async () => {
         expect(await cli(["x402", "pause", ""])).toBe(2);
         expect(await cli(["x402", "pause", "a\nb"])).toBe(2);
@@ -927,6 +940,17 @@ describe("the x402 operator commands", () => {
         const io = captureIo();
         expect(await cli(["x402", "unblock-payto", TEST_PAYTO], io)).toBe(0);
         expect(io.outText()).toBe(`${TEST_PAYTO}: was not blocked`);
+    });
+
+    it("re-blocking an address updates its reason; unblock refuses a non-address", async () => {
+        expect(await cli(["x402", "block-payto", TEST_PAYTO, "first"])).toBe(0);
+        expect(await cli(["x402", "block-payto", TEST_PAYTO, "second"])).toBe(0);
+        const { rows } = await db.pool.query("select reason from x402_blocked_payto");
+        expect(rows).toEqual([{ reason: "second" }]);
+        const io = captureIo();
+        expect(await cli(["x402", "unblock-payto", "0OIl"], io)).toBe(1);
+        expect(io.errText()).toContain("not a 32-byte address");
+        expect(await isPayToBlocked(db.pool, TEST_PAYTO)).toBe(true);
     });
 
     it("service reset sets enabled and failures 0", async () => {

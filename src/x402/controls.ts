@@ -65,7 +65,7 @@ export async function blockedAmong(
 
 export async function blockPayTo(db: Queryable, payTo: string, reason: string): Promise<void> {
     await db.query(
-        "insert into x402_blocked_payto (pay_to, reason) values ($1, $2) on conflict (pay_to) do nothing",
+        "insert into x402_blocked_payto (pay_to, reason) values ($1, $2) on conflict (pay_to) do update set reason = excluded.reason",
         [payTo, reason],
     );
 }

@@ -1,7 +1,7 @@
 import { address } from "@solana/kit";
 import type pg from "pg";
 import { loadSettings, secretValues, type Settings } from "./config.ts";
-import { createPool, withTx } from "./db/pool.ts";
+import { createPool, withTx, type Queryable } from "./db/pool.ts";
 import { isKeysCommand, KEYS_USAGE, runKeys } from "./keys/commands.ts";
 import { jsonLog, type Log } from "./log.ts";
 import { isOrderId } from "./orders/ids.ts";
@@ -626,13 +626,54 @@ async function x402Pause(
     return 0;
 }
 
+// The reason column is shared by all three controls, so it is only cleared once none is left set.
+async function releaseControl(
+    c: Queryable,
+    field: "paused" | "disabled" | "refundsHeld",
+    at: Date,
+): Promise<void> {
+    const { rows } = await c.query<{ paused: boolean; disabled: boolean; refunds_held: boolean }>(
+        "select paused, disabled, refunds_held from x402_controls where id = 1 for update",
+    );
+    const row = rows[0]!;
+    const others = {
+        paused: row.paused,
+        disabled: row.disabled,
+        refundsHeld: row.refunds_held,
+        [field]: false,
+    };
+    const stillSet = others.paused || others.disabled || others.refundsHeld;
+    if (stillSet) {
+        await c.query(
+            `update x402_controls set ${field === "refundsHeld" ? "refunds_held" : field} = false,
+             changed_at = $1 where id = 1`,
+            [at],
+        );
+        return;
+    }
+    await setControls(c, { [field]: false }, null, at);
+}
+
+// An earlier control's reason stays, so the row keeps explaining why it is not running.
+async function engageControl(
+    c: Queryable,
+    field: "disabled" | "refundsHeld",
+    reason: string,
+    at: Date,
+): Promise<void> {
+    const { rows } = await c.query<{ reason: string | null }>(
+        "select reason from x402_controls where id = 1 for update",
+    );
+    await setControls(c, { [field]: true }, rows[0]!.reason ?? reason, at);
+}
+
 async function x402Resume(ctx: CliContext, io: CliIo): Promise<number> {
     const refused = await withTx(ctx.pool, async (c) => {
         // recordIncident updates this row, so the check and the resume cannot interleave with one
         await c.query("select 1 from x402_controls where id = 1 for update");
         const [oldest] = await openIncidents(c);
         if (oldest !== undefined) return `unresolved incident ${oldest.id} ${oldest.kind}`;
-        await setControls(c, { paused: false }, null, ctx.now());
+        await releaseControl(c, "paused", ctx.now());
         return null;
     });
     if (refused !== null) {
@@ -644,13 +685,13 @@ async function x402Resume(ctx: CliContext, io: CliIo): Promise<number> {
 }
 
 async function x402Kill(ctx: CliContext, io: CliIo): Promise<number> {
-    await setControls(ctx.pool, { disabled: true }, "x402 kill", ctx.now());
+    await withTx(ctx.pool, (c) => engageControl(c, "disabled", "x402 kill", ctx.now()));
     io.out("x402 killed");
     return 0;
 }
 
 async function x402Unkill(ctx: CliContext, io: CliIo): Promise<number> {
-    await setControls(ctx.pool, { disabled: false }, null, ctx.now());
+    await withTx(ctx.pool, (c) => releaseControl(c, "disabled", ctx.now()));
     io.out("x402 unkilled");
     return 0;
 }
@@ -674,6 +715,10 @@ async function x402Unblock(
     io: CliIo,
     [payTo = ""]: readonly string[],
 ): Promise<number> {
+    if (!isCanonicalAddress(payTo)) {
+        io.err(`${JSON.stringify(payTo)} is not a 32-byte address`);
+        return 1;
+    }
     io.out(
         (await unblockPayTo(ctx.pool, payTo)) ? `${payTo}: unblocked` : `${payTo}: was not blocked`,
     );
@@ -699,13 +744,13 @@ async function x402ServiceReset(
 }
 
 async function x402RefundsHold(ctx: CliContext, io: CliIo): Promise<number> {
-    await setControls(ctx.pool, { refundsHeld: true }, "x402 refunds hold", ctx.now());
+    await withTx(ctx.pool, (c) => engageControl(c, "refundsHeld", "x402 refunds hold", ctx.now()));
     io.out("x402 refunds held");
     return 0;
 }
 
 async function x402RefundsRelease(ctx: CliContext, io: CliIo): Promise<number> {
-    await setControls(ctx.pool, { refundsHeld: false }, null, ctx.now());
+    await withTx(ctx.pool, (c) => releaseControl(c, "refundsHeld", ctx.now()));
     io.out("x402 refunds released");
     return 0;
 }
