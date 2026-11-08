@@ -657,3 +657,82 @@ describe("paid_via", () => {
         }
     });
 });
+
+describe("public payment list", () => {
+    const PATH = "/api/stats/payments";
+
+    async function paidThroughRoute(): Promise<OrderRow> {
+        const o = await unpaid();
+        const r = await pub(`/o/${o.id}`, {
+            "payment-signature": await headerFor(o),
+            "bugnet-client": "checkout",
+        });
+        expect(r.status).toBe(200);
+        return o;
+    }
+
+    it("answers the page without a token, cacheable for 30 s", async () => {
+        const o = await paidThroughRoute();
+        const r = await pub(PATH);
+        expect(r.status).toBe(200);
+        expect(r.headers.get("cache-control")).toBe("public, max-age=30");
+        expect(r.headers.get("content-type")).toBe("application/json");
+        expect(r.headers.get("x-content-type-options")).toBe("nosniff");
+        const body = await r.json();
+        expect(Object.keys(body)).toEqual(["items", "next"]);
+        const payment = (await findPaymentByOrder(app.pool, o.id))!;
+        expect(body.items).toContainEqual({
+            at: app.now.get().toISOString(),
+            kind: "sandbox",
+            amountMicros: o.amountMicros,
+            method: "checkout",
+            wallet: app.payer.address,
+            tx: payment.txSignature,
+        });
+    });
+
+    it("answers HEAD with the same headers and no body", async () => {
+        const r = await fetch(`${app.publicOrigin}${PATH}`, {
+            method: "HEAD",
+            headers: { "x-forwarded-for": freshIp() },
+        });
+        expect(r.status).toBe(200);
+        expect(r.headers.get("cache-control")).toBe("public, max-age=30");
+        expect(await r.text()).toBe("");
+    });
+
+    it("pages with before and ignores every other query parameter", async () => {
+        const first = await (await pub(PATH)).json();
+        const again = await (await pub(`${PATH}?limit=1&after=x&before=`)).json();
+        expect(again).toEqual(first);
+    });
+
+    it("answers 400 bad_cursor for a cursor that does not decode or is too long", async () => {
+        for (const before of ["nope!", "e30", "a".repeat(201)]) {
+            const r = await pub(`${PATH}?before=${before}`);
+            expect(r.status).toBe(400);
+            expect(r.headers.get("cache-control")).toBe("no-store");
+            expect(await r.json()).toEqual({ error: "bad_cursor" });
+        }
+    });
+
+    it("answers 405 with Allow to any method but GET and HEAD", async () => {
+        for (const method of ["POST", "PUT", "DELETE"]) {
+            const r = await fetch(`${app.publicOrigin}${PATH}`, {
+                method,
+                headers: { "x-forwarded-for": freshIp() },
+            });
+            expect(r.status).toBe(405);
+            expect(r.headers.get("allow")).toBe("GET, HEAD");
+            expect(await r.json()).toEqual({ error: "method_not_allowed" });
+        }
+    });
+
+    it("counts against the per-IP limit of the other public routes", async () => {
+        for (let i = 0; i < 60; i++) {
+            expect((await pub(PATH, { "x-forwarded-for": "10.9.9.9" })).status).toBe(200);
+        }
+        const limited = await pub(PATH, { "x-forwarded-for": "10.9.9.9" });
+        expect(limited.status).toBe(429);
+    });
+});
