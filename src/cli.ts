@@ -1,3 +1,4 @@
+import { address } from "@solana/kit";
 import type pg from "pg";
 import { loadSettings, secretValues, type Settings } from "./config.ts";
 import { createPool, withTx } from "./db/pool.ts";
@@ -15,11 +16,15 @@ import {
     requestRefund,
     returnManualToRedeemed,
 } from "./refunds/request.ts";
-import { isCanonicalSignature } from "./solana/base58.ts";
+import { usdcAta } from "./solana/accounts.ts";
+import { isCanonicalAddress, isCanonicalSignature } from "./solana/base58.ts";
 import { createRpc, type SolanaRpc } from "./solana/rpc.ts";
-import { readControls } from "./x402/controls.ts";
+import { blockPayTo, readControls, setControls, unblockPayTo } from "./x402/controls.ts";
 import { type AllowanceFunding, createAllowanceFunding } from "./x402/funding.ts";
+import { openIncidents, resolveIncident } from "./x402/incidents.ts";
+import { SERVICE_ID } from "./x402/ids.ts";
 import { type ResignProof, resignProof } from "./x402/resign.ts";
+import { x402Status } from "./x402/status.ts";
 
 export interface CliIo {
     out: (s: string) => void;
@@ -46,10 +51,32 @@ const USAGE = [
     "                                           allowance-wallet row: record the transfer",
     "  refunds status",
     "  refunds resume",
+    "  x402 pause <reason>                      stop new x402 payments",
+    "  x402 resume                              allow them again; refused while an incident is open",
+    "  x402 kill                                disable x402 payments",
+    "  x402 unkill                              enable them again",
+    "  x402 block-payto <address> <reason>      refuse payments to this address",
+    "  x402 unblock-payto <address>",
+    "  x402 service reset <accountId> <serviceId>",
+    "                                           make an unreliable service enabled again",
+    "  x402 refunds hold                        hold the allowance-wallet refunds",
+    "  x402 refunds release",
+    "  x402 incident list                       the open incidents",
+    "  x402 incident resolve <id> <finding>     close an incident with what was found",
+    "  x402 status                              controls, pool, balances and open facts",
     KEYS_USAGE,
 ].join("\n");
 
-type Param = "orderId" | "amountMicros" | "refundId" | "orderOrRefund";
+type Param =
+    | "orderId"
+    | "amountMicros"
+    | "refundId"
+    | "orderOrRefund"
+    | "text"
+    | "address"
+    | "accountId"
+    | "serviceId"
+    | "incidentId";
 
 const isCount = (s: string): boolean => /^[1-9][0-9]*$/.test(s) && Number.isSafeInteger(Number(s));
 
@@ -61,6 +88,14 @@ const PARAMS: Record<Param, { valid: (s: string) => boolean; what: string }> = {
         valid: (s) => isOrderId(s) || isCount(s),
         what: "an order id or a refund id",
     },
+    text: {
+        valid: (s) => s.length >= 1 && s.length <= 200 && !/\p{Cc}/u.test(s),
+        what: "1 to 200 characters without control characters",
+    },
+    address: { valid: (s) => s !== "", what: "an address" },
+    accountId: { valid: isOrderId, what: "an account id" },
+    serviceId: { valid: (s) => SERVICE_ID.test(s), what: "a service id" },
+    incidentId: { valid: isCount, what: "an incident id" },
 };
 
 export interface CliOptions {
@@ -97,6 +132,18 @@ const DB_COMMANDS = new Map<string, DbCommand>([
     ["manual resolve", { params: ["orderOrRefund"], flags: ["--tx"], run: resolveManual }],
     ["refunds status", { params: [], run: refundsStatus }],
     ["refunds resume", { params: [], run: refundsResume }],
+    ["x402 pause", { params: ["text"], run: x402Pause }],
+    ["x402 resume", { params: [], run: x402Resume }],
+    ["x402 kill", { params: [], run: x402Kill }],
+    ["x402 unkill", { params: [], run: x402Unkill }],
+    ["x402 block-payto", { params: ["address", "text"], run: x402Block }],
+    ["x402 unblock-payto", { params: ["address"], run: x402Unblock }],
+    ["x402 service reset", { params: ["accountId", "serviceId"], run: x402ServiceReset }],
+    ["x402 refunds hold", { params: [], run: x402RefundsHold }],
+    ["x402 refunds release", { params: [], run: x402RefundsRelease }],
+    ["x402 incident list", { params: [], run: x402IncidentList }],
+    ["x402 incident resolve", { params: ["incidentId", "text"], run: x402IncidentResolve }],
+    ["x402 status", { params: [], run: x402StatusCommand }],
 ]);
 
 export async function cliMain(
@@ -537,6 +584,144 @@ async function refundsStatus(ctx: CliContext, io: CliIo): Promise<number> {
 async function refundsResume(ctx: CliContext, io: CliIo): Promise<number> {
     await resumeRefunds(ctx.pool);
     io.out("refunds resumed");
+    return 0;
+}
+
+async function x402Pause(
+    ctx: CliContext,
+    io: CliIo,
+    [reason = ""]: readonly string[],
+): Promise<number> {
+    await setControls(ctx.pool, { paused: true }, reason, ctx.now());
+    io.out("x402 paused");
+    return 0;
+}
+
+async function x402Resume(ctx: CliContext, io: CliIo): Promise<number> {
+    const refused = await withTx(ctx.pool, async (c) => {
+        // recordIncident updates this row, so the check and the resume cannot interleave with one
+        await c.query("select 1 from x402_controls where id = 1 for update");
+        const [oldest] = await openIncidents(c);
+        if (oldest !== undefined) return `unresolved incident ${oldest.id} ${oldest.kind}`;
+        await setControls(c, { paused: false }, null, ctx.now());
+        return null;
+    });
+    if (refused !== null) {
+        io.err(refused);
+        return 1;
+    }
+    io.out("x402 resumed");
+    return 0;
+}
+
+async function x402Kill(ctx: CliContext, io: CliIo): Promise<number> {
+    await setControls(ctx.pool, { disabled: true }, "x402 kill", ctx.now());
+    io.out("x402 killed");
+    return 0;
+}
+
+async function x402Unkill(ctx: CliContext, io: CliIo): Promise<number> {
+    await setControls(ctx.pool, { disabled: false }, null, ctx.now());
+    io.out("x402 unkilled");
+    return 0;
+}
+
+async function x402Block(
+    ctx: CliContext,
+    io: CliIo,
+    [payTo = "", reason = ""]: readonly string[],
+): Promise<number> {
+    if (!isCanonicalAddress(payTo)) {
+        io.err(`${JSON.stringify(payTo)} is not a 32-byte address`);
+        return 1;
+    }
+    await blockPayTo(ctx.pool, payTo, reason);
+    io.out(`${payTo}: blocked`);
+    return 0;
+}
+
+async function x402Unblock(
+    ctx: CliContext,
+    io: CliIo,
+    [payTo = ""]: readonly string[],
+): Promise<number> {
+    io.out(
+        (await unblockPayTo(ctx.pool, payTo)) ? `${payTo}: unblocked` : `${payTo}: was not blocked`,
+    );
+    return 0;
+}
+
+async function x402ServiceReset(
+    ctx: CliContext,
+    io: CliIo,
+    [accountId = "", serviceId = ""]: readonly string[],
+): Promise<number> {
+    const res = await ctx.pool.query(
+        `update x402_services set state = 'enabled', failures = 0, updated_at = $3
+         where account_id = $1 and service_id = $2`,
+        [accountId, serviceId, ctx.now()],
+    );
+    if (res.rowCount !== 1) {
+        io.err(`${accountId} ${serviceId}: unknown service`);
+        return 1;
+    }
+    io.out(`${serviceId}: enabled`);
+    return 0;
+}
+
+async function x402RefundsHold(ctx: CliContext, io: CliIo): Promise<number> {
+    await setControls(ctx.pool, { refundsHeld: true }, "x402 refunds hold", ctx.now());
+    io.out("x402 refunds held");
+    return 0;
+}
+
+async function x402RefundsRelease(ctx: CliContext, io: CliIo): Promise<number> {
+    await setControls(ctx.pool, { refundsHeld: false }, null, ctx.now());
+    io.out("x402 refunds released");
+    return 0;
+}
+
+async function x402IncidentList(ctx: CliContext, io: CliIo): Promise<number> {
+    for (const i of await openIncidents(ctx.pool)) {
+        io.out(
+            [
+                i.id,
+                i.kind,
+                i.subject,
+                i.lossMicros,
+                i.createdAt.toISOString(),
+                JSON.stringify(i.detail),
+            ].join("\t"),
+        );
+    }
+    return 0;
+}
+
+async function x402IncidentResolve(
+    ctx: CliContext,
+    io: CliIo,
+    [id = "", finding = ""]: readonly string[],
+): Promise<number> {
+    if (!(await resolveIncident(ctx.pool, Number(id), finding, ctx.now()))) {
+        io.err(`incident ${id}: unknown or resolved incident`);
+        return 1;
+    }
+    io.out(`incident ${id}: resolved`);
+    return 0;
+}
+
+async function x402StatusCommand(ctx: CliContext, io: CliIo): Promise<number> {
+    const wallet = ctx.settings.x402.allowance_wallet;
+    const hot = wallet === "" ? null : await usdcAta(address(wallet));
+    for (const line of await x402Status(
+        ctx.pool,
+        ctx.rpcOrNull(),
+        hot,
+        ctx.settings.x402,
+        ctx.now(),
+    )) {
+        io.out(line);
+    }
     return 0;
 }
 

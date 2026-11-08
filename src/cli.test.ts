@@ -14,8 +14,10 @@ import { testDb, type TestDb } from "./testing/db.ts";
 import { createFakeRpc } from "./testing/fake-rpc.ts";
 import { testSigner } from "./testing/keys.ts";
 import { seedOrder, seedPayment } from "./testing/orders.ts";
-import { resetLedger, seedAccount, seedFunding } from "./testing/x402.ts";
-import { setControls } from "./x402/controls.ts";
+import { withTx } from "./db/pool.ts";
+import { resetLedger, seedAccount, seedFunding, seedService, TEST_PAYTO } from "./testing/x402.ts";
+import { isPayToBlocked, readControls, setControls } from "./x402/controls.ts";
+import { openIncidents, recordIncident } from "./x402/incidents.ts";
 import { readPool } from "./x402/ledger.ts";
 
 let db: TestDb;
@@ -33,6 +35,7 @@ beforeAll(async () => {
 beforeEach(async () => {
     await resetLedger(db.pool);
     await db.pool.query("update x402_tail set verified_slot = 0");
+    await db.pool.query("truncate x402_incidents, x402_blocked_payto");
 });
 afterAll(async () => {
     await db.close();
@@ -751,5 +754,124 @@ describe("cliMain hot-wallet queue", () => {
             expect(await cli(args, io)).toBe(2);
             expect(io.errText()).toContain("usage");
         }
+    });
+});
+
+describe("the x402 operator commands", () => {
+    const controls = () => readControls(db.pool);
+
+    it("pause, resume, kill and unkill change the row", async () => {
+        expect(await cli(["x402", "pause", "audit"])).toBe(0);
+        expect(await controls()).toMatchObject({ paused: true, reason: "audit" });
+        expect(await cli(["x402", "resume"])).toBe(0);
+        expect((await controls()).paused).toBe(false);
+        expect(await cli(["x402", "kill"])).toBe(0);
+        expect(await controls()).toMatchObject({ disabled: true, reason: "x402 kill" });
+        expect(await cli(["x402", "unkill"])).toBe(0);
+        expect(await controls()).toMatchObject({ disabled: false, reason: null });
+    });
+
+    it("pause rejects an empty or control-character reason", async () => {
+        expect(await cli(["x402", "pause", ""])).toBe(2);
+        expect(await cli(["x402", "pause", "a\nb"])).toBe(2);
+        expect((await controls()).paused).toBe(false);
+    });
+
+    it("resume exits 1 while an incident is unresolved, then works after incident resolve", async () => {
+        await withTx(db.pool, (c) =>
+            recordIncident(
+                c,
+                { kind: "mirror_gap", subject: SIG(4), detail: {} },
+                silentLog,
+                new Date(),
+            ),
+        );
+        const [inc] = await openIncidents(db.pool);
+        const io = captureIo();
+        expect(await cli(["x402", "resume"], io)).toBe(1);
+        expect(io.errText()).toContain(`unresolved incident ${inc!.id} mirror_gap`);
+        expect((await controls()).paused).toBe(true);
+        expect(
+            await cli(["x402", "incident", "resolve", String(inc!.id), "rpc history lagged"]),
+        ).toBe(0);
+        expect(await cli(["x402", "resume"])).toBe(0);
+        expect((await controls()).paused).toBe(false);
+        const again = captureIo();
+        expect(await cli(["x402", "incident", "resolve", String(inc!.id), "again"], again)).toBe(1);
+        expect(again.errText()).toContain("unknown or resolved incident");
+    });
+
+    it('block-payto refuses "0OIl" and blocks a canonical address; unblock-payto', async () => {
+        expect(await cli(["x402", "block-payto", "0OIl", "scam"])).toBe(1);
+        expect(await cli(["x402", "block-payto", TEST_PAYTO, "scam"])).toBe(0);
+        expect(await isPayToBlocked(db.pool, TEST_PAYTO)).toBe(true);
+        expect(await cli(["x402", "unblock-payto", TEST_PAYTO])).toBe(0);
+        expect(await isPayToBlocked(db.pool, TEST_PAYTO)).toBe(false);
+        const io = captureIo();
+        expect(await cli(["x402", "unblock-payto", TEST_PAYTO], io)).toBe(0);
+        expect(io.outText()).toBe(`${TEST_PAYTO}: was not blocked`);
+    });
+
+    it("service reset sets enabled and failures 0", async () => {
+        const a = await seedAccount(db.pool, {});
+        const s = await seedService(db.pool, {
+            accountId: a.id,
+            serviceId: "xs_w5a4htopmpzmmhos",
+            state: "unreliable",
+            failures: 3,
+        });
+        expect(await cli(["x402", "service", "reset", a.id, s.serviceId])).toBe(0);
+        const row = (
+            await db.pool.query("select state, failures from x402_services where account_id = $1", [
+                a.id,
+            ])
+        ).rows[0];
+        expect(row).toEqual({ state: "enabled", failures: 0 });
+        const io = captureIo();
+        expect(await cli(["x402", "service", "reset", a.id, "xs_beynw7muaoanyeri"], io)).toBe(1);
+        expect(io.errText()).toContain("unknown service");
+    });
+
+    it("refunds hold and release flip refunds_held", async () => {
+        expect(await cli(["x402", "refunds", "hold"])).toBe(0);
+        expect(await controls()).toMatchObject({
+            refundsHeld: true,
+            reason: "x402 refunds hold",
+        });
+        expect(await cli(["x402", "refunds", "release"])).toBe(0);
+        expect((await controls()).refundsHeld).toBe(false);
+    });
+
+    it("incident list prints kind, subject, loss and detail", async () => {
+        await withTx(db.pool, (c) =>
+            recordIncident(
+                c,
+                {
+                    kind: "unknown_change",
+                    subject: SIG(5),
+                    lossMicros: 5_000,
+                    detail: { deltaMicros: "-5000" },
+                },
+                silentLog,
+                new Date(),
+            ),
+        );
+        const io = captureIo();
+        expect(await cli(["x402", "incident", "list"], io)).toBe(0);
+        const cells = io
+            .outText()
+            .split("\n")
+            .find((l) => l.includes(SIG(5)))!
+            .split("\t");
+        expect(cells[1]).toBe("unknown_change");
+        expect(cells[2]).toBe(SIG(5));
+        expect(cells[3]).toBe("5000");
+        expect(JSON.parse(cells[5]!)).toEqual({ deltaMicros: "-5000" });
+    });
+
+    it("x402 status runs without an RPC URL", async () => {
+        const io = captureIo();
+        expect(await cli(["x402", "status"], io)).toBe(0);
+        expect(io.outText()).toContain("chain balance: unavailable");
     });
 });
