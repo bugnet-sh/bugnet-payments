@@ -449,12 +449,9 @@ export function readSecrets(env: NodeJS.ProcessEnv, s: Settings): Secrets {
     const routerToken = env[routerName] ?? "";
     // The router client sends its token only while a router flag is on
     const x402On = s.x402.allowance_wallet !== "";
-    if (s.router.check_payer || s.router.get_order || x402On) {
-        text(routerName);
-        bearer(routerName, routerToken);
-    } else {
-        token(routerName, routerToken);
-    }
+    if (s.router.check_payer || s.router.get_order || x402On) text(routerName);
+    // stats totals answers to any router token that is set, so a set one is always a bearer
+    if (routerToken !== "") bearer(routerName, routerToken);
     // Spec section 4 keeps the router caller token apart from the gateway's token
     if (routerToken !== "" && routerToken === paymentsToken) {
         bad.set(routerName, "must differ from BUGNET_PAYMENTS_TOKEN");

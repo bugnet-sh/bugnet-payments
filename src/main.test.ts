@@ -718,7 +718,7 @@ describe("main", () => {
     it("redacts every secret variable, as a value and inside an Error in an object", async () => {
         const rpc = await rpcStub(true);
         const env = envFor(rpc.url, {
-            BUGNET_PAYMENTS_ROUTER_TOKEN: "router-token-main-test",
+            BUGNET_PAYMENTS_ROUTER_TOKEN: "router-token-main-test-0123456789abcdef",
             BUGNET_TEST_PAYER_KEY: "test-payer-key-main-test",
             BUGNET_TEST_PAYER_MNEMONIC: "abandon ability able, about above absent",
             BUGNET_RECIPIENT_KEY: "recipient-key-main-test",

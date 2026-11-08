@@ -110,8 +110,9 @@ sudoedit /etc/bugnet/payments.env
 ```
 
 Boot refuses a `BUGNET_PAYMENTS_TOKEN` shorter than 32 characters, and a shorter
-`BUGNET_PAYMENTS_ROUTER_TOKEN` while `router.get_order` or `router.check_payer` is on, or `[x402]
-allowance_wallet` is set; `openssl rand -base64 32` makes one of 44.
+`BUGNET_PAYMENTS_ROUTER_TOKEN` whenever it is set (it is required while `router.get_order` or
+`router.check_payer` is on, or `[x402] allowance_wallet` is set); `openssl rand -base64 32` makes
+one of 44.
 
 ## 4. Postgres
 

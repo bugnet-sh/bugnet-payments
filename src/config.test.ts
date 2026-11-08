@@ -234,7 +234,7 @@ describe("readSecrets", () => {
         ).not.toThrow();
     });
 
-    it("refuses a router token shorter than 32 characters only when a router flag is on", () => {
+    it("refuses a router token shorter than 32 characters whenever one is set", () => {
         const short = "s3cr3t-0123456789abcdef-0123456";
         const env = validEnv({ BUGNET_PAYMENTS_ROUTER_TOKEN: short });
         for (const flag of ["check_payer", "get_order"] as const) {
@@ -243,7 +243,16 @@ describe("readSecrets", () => {
             );
             expect(() => readSecrets(env, settings({ [flag]: true }))).not.toThrow(/s3cr3t/);
         }
-        expect(() => readSecrets(env, settings())).not.toThrow();
+        // With no router flag the token still guards stats totals
+        expect(() => readSecrets(env, settings())).toThrow(
+            /^BUGNET_PAYMENTS_ROUTER_TOKEN must be at least 32 characters$/,
+        );
+        expect(() =>
+            readSecrets(validEnv({ BUGNET_PAYMENTS_ROUTER_TOKEN: "dev" }), settings()),
+        ).toThrow(/^BUGNET_PAYMENTS_ROUTER_TOKEN must be at least 32 characters$/);
+        expect(() =>
+            readSecrets(validEnv({ BUGNET_PAYMENTS_ROUTER_TOKEN: "" }), settings()),
+        ).not.toThrow();
         expect(() =>
             readSecrets(
                 validEnv({ BUGNET_PAYMENTS_ROUTER_TOKEN: `${short}x` }),
