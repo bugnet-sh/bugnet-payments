@@ -1,3 +1,7 @@
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 const REQUIRED = [
     "BUGNET_SOLANA_RPC_URL",
     "BUGNET_FEE_PAYER_KEY",
@@ -8,6 +12,8 @@ const REQUIRED = [
     "BUGNET_PAYMENTS_TOKEN",
 ] as const;
 
+const X402_REQUIRED = ["BUGNET_ALLOWANCE_KEY", "BUGNET_SPIKE_SELLER_URL"] as const;
+
 const PAYER_KEY = "BUGNET_TEST_PAYER_KEY";
 const PAYER_MNEMONIC = "BUGNET_TEST_PAYER_MNEMONIC";
 
@@ -15,10 +21,17 @@ function empty(env: NodeJS.ProcessEnv, name: string): boolean {
     return (env[name] ?? "").trim() === "";
 }
 
-export function missingLiveEnv(env: NodeJS.ProcessEnv): string[] {
+export function missingLiveEnv(
+    env: NodeJS.ProcessEnv,
+    exists: (path: string) => boolean = existsSync,
+): string[] {
     const missing: string[] = REQUIRED.filter((name) => empty(env, name));
     if (empty(env, PAYER_KEY) && empty(env, PAYER_MNEMONIC)) {
         missing.push(`${PAYER_KEY} or ${PAYER_MNEMONIC}`);
     }
+    missing.push(...X402_REQUIRED.filter((name) => empty(env, name)));
+    const sellerFile =
+        env.BUGNET_TESTSELLER_ENV ?? join(homedir(), ".config/bugnet/testseller.env");
+    if (!exists(sellerFile)) missing.push(`${sellerFile} missing`);
     return missing;
 }

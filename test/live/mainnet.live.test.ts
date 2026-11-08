@@ -6,8 +6,7 @@
  * verifier and refunds it through a signed router event. The later tests are spike checks that
  * reuse that payment and log their findings for deploy/manual-checks.md.
  */
-import { randomBytes, sign } from "node:crypto";
-import { createServer } from "node:net";
+import { randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
@@ -17,20 +16,20 @@ import {
     type KeyPairSigner,
     signature,
 } from "@solana/kit";
-import { x402Client, x402HTTPClient } from "@x402/core/client";
+import type { x402HTTPClient } from "@x402/core/client";
 import { x402Facilitator } from "@x402/core/facilitator";
 import { decodePaymentResponseHeader } from "@x402/core/http";
 import type { PaymentPayload, PaymentRequired } from "@x402/core/types";
-import { ExactSvmScheme, SOLANA_MAINNET_CAIP2, toFacilitatorSvmSigner } from "@x402/svm";
+import { toFacilitatorSvmSigner } from "@x402/svm";
 import { ExactSvmScheme as ExactSvmFacilitator } from "@x402/svm/exact/facilitator";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { loadSettings, readSecrets, type Secrets, type Settings } from "../../src/config.ts";
+import { readSecrets, type Secrets, type Settings } from "../../src/config.ts";
 import { auditInflows } from "../../src/jobs/audit.ts";
 import { loadTestPayer } from "../../src/keys/test-payer.ts";
 import { jsonLog, type Log } from "../../src/log.ts";
 import { routeConsole, type RunningService, startService } from "../../src/main.ts";
 import { findOrder, findPaymentByOrder } from "../../src/orders/store.ts";
-import { orderKey, orderPublicKeyBase64 } from "../../src/orders/token.ts";
+import { orderPublicKeyBase64 } from "../../src/orders/token.ts";
 import { findOrderRefund, type RefundRow } from "../../src/refunds/request.ts";
 import { usdcAta } from "../../src/solana/accounts.ts";
 import { MEMO_PROGRAM, SOLANA_MAINNET, USDC_MINT } from "../../src/solana/constants.ts";
@@ -40,10 +39,20 @@ import { until } from "../../src/testing/app.ts";
 import { type TestDb, testDb } from "../../src/testing/db.ts";
 import { goAvailable, runGoVector } from "../../src/testing/go-vector.ts";
 import { requirementsFor } from "../../src/x402/challenge.ts";
+import {
+    type Balances,
+    balances as liveBalances,
+    challenge as liveChallenge,
+    lamportsOf as liveLamports,
+    liveSettings,
+    paced,
+    payClient,
+    postOrder as livePostOrder,
+    postSignedEvent as livePostSignedEvent,
+} from "./helpers.ts";
 
 const AMOUNT = 10_000;
 const ATA_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const RPC_PACE_MS = 1_000;
 const REPO = resolve(import.meta.dirname, "../..");
 const routerDir = resolve(REPO, "../bugnet-router");
 
@@ -71,13 +80,6 @@ interface TransferInfo {
     destination: string;
     mint: string;
     tokenAmount: { amount: string };
-}
-
-interface Balances {
-    payerUsdc: bigint;
-    recipientUsdc: bigint;
-    refundUsdc: bigint;
-    feePayerLamports: bigint;
 }
 
 interface Created {
@@ -125,60 +127,17 @@ function landed(): Landed {
     return live;
 }
 
-function freePort(): Promise<number> {
-    return new Promise((done, fail) => {
-        const server = createServer();
-        server.once("error", fail);
-        server.listen(0, "127.0.0.1", () => {
-            const { port } = server.address() as { port: number };
-            server.close(() => done(port));
-        });
+function balances(): Promise<Balances> {
+    return liveBalances(rpc, {
+        testPayer,
+        recipient: settings.solana.recipient,
+        refundWallet,
+        feePayer,
     });
 }
 
-// The public URL names the public port, so that port is picked before the service starts
-async function liveSettings(dbUrl: string): Promise<Settings> {
-    const dev = loadSettings(resolve(REPO, "config/dev.toml"));
-    const port = await freePort();
-    return {
-        ...dev,
-        http: {
-            ...dev.http,
-            internal_listen: "127.0.0.1:0",
-            public_listen: `127.0.0.1:${port}`,
-            public_url: `http://127.0.0.1:${port}`,
-        },
-        database: { ...dev.database, url: dbUrl },
-        router: { ...dev.router, event_public_key: orderPublicKeyBase64(eventSeed) },
-    };
-}
-
-// until polls every 20 ms, far above what the RPC plan allows
-function paced(read: () => Promise<boolean>, ms = RPC_PACE_MS): () => Promise<boolean> {
-    return async () => {
-        if (await read()) return true;
-        await sleep(ms);
-        return false;
-    };
-}
-
-async function usdcOf(owner: Address): Promise<bigint> {
-    const ata = await usdcAta(owner);
-    const { value } = await rpc.getTokenAccountBalance(ata, { commitment: "confirmed" }).send();
-    return BigInt(value.amount);
-}
-
-async function lamportsOf(owner: Address): Promise<bigint> {
-    return (await rpc.getBalance(owner, { commitment: "confirmed" }).send()).value;
-}
-
-async function balances(): Promise<Balances> {
-    return {
-        payerUsdc: await usdcOf(testPayer.address),
-        recipientUsdc: await usdcOf(address(settings.solana.recipient)),
-        refundUsdc: await usdcOf(refundWallet.address),
-        feePayerLamports: await lamportsOf(feePayer.address),
-    };
+function lamportsOf(owner: Address): Promise<bigint> {
+    return liveLamports(rpc, owner);
 }
 
 // A confirmed transaction can reach getTransaction a moment after its status
@@ -226,48 +185,19 @@ function programsOf(tx: ParsedTx): string[] {
     return [...tx.transaction.message.instructions, ...inner].map((ix) => ix.programId);
 }
 
-async function postOrder<T>(s: RunningService, body: unknown): Promise<T> {
-    const res = await fetch(`http://127.0.0.1:${s.internalPort}/v1/orders`, {
-        method: "POST",
-        headers: {
-            authorization: `Bearer ${secrets.paymentsToken}`,
-            "content-type": "application/json",
-        },
-        body: JSON.stringify(body),
-    });
-    expect(res.status).toBe(200);
-    return (await res.json()) as T;
+function postOrder<T>(s: RunningService, body: unknown): Promise<T> {
+    return livePostOrder<T>(s, secrets.paymentsToken, body);
 }
 
-async function postSignedEvent(
+function postSignedEvent(
     s: RunningService,
     e: { type: string; payload: Record<string, unknown> },
 ): Promise<void> {
-    const id = `evt_live_${randomBytes(8).toString("hex")}`;
-    const raw = Buffer.from(
-        JSON.stringify({
-            id,
-            type: e.type,
-            created_at: new Date().toISOString(),
-            payload: e.payload,
-        }),
-    );
-    const res = await fetch(`http://127.0.0.1:${s.internalPort}/v1/events`, {
-        method: "POST",
-        headers: {
-            "content-type": "application/json",
-            "x-bugnet-event-id": id,
-            "x-bugnet-signature": sign(null, raw, orderKey(eventSeed)).toString("base64"),
-        },
-        body: new Uint8Array(raw),
-    });
-    expect(res.status).toBe(200);
+    return livePostSignedEvent(s, eventSeed, e);
 }
 
-async function challenge(payUrl: string): Promise<PaymentRequired> {
-    const res = await fetch(payUrl, { headers: { accept: "application/json" } });
-    expect(res.status).toBe(402);
-    return http.getPaymentRequiredResponse((n) => res.headers.get(n), await res.json());
+function challenge(payUrl: string): Promise<PaymentRequired> {
+    return liveChallenge(http, payUrl);
 }
 
 function createOrder(s: RunningService, description: string): Promise<Created> {
@@ -320,7 +250,7 @@ function errorText(err: unknown): string {
 describe("mainnet", () => {
     beforeAll(async () => {
         db = await testDb();
-        settings = await liveSettings(db.url);
+        settings = await liveSettings(db.url, eventSeed);
         secrets = readSecrets(process.env, settings);
         const hidden = [
             secrets.rpcUrl,
@@ -343,12 +273,7 @@ describe("mainnet", () => {
         feePayer = await loadKeypair(secrets.feePayerKey, "BUGNET_FEE_PAYER_KEY");
         refundWallet = await loadKeypair(secrets.refundKey, "BUGNET_REFUND_KEY");
         recipientAta = await usdcAta(address(settings.solana.recipient));
-        http = new x402HTTPClient(
-            new x402Client().register(
-                SOLANA_MAINNET_CAIP2,
-                new ExactSvmScheme(testPayer, { rpcUrl: secrets.rpcUrl, transactionVersions: [0] }),
-            ),
-        );
+        http = payClient(testPayer, secrets.rpcUrl);
         stale = (await rpc.getLatestBlockhash({ commitment: "confirmed" }).send()).value;
         svc = await startService({ settings, secrets, log });
     }, 120_000);
