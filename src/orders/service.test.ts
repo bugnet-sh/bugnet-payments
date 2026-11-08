@@ -422,7 +422,7 @@ describe("redeem", () => {
                 "fee_payer",
                 "tx",
             ]);
-            expect(claims).toMatchObject({ payer: PAYER, tx });
+            expect(claims).toMatchObject({ payer: PAYER, fee_payer: app.feePayer.address, tx });
         });
 
         it("drops all three and warns once when the stored payer is not canonical", async () => {
@@ -437,6 +437,17 @@ describe("redeem", () => {
                 .slice(before)
                 .filter((l) => l.msg === "order token payer claims dropped");
             expect(warns).toHaveLength(1);
+        });
+
+        it("takes payer from payments.payer, not orders.payer", async () => {
+            const other = b58(11, 32);
+            const claims = await redeemWith(
+                true,
+                { payer: other },
+                { payer: PAYER, txSignature: nextTx() },
+            );
+            expect(claims.payer).toBe(PAYER);
+            expect(claims.payer).not.toBe(other);
         });
 
         it("drops all three when the order has no payment row", async () => {
