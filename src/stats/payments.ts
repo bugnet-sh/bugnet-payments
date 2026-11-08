@@ -44,8 +44,8 @@ const PAGE_SQL = `
          where p.status = 'confirmed' and p.confirmed_at > $1 and p.confirmed_at <= $2
         union all
         select date_trunc('milliseconds', confirmed_at),
-            (case from_wallet when 'refund' then 'refund' else 'allowance_return' end) collate "C",
-            id::text collate "C", amount_micros, null, destination, tx_signature
+            (case kind when 'allowance' then 'allowance_return' else 'refund' end) collate "C",
+            id::text collate "C", amount_micros, null, payer, tx_signature
           from refunds
          where state = 'confirmed' and confirmed_at > $1 and confirmed_at <= $2
     )

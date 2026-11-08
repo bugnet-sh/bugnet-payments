@@ -74,30 +74,41 @@ async function paid(rows: Paid[]): Promise<{ id: string; payer: string; tx: stri
 
 async function refund(
     orderId: string,
-    from: "refund" | "allowance",
+    kind: "full" | "partial" | "allowance",
     at: Date,
-    over: { destination?: string; tx?: string; state?: string; amountMicros?: number } = {},
-): Promise<{ destination: string; tx: string }> {
-    const destination = over.destination ?? wallet();
+    over: {
+        payer?: string;
+        from?: "refund" | "allowance";
+        tx?: string;
+        state?: string;
+        amountMicros?: number;
+    } = {},
+): Promise<{ payer: string; tx: string }> {
+    const payer = over.payer ?? wallet();
     const tx = over.tx ?? signature();
-    const allowance = from === "allowance";
     await db.pool.query(
         `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
             tx_signature, confirmed_at, from_wallet)
-         values ($1, $2, $3, $4, $5, 'payer', $6, $7, $8, $9)`,
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
         [
             orderId,
-            allowance ? "allowance" : "full",
-            allowance ? "x402_unspent" : "late",
+            kind,
+            kind === "allowance" ? "x402_unspent" : "late",
             over.amountMicros ?? 5_000,
-            destination,
+            // A token account, never shown
+            wallet(),
+            payer,
             over.state ?? "confirmed",
             tx,
             at,
-            from,
+            over.from ?? "refund",
         ],
     );
-    return { destination, tx };
+    return { payer, tx };
+}
+
+function shown(r: { payer: string; tx: string }): { wallet: string; tx: string } {
+    return { wallet: r.payer, tx: r.tx };
 }
 
 async function allPages(): Promise<{ pages: StatsPaymentItem[][]; nexts: (string | null)[] }> {
@@ -122,9 +133,10 @@ describe("statsPayments", () => {
             { at: ago(4_000), kind: "extend", amountMicros: 20_000, via: "pay_cli" },
             { at: ago(3_000), kind: "allowance", amountMicros: 1_003_000 },
         ]);
-        const back = await refund(start!.id, "refund", ago(2_000), { amountMicros: 50_000 });
+        const back = await refund(start!.id, "full", ago(2_000), { amountMicros: 50_000 });
         const ret = await refund(allowance!.id, "allowance", ago(1_000), {
             amountMicros: 400_000,
+            from: "allowance",
         });
         const page = await statsPayments(db.pool, null, NOW);
         expect(page).toEqual({
@@ -133,14 +145,14 @@ describe("statsPayments", () => {
                     at: ago(1_000).toISOString(),
                     kind: "allowance_return",
                     amountMicros: 400_000,
-                    wallet: ret.destination,
+                    wallet: ret.payer,
                     tx: ret.tx,
                 },
                 {
                     at: ago(2_000).toISOString(),
                     kind: "refund",
                     amountMicros: 50_000,
-                    wallet: back.destination,
+                    wallet: back.payer,
                     tx: back.tx,
                 },
                 {
@@ -180,6 +192,47 @@ describe("statsPayments", () => {
         expect(page.items[0]!.at).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
     });
 
+    it("names refunds by their kind whichever wallet paid them, one row per refund", async () => {
+        const [cold, x402, allowance] = await paid([
+            { at: ago(9_000), amountMicros: 50_000 },
+            { at: ago(8_000), amountMicros: 1_063_000 },
+            { at: ago(7_000), kind: "allowance" },
+        ]);
+        const partial = await refund(cold!.id, "partial", ago(3_000), {
+            from: "allowance",
+            amountMicros: 20_000,
+        });
+        const full = await refund(x402!.id, "full", ago(2_000), {
+            from: "allowance",
+            amountMicros: 1_063_000,
+        });
+        const ret = await refund(allowance!.id, "allowance", ago(1_000), {
+            from: "allowance",
+            amountMicros: 4_000,
+        });
+        const page = await statsPayments(db.pool, null, NOW);
+        expect(page.items.slice(0, 3)).toEqual([
+            {
+                at: ago(1_000).toISOString(),
+                kind: "allowance_return",
+                amountMicros: 4_000,
+                ...shown(ret),
+            },
+            {
+                at: ago(2_000).toISOString(),
+                kind: "refund",
+                amountMicros: 1_063_000,
+                ...shown(full),
+            },
+            {
+                at: ago(3_000).toISOString(),
+                kind: "refund",
+                amountMicros: 20_000,
+                ...shown(partial),
+            },
+        ]);
+    });
+
     it("pages 51 rows into 50 with a cursor, then 1 with next null", async () => {
         await paid(Array.from({ length: 51 }, (_, i) => ({ at: ago((i + 1) * 60_000) })));
         const { pages, nexts } = await allPages();
@@ -203,7 +256,7 @@ describe("statsPayments", () => {
             ...Array.from({ length: 30 }, () => ({ at: tie, kind: "extend" as const })),
         ]);
         const refunds = [];
-        for (const r of rows.slice(0, 12)) refunds.push(await refund(r.id, "refund", tie));
+        for (const r of rows.slice(0, 12)) refunds.push(await refund(r.id, "full", tie));
         // Microseconds apart, one millisecond on the page
         await db.pool.query(
             "update payments set confirmed_at = confirmed_at + interval '300 microseconds' where order_id = $1",
@@ -238,7 +291,7 @@ describe("statsPayments", () => {
 
     it("leaves out unconfirmed payments and refunds", async () => {
         const [o] = await paid([{ at: ago(1_000), status: "settling" }]);
-        await refund(o!.id, "refund", ago(500), { state: "sent" });
+        await refund(o!.id, "full", ago(500), { state: "sent" });
         expect(await statsPayments(db.pool, null, NOW)).toEqual({ items: [], next: null });
     });
 
@@ -249,8 +302,8 @@ describe("statsPayments", () => {
             { at: ago(600), tx: wallet() },
             { at: ago(700), payer: signature() },
         ]);
-        await refund(bad!.id, "refund", ago(800), { destination: "not a wallet" });
-        await refund(bad!.id, "allowance", ago(900), { tx: "not-a-signature" });
+        await refund(bad!.id, "full", ago(800), { payer: "not a wallet" });
+        await refund(bad!.id, "allowance", ago(900), { tx: "not-a-signature", from: "allowance" });
         const page = await statsPayments(db.pool, null, NOW);
         expect(page.items).toHaveLength(50);
         expect(page.next).toBeNull();
