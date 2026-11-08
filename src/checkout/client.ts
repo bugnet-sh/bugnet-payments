@@ -67,7 +67,10 @@ function element<T extends HTMLElement>(root: HTMLElement, selector: string): T 
 // Shows a step, follows the order's status when the step leaves it unknown, and answers payAfterMs
 async function show(v: View, step: PageStep): Promise<number | undefined> {
     v.message.textContent = step.message;
-    if (step.state !== undefined) v.stateLabel.textContent = STATE_LABELS[step.state];
+    if (step.state !== undefined) {
+        v.stateLabel.textContent = STATE_LABELS[step.state];
+        v.stateLabel.dataset.state = step.state;
+    }
     if (step.watch === undefined) return step.payAfterMs;
     return show(v, stateStep(await watchOrder(v.status, step.watch)));
 }
@@ -112,6 +115,7 @@ function startPayment(root: HTMLElement, v: View): void {
                 const label = document.createElement("label");
                 label.append(input, icon, w.name);
                 const item = document.createElement("li");
+                item.className = "wallet";
                 item.append(label);
                 return item;
             }),
@@ -156,6 +160,26 @@ async function followSettling(v: View): Promise<void> {
     // Only the unpaid page carries the wallet list and the QR
     if (state === "unpaid") location.reload();
     else await show(v, stateStep(state));
+}
+
+const COPIED_FOR_MS = 1_500;
+
+function offerCopy(button: HTMLButtonElement): void {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    button.addEventListener("click", () => {
+        navigator.clipboard.writeText(button.dataset.copy ?? "").then(
+            () => {
+                button.dataset.copied = "";
+                clearTimeout(timer);
+                timer = setTimeout(() => delete button.dataset.copied, COPIED_FOR_MS);
+            },
+            () => undefined,
+        );
+    });
+}
+
+for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-copy]")) {
+    offerCopy(button);
 }
 
 const root = document.getElementById("checkout");

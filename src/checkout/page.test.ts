@@ -1,4 +1,5 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -12,6 +13,7 @@ import { newOrderId } from "../orders/ids.ts";
 import type { OrderRow } from "../orders/types.ts";
 import { get, testApp, type TestApp, totalCalls } from "../testing/app.ts";
 import { seedOrder } from "../testing/orders.ts";
+import { CHECKOUT_FONTS } from "./fonts.ts";
 import { payWithWallet, type WalletPort } from "./flow.ts";
 import {
     amountLabel,
@@ -19,8 +21,11 @@ import {
     type CheckoutView,
     qrSvg,
     renderCheckout,
+    renderNotFound,
     walletLinks,
 } from "./page.ts";
+
+const FONTS_SRC = "src/checkout/fonts";
 
 const id = "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa";
 const view: CheckoutView = {
@@ -70,6 +75,37 @@ describe("checkout page", () => {
         expect(html).toContain("Open in Solflare");
         expect(html).toContain(await qrSvg(links.phantom));
         expect(html).toContain('id="pay-button"');
+        expect(html).toContain('id="wallets"');
+    });
+
+    it("wears the brand: title, header, fonts, copy button and footer", async () => {
+        const html = await renderCheckout({ ...view, amountMicros: 50_000 });
+        expect(html).toContain("<title>Pay $0.05 to Bugnet</title>");
+        expect(html).toContain('<a class="brand" href="https://bugnet.sh/">');
+        expect(html).toContain('<span class="amount-value">$0.05</span>');
+        expect(html).toContain(`data-copy="${id}"`);
+        expect(html).toContain('href="https://bugnet.sh/terms/"');
+        expect(html).toContain('href="https://bugnet.sh/privacy/"');
+        for (const name of ["manrope-400.woff2", "lexend-deca-200.woff2"]) {
+            expect(html).toContain(
+                `<link rel="preload" href="/fonts/${name}" as="font" type="font/woff2" crossorigin>`,
+            );
+        }
+        const faces = [...html.matchAll(/url\("\/fonts\/([^"]+)"\)/g)].map((m) => m[1]);
+        expect(faces).toEqual(CHECKOUT_FONTS);
+        expect(html).not.toMatch(/prefers-color-scheme|border-radius:\s*[1-9]/);
+        expect(html).not.toContain("\u00b7");
+        const notFound = renderNotFound();
+        expect(notFound).toContain("<title>Order not found</title>");
+        expect(notFound).not.toContain("\u00b7");
+    });
+
+    it("ships every allowlisted font with its family's license", async () => {
+        const files = await readdir(FONTS_SRC);
+        for (const name of CHECKOUT_FONTS) expect(files).toContain(name);
+        for (const family of ["manrope", "lexend-deca", "obel-mono"]) {
+            expect(files).toContain(`OFL-${family}.txt`);
+        }
     });
 
     it("shows a closed order's state without a way to pay", async () => {
@@ -80,22 +116,27 @@ describe("checkout page", () => {
             ["review", "Under review"],
         ] as const) {
             const html = await renderCheckout({ ...view, state });
-            expect(html).toContain(label);
+            expect(html).toContain(
+                `<dd id="state" class="state" data-state="${state}">${label}</dd>`,
+            );
             expect(html).toContain(id);
-            expect(html).not.toContain("/checkout.js");
+            // The client only wires the Copy button on a closed order's page
+            expect(html).toContain(`data-copy="${id}"`);
             expect(html).not.toContain('id="pay-button"');
-            expect(html).not.toContain("<svg");
+            expect(html).not.toContain('id="wallets"');
+            expect(html).not.toContain('class="qr"');
+            expect(html).not.toContain("Open in Phantom");
         }
     });
 
     it("follows a settling order with the client but offers no way to pay", async () => {
         const html = await renderCheckout({ ...view, state: "settling" });
-        expect(html).toContain('<dd id="state">Settling</dd>');
+        expect(html).toContain('<dd id="state" class="state" data-state="settling">Settling</dd>');
         expect(html).toContain('<p id="message" role="status" aria-live="polite"></p>');
         expect(html).toContain('<script type="module" src="/checkout.js"></script>');
         expect(html).not.toContain('id="pay-button"');
         expect(html).not.toContain('id="wallets"');
-        expect(html).not.toContain("<svg");
+        expect(html).not.toContain('class="qr"');
     });
 
     it("bundles the browser client", async () => {
@@ -127,6 +168,11 @@ describe("checkout routes", () => {
     beforeAll(async () => {
         dir = await mkdtemp(join(tmpdir(), "bn-checkout-"));
         await writeFile(join(dir, "checkout.js"), bundle);
+        await mkdir(join(dir, "fonts"));
+        for (const name of CHECKOUT_FONTS) {
+            await copyFile(join(FONTS_SRC, name), join(dir, "fonts", name));
+        }
+        await writeFile(join(dir, "secret.txt"), "not a font\n");
         app = await testApp({ checkoutJsPath: join(dir, "checkout.js") });
     });
     afterAll(async () => {
@@ -144,7 +190,7 @@ describe("checkout routes", () => {
         expect(r.status).toBe(200);
         expect(r.headers.get("content-security-policy")).toBe(CHECKOUT_CSP);
         expect(CHECKOUT_CSP).toBe(
-            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
         );
         expect(r.headers.get("content-type")).toBe("text/html; charset=utf-8");
         expect(r.headers.get("cache-control")).toBe("no-store");
@@ -183,7 +229,7 @@ describe("checkout routes", () => {
         const page = await expired.text();
         expect(page).toContain(lapsed.id);
         expect(page).toContain("Expired");
-        expect(page).not.toContain("/checkout.js");
+        expect(page).not.toContain('id="pay-button"');
 
         const refunded = (
             await seedOrder(app.pool, { state: "refunded", expiresAt: app.now.get() })
@@ -235,6 +281,61 @@ describe("checkout routes", () => {
         expect(await r.text()).toBe(bundle);
         const post = await fetch(`${app.publicOrigin}/checkout.js`, { method: "POST" });
         expect(post.status).toBe(405);
+    });
+
+    it("serves the allowlisted fonts for a year, GET and HEAD only", async () => {
+        for (const name of CHECKOUT_FONTS) {
+            const r = await get(app, `/fonts/${name}`);
+            expect(r.status).toBe(200);
+            expect(r.headers.get("content-type")).toBe("font/woff2");
+            expect(r.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+            const body = Buffer.from(await r.arrayBuffer());
+            expect(body.equals(await readFile(join(FONTS_SRC, name)))).toBe(true);
+        }
+        const head = await fetch(`${app.publicOrigin}/fonts/manrope-400.woff2`, { method: "HEAD" });
+        expect(head.status).toBe(200);
+        expect(head.headers.get("content-type")).toBe("font/woff2");
+        expect(await head.text()).toBe("");
+        const post = await fetch(`${app.publicOrigin}/fonts/manrope-400.woff2`, { method: "POST" });
+        expect(post.status).toBe(404);
+    });
+
+    it("answers 404 for any font path off the allowlist, traversal included", async () => {
+        // Sent byte for byte, as fetch would normalise the dot segments first
+        const raw = (path: string) =>
+            new Promise<{ status: number; type: string | undefined }>((resolve, reject) => {
+                const url = new URL(app.publicOrigin);
+                const req = request(
+                    { host: url.hostname, port: url.port, path, method: "GET" },
+                    (res) => {
+                        res.resume();
+                        res.on("end", () =>
+                            resolve({
+                                status: res.statusCode ?? 0,
+                                type: res.headers["content-type"],
+                            }),
+                        );
+                    },
+                );
+                req.on("error", reject);
+                req.end();
+            });
+        for (const path of [
+            "/fonts/../secret.txt",
+            "/fonts/%2e%2e/secret.txt",
+            "/fonts/%2E%2E%2Fsecret.txt",
+            "/fonts/..%2fsecret.txt",
+            "/fonts/fonts/manrope-400.woff2",
+            "/fonts/manrope-700.woff2",
+            "/fonts/MANROPE-400.WOFF2",
+            "/fonts/manrope-400.woff2/",
+            "/fonts/",
+            "/fonts/OFL-manrope.txt",
+        ]) {
+            const r = await raw(path);
+            expect([path, r.status]).toEqual([path, 404]);
+            expect(r.type).toBe("application/json");
+        }
     });
 
     it("pays an order through the real routes with a browser wallet", async () => {
