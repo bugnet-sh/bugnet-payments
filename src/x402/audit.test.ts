@@ -183,6 +183,19 @@ describe("auditX402 rows on chain", () => {
         expect(cp.rows[0].signature).toBe("1000");
     });
 
+    it("after a key switch reopens the tail, rows below the new opening slot are not audited", async () => {
+        await openTail(db.pool, HOT, 0n, 100n, new Date(t0.getTime() - 86_400_000));
+        await advanceVerified(db.pool, 300n, t0);
+        await auditX402(deps(createFakeRpc({ getTransaction: () => null })));
+        const a = await seedAccount(db.pool, {});
+        await seedX402Payment(db.pool, { accountId: a.id, txSignature: SIG(), landedSlot: 400n });
+        await openTail(db.pool, HOT, 0n, 800n, new Date(t0.getTime() - 3_600_000));
+        await advanceVerified(db.pool, 1_000n, t0);
+        const r = await auditX402(deps(createFakeRpc({ getTransaction: () => null })));
+        expect(r.checked).toBe(0);
+        expect(r.mismatches).toEqual([]);
+    });
+
     it("an RPC error throws and leaves the checkpoint where it was", async () => {
         await openTail(db.pool, HOT, 0n, 100n, new Date(t0.getTime() - 86_400_000));
         await advanceVerified(db.pool, 1_000n, t0);

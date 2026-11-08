@@ -196,7 +196,9 @@ async function loadCheckpoint(db: pg.Pool, openingSlot: bigint): Promise<bigint>
         [CHECKPOINT],
     );
     const text = res.rows[0]?.signature;
-    return text === undefined || text === "" ? openingSlot : BigInt(text);
+    if (text === undefined || text === "") return openingSlot;
+    const stored = BigInt(text);
+    return stored > openingSlot ? stored : openingSlot;
 }
 
 async function saveCheckpoint(db: pg.Pool, slot: bigint, at: Date): Promise<void> {
