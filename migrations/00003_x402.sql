@@ -38,7 +38,7 @@ alter table refunds add column from_wallet text not null default 'refund'
 -- by manual retry and manual refund; hand_tx when the operator paid a hot row by hand (7.10)
 alter table refunds add column landed_slot bigint, add column expiry_seen_slot bigint,
     add column signing_slot bigint, add column budget_waived boolean not null default false,
-    add column hand_tx text;
+    add column hand_tx text, add column audited_at timestamptz;
 
 create table x402_accounts (
     id text primary key references orders (id),            -- the placement's start order id
@@ -121,6 +121,7 @@ create table x402_payments (
     hint text check (hint in ('success', 'failure', 'absent', 'rejected')),
     hint_tx text, hint_error text, http_status int,
     stream_cut boolean not null default false,
+    audited_at timestamptz,                                 -- the nightly money audit (7.9)
     ended_clean boolean not null default false,
     created_at timestamptz not null default now(), signed_at timestamptz, resolved_at timestamptz
 );
@@ -168,6 +169,7 @@ create table x402_cold_transfers (
     previous_signatures text[] not null default '{}',
     attempts int not null default 0,
     signing_slot bigint, landed_slot bigint, expiry_seen_slot bigint,
+    audited_at timestamptz,
     created_at timestamptz not null default now(), confirmed_at timestamptz
 );
 

@@ -3,7 +3,6 @@ import type pg from "pg";
 import type { Settings } from "../config.ts";
 import type { Log } from "../log.ts";
 import { deadline, type SolanaRpc } from "../solana/rpc.ts";
-import { readPool } from "./ledger.ts";
 import { bugnetMoneyAt, liabilitiesAt, unsettledColdTransfersAt } from "./liabilities.ts";
 import { parseChainTx } from "./match.ts";
 import { readTail } from "./tail.ts";
@@ -49,18 +48,19 @@ export async function auditX402(d: X402AuditDeps): Promise<X402AuditReport> {
     const report: X402AuditReport = { checked: 0, mismatches: [], driftMicros: 0 };
     const v = tail.verifiedSlot;
 
-    const checkpoint = await loadCheckpoint(d.pool, tail.openingSlot);
-    for (const row of await rowsOnChain(d.pool, checkpoint, v)) {
+    for (const row of await rowsOnChain(d.pool, tail.openingSlot, v)) {
         report.checked++;
-        if (await onChain(d, row)) continue;
-        report.mismatches.push(`${row.kind} ${row.id}`);
-        d.log.alarm("x402_audit_mismatch", {
-            kind: row.kind,
-            id: row.id,
-            signature: row.signature,
-        });
+        if (!(await onChain(d, row))) {
+            report.mismatches.push(`${row.kind} ${row.id}`);
+            d.log.alarm("x402_audit_mismatch", {
+                kind: row.kind,
+                id: row.id,
+                signature: row.signature,
+            });
+        }
+        await markAudited(d.pool, row, d.now());
     }
-    if (v > checkpoint) await saveCheckpoint(d.pool, v, d.now());
+    await saveCheckpoint(d.pool, v, d.now());
 
     if (tail.tokenAccount !== null && tail.verifiedAt !== null) {
         const chain = await chainBalanceAt(d.pool, v, tail.openingBalanceMicros, tail.openingSlot);
@@ -80,8 +80,7 @@ export async function auditX402(d: X402AuditDeps): Promise<X402AuditReport> {
         }
     }
 
-    const stored = (await readPool(d.pool)).committedMicros;
-    const recomputed = await recomputeCommitted(d.pool);
+    const { stored, recomputed } = await committedBoth(d.pool);
     report.driftMicros = stored - recomputed;
     if (report.driftMicros !== 0) {
         d.log.alarm("x402_pool_drift", { storedMicros: stored, recomputedMicros: recomputed });
@@ -101,13 +100,14 @@ async function rowsOnChain(db: pg.Pool, from: bigint, to: bigint): Promise<Audit
         `select kind, id, signature, landed_slot, amount, payee from (
             select 'payment' as kind, id, tx_signature as signature, landed_slot,
                 amount_micros as amount, pay_to_token_account as payee
-            from x402_payments where state = 'confirmed'
+            from x402_payments where state = 'confirmed' and audited_at is null
             union all
             select 'refund', id::text, tx_signature, landed_slot, amount_micros, destination
             from refunds where from_wallet = 'allowance' and state = 'confirmed'
+                and audited_at is null
             union all
             select 'cold', id::text, tx_signature, landed_slot, amount_micros, null
-            from x402_cold_transfers where state = 'confirmed'
+            from x402_cold_transfers where state = 'confirmed' and audited_at is null
          ) t
          where signature is not null and landed_slot > $1 and landed_slot <= $2
          order by landed_slot, kind, id`,
@@ -177,28 +177,30 @@ async function ledgerAdjustments(
     return BigInt(res.rows[0]!.micros);
 }
 
-async function recomputeCommitted(db: pg.Pool): Promise<number> {
-    const res = await db.query<{ micros: string }>(
+// One statement, so a money change between the two reads cannot show as drift.
+async function committedBoth(db: pg.Pool): Promise<{ stored: number; recomputed: number }> {
+    const res = await db.query<{ stored: string; recomputed: string }>(
         `select
+            (select committed_micros from x402_pool where id = 1) as stored,
             (select coalesce(sum(funded_micros - spent_micros - refunded_micros - kept_micros), 0)
                 from x402_accounts where state <> 'closed')
             + (select coalesce(sum(amount_micros), 0) from refunds
                 where kind = 'allowance' and state <> 'confirmed'
                   and manual_reason is distinct from 'resolved_by_hand')
-            as micros`,
+            as recomputed`,
     );
-    return Number(res.rows[0]!.micros);
+    const r = res.rows[0]!;
+    return { stored: Number(r.stored), recomputed: Number(r.recomputed) };
 }
 
-async function loadCheckpoint(db: pg.Pool, openingSlot: bigint): Promise<bigint> {
-    const res = await db.query<{ signature: string }>(
-        "select signature from audit_checkpoints where name = $1",
-        [CHECKPOINT],
-    );
-    const text = res.rows[0]?.signature;
-    if (text === undefined || text === "") return openingSlot;
-    const stored = BigInt(text);
-    return stored > openingSlot ? stored : openingSlot;
+async function markAudited(db: pg.Pool, row: AuditRow, at: Date): Promise<void> {
+    const table =
+        row.kind === "payment"
+            ? "x402_payments"
+            : row.kind === "refund"
+              ? "refunds"
+              : "x402_cold_transfers";
+    await db.query(`update ${table} set audited_at = $2 where id::text = $1`, [row.id, at]);
 }
 
 async function saveCheckpoint(db: pg.Pool, slot: bigint, at: Date): Promise<void> {

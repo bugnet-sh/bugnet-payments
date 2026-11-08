@@ -196,6 +196,29 @@ describe("auditX402 rows on chain", () => {
         expect(r.mismatches).toEqual([]);
     });
 
+    it("a row confirmed late is audited the next night and no row is audited twice", async () => {
+        await openTail(db.pool, HOT, 0n, 100n, new Date(t0.getTime() - 86_400_000));
+        await advanceVerified(db.pool, 1_000n, t0);
+        const a = await seedAccount(db.pool, {});
+        await seedX402Payment(db.pool, { accountId: a.id, txSignature: SIG(), landedSlot: 500n });
+        const rpc = createFakeRpc({ getTransaction: () => null });
+        expect((await auditX402(deps(rpc))).checked).toBe(1);
+        const late = await seedX402Payment(db.pool, {
+            accountId: a.id,
+            state: "confirmed",
+            txSignature: SIG(),
+            landedSlot: 400n,
+        });
+        const second = await auditX402(deps(rpc));
+        expect(second.checked).toBe(1);
+        expect(second.mismatches).toContain(`payment ${late.id}`);
+        expect((await auditX402(deps(rpc))).checked).toBe(0);
+        const done = await db.pool.query(
+            "select count(*)::int as n from x402_payments where audited_at is not null",
+        );
+        expect(done.rows[0].n).toBe(2);
+    });
+
     it("an RPC error throws and leaves the checkpoint where it was", async () => {
         await openTail(db.pool, HOT, 0n, 100n, new Date(t0.getTime() - 86_400_000));
         await advanceVerified(db.pool, 1_000n, t0);
@@ -209,6 +232,86 @@ describe("auditX402 rows on chain", () => {
         await expect(auditX402(deps(rpc))).rejects.toThrow();
         const cp = await db.pool.query("select 1 from audit_checkpoints where name = 'x402_audit'");
         expect(cp.rowCount).toBe(0);
+    });
+});
+
+async function landedOnChain(amount = 10_000n) {
+    chain = await startFakeChain({ autoFinalize: true });
+    const payToAta = await usdcAta(address(TEST_PAYTO));
+    chain.setTokenAccount({ address: HOT, owner: (await testSigner(11)).address, amount: 50_000n });
+    chain.setTokenAccount({ address: payToAta, owner: TEST_PAYTO, amount: 0n });
+    await openTail(db.pool, HOT, 50_000n, chain.slot(), new Date(t0.getTime() - 86_400_000));
+    chain.advance(1);
+    const landed = await landPayment(chain, db.pool, { amount });
+    chain.finalize();
+    const slot = chain.submitted().find((s) => s.signature === landed.txSignature)!.slot;
+    await advanceVerified(db.pool, slot + 1n, t0);
+    return { payToAta, signature: landed.txSignature, slot };
+}
+
+async function seedAllowanceRefund(over: {
+    signature: string;
+    slot: bigint;
+    amount: number;
+    destination: string;
+}) {
+    const { order } = await seedOrder(db.pool, { state: "redeemed" });
+    const res = await db.pool.query<{ id: string }>(
+        `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
+            tx_signature, landed_slot, from_wallet)
+         values ($1, 'allowance', 'x402_unspent', $2, $3, 'p', 'confirmed', $4, $5, 'allowance')
+         returning id`,
+        [order.id, over.amount, over.destination, over.signature, over.slot.toString()],
+    );
+    return res.rows[0]!.id;
+}
+
+async function seedColdTransfer(signature: string, slot: bigint, amount: number) {
+    const res = await db.pool.query<{ id: string }>(
+        `insert into x402_cold_transfers (amount_micros, state, tx_signature, landed_slot)
+         values ($1, 'confirmed', $2, $3) returning id`,
+        [amount, signature, slot.toString()],
+    );
+    return res.rows[0]!.id;
+}
+
+describe("auditX402 refund and cold rows", () => {
+    it("a refund to the destination it was recorded with passes", async () => {
+        const c = await landedOnChain();
+        await seedAllowanceRefund({
+            signature: c.signature,
+            slot: c.slot,
+            amount: 10_000,
+            destination: c.payToAta,
+        });
+        const r = await auditX402(deps(chain!.rpc));
+        expect(r.checked).toBe(1);
+        expect(r.mismatches.filter((m) => m.startsWith("refund"))).toEqual([]);
+    });
+
+    it("a refund whose destination received nothing mismatches as 'refund <id>'", async () => {
+        const c = await landedOnChain();
+        const other = await usdcAta((await testSigner(31)).address);
+        const id = await seedAllowanceRefund({
+            signature: c.signature,
+            slot: c.slot,
+            amount: 10_000,
+            destination: other,
+        });
+        const r = await auditX402(deps(chain!.rpc));
+        expect(r.mismatches).toContain(`refund ${id}`);
+    });
+
+    it("a cold transfer is checked on the hot side only", async () => {
+        const c = await landedOnChain();
+        const id = await seedColdTransfer(c.signature, c.slot, 10_000);
+        const ok = await auditX402(deps(chain!.rpc));
+        expect(ok.checked).toBe(1);
+        expect(ok.mismatches.filter((m) => m.startsWith("cold"))).toEqual([]);
+        await db.pool.query("update x402_cold_transfers set audited_at = null");
+        await db.pool.query("update x402_cold_transfers set amount_micros = 20000");
+        const bad = await auditX402(deps(chain!.rpc));
+        expect(bad.mismatches).toContain(`cold ${id}`);
     });
 });
 
@@ -273,7 +376,9 @@ describe("auditX402 balance and committed", () => {
             [SIG()],
         );
         const log = memoryLog();
-        expect((await auditX402(deps(createFakeRpc(), log))).mismatches).toEqual([]);
+        const r = await auditX402(deps(createFakeRpc(), log));
+        expect(r.mismatches).toEqual([]);
+        expect(alarms(log, "x402_audit_mismatch")).toEqual([]);
     });
 
     it("committed drift raises x402_pool_drift", async () => {
