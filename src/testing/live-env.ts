@@ -21,15 +21,20 @@ function empty(env: NodeJS.ProcessEnv, name: string): boolean {
     return (env[name] ?? "").trim() === "";
 }
 
-export function missingLiveEnv(
-    env: NodeJS.ProcessEnv,
-    exists: (path: string) => boolean = existsSync,
-): string[] {
+export function missingLiveEnv(env: NodeJS.ProcessEnv): string[] {
     const missing: string[] = REQUIRED.filter((name) => empty(env, name));
     if (empty(env, PAYER_KEY) && empty(env, PAYER_MNEMONIC)) {
         missing.push(`${PAYER_KEY} or ${PAYER_MNEMONIC}`);
     }
-    missing.push(...X402_REQUIRED.filter((name) => empty(env, name)));
+    return missing;
+}
+
+// Only the x402 live file needs these, so the v1 mainnet live test runs without them
+export function missingX402Env(
+    env: NodeJS.ProcessEnv,
+    exists: (path: string) => boolean = existsSync,
+): string[] {
+    const missing: string[] = X402_REQUIRED.filter((name) => empty(env, name));
     const sellerFile =
         env.BUGNET_TESTSELLER_ENV ?? join(homedir(), ".config/bugnet/testseller.env");
     if (!exists(sellerFile)) missing.push(`${sellerFile} missing`);

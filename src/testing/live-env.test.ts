@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { missingLiveEnv } from "./live-env.ts";
+import { missingLiveEnv, missingX402Env } from "./live-env.ts";
 
 const PAYER = "BUGNET_TEST_PAYER_KEY or BUGNET_TEST_PAYER_MNEMONIC";
 
@@ -28,15 +28,12 @@ describe("missingLiveEnv", () => {
             expect.arrayContaining(["BUGNET_SOLANA_RPC_URL", "BUGNET_RECIPIENT_KEY", PAYER]),
         );
         expect(
-            missingLiveEnv(
-                fullEnv({ BUGNET_TEST_PAYER_KEY: "", BUGNET_TEST_PAYER_MNEMONIC: "w" }),
-                () => true,
-            ),
+            missingLiveEnv(fullEnv({ BUGNET_TEST_PAYER_KEY: "", BUGNET_TEST_PAYER_MNEMONIC: "w" })),
         ).toEqual([]);
     });
 
     it("lists every name for an empty environment", () => {
-        expect(missingLiveEnv({}, () => true)).toEqual([
+        expect(missingLiveEnv({})).toEqual([
             "BUGNET_SOLANA_RPC_URL",
             "BUGNET_FEE_PAYER_KEY",
             "BUGNET_REFUND_KEY",
@@ -45,28 +42,28 @@ describe("missingLiveEnv", () => {
             "BUGNET_CLAIM_KEY",
             "BUGNET_PAYMENTS_TOKEN",
             PAYER,
-            "BUGNET_ALLOWANCE_KEY",
-            "BUGNET_SPIKE_SELLER_URL",
         ]);
     });
 
     it("accepts the test payer key without a mnemonic", () => {
-        expect(missingLiveEnv(fullEnv(), () => true)).toEqual([]);
+        expect(missingLiveEnv(fullEnv())).toEqual([]);
     });
 
     it("counts a whitespace-only value as missing", () => {
         expect(
-            missingLiveEnv(
-                fullEnv({ BUGNET_CLAIM_KEY: "  ", BUGNET_TEST_PAYER_KEY: " " }),
-                () => true,
-            ),
+            missingLiveEnv(fullEnv({ BUGNET_CLAIM_KEY: "  ", BUGNET_TEST_PAYER_KEY: " " })),
         ).toEqual(["BUGNET_CLAIM_KEY", PAYER]);
+    });
+
+    it("asks for no x402 variable or file for the v1 live test", () => {
+        const env = fullEnv({ BUGNET_ALLOWANCE_KEY: "", BUGNET_SPIKE_SELLER_URL: "" });
+        expect(missingLiveEnv(env)).toEqual([]);
     });
 
     it("needs the allowance key, the spike seller and the test seller file", () => {
         const env = fullEnv({ BUGNET_ALLOWANCE_KEY: "", BUGNET_SPIKE_SELLER_URL: "" });
         const file = join(homedir(), ".config/bugnet/testseller.env");
-        expect(missingLiveEnv(env, () => false)).toEqual(
+        expect(missingX402Env(env, () => false)).toEqual(
             expect.arrayContaining([
                 "BUGNET_ALLOWANCE_KEY",
                 "BUGNET_SPIKE_SELLER_URL",
@@ -74,13 +71,13 @@ describe("missingLiveEnv", () => {
             ]),
         );
         expect(
-            missingLiveEnv(
+            missingX402Env(
                 fullEnv({ BUGNET_TESTSELLER_ENV: "/tmp/ts.env" }),
                 (p) => p !== "/tmp/ts.env",
             ),
         ).toContain("/tmp/ts.env missing");
         expect(
-            missingLiveEnv(
+            missingX402Env(
                 fullEnv({
                     BUGNET_ALLOWANCE_KEY: "k",
                     BUGNET_SPIKE_SELLER_URL: "https://s.example/x",

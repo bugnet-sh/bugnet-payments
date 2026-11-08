@@ -76,6 +76,9 @@ async function liveTables(dbUrl: string, eventSeed: Buffer): Promise<Tables> {
     };
 }
 
+// Far above every test amount, so no cold transfer moves the hot balance until the cold step
+export const COLD_OFF_MICROS = 1_000_000_000_000;
+
 export async function liveSettings(dbUrl: string, eventSeed: Buffer): Promise<Settings> {
     return parseSettings(stringify(await liveTables(dbUrl, eventSeed)), "live");
 }
@@ -299,7 +302,7 @@ export async function startX402Live(o: {
             client_ca_file: pki.ca,
             indexed_services_file: indexFile,
             min_allowance_micros: 50_000,
-            cold_transfer_threshold_micros: 1,
+            cold_transfer_threshold_micros: COLD_OFF_MICROS,
             cold_transfer_check_every: "5s",
             close_every: "2s",
             ...over.x402,

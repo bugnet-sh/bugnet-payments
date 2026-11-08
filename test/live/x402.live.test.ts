@@ -5,7 +5,7 @@
  * the test seller's wallets are drained back with `keys drain --testseller` afterwards.
  */
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -24,6 +24,7 @@ import { createRpc, type SolanaRpc } from "../../src/solana/rpc.ts";
 import { until } from "../../src/testing/app.ts";
 import { type TestDb, testDb } from "../../src/testing/db.ts";
 import { findAccount } from "../../src/x402/ledger.ts";
+import { missingX402Env } from "../../src/testing/live-env.ts";
 import { ledgerCheck } from "../../src/x402/ledger-check.ts";
 import { toX402Payment, X402_PAYMENT_COLUMNS } from "../../src/x402/reserve.ts";
 import type { AccountRow, X402PaymentRow } from "../../src/x402/types.ts";
@@ -214,10 +215,13 @@ async function routerEventPhases(p: pg.Pool, account: string): Promise<string[]>
 
 describe("x402 on mainnet", () => {
     beforeAll(async () => {
+        const missing = missingX402Env(process.env);
+        if (missing.length > 0) {
+            throw new Error(`x402 live test needs ${missing.join(", ")} (Task 36 Step 2)`);
+        }
         db = await testDb();
         const sellerFile =
             process.env.BUGNET_TESTSELLER_ENV ?? join(homedir(), ".config/bugnet/testseller.env");
-        if (!existsSync(sellerFile)) throw new Error(`${sellerFile} missing`);
         const sellerKeys = parseEnvText(readFileSync(sellerFile, "utf8"));
         feePayer = await loadKeypair(
             sellerKeys.TESTSELLER_FEE_PAYER_KEY ?? "",
@@ -444,6 +448,7 @@ describe("x402 on mainnet", () => {
             await Promise.all(first.map((a) => seller10k.settle(signedOf(a).paymentSignature)));
             await until(async () => (await confirmedCount(pool(), account)) === 5, SETTLE_WAIT_MS);
             expect((await accountOf(pool(), account)).spentMicros).toBe(50_000);
+            expect((await ledgerCheck(pool(), rpc, account, RPC_TIMEOUT_MS)).ok).toBe(true);
         },
         TEST_TIMEOUT_MS,
     );
@@ -555,6 +560,7 @@ describe("x402 on mainnet", () => {
             const tx = await getTx(settled.transaction);
             expect(tx.meta!.err).toBeNull();
             printLine(JSON.stringify({ t18cu: String(tx.meta!.computeUnitsConsumed) }));
+            expect((await ledgerCheck(pool(), rpc, account, RPC_TIMEOUT_MS)).ok).toBe(true);
         },
         TEST_TIMEOUT_MS,
     );
@@ -580,6 +586,9 @@ describe("x402 on mainnet", () => {
     it(
         "transfers the shares to cold",
         async () => {
+            await svc!.stop();
+            const settings = live!.settings({ x402: { cold_transfer_threshold_micros: 1 } });
+            svc = await startService({ settings, secrets: live!.secrets(settings), log });
             await until(
                 async () => (await confirmedColdTransfers(pool())).length >= 1,
                 CLOSE_WAIT_MS,
