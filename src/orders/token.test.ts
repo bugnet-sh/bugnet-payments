@@ -177,5 +177,30 @@ describe.skipIf(!existsSync(join(router, "internal/ordertoken")) || !goAvailable
             } as OrderClaims);
             expect(runGoVector(router, withPayer, PUB, "malformed")).toBe(0);
         });
+
+        it("accepts allowance_micros, payer, fee_payer and tx once router Task 28 runs", () => {
+            const proof = { payer: PAYER, feePayer: FEE_PAYER, tx: TX };
+            const now = new Date("2026-11-06T12:00:00Z");
+            const start = orderRow({
+                id: "ord_cccccccccccccccccccccccccc",
+                kind: "start",
+                packageId: "cpu-2-2g-10m",
+                amountMicros: 1_050_000,
+                allowanceMicros: 1_000_000,
+                handleSha256: null,
+            });
+            const extend = orderRow({
+                id: "ord_dddddddddddddddddddddddddd",
+                kind: "extend",
+                packageId: "ext-10m",
+                amountMicros: 20_000,
+                handleSha256: "6e84ff9f1b031bc128494c91a9e0286578046eb6499d6e4e89a970813b2982a5",
+            });
+            const key = orderKey(seed);
+            const both = signOrderToken(key, claimsFor(start, at, true, proof));
+            const extended = signOrderToken(key, claimsFor(extend, at, true, proof));
+            expect(runGoVector(router, both, PUB, "ok", now)).toBe(0);
+            expect(runGoVector(router, extended, PUB, "ok", now)).toBe(0);
+        });
     },
 );
