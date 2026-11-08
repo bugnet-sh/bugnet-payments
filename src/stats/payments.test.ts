@@ -169,6 +169,14 @@ describe("statsPayments", () => {
             ],
             next: null,
         });
+        expect(Object.keys(page.items[3]!)).toEqual([
+            "at",
+            "kind",
+            "amountMicros",
+            "method",
+            "wallet",
+            "tx",
+        ]);
         expect(page.items[0]!.at).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
     });
 

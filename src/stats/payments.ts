@@ -64,15 +64,14 @@ function toItem(r: ItemRow): StatsPaymentItem | null {
     if (!isCanonicalAddress(r.wallet) || !isCanonicalSignature(r.tx)) return null;
     const amount = BigInt(r.amount_micros);
     if (amount > BigInt(Number.MAX_SAFE_INTEGER)) return null;
-    const item: StatsPaymentItem = {
+    return {
         at: r.at.toISOString(),
         kind: r.kind,
         amountMicros: Number(amount),
+        ...(r.method === null ? {} : { method: r.method }),
         wallet: r.wallet,
         tx: r.tx,
     };
-    if (r.method !== null) item.method = r.method;
-    return item;
 }
 
 /** One page of the public payment list: the last 30 days, newest first (site-and-stats 7). */
