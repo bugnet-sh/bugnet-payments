@@ -304,6 +304,26 @@ describe("startService", () => {
         await expect(fetch(`http://${failing.http.public_listen}/healthz`)).rejects.toThrow();
     });
 
+    it("refuses to start with allowance_wallet empty while an allowance order is unfinished", async () => {
+        await seedOrder(db.pool, {
+            kind: "start",
+            state: "paid",
+            payInto: "allowance",
+            amountMicros: 1_013_000,
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+        });
+        const internal = await freePort();
+        const pub = await freePort();
+        const failing = testSettings({
+            http: { internal_listen: `127.0.0.1:${internal}`, public_listen: `127.0.0.1:${pub}` },
+        });
+        await expect(
+            startService({ settings: failing, secrets, rpc: okRpc(), log: silentLog }),
+        ).rejects.toThrow(/allowance_wallet is empty while 1 allowance order/);
+        await expect(fetch(`http://${failing.http.internal_listen}/healthz`)).rejects.toThrow();
+    });
+
     it("warns at boot when an order can be larger than the refund daily cap", async () => {
         const capWarnings = (log: ReturnType<typeof memoryLog>) =>
             log.lines.filter(

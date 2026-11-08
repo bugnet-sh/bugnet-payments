@@ -10,7 +10,7 @@
 import { format } from "node:util";
 import { type Address, address, type KeyPairSigner } from "@solana/kit";
 import type pg from "pg";
-import { BootCheckError, bootChecks } from "./boot.ts";
+import { BootCheckError, bootChecks, refuseUnfinishedAllowanceOrders } from "./boot.ts";
 import {
     ConfigError,
     loadSettings,
@@ -67,6 +67,7 @@ export async function startService(o: StartOptions): Promise<RunningService> {
     };
     try {
         const migrations = await migrate(pool);
+        if (s.x402.allowance_wallet === "") await refuseUnfinishedAllowanceOrders(pool);
 
         const feePayer = await loadKeypair(secrets.feePayerKey, "BUGNET_FEE_PAYER_KEY");
         const refundSigner = await loadKeypair(secrets.refundKey, "BUGNET_REFUND_KEY");
