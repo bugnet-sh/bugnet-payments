@@ -32,7 +32,7 @@ interface ItemRow extends pg.QueryResultRow {
     tx: string | null;
 }
 
-// Times are cut to the millisecond and text compared bytewise, so the cursor repeats the order exactly
+// Millisecond times and bytewise text order, so a cursor repeats the order exactly
 const PAGE_SQL = `
     with items as (
         select date_trunc('milliseconds', p.confirmed_at) as at,

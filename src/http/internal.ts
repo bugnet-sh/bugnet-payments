@@ -26,7 +26,7 @@ import {
 export interface InternalDeps {
     service: OrderServiceDeps;
     token: string;
-    // The router's own token, which it presents for the stats totals; empty turns the route off
+    // The router's own token, which it presents for the stats totals, empty turns the route off
     routerToken?: string;
     events?: (raw: Buffer, h: IncomingHttpHeaders) => Promise<{ status: number; body: unknown }>;
     maxBodyBytes: number;

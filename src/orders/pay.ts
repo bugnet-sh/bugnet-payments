@@ -347,7 +347,7 @@ async function settle(
                 createdAt: t,
                 keySha256: keyHash(key),
             });
-            // An unpaid order was never paid, so this request is the one any later paid state follows
+            // The order was never paid, so any later paid state follows this request
             await setOrderState(c, order.id, "unpaid", "settling", {
                 payer: dec.payer,
                 paidVia: via,
