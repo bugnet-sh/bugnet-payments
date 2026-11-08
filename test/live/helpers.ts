@@ -246,9 +246,13 @@ export async function startX402Live(o: {
     const indexFile = join(dir, "x402-index.json");
     writeFileSync(indexFile, '{"v":1,"services":[]}');
     const placements = new Map<string, string>();
+    // One placement per start order, made on first use by the test or by the router lookup
     const placementOf = (accountId: string): string => {
-        const id = placements.get(accountId);
-        if (id === undefined) throw new Error(`no placement was asked for ${accountId}`);
+        let id = placements.get(accountId);
+        if (id === undefined) {
+            id = randomUUID();
+            placements.set(accountId, id);
+        }
         return id;
     };
     const router: FakeRouter = await startFakeRouter({
@@ -350,7 +354,7 @@ export async function startX402Live(o: {
                 },
             },
         );
-        expect(created.status).toBe("payment_required");
+        expect(created, JSON.stringify(created)).toMatchObject({ status: "payment_required" });
         const payload = await http.createPaymentPayload(await challenge(http, created.payUrl));
         const paid = await fetch(created.payUrl, {
             headers: http.encodePaymentSignatureHeader(payload),
