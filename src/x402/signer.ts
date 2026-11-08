@@ -407,7 +407,12 @@ export async function reserveAndSign(d: SignerDeps, req: ReserveAndSignRequest):
         if (raced === null) throw err;
         return answerExisting(raced);
     }
-    if (!reserved.ok) return refuse(reserved.reason, reserved.leftMicros);
+    if (!reserved.ok) {
+        // A call with the same ref may have taken the room this one was refused for
+        const raced = await byRef();
+        if (raced !== null) return answerExisting(raced);
+        return refuse(reserved.reason, reserved.leftMicros);
+    }
 
     const failed = async (reason: SignerRefusal): Promise<Answer> => {
         await releaseReserved(pool, id, d.now());
