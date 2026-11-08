@@ -254,12 +254,14 @@ export async function reserveAndSign(d: SignerDeps, req: ReserveAndSignRequest):
     if (!x402.enabled || controls.disabled) return refuse("x402_disabled");
     if (controls.paused) return refuse("outflow_paused");
 
-    const same = await pool.query(
-        `select ${X402_PAYMENT_COLUMNS} from x402_payments where ref = $1`,
-        [req.ref],
-    );
-    const existing = same.rows[0] ? toX402Payment(same.rows[0]) : null;
-    if (existing !== null) {
+    const byRef = async (): Promise<X402PaymentRow | null> => {
+        const same = await pool.query(
+            `select ${X402_PAYMENT_COLUMNS} from x402_payments where ref = $1`,
+            [req.ref],
+        );
+        return same.rows[0] ? toX402Payment(same.rows[0]) : null;
+    };
+    const answerExisting = async (existing: X402PaymentRow): Promise<Answer> => {
         if (!sameRequest(existing, req)) return conflict(existing, true);
         if (existing.state === "reserved") return refuse("payments_unavailable");
         if (existing.state !== "signed") return conflict(existing, false);
@@ -274,7 +276,9 @@ export async function reserveAndSign(d: SignerDeps, req: ReserveAndSignRequest):
             await leftOf(existing.accountId),
             false,
         );
-    }
+    };
+    const existing = await byRef();
+    if (existing !== null) return answerExisting(existing);
 
     const account = await findAccount(pool, req.accountId);
     if (account === null) return refuse("service_not_enabled");
@@ -370,29 +374,39 @@ export async function reserveAndSign(d: SignerDeps, req: ReserveAndSignRequest):
 
     const id = newX402PaymentId();
     const now = d.now();
-    const reserved = await reserve(
-        pool,
-        {
-            id,
-            ref: req.ref,
-            accountId: account.id,
-            placementId: req.placementId,
-            serviceId: req.serviceId,
-            method: req.method,
-            host: req.host,
-            path: req.path,
-            targetSha256: Buffer.from(req.targetSha256),
-            bodySha256: Buffer.from(req.bodySha256),
-            amountMicros: Number(entry.amountMicros),
-            payTo: entry.payTo,
-            payToTokenAccount: await usdcAta(address(entry.payTo)),
-            feePayer: entry.feePayer,
-            listed: s.listed,
-        },
-        x402,
-        log,
-        now,
-    );
+    let reserved;
+    try {
+        reserved = await reserve(
+            pool,
+            {
+                id,
+                ref: req.ref,
+                accountId: account.id,
+                placementId: req.placementId,
+                serviceId: req.serviceId,
+                method: req.method,
+                host: req.host,
+                path: req.path,
+                targetSha256: Buffer.from(req.targetSha256),
+                bodySha256: Buffer.from(req.bodySha256),
+                amountMicros: Number(entry.amountMicros),
+                payTo: entry.payTo,
+                payToTokenAccount: await usdcAta(address(entry.payTo)),
+                feePayer: entry.feePayer,
+                listed: s.listed,
+            },
+            x402,
+            log,
+            now,
+        );
+    } catch (err) {
+        // Another call with the same ref reserved between our ref lookup and our insert
+        const e = err as { code?: string; constraint?: string };
+        if (e.code !== "23505" || e.constraint !== "x402_payments_ref_key") throw err;
+        const raced = await byRef();
+        if (raced === null) throw err;
+        return answerExisting(raced);
+    }
     if (!reserved.ok) return refuse(reserved.reason, reserved.leftMicros);
 
     const failed = async (reason: SignerRefusal): Promise<Answer> => {

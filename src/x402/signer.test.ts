@@ -448,6 +448,29 @@ describe("ReserveAndSign", () => {
         expect(refusedOf(await reserveAndSign(deps(), req)).reason).toBe("payments_unavailable");
     });
 
+    it("two concurrent calls with one new ref answer as a repeat, never Internal", async () => {
+        await db.pool.query("update x402_accounts set placement_id = null");
+        let arrived = 0;
+        let bothArrived!: () => void;
+        const barrier = new Promise<void>((r) => (bothArrived = r));
+        lookup = async () => {
+            if (++arrived === 2) bothArrived();
+            await barrier;
+            return found(PLACEMENT);
+        };
+        let signNow!: () => void;
+        const signGate = new Promise<void>((r) => (signNow = r));
+        const d = deps({ hooks: { beforeSign: () => signGate } });
+        const req = request();
+        const calls = [reserveAndSign(d, req), reserveAndSign(d, req)];
+        expect(refusedOf(await Promise.race(calls)).reason).toBe("payments_unavailable");
+        signNow();
+        const answers = await Promise.all(calls);
+        expect(answers.map((a) => a.result?.case).sort()).toEqual(["refused", "signed"]);
+        expect(await count()).toBe(1);
+        expect((await money()).held).toBe(10_000);
+    });
+
     it("resend: the same transaction for an unclean row with a live blockhash", async () => {
         const first = request();
         const a = signedOf(await reserveAndSign(deps(), first));
