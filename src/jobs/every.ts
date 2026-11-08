@@ -32,6 +32,43 @@ export function every(ms: number, name: string, fn: () => Promise<unknown>, log:
     return () => clearInterval(timer);
 }
 
+// The wait comes after the run, so runs never overlap and a slow run pushes the next one back
+export function paced(
+    name: string,
+    fn: () => Promise<unknown>,
+    nextMs: () => Promise<number>,
+    log: Log,
+): () => void {
+    let timer: NodeJS.Timeout | undefined;
+    let stopped = false;
+    const schedule = () => {
+        // nextMs is the caller's to keep from rejecting; a throw is logged and retried after a second
+        void Promise.resolve()
+            .then(nextMs)
+            .then(
+                (ms) => Math.min(Math.max(ms, 1), MAX_TIMER_MS),
+                (err: unknown) => {
+                    log.error("job failed", { job: name, err });
+                    return 1_000;
+                },
+            )
+            .then((ms) => {
+                if (stopped) return;
+                timer = setTimeout(() => {
+                    void runLogged(name, fn, log).finally(() => {
+                        if (!stopped) schedule();
+                    });
+                }, ms);
+            })
+            .catch(() => undefined);
+    };
+    schedule();
+    return () => {
+        stopped = true;
+        clearTimeout(timer);
+    };
+}
+
 function nextAt(hour: number, minute: number, after: number): number {
     const d = new Date(after);
     const at = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), hour, minute);

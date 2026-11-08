@@ -148,7 +148,7 @@ async function liveSettings(dbUrl: string): Promise<Settings> {
             public_listen: `127.0.0.1:${port}`,
             public_url: `http://127.0.0.1:${port}`,
         },
-        database: { url: dbUrl },
+        database: { ...dev.database, url: dbUrl },
         router: { ...dev.router, event_public_key: orderPublicKeyBase64(eventSeed) },
     };
 }

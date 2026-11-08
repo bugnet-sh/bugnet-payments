@@ -112,6 +112,8 @@ const settingsSchema = z
                     .string()
                     .min(1)
                     .default("postgres:///bugnet_payments?host=/var/run/postgresql"),
+                // Each single-runner job holds one client for its lock while its work takes others
+                pool_max: count.default(20),
             })
             .strict()
             .prefault({}),

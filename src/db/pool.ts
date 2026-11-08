@@ -8,8 +8,8 @@ function defaultLog(): Log {
     return jsonLog("payments", { secrets: secretValues(process.env) });
 }
 
-export function createPool(url: string, log: Log = defaultLog()): pg.Pool {
-    const pool = new pg.Pool({ connectionString: url });
+export function createPool(url: string, log: Log = defaultLog(), max?: number): pg.Pool {
+    const pool = new pg.Pool({ connectionString: url, ...(max === undefined ? {} : { max }) });
     // An idle client erroring (server restart, dropped connection) would otherwise crash the process.
     pool.on("error", (err) => log.error("postgres idle client error", { err }));
     return pool;

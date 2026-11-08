@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type Log, memoryLog } from "../log.ts";
-import { dailyAt, every } from "./every.ts";
+import { type Log, memoryLog, silentLog } from "../log.ts";
+import { dailyAt, every, paced } from "./every.ts";
 
 const MIN = 60_000;
 const DAY = 24 * 60 * MIN;
@@ -244,5 +244,69 @@ describe("dailyAt", () => {
         stop();
         await vi.advanceTimersByTimeAsync(2 * DAY);
         expect(calls).toBe(0);
+    });
+});
+
+describe("paced", () => {
+    it("waits nextMs before each run and never overlaps", async () => {
+        const delays = [100, 300];
+        const runs: number[] = [];
+        const stop = paced(
+            "t",
+            async () => void runs.push(Date.now()),
+            async () => delays.shift() ?? 1_000,
+            silentLog,
+        );
+        await vi.advanceTimersByTimeAsync(99);
+        expect(runs).toHaveLength(0);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(runs).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(300);
+        expect(runs).toHaveLength(2);
+        stop();
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(runs).toHaveLength(2);
+    });
+
+    it("does not start the next wait while a run is still going", async () => {
+        const slow = gate();
+        let calls = 0;
+        const stop = paced(
+            "t",
+            async () => {
+                calls++;
+                await slow.opened;
+            },
+            async () => 10,
+            silentLog,
+        );
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(calls).toBe(1);
+        slow.open();
+        await vi.advanceTimersByTimeAsync(10);
+        expect(calls).toBe(2);
+        stop();
+    });
+
+    it("logs a failed run and keeps going", async () => {
+        const log = memoryLog();
+        let calls = 0;
+        const stop = paced(
+            "t",
+            async () => {
+                calls++;
+                if (calls === 1) throw new Error("boom");
+            },
+            async () => 10,
+            log,
+        );
+        await vi.advanceTimersByTimeAsync(10);
+        expect(calls).toBe(1);
+        const failed = log.lines.filter((l) => l.msg === "job failed");
+        expect(failed).toHaveLength(1);
+        expect(failed[0]?.job).toBe("t");
+        await vi.advanceTimersByTimeAsync(10);
+        expect(calls).toBe(2);
+        stop();
     });
 });

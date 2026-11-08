@@ -10,6 +10,7 @@ max_body_bytes = 65536
 
 [database]
 url = "postgres:///bugnet_payments?host=/var/run/postgresql"
+pool_max = 20
 
 [solana]
 network = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"

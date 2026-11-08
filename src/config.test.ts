@@ -42,6 +42,10 @@ function validEnv(overrides: Record<string, string | undefined> = {}): NodeJS.Pr
 }
 
 describe("parseSettings", () => {
+    it("database.pool_max defaults to 20", () => {
+        expect(parseSettings(`[solana]\nrecipient = "${ADDR}"`, "t").database.pool_max).toBe(20);
+    });
+
     it("defaults match the spec", () => {
         const s = parseSettings(`[solana]\nrecipient = "${ADDR}"`, "t.toml");
         expect(s.solana.network).toBe("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp");

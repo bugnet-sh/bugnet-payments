@@ -58,7 +58,7 @@ export async function startService(o: StartOptions): Promise<RunningService> {
     const now = o.now ?? (() => new Date());
     const log =
         o.log ?? jsonLog("payments", { secrets: secretValues(secretsEnv(secrets), process.env) });
-    const pool = createPool(s.database.url, log);
+    const pool = createPool(s.database.url, log, s.database.pool_max);
     const closers: Array<() => Promise<void>> = [() => pool.end()];
     const closeAll = async () => {
         for (const close of [...closers].reverse()) {
