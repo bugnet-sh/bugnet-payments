@@ -18,7 +18,7 @@ import { loadTestPayer } from "../../src/keys/test-payer.ts";
 import { jsonLog, type Log } from "../../src/log.ts";
 import { routeConsole, type RunningService, startService } from "../../src/main.ts";
 import { usdcAta } from "../../src/solana/accounts.ts";
-import { MEMO_PROGRAM } from "../../src/solana/constants.ts";
+import { MEMO_PROGRAM, SOLANA_MAINNET, USDC_MINT } from "../../src/solana/constants.ts";
 import { loadKeypair } from "../../src/solana/keys.ts";
 import { createRpc, type SolanaRpc } from "../../src/solana/rpc.ts";
 import { until } from "../../src/testing/app.ts";
@@ -391,7 +391,12 @@ describe("x402 on mainnet", () => {
             const probe = await fetch(url);
             expect(probe.status).toBe(402);
             const paymentRequired = probe.headers.get("payment-required")!;
-            const accepted = decodedAccepts(paymentRequired)[0]!;
+            // Multi-chain sellers list other networks first; Payments pays the first exact Solana USDC entry
+            const accepted = decodedAccepts(paymentRequired).find(
+                (a) =>
+                    a.scheme === "exact" && a.network === SOLANA_MAINNET && a.asset === USDC_MINT,
+            )!;
+            expect(accepted).toBeDefined();
             expect(Number(accepted.amount)).toBeLessThanOrEqual(1_000);
             const account = await live!.startOrderWithPin(svc!, {
                 method: "GET",
