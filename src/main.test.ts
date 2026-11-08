@@ -5,9 +5,18 @@ import { connect as netConnect, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { create as createMessage } from "@bufbuild/protobuf";
-import { createClient } from "@connectrpc/connect";
+import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
-import { type Address, getAddressEncoder, getBase58Decoder, type KeyPairSigner } from "@solana/kit";
+import {
+    type Address,
+    getAddressEncoder,
+    getBase58Decoder,
+    getBase64Encoder,
+    getCompiledTransactionMessageDecoder,
+    getTransactionDecoder,
+    type KeyPairSigner,
+} from "@solana/kit";
+import { getTransferCheckedInstructionDataDecoder } from "@solana-program/token";
 import { decodePaymentRequiredHeader } from "@x402/core/http";
 import type pg from "pg";
 import { stringify } from "smol-toml";
@@ -778,6 +787,7 @@ describe("x402 wiring", () => {
     let pki: ReturnType<typeof makeTestPki>;
     let allowance: KeyPairSigner;
     let funder: KeyPairSigner;
+    let placementState: string | null = null;
     let indexPath: string;
     let x402Secrets: Secrets;
     const EMPTY_INDEX = '{"v":1,"services":[]}';
@@ -900,6 +910,15 @@ describe("x402 wiring", () => {
         fakeRouter = await startFakeRouter({
             appendAllowanceEvent: () => ({}),
             appendX402Resolved: () => ({}),
+            lookupPlacement: () => {
+                if (placementState === null) throw new ConnectError("none", Code.NotFound);
+                return {
+                    placementId: "00000000-0000-4000-8000-000000000001",
+                    state: placementState,
+                    x402Capable: true,
+                    packageId: "cpu-small",
+                };
+            },
         });
         x402Secrets = {
             ...secrets,
@@ -974,6 +993,94 @@ describe("x402 wiring", () => {
                 5_000,
             );
         } finally {
+            await s.stop();
+        }
+    });
+
+    it("a transferable share goes to the recipient's USDC account through the wired cold job", async () => {
+        await db.pool.query("truncate x402_cold_transfers, x402_incidents cascade");
+        await db.pool.query("update x402_controls set paused = false, disabled = false");
+        const s = await startService({
+            settings: x402Settings({
+                x402: { cold_transfer_check_every: "200ms", cold_transfer_threshold_micros: 1 },
+            }),
+            secrets: x402Secrets,
+            rpc: withBalance(chain.rpc),
+            log: silentLog,
+        });
+        try {
+            const tail = await readTail(s.pool);
+            const since = new Date(Date.now() - 60_000);
+            const { order } = await seedOrder(s.pool, {
+                kind: "start",
+                state: "redeemed",
+                payInto: "allowance",
+                allowanceMicros: 1_000_000,
+                feeMicros: 3_000,
+                amountMicros: 1_013_000,
+                createdAt: since,
+                paidAt: since,
+            });
+            await seedPayment(s.pool, order.id, {
+                status: "confirmed",
+                confirmedAt: since,
+                landedSlot: tail.openingSlot,
+            });
+            await s.pool.query(
+                `insert into events (event_id, type, created_at, received_at, order_id, payload)
+                 values ($1, 'placement.ready', $2, $2, $3, $4::jsonb)`,
+                [
+                    randomBytes(8).toString("hex"),
+                    since,
+                    order.id,
+                    JSON.stringify({ order_id: order.id }),
+                ],
+            );
+            const wire = async () =>
+                (
+                    await s.pool.query<{ wire_tx: string | null }>(
+                        "select wire_tx from x402_cold_transfers where amount_micros = 13000",
+                    )
+                ).rows[0]?.wire_tx ?? null;
+            await until(async () => (await wire()) !== null, 5_000);
+            const tx = getTransactionDecoder().decode(getBase64Encoder().encode((await wire())!));
+            const msg = getCompiledTransactionMessageDecoder().decode(tx.messageBytes);
+            const ix = msg.instructions.find(
+                (i) => msg.staticAccounts[i.programAddressIndex] === TOKEN_PROGRAM,
+            )!;
+            const [source, , destination] = ix.accountIndices!.map((n) => msg.staticAccounts[n]);
+            expect(source).toBe(await usdcAta(allowance.address));
+            expect(destination).toBe(await usdcAta(recipient.address));
+            expect(getTransferCheckedInstructionDataDecoder().decode(ix.data!).amount).toBe(
+                13_000n,
+            );
+        } finally {
+            await s.stop();
+        }
+    });
+
+    it("a closing account reaches closed through the wired close check and close job", async () => {
+        const account = await seedAccount(db.pool, {
+            state: "open",
+            fundedMicros: 1_000_000,
+            spentMicros: 1_000_000,
+            createdAt: new Date(Date.now() - 20 * MIN),
+            handleSha256: randomBytes(32).toString("hex"),
+        });
+        placementState = "terminated";
+        const s = await startService({
+            settings: x402Settings({ x402: { close_check_every: "200ms", close_every: "200ms" } }),
+            secrets: x402Secrets,
+            rpc: withBalance(chain.rpc),
+            log: silentLog,
+        });
+        try {
+            await until(
+                async () => (await rowState(s.pool, "x402_accounts", account.id)) === "closed",
+                5_000,
+            );
+        } finally {
+            placementState = null;
             await s.stop();
         }
     });
