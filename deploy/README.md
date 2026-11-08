@@ -373,10 +373,15 @@ unresolved.
    end. With refunds held, their hot refunds stay `pending`: pay each by hand from the cold
    recipient and record it with `pcli manual resolve <refundId> --tx`, which takes a `pending`
    row while held. Without a hold, let them confirm and do the same for any that go `manual`.
-   Then run `PCLI_ENV=<test payer env file> pcli keys drain --allowance` (section 8), make a new
-   key (`pnpm cli keys generate` with `BUGNET_ALLOWANCE_KEY` cleared), set
-   `[x402] allowance_wallet`, run `pnpm cli keys fund --create-allowance-ata`, and restart (boot
-   check 4 opens the new tail).
+   Then stop the unit (`sudo systemctl stop bugnet-payments@<version>`) and only then run
+   `PCLI_ENV=<test payer env file> pcli keys drain --allowance` (section 8). Make a new key
+   (`pnpm cli keys generate` with `BUGNET_ALLOWANCE_KEY` cleared) and copy it into
+   `/etc/bugnet/payments.env` as in section 10, set `[x402] allowance_wallet` to its address, run
+   `pnpm cli keys fund --create-allowance-ata`, and start the unit
+   (`sudo systemctl start bugnet-payments@<version>`; boot check 4 opens the new tail). A drain
+   while Payments runs is a hot outflow that matches nothing: expect an `unknown_change` incident
+   whose `loss_micros` is the drained amount, a pause and `x402_incident`, and resolve it in
+   step 5.
 5. `pcli x402 incident resolve <id> <finding>`, then `pcli x402 refunds release`,
    `pcli x402 unkill` and `pcli x402 resume` as they apply.
 

@@ -1343,6 +1343,22 @@ describe("deploy notes", () => {
         expect(setup).toContain("kill -s HUP");
     });
 
+    it("the key rotation stops the unit before the allowance drain", () => {
+        const text = readFileSync(
+            path.join(import.meta.dirname, "..", "deploy", "README.md"),
+            "utf8",
+        );
+        const words = text.replace(/\s+/g, " ");
+        const stop = words.indexOf("sudo systemctl stop bugnet-payments@<version>");
+        const drain = words.indexOf("pcli keys drain --allowance", stop);
+        expect(stop).toBeGreaterThan(-1);
+        expect(drain).toBeGreaterThan(stop);
+        expect(
+            words.indexOf("sudo systemctl start bugnet-payments@<version>", drain),
+        ).toBeGreaterThan(drain);
+        expect(words).toContain("expect an `unknown_change` incident");
+    });
+
     it("run every database command against the deploy settings, never the dev default", () => {
         for (const file of ["README.md", "x402-mainnet-tests.md"]) {
             const text = readFileSync(path.join(import.meta.dirname, "..", "deploy", file), "utf8");
