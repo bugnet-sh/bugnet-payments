@@ -1074,6 +1074,78 @@ describe("x402 wiring", () => {
         }
     });
 
+    it("the TLS check reads the served copy, and a disk copy left unloaded alarms after 10 minutes", async () => {
+        const log = memoryLog();
+        const certPath = path.join(mkdtempSync(path.join(tmpdir(), "bn-tls-")), "server.crt");
+        writeFileSync(certPath, readFileSync(pki.serverCert));
+        let shift = 0;
+        const s = await startService({
+            settings: x402Settings({
+                x402: { tls_cert_file: certPath },
+                jobs: { alarms_every: "20ms" },
+            }),
+            secrets: x402Secrets,
+            rpc: withBalance(chain.rpc),
+            log,
+            now: () => new Date(Date.now() + shift),
+        });
+        const terms = async () => {
+            const res = await fetch(`http://127.0.0.1:${s.internalPort}/v1/x402/terms`, {
+                headers: { authorization: `Bearer ${x402Secrets.paymentsToken}` },
+            });
+            return (await res.json()) as { enabled: boolean };
+        };
+        const drift = () =>
+            log.lines.filter((l) => l.alarm === "x402_reload_failed" && l.file === "tls");
+        try {
+            expect(s.x402Port).not.toBeNull();
+            writeFileSync(certPath, "half a certifi");
+            await new Promise((r) => setTimeout(r, 200)); // the TLS check runs every 20ms
+            expect((await terms()).enabled).toBe(true);
+            expect(drift()).toEqual([]);
+            shift = 11 * 60_000;
+            await until(async () => drift().length > 0, 2_000);
+            await new Promise((r) => setTimeout(r, 100));
+            expect(drift()).toHaveLength(1);
+            expect(drift()[0]?.problem).toBe(
+                "tls files on disk differ from the loaded copy: send SIGHUP",
+            );
+        } finally {
+            await s.stop();
+        }
+    });
+
+    it("the expiry alarm reads the served certificate, not the disk copy", async () => {
+        const log = memoryLog();
+        const shortPki = makeTestPki(mkdtempSync(path.join(tmpdir(), "bn-pki-")), { days: 10 });
+        const certPath = path.join(mkdtempSync(path.join(tmpdir(), "bn-tls-")), "server.crt");
+        writeFileSync(certPath, readFileSync(shortPki.serverCert));
+        // The audit job runs at audit_at_utc, so the clock starts just before it
+        const target = new Date();
+        target.setUTCHours(3, 30, 0, 0);
+        if (target.getTime() <= Date.now() + 60_000) target.setUTCDate(target.getUTCDate() + 1);
+        const shift = target.getTime() - Date.now() - 1_500;
+        const s = await startService({
+            settings: x402Settings({
+                x402: { tls_cert_file: certPath, client_ca_file: shortPki.ca },
+                jobs: { audit_at_utc: "03:30" },
+            }),
+            secrets: { ...x402Secrets, x402TlsKey: readFileSync(shortPki.serverKey, "utf8") },
+            rpc: withBalance(chain.rpc),
+            log,
+            now: () => new Date(Date.now() + shift),
+        });
+        try {
+            expect(s.x402Port).not.toBeNull();
+            writeFileSync(certPath, "half a certifi");
+            await until(async () => log.lines.some((l) => l.alarm === "x402_cert_expiry"), 5_000);
+            const alarm = log.lines.find((l) => l.alarm === "x402_cert_expiry");
+            expect(alarm?.expiring).toEqual(["server"]);
+        } finally {
+            await s.stop();
+        }
+    });
+
     it("stop waits for a listener still opening and closes it", async () => {
         const probe = createServer();
         await new Promise<void>((r) => probe.listen(0, "127.0.0.1", r));

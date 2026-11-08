@@ -88,6 +88,8 @@ export interface RunningService {
 
 const USAGE = "usage: main.js -config FILE";
 const EMPTY_INDEX = parseIndex('{"v":1,"services":[]}', "none");
+// How long the TLS files on disk may differ from the served ones before x402_reload_failed
+const TLS_DRIFT_MS = 10 * 60_000;
 
 export function installReload(onReload: () => void): () => void {
     process.on("SIGHUP", onReload);
@@ -505,7 +507,8 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
                         now,
                     });
                 } finally {
-                    const tls = checkTlsFiles(x.readTls(), SERVER_NAME, now());
+                    const inUse = x.listener()?.loaded() ?? x.readTls();
+                    const tls = checkTlsFiles(inUse, SERVER_NAME, now());
                     if (tls.ok) {
                         certExpiryAlarm({
                             serverNotAfter: tls.serverNotAfter,
@@ -570,6 +573,7 @@ function startX402Jobs(
     const { s, pool, rpc, log, now } = d;
     const rpcTimeoutMs = s.solana.rpc_timeout;
     const x402 = s.x402;
+    let tlsDrift: { since: Date; alarmed: boolean } | null = null;
     const alone = (key: number, fn: () => Promise<unknown>) =>
         tracked(() => singleRunner(pool, key, fn));
     const closeDeps = {
@@ -682,12 +686,29 @@ function startX402Jobs(
             "x402_tls_check",
             tracked(async () => {
                 // Files fixed on disk do not open the listener, only a SIGHUP does
-                if (x.listener() === null) {
+                const listener = x.listener();
+                if (listener === null) {
                     x.gate.record("tls", "fail", "listener not open: send SIGHUP");
                     return;
                 }
-                const tls = checkTlsFiles(x.readTls(), SERVER_NAME, now());
+                // The served copy decides: files renewed on disk serve nothing until a SIGHUP
+                const inUse = listener.loaded();
+                const tls = checkTlsFiles(inUse, SERVER_NAME, now());
                 x.gate.record("tls", tls.ok ? "pass" : "fail", tls.ok ? undefined : tls.problem);
+                const disk = x.readTls();
+                if (disk.certPem === inUse.certPem && disk.caPem === inUse.caPem) {
+                    tlsDrift = null;
+                    return;
+                }
+                const at = now();
+                tlsDrift ??= { since: at, alarmed: false };
+                if (!tlsDrift.alarmed && at.getTime() - tlsDrift.since.getTime() > TLS_DRIFT_MS) {
+                    tlsDrift.alarmed = true;
+                    log.alarm("x402_reload_failed", {
+                        file: "tls",
+                        problem: "tls files on disk differ from the loaded copy: send SIGHUP",
+                    });
+                }
             }),
             log,
         ),

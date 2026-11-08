@@ -125,6 +125,8 @@ export class SignerGate implements SignerHealth {
 export interface SignerListener {
     port: number;
     reload(f: TlsFiles): boolean;
+    // The files the TLS stack serves now: the ones it started with or last reloaded
+    loaded(): TlsFiles;
     lastClientCertNotAfter(): Date | null;
     close(): Promise<void>;
 }
@@ -171,6 +173,7 @@ export async function startSignerListener(o: {
         connectNodeAdapter({ routes: (r) => r.service(X402SignerService, service) }),
     );
     let clientNotAfter: Date | null = null;
+    let loaded = o.files;
     // Runs before http2 makes a session, so a refused peer never reaches the service
     server.prependListener("secureConnection", (socket) => {
         const peer = socket.getPeerX509Certificate();
@@ -213,8 +216,10 @@ export async function startSignerListener(o: {
                 });
                 return false;
             }
+            loaded = f;
             return true;
         },
+        loaded: () => loaded,
         lastClientCertNotAfter: () => clientNotAfter,
         close: () =>
             new Promise<void>((resolve) => {

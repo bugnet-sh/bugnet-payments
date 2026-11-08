@@ -246,10 +246,14 @@ describe("startSignerListener", () => {
     it("reload keeps the old files on a bad file and alarms", async () => {
         const l = await listen();
         const before = await peerFingerprint(l.port);
+        expect(l.loaded()).toEqual(files);
         expect(l.reload({ ...files, certPem: "garbage" })).toBe(false);
+        expect(l.loaded()).toEqual(files);
         expect(alarms("x402_reload_failed")).toHaveLength(1);
         expect(await peerFingerprint(l.port)).toBe(before);
-        expect(l.reload(files)).toBe(true);
+        const renewed = { ...files, certPem: `${files.certPem}\n` };
+        expect(l.reload(renewed)).toBe(true);
+        expect(l.loaded()).toEqual(renewed);
         expect(alarms("x402_reload_failed")).toHaveLength(1);
         expect((await egress(l.port).reserveAndSign({ ref: "abcdefghijklmnop" })).result.case).toBe(
             "refused",
