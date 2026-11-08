@@ -225,6 +225,10 @@ describe("runOutbox", () => {
 
     it("ORDER_UNKNOWN keeps an allowance row retrying with backoff", async () => {
         const s = await start();
+        await db.pool.query("update orders set token_expires_at = $2 where id = $1", [
+            s.id,
+            later(3_600_000),
+        ]);
         await paidEvent(s.id);
         const steps: number[] = [];
         let at = T0;
@@ -238,6 +242,30 @@ describe("runOutbox", () => {
         expect(steps).toEqual([
             2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 300_000, 300_000,
         ]);
+    });
+
+    it("ORDER_UNKNOWN drops an allowance row once the start order's token is past its grace", async () => {
+        const s = await start();
+        await db.pool.query("update orders set token_expires_at = $2 where id = $1", [
+            s.id,
+            later(60_000),
+        ]);
+        await paidEvent(s.id);
+        const r = router(() => "order_unknown");
+        await runOutbox(deps(r.router, later(60_000 + 5 * 60_000)));
+        expect((await rowOf(s.id, "paid")).state).toBe("pending");
+        const past = later(60_000 + 5 * 60_000 + 1);
+        await db.pool.query("update x402_router_events set next_at = $1", [past]);
+        expect(await runOutbox(deps(r.router, past))).toEqual({
+            sent: 0,
+            dropped: 1,
+            retried: 0,
+        });
+        expect(await rowOf(s.id, "paid")).toMatchObject({
+            state: "dropped",
+            dropped_reason: "order_never_placed",
+        });
+        expect(log.lines.filter((l) => l.alarm !== undefined)).toEqual([]);
     });
 
     it("void drops a pending paid row", async () => {

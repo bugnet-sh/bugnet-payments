@@ -87,6 +87,8 @@ export async function paidEventSent(db: Queryable, orderId: string): Promise<boo
 
 const SEND_TIMEOUT_MS = 10_000;
 const BASE_BACKOFF_MS = 2_000;
+// After the start order's token expires the router can never learn the order
+const NEVER_PLACED_GRACE_MS = 5 * 60_000;
 
 export interface OutboxDeps {
     pool: pg.Pool;
@@ -154,6 +156,25 @@ async function sendOne(d: OutboxDeps, skip: string[]): Promise<{ id: string; out
                     [row.id, now],
                 );
                 return { id: row.id, out: "sent" };
+            }
+            if (answer === "order_unknown" && row.kind === "allowance") {
+                const placeable = await c.query<{ until: Date | null }>(
+                    "select coalesce(token_expires_at, expires_at) as until from orders where id = $1",
+                    [row.start_order_id],
+                );
+                const until = placeable.rows[0]?.until ?? null;
+                if (until !== null && now.getTime() > until.getTime() + NEVER_PLACED_GRACE_MS) {
+                    await c.query(
+                        `update x402_router_events set state = 'dropped', dropped_reason = $2
+                         where id = $1 and state = 'pending'`,
+                        [row.id, "order_never_placed"],
+                    );
+                    d.log.warn("x402_event_never_placed", {
+                        eventId: row.id,
+                        startOrderId: row.start_order_id,
+                    });
+                    return { id: row.id, out: "dropped" };
+                }
             }
             if (answer === "invalid" || (answer === "order_unknown" && row.kind !== "allowance")) {
                 await c.query(
