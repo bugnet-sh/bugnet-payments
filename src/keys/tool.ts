@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { basename, resolve } from "node:path";
 import { type Address, type Instruction, type KeyPairSigner } from "@solana/kit";
 import { getTransferSolInstruction } from "@solana-program/system";
 import {
@@ -23,6 +24,10 @@ const WALLET_KEYS = [
     ["BUGNET_RECIPIENT_KEY", "recipient"],
 ] as const;
 
+const ALLOWANCE_KEY = "BUGNET_ALLOWANCE_KEY";
+const TESTSELLER_KEYS = ["TESTSELLER_FEE_PAYER_KEY", "TESTSELLER_PAYTO_KEY"] as const;
+const PAYMENTS_ENV_FILE = "/etc/bugnet/payments.env";
+
 const SERVICE_SECRETS = [
     ["BUGNET_ORDER_PRIVATE_KEY", () => randomBytes(32).toString("base64")],
     ["BUGNET_CLAIM_KEY", () => randomBytes(32).toString("base64")],
@@ -44,12 +49,12 @@ export function walletAddresses(
     env: NodeJS.ProcessEnv,
 ): Promise<{ name: string; signer: KeyPairSigner }[]> {
     return Promise.all(
-        WALLET_KEYS.filter(([variable]) => (env[variable] ?? "").trim() !== "").map(
-            async ([variable, name]) => ({
+        [...WALLET_KEYS, [ALLOWANCE_KEY, "allowance"] as const]
+            .filter(([variable]) => (env[variable] ?? "").trim() !== "")
+            .map(async ([variable, name]) => ({
                 name,
                 signer: await loadKeypair(env[variable]!, variable),
-            }),
-        ),
+            })),
     );
 }
 
@@ -73,6 +78,9 @@ export async function generateSecrets(
     }
     for (const [variable, make] of SERVICE_SECRETS) {
         if ((current[variable] ?? "") === "") set(variable, make());
+    }
+    if ((current[ALLOWANCE_KEY] ?? "") === "") {
+        set(ALLOWANCE_KEY, (await generateExportableKeypair()).secretBase58);
     }
     const addresses: Record<string, string> = {};
     const testPayer = await loadTestPayer(current);
@@ -100,6 +108,7 @@ export async function fundingPlan(o: {
     rentExemptMin: bigint;
     refundUsdcMicros: bigint;
     createRecipientAta: boolean;
+    allowanceWallet: Address | null;
 }): Promise<PlannedTx[]> {
     if (o.feePayerLamports > 0n && o.feePayerBalance + o.feePayerLamports < o.rentExemptMin) {
         throw new Error(
@@ -118,6 +127,7 @@ export async function fundingPlan(o: {
         );
     }
     const owners = o.createRecipientAta ? [o.refundWallet, o.recipient] : [o.refundWallet];
+    if (o.allowanceWallet !== null) owners.push(o.allowanceWallet);
     for (const owner of owners) {
         instructions.push(
             await getCreateAssociatedTokenIdempotentInstructionAsync({
@@ -198,4 +208,117 @@ export async function drainPlan(
         ]);
     }
     return txs;
+}
+
+export async function allowanceDrainPlan(
+    o: { testPayer: KeyPairSigner; allowance: KeyPairSigner },
+    hotUsdc: bigint,
+): Promise<PlannedTx[]> {
+    if (hotUsdc === 0n) return [];
+    return [
+        {
+            feePayer: o.testPayer.address,
+            instructions: [
+                await usdcTransferChecked(o.allowance, await usdcAta(o.testPayer.address), hotUsdc),
+            ],
+        },
+    ];
+}
+
+export async function testSellerPlan(o: {
+    testPayer: KeyPairSigner;
+    payTo: Address;
+}): Promise<PlannedTx[]> {
+    return [
+        {
+            feePayer: o.testPayer.address,
+            instructions: [
+                await getCreateAssociatedTokenIdempotentInstructionAsync({
+                    payer: o.testPayer,
+                    owner: o.payTo,
+                    mint: USDC_MINT,
+                }),
+            ],
+        },
+    ];
+}
+
+export async function testSellerDrainPlan(
+    o: { testPayer: KeyPairSigner; feePayer: KeyPairSigner; payTo: KeyPairSigner },
+    balances: { feePayerLamports: bigint; payToLamports: bigint; payToUsdc: bigint },
+): Promise<PlannedTx[]> {
+    const txs: PlannedTx[] = [];
+    const plan = (instructions: Instruction[]) =>
+        txs.push({ feePayer: o.testPayer.address, instructions });
+    const instructions: Instruction[] = [];
+    if (balances.payToUsdc > 0n) {
+        instructions.push(
+            await usdcTransferChecked(
+                o.payTo,
+                await usdcAta(o.testPayer.address),
+                balances.payToUsdc,
+            ),
+        );
+    }
+    instructions.push(
+        getCloseAccountInstruction(
+            {
+                account: await usdcAta(o.payTo.address),
+                destination: o.testPayer.address,
+                owner: o.payTo,
+            },
+            { programAddress: TOKEN_PROGRAM },
+        ),
+    );
+    plan(instructions);
+    for (const [signer, lamports] of [
+        [o.feePayer, balances.feePayerLamports],
+        [o.payTo, balances.payToLamports],
+    ] as const) {
+        if (lamports === 0n) continue;
+        plan([
+            getTransferSolInstruction({
+                source: signer,
+                destination: o.testPayer.address,
+                amount: lamports,
+            }),
+        ]);
+    }
+    return txs;
+}
+
+export async function writeTestSellerEnv(
+    path: string,
+): Promise<{ added: string[]; feePayer: Address; payTo: Address }> {
+    if (basename(path) === ".env" || resolve(path) === PAYMENTS_ENV_FILE) {
+        throw new Error(
+            `refusing to write the test seller's keys to ${path}: use a file of its own`,
+        );
+    }
+    const existed = existsSync(path);
+    const text = existed ? readFileSync(path, "utf8") : "";
+    const lines = text === "" ? [] : text.replace(/\n$/, "").split("\n");
+    const current = parseEnvText(text);
+    const added: string[] = [];
+    for (const variable of TESTSELLER_KEYS) {
+        if ((current[variable] ?? "") !== "") continue;
+        const value = (await generateExportableKeypair()).secretBase58;
+        const at = lines.findIndex((l) => LINE.exec(l)?.[1] === variable);
+        if (at === -1) lines.push(`${variable}=${value}`);
+        else lines[at] = `${variable}=${value}`;
+        current[variable] = value;
+        added.push(variable);
+    }
+    if (added.length > 0) {
+        const temp = `${path}.${process.pid}.tmp`;
+        writeFileSync(temp, `${lines.join("\n")}\n`, { mode: 0o600 });
+        chmodSync(temp, 0o600);
+        renameSync(temp, path);
+    } else {
+        chmodSync(path, 0o600);
+    }
+    const [feePayer, payTo] = await Promise.all(
+        TESTSELLER_KEYS.map((v) => loadKeypair(current[v]!, v)),
+    );
+    return { added, feePayer: feePayer!.address, payTo: payTo!.address };
 }

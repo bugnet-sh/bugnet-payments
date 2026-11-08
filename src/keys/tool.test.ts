@@ -1,7 +1,7 @@
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getBase58Encoder, type Instruction, type KeyPairSigner } from "@solana/kit";
+import { type Address, getBase58Encoder, type Instruction, type KeyPairSigner } from "@solana/kit";
 import {
     SYSTEM_PROGRAM_ADDRESS,
     getTransferSolInstructionDataDecoder,
@@ -17,7 +17,18 @@ import { generateExportableKeypair } from "../solana/keys.ts";
 import { TEST_RENT_EXEMPT_MIN_LAMPORTS } from "../testing/fake-rpc.ts";
 import { testSigner } from "../testing/keys.ts";
 import { KEYS_USAGE } from "./commands.ts";
-import { drainPlan, fundingPlan, type PlannedTx, parseEnvText } from "./tool.ts";
+import { loadKeypair } from "../solana/keys.ts";
+import {
+    allowanceDrainPlan,
+    drainPlan,
+    fundingPlan,
+    generateSecrets,
+    type PlannedTx,
+    parseEnvText,
+    testSellerDrainPlan,
+    testSellerPlan,
+    writeTestSellerEnv,
+} from "./tool.ts";
 
 const ABANDON =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -29,15 +40,22 @@ let testPayer: KeyPairSigner;
 let feePayer: KeyPairSigner;
 let refundSigner: KeyPairSigner;
 let recipient: KeyPairSigner;
+let allowance: KeyPairSigner;
+let payTo: KeyPairSigner;
+let sellerFeePayer: KeyPairSigner;
 
 beforeAll(async () => {
     dir = mkdtempSync(join(tmpdir(), "bn-pay-keys-"));
-    [testPayer, feePayer, refundSigner, recipient] = await Promise.all([
-        testSigner(1),
-        testSigner(2),
-        testSigner(3),
-        testSigner(4),
-    ]);
+    [testPayer, feePayer, refundSigner, recipient, allowance, payTo, sellerFeePayer] =
+        await Promise.all([
+            testSigner(1),
+            testSigner(2),
+            testSigner(3),
+            testSigner(4),
+            testSigner(5),
+            testSigner(6),
+            testSigner(7),
+        ]);
 });
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -113,6 +131,7 @@ function fundOptions() {
         rentExemptMin: TEST_RENT_EXEMPT_MIN_LAMPORTS,
         refundUsdcMicros: 5_000_000n,
         createRecipientAta: false,
+        allowanceWallet: null as Address | null,
     };
 }
 
@@ -177,6 +196,147 @@ describe("keys generate", () => {
         expect(after.startsWith(text.replace(/\n$/, ""))).toBe(true);
         expect(after).not.toContain("BUGNET_TEST_RECIPIENT_KEY");
         expect(parseEnv(after).BUGNET_TEST_PAYER_KEY).toBe("");
+    });
+});
+
+describe("keys generate", () => {
+    async function fullTask24Env(over: Record<string, string> = {}): Promise<string> {
+        const k = async () => (await generateExportableKeypair()).secretBase58;
+        const vars: Record<string, string> = {
+            BUGNET_FEE_PAYER_KEY: await k(),
+            BUGNET_REFUND_KEY: await k(),
+            BUGNET_RECIPIENT_KEY: await k(),
+            BUGNET_ORDER_PRIVATE_KEY: Buffer.alloc(32, 1).toString("base64"),
+            BUGNET_CLAIM_KEY: Buffer.alloc(32, 2).toString("base64"),
+            BUGNET_PAYMENTS_TOKEN: "token",
+            BUGNET_ALLOWANCE_KEY: await k(),
+            ...over,
+        };
+        return Object.entries(vars)
+            .map(([n, v]) => `${n}=${v}`)
+            .join("\n");
+    }
+
+    it("generate adds only BUGNET_ALLOWANCE_KEY when empty and prints its address, never the key", async () => {
+        const p = tmpEnv(await fullTask24Env({ BUGNET_ALLOWANCE_KEY: "" }), 0o600);
+        const io = captureIo();
+        expect(await cliMain(["keys", "generate", "--env", p], {}, io)).toBe(0);
+        const env = parseEnv(readFileSync(p, "utf8"));
+        const key = await loadKeypair(env.BUGNET_ALLOWANCE_KEY!, "BUGNET_ALLOWANCE_KEY");
+        expect(io.outText()).toContain("added=BUGNET_ALLOWANCE_KEY");
+        expect(io.outText()).toContain(`allowance=${key.address}`);
+        expect(io.outText()).not.toContain(env.BUGNET_ALLOWANCE_KEY);
+        expect(statSync(p).mode & 0o777).toBe(0o600);
+        expect((await generateSecrets(p)).added).toEqual([]);
+        expect(parseEnv(readFileSync(p, "utf8")).BUGNET_ALLOWANCE_KEY).toBe(
+            env.BUGNET_ALLOWANCE_KEY,
+        );
+        expect(env.BUGNET_X402_TLS_KEY ?? "").toBe("");
+    });
+
+    it("first generate on a fresh file adds BUGNET_ALLOWANCE_KEY too", async () => {
+        expect((await generateSecrets(tmpEnv("", 0o600))).added).toContain("BUGNET_ALLOWANCE_KEY");
+    });
+});
+
+describe("allowance and test seller plans", () => {
+    it("fund --create-allowance-ata uses the idempotent create", async () => {
+        const txs = await fundingPlan({
+            ...fundOptions(),
+            feePayerLamports: 0n,
+            refundUsdcMicros: 0n,
+            createRecipientAta: false,
+            allowanceWallet: allowance.address,
+        });
+        const ix = instructionsOf(txs);
+        expect(ix.map((i) => i.programAddress)).toEqual([ATA_PROGRAM, ATA_PROGRAM]);
+        expect(ix[1]!.data![0]).toBe(1);
+        expect(ix[1]!.accounts![1]!.address).toBe(await usdcAta(allowance.address));
+        expect(ix[1]!.accounts![2]!.address).toBe(allowance.address);
+        expect(feePayersOf(txs).every((a) => a === testPayer.address)).toBe(true);
+    });
+
+    it("drain never touches the hot USDC account", async () => {
+        const txs = await drainPlan(
+            { testPayer, feePayer, refundSigner, recipient, closeAtas: true },
+            {
+                feePayerLamports: 1n,
+                refundLamports: 1n,
+                recipientLamports: 1n,
+                refundUsdc: 1n,
+                recipientUsdc: 1n,
+            },
+        );
+        const hot = await usdcAta(allowance.address);
+        const touched = instructionsOf(txs)
+            .flatMap((i) => i.accounts ?? [])
+            .map((a) => a.address);
+        expect(touched).not.toContain(hot);
+    });
+
+    it("allowanceDrainPlan moves the whole balance with the test payer paying", async () => {
+        const txs = await allowanceDrainPlan({ testPayer, allowance }, 970_000n);
+        expect(txs).toHaveLength(1);
+        expect(txs[0]!.feePayer).toBe(testPayer.address);
+        expect(tokenTransfers(txs)).toEqual([
+            {
+                source: await usdcAta(allowance.address),
+                destination: await usdcAta(testPayer.address),
+                authority: allowance.address,
+                amount: 970_000n,
+            },
+        ]);
+        expect(await allowanceDrainPlan({ testPayer, allowance }, 0n)).toEqual([]);
+    });
+
+    it("testseller refuses the Payments env file and writes 0600", async () => {
+        await expect(writeTestSellerEnv(join(dir, ".env"))).rejects.toThrow(
+            /use a file of its own/,
+        );
+        await expect(writeTestSellerEnv("/etc/bugnet/payments.env")).rejects.toThrow(
+            /use a file of its own/,
+        );
+        const p = join(dir, "testseller.env");
+        const r = await writeTestSellerEnv(p);
+        expect(r.added).toEqual(["TESTSELLER_FEE_PAYER_KEY", "TESTSELLER_PAYTO_KEY"]);
+        expect(statSync(p).mode & 0o777).toBe(0o600);
+        const env = parseEnv(readFileSync(p, "utf8"));
+        expect((await loadKeypair(env.TESTSELLER_FEE_PAYER_KEY!, "f")).address).toBe(r.feePayer);
+        expect((await loadKeypair(env.TESTSELLER_PAYTO_KEY!, "p")).address).toBe(r.payTo);
+        expect((await writeTestSellerEnv(p)).added).toEqual([]);
+        expect(parseEnv(readFileSync(p, "utf8"))).toEqual(env);
+    });
+
+    it("testSellerPlan creates ATA(payTo) idempotently, the test payer paying", async () => {
+        const txs = await testSellerPlan({ testPayer, payTo: payTo.address });
+        const ix = instructionsOf(txs);
+        expect(ix).toHaveLength(1);
+        expect(ix[0]!.programAddress).toBe(ATA_PROGRAM);
+        expect(ix[0]!.data![0]).toBe(1);
+        expect(ix[0]!.accounts![0]!.address).toBe(testPayer.address);
+        expect(ix[0]!.accounts![2]!.address).toBe(payTo.address);
+        expect(feePayersOf(txs)).toEqual([testPayer.address]);
+    });
+
+    it("testSellerDrainPlan returns the seller's USDC, its ATA rent and its SOL to the test payer", async () => {
+        const txs = await testSellerDrainPlan(
+            { testPayer, feePayer: sellerFeePayer, payTo },
+            { feePayerLamports: 9_000_000n, payToLamports: 0n, payToUsdc: 150_000n },
+        );
+        expect(tokenTransfers(txs).map((t) => t.amount)).toEqual([150_000n]);
+        expect(systemTransfers(txs)).toEqual([
+            { source: sellerFeePayer.address, destination: testPayer.address, amount: 9_000_000n },
+        ]);
+        expect(closes(txs)).toEqual([
+            {
+                account: await usdcAta(payTo.address),
+                destination: testPayer.address,
+                authority: payTo.address,
+            },
+        ]);
+        const first = txs[0]!.instructions.map((i) => i.data![0]);
+        expect(first).toEqual([12, 9]);
+        expect(feePayersOf(txs).every((a) => a === testPayer.address)).toBe(true);
     });
 });
 

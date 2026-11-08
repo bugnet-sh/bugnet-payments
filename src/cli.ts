@@ -155,7 +155,7 @@ export async function cliMain(
     const args = splitConfig(argv);
     if (args === null) return usage(io, "-config needs a file");
     const [group, action, ...keysWords] = args.words;
-    if (isKeysCommand(group)) return runKeys(action, keysWords, env, io);
+    if (isKeysCommand(group)) return runKeys(action, keysWords, env, io, args.config);
     let cmd: DbCommand | undefined;
     let used = 0;
     for (const n of [3, 2]) {

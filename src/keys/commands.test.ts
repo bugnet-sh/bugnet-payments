@@ -1,5 +1,8 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
     getBase64Encoder,
     getCompiledTransactionMessageDecoder,
@@ -10,7 +13,10 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { cliMain } from "../cli.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { generateExportableKeypair } from "../solana/keys.ts";
+import { testDb, type TestDb } from "../testing/db.ts";
 import { TEST_ATA_RENT_LAMPORTS, TEST_RENT_EXEMPT_MIN_LAMPORTS } from "../testing/fake-rpc.ts";
+import { seedAccount } from "../testing/x402.ts";
+import { parseEnvText } from "./tool.ts";
 
 interface Wallet {
     secret: string;
@@ -23,6 +29,11 @@ let testPayer: Wallet;
 let feePayer: Wallet;
 let refund: Wallet;
 let cold: Wallet;
+let allowance: Wallet;
+let otherKey: Wallet;
+let db: TestDb;
+let dir: string;
+let config: string;
 const sent: string[] = [];
 let statusReply: () => unknown = () => ({
     context: { slot: 1 },
@@ -102,12 +113,23 @@ function result(method: string, params: unknown[]): unknown {
 }
 
 beforeAll(async () => {
-    [testPayer, feePayer, refund, cold] = await Promise.all([
+    db = await testDb();
+    dir = mkdtempSync(join(tmpdir(), "bn-pay-keys-cmd-"));
+    [testPayer, feePayer, refund, cold, allowance, otherKey] = await Promise.all([
+        wallet(),
+        wallet(),
+        wallet(),
+        wallet(),
         wallet(),
         wallet(),
         wallet(),
         wallet(),
     ]);
+    config = join(dir, "config.toml");
+    writeFileSync(
+        config,
+        `[database]\nurl = "${db.url}"\n\n[solana]\nrecipient = "${cold.address}"\n\n[x402]\nallowance_wallet = "${allowance.address}"\n`,
+    );
     server = createServer((req, res) => {
         let body = "";
         req.on("data", (c) => (body += c));
@@ -130,7 +152,11 @@ beforeAll(async () => {
     url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/secret-api-key`;
     tokenOwners.set(String(await usdcAta(testPayer.address as never)), testPayer.address);
 });
-afterAll(() => new Promise<void>((r) => server.close(() => r())));
+afterAll(async () => {
+    await new Promise<void>((r) => server.close(() => r()));
+    await db.close();
+    rmSync(dir, { recursive: true, force: true });
+});
 
 function env(over: Record<string, string> = {}): NodeJS.ProcessEnv {
     return {
@@ -333,6 +359,164 @@ describe("keys over a stub RPC", () => {
         expect(await cliMain(["keys", "show"], env(), io)).toBe(0);
         expect(io.outText()).toContain(`fee_payer=${feePayer.address} sol=42 usdc=0`);
         expect(io.outText()).toContain(`recipient=${cold.address} sol=0 usdc=0`);
+    });
+
+    it("show lists allowance= with SOL and USDC", async () => {
+        lamports.clear();
+        usdc.clear();
+        tokenOwners.clear();
+        lamports.set(allowance.address, 0);
+        usdc.set(String(await usdcAta(allowance.address as never)), 970_000);
+        tokenOwners.set(String(await usdcAta(allowance.address as never)), allowance.address);
+        const io = captureIo();
+        expect(
+            await cliMain(["keys", "show"], env({ BUGNET_ALLOWANCE_KEY: allowance.secret }), io),
+        ).toBe(0);
+        expect(io.outText()).toContain(`allowance=${allowance.address} sol=0 usdc=970000`);
+    });
+
+    it("fund --create-allowance-ata creates the account and moves no funds", async () => {
+        sent.length = 0;
+        lamports.clear();
+        usdc.clear();
+        lamports.set(testPayer.address, 5_000_000_000);
+        const io = captureIo();
+        const code = await cliMain(
+            ["keys", "fund", "--create-allowance-ata"],
+            env({ BUGNET_ALLOWANCE_KEY: allowance.secret }),
+            io,
+        );
+        expect(io.errText()).not.toContain('"level":"error"');
+        expect(code).toBe(0);
+        const [tx] = decodeSent();
+        const accounts = getCompiledTransactionMessageDecoder().decode(
+            tx!.messageBytes,
+        ).staticAccounts;
+        expect(accounts).toContain(String(await usdcAta(allowance.address as never)));
+    });
+
+    it("fund --create-allowance-ata exits 1 without BUGNET_ALLOWANCE_KEY", async () => {
+        sent.length = 0;
+        const io = captureIo();
+        expect(await cliMain(["keys", "fund", "--create-allowance-ata"], env(), io)).toBe(1);
+        expect(io.errText()).toContain("BUGNET_ALLOWANCE_KEY must be set: run keys generate first");
+        expect(sent).toHaveLength(0);
+    });
+
+    describe("drain --allowance", () => {
+        afterEach(() => db.pool.query("delete from x402_accounts"));
+
+        it("exits 1 while the hot ledger is not empty, before any key or RPC call", async () => {
+            sent.length = 0;
+            await seedAccount(db.pool, { state: "open" });
+            const io = captureIo();
+            expect(await cliMain(["keys", "drain", "--allowance", "-config", config], {}, io)).toBe(
+                1,
+            );
+            expect(io.errText()).toContain("hot ledger not empty");
+            expect(sent).toHaveLength(0);
+        });
+
+        it("exits 1 when the key is not allowance_wallet", async () => {
+            sent.length = 0;
+            const io = captureIo();
+            expect(
+                await cliMain(
+                    ["keys", "drain", "--allowance", "-config", config],
+                    env({ BUGNET_ALLOWANCE_KEY: otherKey.secret }),
+                    io,
+                ),
+            ).toBe(1);
+            expect(io.errText()).toContain("BUGNET_ALLOWANCE_KEY is not [x402] allowance_wallet");
+            expect(sent).toHaveLength(0);
+        });
+
+        it("moves the hot USDC to the test payer, signed by both wallets", async () => {
+            sent.length = 0;
+            lamports.clear();
+            usdc.clear();
+            const hot = String(await usdcAta(allowance.address as never));
+            usdc.set(hot, 970_000);
+            tokenOwners.set(hot, allowance.address);
+            const io = captureIo();
+            expect(
+                await cliMain(
+                    ["keys", "drain", "--allowance", "-config", config],
+                    env({ BUGNET_ALLOWANCE_KEY: allowance.secret }),
+                    io,
+                ),
+            ).toBe(0);
+            expect(io.outText()).toMatch(/^confirmed [1-9A-HJ-NP-Za-km-z]{86,88}$/);
+            const [tx] = decodeSent();
+            expect(Object.keys(tx!.signatures).sort()).toEqual(
+                [testPayer.address, allowance.address].sort(),
+            );
+        });
+    });
+
+    describe("the test seller", () => {
+        it("testseller writes its env file, prints both addresses and creates the ATA", async () => {
+            sent.length = 0;
+            lamports.clear();
+            usdc.clear();
+            lamports.set(testPayer.address, 5_000_000_000);
+            const file = join(dir, "seller.env");
+            const io = captureIo();
+            expect(await cliMain(["keys", "testseller", "--env", file], env(), io)).toBe(0);
+            const keys = parseEnvText(readFileSync(file, "utf8"));
+            expect(io.outText()).toMatch(/^testseller_fee_payer=[1-9A-HJ-NP-Za-km-z]{32,44}$/m);
+            expect(io.outText()).toMatch(/^testseller_payto=[1-9A-HJ-NP-Za-km-z]{32,44}$/m);
+            for (const v of Object.values(keys)) {
+                expect(io.outText() + io.errText()).not.toContain(v);
+            }
+            expect(decodeSent()).toHaveLength(1);
+        });
+
+        it("testseller refuses a Payments env file name", async () => {
+            const io = captureIo();
+            expect(
+                await cliMain(["keys", "testseller", "--env", join(dir, ".env")], env(), io),
+            ).toBe(1);
+            expect(io.errText()).toContain("use a file of its own");
+        });
+
+        it("drain --testseller sends the seller's funds back from the file's keys", async () => {
+            const file = join(dir, "seller-drain.env");
+            const made = captureIo();
+            lamports.clear();
+            usdc.clear();
+            lamports.set(testPayer.address, 5_000_000_000);
+            await cliMain(["keys", "testseller", "--env", file], env(), made);
+            const keys = parseEnvText(readFileSync(file, "utf8"));
+            const payToAddress = /testseller_payto=(\S+)/.exec(made.outText())![1]!;
+            const feeAddress = /testseller_fee_payer=(\S+)/.exec(made.outText())![1]!;
+            sent.length = 0;
+            lamports.set(feeAddress, 9_000_000);
+            const ata = String(await usdcAta(payToAddress as never));
+            usdc.set(ata, 150_000);
+            tokenOwners.set(ata, payToAddress);
+            const io = captureIo();
+            expect(await cliMain(["keys", "drain", "--testseller", "--env", file], env(), io)).toBe(
+                0,
+            );
+            expect(io.outText().split("\n")).toHaveLength(2);
+            expect(decodeSent()).toHaveLength(2);
+            for (const v of Object.values(keys)) {
+                expect(io.outText() + io.errText()).not.toContain(v);
+            }
+        });
+    });
+
+    it.each([
+        [["fund", "--create-allowance-atas"], 2],
+        [["drain", "--allowances"], 2],
+        [["drain", "--allowance", "--testseller"], 2],
+        [["testseller"], 2],
+        [["drain", "--testseller"], 2],
+    ])("keys %j exits %i before reaching a command", async (words, want) => {
+        sent.length = 0;
+        expect(await cliMain(["keys", ...words], env(), captureIo())).toBe(want);
+        expect(sent).toHaveLength(0);
     });
 
     describe("confirmation by block height", () => {
