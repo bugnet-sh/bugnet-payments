@@ -68,6 +68,7 @@ describe("parseHosts", () => {
         expect(parseHosts("a.example,,b.example,a.example")).toEqual(["a.example", "b.example"]);
         const many = Array.from({ length: 21 }, (_, i) => `h${i}.example`).join(",");
         expect(parseHosts(many)).toBeNull();
+        expect(parseHosts(" A.Example ,a.example")).toEqual(["a.example"]);
         expect(parseHosts(null)).toBeNull();
         expect(parseHosts("")).toBeNull();
         expect(parseHosts(`${"a".repeat(254)}`)).toBeNull();

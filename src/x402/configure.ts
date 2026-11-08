@@ -97,6 +97,7 @@ export async function configure(
     if (!parsed.success) return refuse("bad_request");
     const r: ConfigureRequest = parsed.data;
     const sent = new Set(r.services.map((s) => s.serviceId));
+    if (sent.size !== r.services.length) return refuse("bad_request");
     if (r.disable.some((id) => sent.has(id))) return refuse("bad_request");
 
     const found = await findAccountForHandle(pool, d.router, r.handleSha256, signal);
@@ -112,78 +113,82 @@ export async function configure(
     }
 
     try {
-        return await withTx(pool, async (c) => {
-            const locked = await lockAccount(c, account.id);
-            if (locked === null || locked.state !== "open") return refuse("sandbox_ended");
-            const held = await c.query<HeldRow>(
-                `select service_id, method, host, prefix, pay_to, max_price_micros, state
+        return await withTx(
+            pool,
+            async (c) => {
+                const locked = await lockAccount(c, account.id);
+                if (locked === null || locked.state !== "open") return refuse("sandbox_ended");
+                const held = await c.query<HeldRow>(
+                    `select service_id, method, host, prefix, pay_to, max_price_micros, state
                  from x402_services where account_id = $1 order by service_id for no key update`,
-                [account.id],
-            );
-            const rows = new Map(
-                held.rows.map((h) => [
-                    h.service_id,
-                    { price: Number(h.max_price_micros), state: h.state },
-                ]),
-            );
-            const byId = new Map(held.rows.map((h) => [h.service_id, h]));
-            for (const p of r.services) {
-                const h = byId.get(p.serviceId);
-                if (
-                    h === undefined ||
-                    h.method !== p.method ||
-                    h.host !== p.host ||
-                    h.prefix !== p.prefix ||
-                    h.pay_to !== p.payTo
-                ) {
-                    return refuse("needs_payment");
+                    [account.id],
+                );
+                const rows = new Map(
+                    held.rows.map((h) => [
+                        h.service_id,
+                        { price: Number(h.max_price_micros), state: h.state },
+                    ]),
+                );
+                const byId = new Map(held.rows.map((h) => [h.service_id, h]));
+                for (const p of r.services) {
+                    const h = byId.get(p.serviceId);
+                    if (
+                        h === undefined ||
+                        h.method !== p.method ||
+                        h.host !== p.host ||
+                        h.prefix !== p.prefix ||
+                        h.pay_to !== p.payTo
+                    ) {
+                        return refuse("needs_payment");
+                    }
+                    if (p.maxPriceMicros > d.x402.max_price_per_call_micros) {
+                        return refuse("price_above_ceiling");
+                    }
+                    rows.set(p.serviceId, {
+                        price: p.maxPriceMicros,
+                        state: h.state === "disabled" ? "enabled" : h.state,
+                    });
                 }
-                if (p.maxPriceMicros > d.x402.max_price_per_call_micros) {
-                    return refuse("price_above_ceiling");
+                for (const id of r.disable) {
+                    const row = rows.get(id);
+                    if (row === undefined) return refuse("needs_payment");
+                    row.state = "disabled";
                 }
-                rows.set(p.serviceId, {
-                    price: p.maxPriceMicros,
-                    state: h.state === "disabled" ? "enabled" : h.state,
-                });
-            }
-            for (const id of r.disable) {
-                const row = rows.get(id);
-                if (row === undefined) return refuse("needs_payment");
-                row.state = "disabled";
-            }
-            const live = [...rows.values()].filter((v) => v.state !== "disabled");
-            if (live.length > d.x402.max_services) return refuse("too_many_services");
-            const limit = r.spendPerMinuteMicros ?? locked.spendPerMinuteMicros;
-            const prices = live.filter((v) => v.state === "enabled").map((v) => v.price);
-            if (!spendRateFits(limit, prices, d.x402)) return refuse("spend_rate_out_of_range");
+                const live = [...rows.values()].filter((v) => v.state !== "disabled");
+                if (live.length > d.x402.max_services) return refuse("too_many_services");
+                const limit = r.spendPerMinuteMicros ?? locked.spendPerMinuteMicros;
+                const prices = live.map((v) => v.price);
+                if (!spendRateFits(limit, prices, d.x402)) return refuse("spend_rate_out_of_range");
 
-            const now = d.now();
-            for (const id of [...sent, ...r.disable]) {
-                const row = rows.get(id)!;
-                await c.query(
-                    `update x402_services set max_price_micros = $3, state = $4, updated_at = $5
+                const now = d.now();
+                for (const id of [...sent, ...r.disable]) {
+                    const row = rows.get(id)!;
+                    await c.query(
+                        `update x402_services set max_price_micros = $3, state = $4, updated_at = $5
                      where account_id = $1 and service_id = $2`,
-                    [account.id, id, row.price, row.state, now],
-                );
-            }
-            if (r.spendPerMinuteMicros !== undefined) {
-                await c.query(
-                    "update x402_accounts set spend_per_minute_micros = $2 where id = $1",
-                    [account.id, r.spendPerMinuteMicros],
-                );
-            }
-            const answer: ConfigureResult = {
-                status: "ok",
-                x402: await accountView(c, account.id, d.x402),
-            };
-            const stored = await c.query(
-                `insert into x402_configure_requests (account_id, request_id, request_sha256, answer)
+                        [account.id, id, row.price, row.state, now],
+                    );
+                }
+                if (r.spendPerMinuteMicros !== undefined) {
+                    await c.query(
+                        "update x402_accounts set spend_per_minute_micros = $2 where id = $1",
+                        [account.id, r.spendPerMinuteMicros],
+                    );
+                }
+                const answer: ConfigureResult = {
+                    status: "ok",
+                    x402: await accountView(c, account.id, d.x402),
+                };
+                const stored = await c.query(
+                    `insert into x402_configure_requests (account_id, request_id, request_sha256, answer)
                  values ($1, $2, $3, $4::jsonb) on conflict do nothing`,
-                [account.id, r.requestId, configureRequestSha256(r), JSON.stringify(answer)],
-            );
-            if (stored.rowCount === 0) throw new Twin();
-            return answer;
-        });
+                    [account.id, r.requestId, configureRequestSha256(r), JSON.stringify(answer)],
+                );
+                if (stored.rowCount === 0) throw new Twin();
+                return answer;
+            },
+            d.log,
+        );
     } catch (err) {
         if (!(err instanceof Twin)) throw err;
         return (await storedAnswer(pool, account.id, r))!;

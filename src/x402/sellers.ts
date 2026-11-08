@@ -6,7 +6,14 @@ const MAX_HOST_LENGTH = 253;
 
 export function parseHosts(query: string | null): string[] | null {
     if (query === null) return null;
-    const hosts = [...new Set(query.split(",").filter((h) => h !== ""))];
+    const hosts = [
+        ...new Set(
+            query
+                .split(",")
+                .map((h) => h.trim().toLowerCase())
+                .filter((h) => h !== ""),
+        ),
+    ];
     if (hosts.length === 0 || hosts.length > MAX_HOSTS) return null;
     if (hosts.some((h) => h.length > MAX_HOST_LENGTH)) return null;
     return hosts;

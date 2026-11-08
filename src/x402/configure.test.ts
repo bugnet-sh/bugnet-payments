@@ -123,6 +123,22 @@ describe("configure", () => {
         expect(row.max_price_micros).toBe("20000");
     });
 
+    it("counts an unreliable service against the minute limit", async () => {
+        const a = await held({ state: "unreliable", failures: 3 });
+        const r = await run(a, {
+            services: [{ ...PIN, maxPriceMicros: 20_000 }],
+            spendPerMinuteMicros: 10_000,
+        });
+        expect(r).toMatchObject({ status: "refused", reason: "spend_rate_out_of_range" });
+        expect((await svc(a)).max_price_micros).not.toBe("20000");
+    });
+
+    it("a services list naming one serviceId twice answers bad_request", async () => {
+        const a = await held();
+        const r = await run(a, { services: [PIN, { ...PIN, maxPriceMicros: 20_000 }] });
+        expect(r).toMatchObject({ status: "refused", reason: "bad_request" });
+    });
+
     it("a new service or payTo answers needs_payment", async () => {
         const a = await held();
         const other = {
