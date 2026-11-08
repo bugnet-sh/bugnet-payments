@@ -297,15 +297,14 @@ export async function testSellerDrainPlan(
 export async function writeTestSellerEnv(
     path: string,
 ): Promise<{ added: string[]; feePayer: Address; payTo: Address }> {
-    if (basename(path) === ".env" || resolve(path) === PAYMENTS_ENV_FILE) {
-        throw new Error(
-            `refusing to write the test seller's keys to ${path}: use a file of its own`,
-        );
-    }
+    const refuse = () =>
+        new Error(`refusing to write the test seller's keys to ${path}: use a file of its own`);
+    if (basename(path) === ".env" || resolve(path) === PAYMENTS_ENV_FILE) throw refuse();
     const existed = existsSync(path);
     const text = existed ? readFileSync(path, "utf8") : "";
     const lines = text === "" ? [] : text.replace(/\n$/, "").split("\n");
     const current = parseEnvText(text);
+    if (Object.keys(current).some((k) => k.startsWith("BUGNET_"))) throw refuse();
     const added: string[] = [];
     for (const variable of TESTSELLER_KEYS) {
         if ((current[variable] ?? "") !== "") continue;

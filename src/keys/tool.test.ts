@@ -296,6 +296,10 @@ describe("allowance and test seller plans", () => {
         await expect(writeTestSellerEnv("/etc/bugnet/payments.env")).rejects.toThrow(
             /use a file of its own/,
         );
+        const production = join(dir, ".env.production");
+        writeFileSync(production, "BUGNET_ALLOWANCE_KEY=x\n");
+        await expect(writeTestSellerEnv(production)).rejects.toThrow(/use a file of its own/);
+        expect(readFileSync(production, "utf8")).toBe("BUGNET_ALLOWANCE_KEY=x\n");
         const p = join(dir, "testseller.env");
         const r = await writeTestSellerEnv(p);
         expect(r.added).toEqual(["TESTSELLER_FEE_PAYER_KEY", "TESTSELLER_PAYTO_KEY"]);
