@@ -434,12 +434,22 @@ Checks: 7.8. Last: `pcli x402 ledger-check <accountId>` exits 0.
 
 Checks: 7.8. Last: `pcli x402 ledger-check <accountId>` exits 0.
 
+Payments-level measurement (test/live/x402.live.test.ts, mainnet, 2026-11-08): a 64-byte seller
+memo landed using 24,588 compute units against a limit raised to 40,000 for the test. A 32-byte
+memo (T17) used 13,180. The default `seller_compute_unit_limit` of 20,000 therefore covers the
+default 32-byte memo but not a 64-byte one; keep `seller_memo_max_bytes` at 32 unless the limit is
+raised with it.
+
 ### T19: the refund memo's compute units (7.10)
 
 1. founder: `bugnet_start` with x402 and $1.00; spend a little; `bugnet_stop`.
 2. bugnet-22: when the allowance refund is confirmed, read its transaction
    (`meta.computeUnitsConsumed`) and compare it with `[refunds] compute_unit_limit`. Record the
    number for 7.10.
+
+Payments-level measurement (mainnet, 2026-11-08): the allowance refund used 7,429 compute units
+against `[refunds] compute_unit_limit` 20,000. The real third-party spike (12.3 step 5,
+apexfaucet.xyz at $0.001) accepted Payments' own-blockhash payload; the paid call took 1,164 ms.
 
 Checks: 7.10. Last: `pcli x402 ledger-check <accountId>` exits 0.
 
