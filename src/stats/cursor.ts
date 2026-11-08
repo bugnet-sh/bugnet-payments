@@ -19,6 +19,8 @@ export interface Cursor {
 export const MAX_CURSOR_LENGTH = 200;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const ID = /^[A-Za-z0-9_]{1,64}$/;
+// A later at is an Invalid Date, which Postgres refuses
+const MAX_DATE_MS = 8.64e15;
 
 export function encodeCursor(c: Cursor): string {
     return Buffer.from(JSON.stringify({ at: c.at, kind: c.kind, id: c.id })).toString("base64url");
@@ -37,7 +39,9 @@ export function decodeCursor(s: string): Cursor | null {
     }
     if (!isRecord(v)) return null;
     const { at, kind, id } = v;
-    if (typeof at !== "number" || !Number.isSafeInteger(at) || at < 0) return null;
+    if (typeof at !== "number" || !Number.isSafeInteger(at) || at < 0 || at > MAX_DATE_MS) {
+        return null;
+    }
     if (typeof kind !== "string" || !(LIST_KINDS as readonly string[]).includes(kind)) return null;
     if (typeof id !== "string" || !ID.test(id)) return null;
     return { at, kind: kind as ListKind, id };

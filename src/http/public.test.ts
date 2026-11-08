@@ -708,7 +708,9 @@ describe("public payment list", () => {
     });
 
     it("answers 400 bad_cursor for a cursor that does not decode or is too long", async () => {
-        for (const before of ["nope!", "e30", "a".repeat(201)]) {
+        // The last one has at 8.7e15, past the largest Date
+        const pastDates = "eyJhdCI6ODcwMDAwMDAwMDAwMDAwMCwia2luZCI6InNhbmRib3giLCJpZCI6IngifQ";
+        for (const before of ["nope!", "e30", "a".repeat(201), pastDates]) {
             const r = await pub(`${PATH}?before=${before}`);
             expect(r.status).toBe(400);
             expect(r.headers.get("cache-control")).toBe("no-store");

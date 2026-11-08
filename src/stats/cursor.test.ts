@@ -11,6 +11,8 @@ describe("stats cursor", () => {
         expect(decodeCursor(s)).toEqual(c);
         const order = { at: 0, kind: "sandbox", id: "ord_abcdefghijklmnopqrstuvwxyz" } as const;
         expect(decodeCursor(encodeCursor(order))).toEqual(order);
+        const last = { at: 8.64e15, kind: "extend", id: "1" } as const;
+        expect(decodeCursor(encodeCursor(last))).toEqual(last);
     });
 
     it("refuses a cursor over the length cap", () => {
@@ -30,6 +32,7 @@ describe("stats cursor", () => {
         ["a negative at", b64({ at: -1, kind: "extend", id: "1" })],
         ["a fractional at", b64({ at: 1.5, kind: "extend", id: "1" })],
         ["an unsafe at", b64({ at: 2 ** 53, kind: "extend", id: "1" })],
+        ["an at past the largest Date", b64({ at: 8.64e15 + 1, kind: "extend", id: "1" })],
         ["a string at", b64({ at: "1", kind: "extend", id: "1" })],
         ["a missing id", b64({ at: 1, kind: "extend" })],
         ["an empty id", b64({ at: 1, kind: "extend", id: "" })],
