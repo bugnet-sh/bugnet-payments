@@ -14,7 +14,7 @@
         "lint": "eslint . && prettier --check .",
         "format": "prettier --write .",
         "build": "pnpm proto && esbuild src/main.ts src/cli.ts --bundle --platform=node --format=esm --target=node26 --packages=external --outdir=dist && pnpm build:checkout",
-        "build:checkout": "esbuild src/checkout/client.ts --bundle --platform=browser --format=esm --target=es2022 --minify --outfile=dist/checkout.js",
+        "build:checkout": "esbuild src/checkout/client.ts --bundle --platform=browser --format=esm --target=es2022 --minify --outfile=dist/checkout.js && mkdir -p dist/fonts && cp src/checkout/fonts/*.woff2 src/checkout/fonts/OFL-*.txt dist/fonts/",
         "dev": "pnpm proto && tsx src/main.ts -config config/dev.toml",
         "cli": "tsx src/cli.ts"
     },
