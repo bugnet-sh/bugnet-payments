@@ -110,7 +110,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
     await db.pool.query("truncate orders cascade");
-    await db.pool.query("truncate audit_checkpoints");
+    await db.pool.query("truncate audit_checkpoints, x402_cold_transfers cascade");
     for (const k of Object.keys(sigs)) delete sigs[k];
     log = memoryLog();
     order = (await seedOrder(db.pool, { state: "paid", amountMicros: 10_000 })).order;
@@ -407,5 +407,56 @@ describe("auditInflows", () => {
             maxSupportedTransactionVersion: 1,
             commitment: "finalized",
         });
+    });
+
+    it("a transfer to cold never raises inflow_mismatch", async () => {
+        await db.pool.query(
+            `insert into x402_cold_transfers (amount_micros, state, tx_signature, previous_signatures)
+             values (1000000, 'sent', $1, $2), (2000000, 'confirmed', $3, '{}')`,
+            [sigOf(), [sig("C1")], sig("C2")],
+        );
+        const r = await auditInflows(
+            deps(
+                rpcWith([
+                    inflow({ name: "C1", memo: "bugnet-cold 1", amount: "1000000" }),
+                    inflow({ name: "C2", memo: "bugnet-cold 2", amount: "2000000" }),
+                ]),
+            ),
+        );
+        expect(r.mismatches).toEqual([]);
+        expect(r.matched).toBe(2);
+    });
+
+    it("a failed transfer to cold still mismatches", async () => {
+        await db.pool.query(
+            "insert into x402_cold_transfers (amount_micros, state, tx_signature) values (1000000, 'failed', $1)",
+            [sig("C3")],
+        );
+        const r = await auditInflows(
+            deps(rpcWith([inflow({ name: "C3", memo: "bugnet-cold 3", amount: "1000000" })])),
+        );
+        expect(r.mismatches).toEqual([sig("C3")]);
+    });
+
+    it("hot orders are left out of the recipient scan", async () => {
+        const { order: hot } = await seedOrder(db.pool, {
+            state: "paid",
+            payInto: "allowance",
+            amountMicros: 1_013_000,
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+        });
+        await seedPayment(db.pool, hot.id, {
+            txSignature: sig("H1"),
+            status: "confirmed",
+            confirmedAt: new Date(t0.getTime() - 10 * MIN),
+        });
+        const r = await auditInflows(
+            deps(rpcWith([inflow({ name: "S1", memo: order.id, amount: "10000" })])),
+        );
+        expect(r.missing).not.toContain(hot.id);
+        expect(
+            log.lines.some((l) => l.alarm === "payment_missing_inflow" && l.orderId === hot.id),
+        ).toBe(false);
     });
 });

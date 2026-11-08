@@ -22,6 +22,8 @@ const defaults: Settings["alarms"] = {
 const refunds = {
     float_low_micros: 10_000_000,
     max_per_hour: 10,
+    compute_unit_limit: 20_000,
+    compute_unit_price_micro_lamports: 10_000,
 } as Settings["refunds"];
 
 let db: TestDb;
@@ -32,6 +34,7 @@ beforeAll(async () => {
 afterAll(() => db.close());
 beforeEach(async () => {
     await db.pool.query("truncate orders cascade");
+    await db.pool.query("truncate x402_cold_transfers cascade");
 });
 
 function run(
@@ -91,7 +94,45 @@ async function confirmedPayments(n: number) {
     }
 }
 
+async function allowanceRows(n: number, state: "confirmed" | "pending", when: Date) {
+    for (let i = 0; i < n; i++) {
+        const { order } = await seedOrder(db.pool, {
+            kind: "start",
+            state: "redeemed",
+            payInto: "allowance",
+            amountMicros: 1_013_000,
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+        });
+        await db.pool.query(
+            `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
+                from_wallet, created_at, confirmed_at)
+             values ($1, 'allowance', 'x402_unspent', 10000, 'dest', 'payer', $2, 'allowance', $3, $4)`,
+            [order.id, state, when, state === "confirmed" ? when : null],
+        );
+    }
+}
+const lowMin = { ...defaults, fee_payer_min_lamports: 0 };
+
 describe("checkAlarms", () => {
+    it("x402 ends never raise sol_per_order_high or sol_spent_without_orders", async () => {
+        await allowanceRows(3, "confirmed", at(-30_000));
+        await db.pool.query(
+            "insert into x402_cold_transfers (amount_micros, state, confirmed_at) values (1, 'confirmed', $1)",
+            [at(-30_000)],
+        );
+        const prev = { at: at(-60_000), feePayerLamports: 1_000_000n, confirmedPayments: 0 };
+        expect(await run({ lamports: 959_200n, prev, alarms: lowMin }).names()).toEqual([]);
+        expect(await run({ lamports: 939_199n, prev, alarms: lowMin }).names()).toContain(
+            "sol_spent_without_orders",
+        );
+    });
+
+    it("refunds_per_hour_high ignores allowance rows", async () => {
+        await allowanceRows(11, "pending", at(-10 * MIN));
+        expect(await run({ alarms: lowMin }).names()).not.toContain("refunds_per_hour_high");
+    });
+
     it("gives up on a stalled getBalance within solana.rpc_timeout and raises nothing", async () => {
         const started = performance.now();
         const { result, log } = run({

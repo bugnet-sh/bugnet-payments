@@ -190,7 +190,11 @@ async function matches(
 ): Promise<boolean> {
     const res = await db.query<{ ok: boolean }>(
         `select true as ok from payments
-         where tx_signature = $1 and amount_micros = $2 and order_id = any($3::text[])`,
+         where tx_signature = $1 and amount_micros = $2 and order_id = any($3::text[])
+         union all
+         select true from x402_cold_transfers
+         where state <> 'failed' and amount_micros = $2
+           and ($1 = tx_signature or $1 = any(previous_signatures))`,
         [sig, amount.toString(), memos],
     );
     return res.rowCount === 1;
@@ -202,9 +206,11 @@ async function confirmedBetween(
     to: Date,
 ): Promise<{ orderId: string; signature: string }[]> {
     const res = await db.query<{ order_id: string; tx_signature: string }>(
-        `select order_id, tx_signature from payments
-         where status = 'confirmed' and confirmed_at >= $1 and confirmed_at < $2
-         order by confirmed_at, order_id`,
+        `select p.order_id, p.tx_signature from payments p
+         join orders o on o.id = p.order_id
+         where p.status = 'confirmed' and o.pay_into = 'cold'
+           and p.confirmed_at >= $1 and p.confirmed_at < $2
+         order by p.confirmed_at, p.order_id`,
         [from, to],
     );
     return res.rows.map((r) => ({ orderId: r.order_id, signature: r.tx_signature }));

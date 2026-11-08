@@ -12,6 +12,7 @@ import type { Settings } from "../config.ts";
 import type { Log } from "../log.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { deadline, type SolanaRpc } from "../solana/rpc.ts";
+import { hotFeeLamports } from "../x402/audit.ts";
 
 export interface AlarmSnapshot {
     at: Date;
@@ -48,7 +49,10 @@ export async function checkAlarms(
         });
     }
 
-    const spent = prev ? prev.feePayerLamports - lamports : 0n;
+    const x402Ends = prev ? await hotEnds(d.pool, prev.at, now) : 0;
+    const spent = prev
+        ? prev.feePayerLamports - lamports - hotFeeLamports(d.refunds) * BigInt(x402Ends)
+        : 0n;
     const max = BigInt(d.alarms.max_lamports_per_order);
     if (spent > 0n) {
         if (txs === 0) {
@@ -96,10 +100,23 @@ async function confirmedPayments(pool: pg.Pool, from: Date, to: Date): Promise<n
     return res.rows[0]?.n ?? 0;
 }
 
+// Hot refunds and cold transfers are paid for by the fee payer without an order behind them.
+async function hotEnds(pool: pg.Pool, from: Date, to: Date): Promise<number> {
+    const res = await pool.query<{ n: number }>(
+        `select (select count(*) from refunds where from_wallet = 'allowance'
+                    and state = 'confirmed' and confirmed_at > $1 and confirmed_at <= $2)::int
+              + (select count(*) from x402_cold_transfers
+                    where state = 'confirmed' and confirmed_at > $1 and confirmed_at <= $2)::int
+              as n`,
+        [from, to],
+    );
+    return res.rows[0]?.n ?? 0;
+}
+
 async function refundsCreatedLastHour(pool: pg.Pool, now: Date): Promise<number> {
     const res = await pool.query<{ n: number }>(
         `select count(*)::int as n from refunds
-         where created_at > $1::timestamptz - interval '1 hour' and created_at <= $1`,
+         where from_wallet = 'refund' and created_at > $1::timestamptz - interval '1 hour' and created_at <= $1`,
         [now],
     );
     return res.rows[0]?.n ?? 0;
