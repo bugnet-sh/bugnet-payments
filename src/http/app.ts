@@ -12,11 +12,19 @@ import type { SolanaRpc } from "../solana/rpc.ts";
 import { parseIndex, type IndexCopy } from "../x402/index-file.ts";
 import { bugnetAddresses } from "../x402/ids.ts";
 import type { BugnetAddresses, SignerHealth } from "../x402/types.ts";
-import { createAllowanceFunding } from "../x402/funding.ts";
+import { type AllowanceFunding, createAllowanceFunding } from "../x402/funding.ts";
 import { createSettler } from "../x402/settler.ts";
 import { createInternalHandler } from "./internal.ts";
 import { createPublicHandler } from "./public.ts";
 import type { Handler } from "./server.ts";
+
+export interface HttpX402Parts {
+    index: () => IndexCopy;
+    signer: SignerHealth;
+    addresses: BugnetAddresses;
+    // Shared with the jobs; built here when absent
+    funding?: AllowanceFunding;
+}
 
 export interface HttpAppDeps {
     settings: Settings;
@@ -24,7 +32,7 @@ export interface HttpAppDeps {
     pool: pg.Pool;
     rpc: SolanaRpc;
     feePayer: KeyPairSigner;
-    x402?: { signer: SignerHealth; index: () => IndexCopy; addresses: BugnetAddresses };
+    x402?: HttpX402Parts;
     log: Log;
     now: () => Date;
 }
@@ -47,7 +55,7 @@ const CHECKOUT_JS = "dist/checkout.js";
 export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
     const { settings: s, secrets, pool, rpc, feePayer, log, now } = d;
     const emptyIndex = parseIndex('{"v":1,"services":[]}', "none");
-    const x402 = d.x402 ?? {
+    const x402: HttpX402Parts = d.x402 ?? {
         signer: { open: () => false },
         index: () => emptyIndex,
         addresses: bugnetAddresses({
@@ -87,7 +95,7 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
         feePayer: feePayer.address,
         transactionVersions: s.solana.transaction_versions,
     };
-    const allowanceFunding = createAllowanceFunding({ x402: s.x402, log });
+    const allowanceFunding = x402.funding ?? createAllowanceFunding({ x402: s.x402, log });
     const pay = createPayDeps({
         pool,
         settler,

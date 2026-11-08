@@ -1,26 +1,44 @@
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { create as createMessage } from "@bufbuild/protobuf";
+import { createClient } from "@connectrpc/connect";
+import { createConnectTransport } from "@connectrpc/connect-node";
 import { type Address, getAddressEncoder, getBase58Decoder, type KeyPairSigner } from "@solana/kit";
 import { decodePaymentRequiredHeader } from "@x402/core/http";
+import type pg from "pg";
 import { stringify } from "smol-toml";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { BootCheckError } from "./boot.ts";
 import { parseSettings, SECRET_VARS, type Secrets, secretsEnv, type Settings } from "./config.ts";
 import { jsonLog, memoryLog, silentLog } from "./log.ts";
-import { main, routeConsole, startService } from "./main.ts";
+import {
+    ReserveAndSignRequestSchema,
+    X402SignerService,
+} from "./gen/bugnet/payments/v1/x402_pb.ts";
+import { indexHolder, installReload, main, routeConsole, startService } from "./main.ts";
 import { findOrder } from "./orders/store.ts";
 import { orderPublicKeyBase64 } from "./orders/token.ts";
 import { usdcAta } from "./solana/accounts.ts";
+import type { SolanaRpc } from "./solana/rpc.ts";
 import { TOKEN_PROGRAM, USDC_MINT } from "./solana/constants.ts";
 import { create, until } from "./testing/app.ts";
 import { testDb, type TestDb } from "./testing/db.ts";
 import { createFakeRpc, epochAt, type FakeRpcScript } from "./testing/fake-rpc.ts";
 import { testSigner } from "./testing/keys.ts";
+import { startFakeChain, type FakeChain } from "./testing/fake-chain.ts";
+import { startFakeRouter, type FakeRouter } from "./testing/fake-router.ts";
 import { seedOrder, seedPayment } from "./testing/orders.ts";
+import { makeTestPki } from "./testing/pki.ts";
+import { seedAccount, seedFunding, seedX402Payment, TEST_PAYTO } from "./testing/x402.ts";
+import { newOrderId } from "./orders/ids.ts";
+import { enqueueAllowanceEvent } from "./x402/outbox.ts";
+import { resetMirrorState } from "./x402/mirror.ts";
+import { parseIndex } from "./x402/index-file.ts";
+import { readTail } from "./x402/tail.ts";
 
 type Tables = Record<string, Record<string, unknown>>;
 
@@ -738,5 +756,403 @@ describe("deploy unit", () => {
         const unit = readFileSync("deploy/bugnet-payments@.service", "utf8");
         expect(unit).not.toMatch(/^ExecReload=/m);
         expect(unit).not.toMatch(/^MemoryDenyWriteExecute=/m);
+    });
+});
+
+describe("x402 wiring", () => {
+    let dir: string;
+    let chain: FakeChain;
+    let fakeRouter: FakeRouter;
+    let pki: ReturnType<typeof makeTestPki>;
+    let allowance: KeyPairSigner;
+    let funder: KeyPairSigner;
+    let indexPath: string;
+    let x402Secrets: Secrets;
+    const EMPTY_INDEX = '{"v":1,"services":[]}';
+
+    function withBalance(rpc: SolanaRpc): SolanaRpc {
+        return new Proxy(rpc, {
+            get(target, prop, receiver) {
+                if (prop === "getBalance") {
+                    return () => ({ send: async () => ({ value: 1_000_000_000n }) });
+                }
+                return Reflect.get(target, prop, receiver) as unknown;
+            },
+        });
+    }
+
+    function x402Settings(over: Tables = {}): Settings {
+        const merged: Tables = {
+            x402: {
+                enabled: true,
+                allowance_wallet: allowance.address,
+                listen: "127.0.0.1:0",
+                tls_cert_file: pki.serverCert,
+                client_ca_file: pki.ca,
+                indexed_services_file: indexPath,
+                release_every: "200ms",
+                reserved_release_after: "1s",
+                events_every: "200ms",
+            },
+            router: { url: fakeRouter.url },
+        };
+        for (const [table, fields] of Object.entries(over)) {
+            merged[table] = { ...merged[table], ...fields };
+        }
+        return testSettings(merged);
+    }
+
+    function signerClient(port: number) {
+        return createClient(
+            X402SignerService,
+            createConnectTransport({
+                baseUrl: `https://127.0.0.1:${port}`,
+                httpVersion: "2",
+                nodeOptions: {
+                    ca: readFileSync(pki.ca, "utf8"),
+                    cert: readFileSync(pki.clientCert, "utf8"),
+                    key: readFileSync(pki.clientKey, "utf8"),
+                    servername: "bugnet-payments.internal",
+                },
+            }),
+        );
+    }
+
+    function reserveRequest(over: { accountId: string }) {
+        return createMessage(ReserveAndSignRequestSchema, {
+            accountId: over.accountId,
+            placementId: "00000000-0000-4000-8000-000000000001",
+            ref: "abcdefghijklmnop",
+            serviceId: "xs_abcdefghijklmnop",
+            method: "POST",
+            host: "agent402.tools",
+            path: "/v1/auto/chat/completions",
+            bodySha256: new Uint8Array(32).fill(2),
+            targetSha256: new Uint8Array(32).fill(1),
+            paymentRequired: "",
+        });
+    }
+
+    async function rowState(pool: pg.Pool, table: string, id: string | number) {
+        const res = await pool.query<{ state: string }>(
+            `select state from ${table} where id = $1`,
+            [id],
+        );
+        return res.rows[0]?.state;
+    }
+
+    async function seedAllowanceRefund(pool: pg.Pool, micros: number): Promise<number> {
+        const source = await usdcAta(funder.address);
+        chain.setTokenAccount({ address: source, owner: funder.address, amount: 0n });
+        const account = await seedAccount(pool, {
+            state: "open",
+            handleSha256: randomBytes(32).toString("hex"),
+        });
+        const funding = await seedFunding(pool, {
+            accountId: account.id,
+            allowanceMicros: 1_000_000,
+            payer: funder.address,
+            sourceTokenAccount: source,
+        });
+        await pool.query("update x402_pool set committed_micros = 1000000");
+        const res = await pool.query<{ id: string }>(
+            `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
+                from_wallet, budget_waived)
+             values ($1, 'allowance', 'x402_unspent', $2, $3, $4, 'pending', 'allowance', false)
+             returning id`,
+            [funding.orderId, micros, source, funder.address],
+        );
+        return Number(res.rows[0]!.id);
+    }
+
+    beforeAll(async () => {
+        dir = mkdtempSync(path.join(tmpdir(), "bn-pay-x402-main-"));
+        mkdirSync(path.join(dir, "pki"));
+        pki = makeTestPki(path.join(dir, "pki"));
+        indexPath = path.join(dir, "x402-index.json");
+        writeFileSync(indexPath, EMPTY_INDEX);
+        allowance = await testSigner(11);
+        funder = await testSigner(12);
+        chain = await startFakeChain({ autoFinalize: true });
+        for (const [address, owner] of [
+            [await usdcAta(allowance.address), allowance.address],
+            [await usdcAta(recipient.address), recipient.address],
+            [await usdcAta(refundWallet.address), refundWallet.address],
+        ] as const) {
+            chain.setTokenAccount({
+                address,
+                owner,
+                amount: address === (await usdcAta(allowance.address)) ? 5_000_000n : 0n,
+            });
+        }
+        fakeRouter = await startFakeRouter({
+            appendAllowanceEvent: () => ({}),
+            appendX402Resolved: () => ({}),
+        });
+        x402Secrets = {
+            ...secrets,
+            allowanceKey: await secretKey(11),
+            x402TlsKey: readFileSync(pki.serverKey, "utf8"),
+            routerToken: "router-token-0123456789",
+        };
+    });
+    afterAll(async () => {
+        await chain.close();
+        await fakeRouter.close();
+        rmSync(dir, { recursive: true, force: true });
+    });
+    beforeEach(async () => {
+        resetMirrorState();
+        await db.pool.query(
+            `update x402_tail set token_account = null, opening_balance_micros = 0,
+                opening_slot = 0, opened_at = null, verified_slot = 0, verified_at = null,
+                finalized_height = 0, mismatch_since = null`,
+        );
+    });
+
+    it("starts the x402 listener and every job when allowance_wallet is set", async () => {
+        const s = await startService({
+            settings: x402Settings(),
+            secrets: x402Secrets,
+            rpc: withBalance(chain.rpc),
+            log: silentLog,
+        });
+        try {
+            expect(s.x402Port).not.toBeNull();
+            const res = await signerClient(s.x402Port!).reserveAndSign(
+                reserveRequest({ accountId: newOrderId() }),
+            );
+            expect(res.result.case).toBe("refused");
+            expect((await readTail(s.pool)).tokenAccount).toBe(await usdcAta(allowance.address));
+
+            const account = await seedAccount(s.pool, {
+                fundedMicros: 1_000_000,
+                heldMicros: 10_000,
+            });
+            const row = await seedX402Payment(s.pool, {
+                accountId: account.id,
+                state: "reserved",
+                createdAt: new Date(Date.now() - 60_000),
+            });
+            await until(
+                async () => (await rowState(s.pool, "x402_payments", row.id)) === "released",
+                5_000,
+            );
+
+            await enqueueAllowanceEvent(
+                s.pool,
+                {
+                    startOrderId: account.id,
+                    orderId: account.id,
+                    phase: "paid",
+                    amountMicros: 1_000_000,
+                    keptMicros: 0,
+                    tx: signature(),
+                },
+                new Date(),
+            );
+            await until(
+                async () =>
+                    (
+                        await s.pool.query(
+                            "select state from x402_router_events where order_id = $1",
+                            [account.id],
+                        )
+                    ).rows[0]?.state === "sent",
+                5_000,
+            );
+        } finally {
+            await s.stop();
+        }
+    });
+
+    it("starts no x402 piece when allowance_wallet is empty", async () => {
+        const rpc = okRpc();
+        const s = await startService({ settings: testSettings(), secrets, rpc, log: silentLog });
+        try {
+            expect(s.x402Port).toBeNull();
+            expect((await readTail(s.pool)).tokenAccount).toBeNull();
+            expect(rpc.calls.getAccountInfo).toBe(2); // recipient and refund ATAs, as before
+        } finally {
+            await s.stop();
+        }
+    });
+
+    it("SIGHUP is handled before the listeners open, and stop removes the handler", async () => {
+        const before = process.listenerCount("SIGHUP");
+        let atBoot = -1;
+        const rpc = okRpc({
+            getBalance: () => {
+                atBoot = process.listenerCount("SIGHUP"); // bootChecks runs before any listener binds
+                return { value: 1_000_000_000n };
+            },
+        });
+        const s = await startService({ settings: testSettings(), secrets, rpc, log: silentLog });
+        await s.stop();
+        expect(atBoot).toBe(before + 1);
+        expect(process.listenerCount("SIGHUP")).toBe(before);
+    });
+
+    it("a bad index on SIGHUP keeps the old copy and alarms x402_reload_failed", async () => {
+        const log = memoryLog();
+        const s = await startService({
+            settings: x402Settings(),
+            secrets: x402Secrets,
+            rpc: withBalance(chain.rpc),
+            log,
+        });
+        try {
+            writeFileSync(indexPath, "not json");
+            process.emit("SIGHUP");
+            expect(log.lines.filter((l) => l.alarm === "x402_reload_failed")).toHaveLength(1);
+        } finally {
+            await s.stop();
+            writeFileSync(indexPath, EMPTY_INDEX);
+        }
+    });
+
+    it("the hot executor runs with refunds.enabled false", async () => {
+        const settings = x402Settings({
+            refunds: { enabled: false },
+            jobs: { refunds_every: "200ms" },
+        });
+        const s = await startService({
+            settings,
+            secrets: x402Secrets,
+            rpc: withBalance(chain.rpc),
+            log: silentLog,
+        });
+        try {
+            const id = await seedAllowanceRefund(s.pool, 300_000);
+            await until(async () => (await rowState(s.pool, "refunds", id)) !== "pending", 5_000);
+        } finally {
+            await s.stop();
+        }
+    });
+
+    it("switched off still runs every job and refuses only signing", async () => {
+        const s = await startService({
+            settings: x402Settings({ x402: { enabled: false } }),
+            secrets: x402Secrets,
+            rpc: withBalance(chain.rpc),
+            log: silentLog,
+        });
+        try {
+            const res = await signerClient(s.x402Port!).reserveAndSign(
+                reserveRequest({ accountId: newOrderId() }),
+            );
+            expect(res.result.case === "refused" && res.result.value.reason).toBe("x402_disabled");
+            const account = await seedAccount(s.pool, {
+                fundedMicros: 1_000_000,
+                heldMicros: 10_000,
+            });
+            const row = await seedX402Payment(s.pool, {
+                accountId: account.id,
+                state: "reserved",
+                createdAt: new Date(Date.now() - 60_000),
+            });
+            await until(
+                async () => (await rowState(s.pool, "x402_payments", row.id)) === "released",
+                5_000,
+            );
+            await enqueueAllowanceEvent(
+                s.pool,
+                {
+                    startOrderId: account.id,
+                    orderId: account.id,
+                    phase: "paid",
+                    amountMicros: 1_000_000,
+                    keptMicros: 0,
+                    tx: signature(),
+                },
+                new Date(),
+            );
+            await until(
+                async () =>
+                    (
+                        await s.pool.query(
+                            "select state from x402_router_events where order_id = $1",
+                            [account.id],
+                        )
+                    ).rows[0]?.state === "sent",
+                5_000,
+            );
+        } finally {
+            await s.stop();
+        }
+    });
+});
+
+describe("installReload", () => {
+    it("calls the handler on SIGHUP and the remover detaches it", () => {
+        const before = process.listenerCount("SIGHUP");
+        const onReload = vi.fn();
+        const remove = installReload(onReload);
+        process.emit("SIGHUP");
+        expect(onReload).toHaveBeenCalledTimes(1);
+        remove();
+        process.emit("SIGHUP");
+        expect(onReload).toHaveBeenCalledTimes(1);
+        expect(process.listenerCount("SIGHUP")).toBe(before);
+    });
+});
+
+describe("indexHolder", () => {
+    const entry = (host: string) =>
+        JSON.stringify({
+            method: "POST",
+            host,
+            prefix: "/v1/",
+            url: `https://${host}/v1/`,
+            payTo: TEST_PAYTO,
+        });
+
+    it("keeps the old copy on a bad file and fires x402_reload_failed", () => {
+        const dir = mkdtempSync(path.join(tmpdir(), "bn-pay-index-"));
+        try {
+            const file = path.join(dir, "x402-index.json");
+            const text = (hosts: string[]) => `{"v":1,"services":[${hosts.map(entry).join(",")}]}`;
+            writeFileSync(file, text(["a.example"]));
+            const log = memoryLog();
+            const holder = indexHolder(file, log, parseIndex(readFileSync(file, "utf8"), file));
+            expect(holder.current().size).toBe(1);
+
+            writeFileSync(file, "not json");
+            expect(holder.reload()).toBe(false);
+            expect(holder.current().size).toBe(1);
+            expect(log.lines.filter((l) => l.alarm === "x402_reload_failed")).toHaveLength(1);
+
+            writeFileSync(file, text(["a.example", "b.example"]));
+            expect(holder.reload()).toBe(true);
+            expect(holder.current().size).toBe(2);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("deploy notes", () => {
+    it("cover the x402 setup", () => {
+        const readme = readFileSync("deploy/README.md", "utf8");
+        for (const s of [
+            "127.0.0.1:8449",
+            "/etc/bugnet/internal-ca.pem",
+            "/etc/bugnet/payments/x402-server.pem",
+            "x402-index.json",
+            "BUGNET_ALLOWANCE_KEY",
+            "BUGNET_X402_TLS_KEY",
+            "keys fund --create-allowance-ata",
+            "systemctl kill -s HUP",
+            "mtls init --renew --from",
+            "allowance_claim = true",
+            "payments_timeout",
+            "x402 incident resolve",
+            "x402 refunds hold",
+            "keys drain --allowance",
+            "x402_resign_waiting",
+            "x402_cold_transfer_failed",
+        ]) {
+            expect(readme).toContain(s);
+        }
     });
 });
