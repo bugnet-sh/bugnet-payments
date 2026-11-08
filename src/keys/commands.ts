@@ -148,7 +148,7 @@ export async function runKeys(
             ? parseEnvText(readFileSync(envFile, "utf8"))
             : env;
     const sellerFile =
-        action === "testseller" || flags.switches.has("--testseller")
+        (action === "testseller" || flags.switches.has("--testseller")) && flags.values.has("--env")
             ? sellerEnvFile(envFile, existsSync(envFile))
             : {};
     const log = jsonLog("payments-keys", {

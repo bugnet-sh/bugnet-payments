@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -553,6 +553,23 @@ describe("keys over a stub RPC", () => {
         expect(await cliMain(["keys", ...words], env(), captureIo())).toBe(want);
         expect(sent).toHaveLength(0);
     });
+
+    it.each([[["testseller"]], [["drain", "--testseller"]]])(
+        "keys %j without --env exits 2 before reading any env file",
+        async (words) => {
+            const cwd = process.cwd();
+            const here = mkdtempSync(join(tmpdir(), "keys-noenv-"));
+            // A directory named .env: any read of it throws EISDIR
+            mkdirSync(join(here, ".env"));
+            process.chdir(here);
+            try {
+                expect(await cliMain(["keys", ...words], env(), captureIo())).toBe(2);
+            } finally {
+                process.chdir(cwd);
+                rmSync(here, { recursive: true });
+            }
+        },
+    );
 
     describe("confirmation by block height", () => {
         const fundArgs = ["keys", "fund", "--fee-payer-lamports", "100000000"];
