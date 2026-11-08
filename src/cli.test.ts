@@ -1,17 +1,22 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getBase58Decoder } from "@solana/kit";
 import { stringify } from "smol-toml";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { cliMain } from "./cli.ts";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { type CliOptions, cliMain } from "./cli.ts";
 import { silentLog } from "./log.ts";
 import { findOrder } from "./orders/store.ts";
 import type { OrderRow } from "./orders/types.ts";
 import { pauseRefunds, refundsPaused, resumeRefunds } from "./refunds/executor.ts";
-import { findOrderRefund } from "./refunds/request.ts";
+import { findOrderRefund, findRefundById } from "./refunds/request.ts";
 import { testDb, type TestDb } from "./testing/db.ts";
+import { createFakeRpc } from "./testing/fake-rpc.ts";
 import { testSigner } from "./testing/keys.ts";
 import { seedOrder, seedPayment } from "./testing/orders.ts";
+import { resetLedger, seedAccount, seedFunding } from "./testing/x402.ts";
+import { setControls } from "./x402/controls.ts";
+import { readPool } from "./x402/ledger.ts";
 
 let db: TestDb;
 let dir: string;
@@ -24,6 +29,10 @@ beforeAll(async () => {
     config = join(dir, "test.toml");
     const recipient = (await testSigner(1)).address;
     writeFileSync(config, stringify({ database: { url: db.url }, solana: { recipient } }));
+});
+beforeEach(async () => {
+    await resetLedger(db.pool);
+    await db.pool.query("update x402_tail set verified_slot = 0");
 });
 afterAll(async () => {
     await db.close();
@@ -41,8 +50,8 @@ function captureIo() {
     };
 }
 
-function cli(args: string[], io = captureIo()): Promise<number> {
-    return cliMain(["-config", config, ...args], env, io);
+function cli(args: string[], io = captureIo(), o: CliOptions = {}): Promise<number> {
+    return cliMain(["-config", config, ...args], env, io, o);
 }
 
 async function manualOrder(
@@ -304,6 +313,442 @@ describe("cliMain", () => {
             const io = captureIo();
             expect(await cliMain(argv, env, io)).toBe(2);
             expect(io.errText()).toContain("-config needs a file");
+            expect(io.errText()).toContain("usage");
+        }
+    });
+});
+
+const SIG = (n: number) => getBase58Decoder().decode(new Uint8Array(64).fill(n));
+const SIG63 = getBase58Decoder().decode(new Uint8Array(63).fill(1));
+const REASON = {
+    full: "operator",
+    partial: "router_refundable",
+    allowance: "x402_unspent",
+} as const;
+
+let handles = 0;
+
+async function hotOrder(over: Partial<OrderRow> = {}): Promise<OrderRow> {
+    const handleSha256 = (++handles).toString(16).padStart(64, "0");
+    const { order } = await seedOrder(db.pool, {
+        kind: "start",
+        payInto: "allowance",
+        amountMicros: 1_013_000,
+        allowanceMicros: 1_000_000,
+        feeMicros: 3_000,
+        state: "redeemed",
+        ...over,
+    });
+    await seedPayment(db.pool, order.id, {
+        status: "confirmed",
+        payer: "payer-cli",
+        sourceTokenAccount: "source-cli",
+    });
+    await seedAccount(db.pool, { id: order.id, handleSha256, fundedMicros: 1_000_000 });
+    await seedFunding(db.pool, {
+        accountId: order.id,
+        orderId: order.id,
+        allowanceMicros: 1_000_000,
+        payer: "payer-cli",
+        sourceTokenAccount: "source-cli",
+    });
+    return order;
+}
+
+async function row(
+    orderId: string,
+    r: {
+        kind: "full" | "partial" | "allowance";
+        fromWallet: "refund" | "allowance";
+        state: string;
+        amountMicros: number;
+        manualReason?: string | null;
+        txSignature?: string | null;
+        expirySeenSlot?: bigint;
+    },
+): Promise<number> {
+    const res = await db.pool.query(
+        `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
+            from_wallet, manual_reason, tx_signature, expiry_seen_slot, attempts)
+         values ($1, $2, $3, $4, 'source-cli', 'payer-cli', $5, $6, $7, $8, $9, 3) returning id`,
+        [
+            orderId,
+            r.kind,
+            REASON[r.kind],
+            r.amountMicros,
+            r.state,
+            r.fromWallet,
+            r.manualReason ?? null,
+            r.txSignature ?? null,
+            r.expirySeenSlot?.toString() ?? null,
+        ],
+    );
+    return Number(res.rows[0].id);
+}
+
+const refundOf = async (id: number) => (await findRefundById(db.pool, id))!;
+const absentRpc = () =>
+    createFakeRpc({
+        getSignatureStatuses: () => ({ context: { slot: 1_400n }, value: [null] }),
+    });
+
+describe("cliMain hot-wallet queue", () => {
+    it("manual list shows hot rows by refund id", async () => {
+        const o = await hotOrder();
+        const listed = await row(o.id, {
+            kind: "allowance",
+            fromWallet: "allowance",
+            state: "manual",
+            amountMicros: 300_000,
+            manualReason: "refund_destination_invalid",
+        });
+        const p = await hotOrder({ coldTransferId: 5 });
+        const partial = await row(p.id, {
+            kind: "partial",
+            fromWallet: "refund",
+            state: "manual",
+            amountMicros: 13_000,
+            manualReason: "refund_failed_onchain",
+        });
+        const h = await hotOrder();
+        const byHand = await row(h.id, {
+            kind: "allowance",
+            fromWallet: "allowance",
+            state: "manual",
+            amountMicros: 1,
+            manualReason: "resolved_by_hand",
+        });
+        const io = captureIo();
+        expect(await cli(["manual", "list"], io)).toBe(0);
+        const lines = io.outText().split("\n");
+        expect(lines).toContain(
+            [
+                "refund",
+                listed,
+                "allowance",
+                "allowance",
+                "refund_destination_invalid",
+                "300000",
+                "source-cli",
+            ].join("\t"),
+        );
+        expect(lines).toContain(
+            [
+                "refund",
+                partial,
+                "partial",
+                "refund",
+                "refund_failed_onchain",
+                "13000",
+                "source-cli",
+            ].join("\t"),
+        );
+        expect(lines.some((l) => l.startsWith(`refund\t${byHand}\t`))).toBe(false);
+    });
+
+    it("retry by refund id waits for the proof on an allowance row, then resets it", async () => {
+        const o = await hotOrder();
+        const id = await row(o.id, {
+            kind: "allowance",
+            fromWallet: "allowance",
+            state: "manual",
+            amountMicros: 300_000,
+            manualReason: "refund_expired_repeatedly",
+            txSignature: SIG(1),
+            expirySeenSlot: 1_000n,
+        });
+        await db.pool.query("update x402_tail set verified_slot = 1299");
+        const io = captureIo();
+        expect(await cli(["manual", "retry", String(id)], io, { rpc: absentRpc() })).toBe(1);
+        expect(io.errText()).toContain(
+            `refund ${id}: its last transaction is not yet proven absent`,
+        );
+        expect((await refundOf(id)).state).toBe("manual");
+        await db.pool.query("update x402_tail set verified_slot = 1300");
+        const ok = captureIo();
+        expect(await cli(["manual", "retry", String(id)], ok, { rpc: absentRpc() })).toBe(0);
+        expect(ok.outText()).toBe(`refund ${id}: pending`);
+        expect(await refundOf(id)).toMatchObject({
+            state: "pending",
+            attempts: 0,
+            budgetWaived: true,
+            manualReason: null,
+            txSignature: SIG(1),
+        });
+    });
+
+    it("retry by refund id refuses a row the listing does not name", async () => {
+        const o = await hotOrder({ state: "manual", manualReason: "refund_destination_invalid" });
+        const id = await row(o.id, {
+            kind: "full",
+            fromWallet: "allowance",
+            state: "manual",
+            amountMicros: 1_013_000,
+            manualReason: "refund_destination_invalid",
+        });
+        const io = captureIo();
+        expect(await cli(["manual", "retry", String(id)], io)).toBe(1);
+        expect(io.errText()).toContain("use the order-level command");
+        const unknown = captureIo();
+        expect(await cli(["manual", "retry", "999999"], unknown)).toBe(1);
+        expect(unknown.errText()).toContain("refund 999999: unknown refund");
+    });
+
+    it("needs BUGNET_SOLANA_RPC_URL for a proof", async () => {
+        const o = await hotOrder();
+        const id = await row(o.id, {
+            kind: "allowance",
+            fromWallet: "allowance",
+            state: "manual",
+            amountMicros: 1,
+            txSignature: SIG(2),
+            expirySeenSlot: 1n,
+        });
+        const io = captureIo();
+        expect(await cli(["manual", "retry", String(id)], io)).toBe(1);
+        expect(io.errText()).toContain("BUGNET_SOLANA_RPC_URL must be set");
+    });
+
+    it("manual resolve <refundId> --tx on a pending row while refunds are held", async () => {
+        const o = await hotOrder();
+        const id = await row(o.id, {
+            kind: "allowance",
+            fromWallet: "allowance",
+            state: "pending",
+            amountMicros: 300_000,
+        });
+        await db.pool.query("update x402_pool set committed_micros = 1000000");
+        const notHeld = captureIo();
+        expect(await cli(["manual", "resolve", String(id), "--tx", SIG(7)], notHeld)).toBe(1);
+        expect(notHeld.errText()).toContain("pending rows only while refunds are held");
+        await setControls(db.pool, { refundsHeld: true }, "leak", new Date());
+        const io = captureIo();
+        expect(await cli(["manual", "resolve", String(id), "--tx", SIG(7)], io)).toBe(0);
+        expect(io.outText()).toBe(`refund ${id}: resolved by hand`);
+        expect(await refundOf(id)).toMatchObject({
+            state: "manual",
+            manualReason: "resolved_by_hand",
+            handTx: SIG(7),
+            confirmedAt: expect.any(Date),
+        });
+        const ev = await db.pool.query(
+            "select payload from x402_router_events where kind = 'allowance' and order_id = $1 and phase = 'refunded'",
+            [o.id],
+        );
+        expect(ev.rows[0].payload).toMatchObject({ amountMicros: 300_000, tx: SIG(7) });
+        expect((await readPool(db.pool)).committedMicros).toBe(700_000);
+    });
+
+    it("manual resolve <refundId> --tx on a manual row waits for the proof", async () => {
+        const o = await hotOrder();
+        const id = await row(o.id, {
+            kind: "allowance",
+            fromWallet: "allowance",
+            state: "manual",
+            amountMicros: 300_000,
+            manualReason: "refund_expired_repeatedly",
+            txSignature: SIG(3),
+            expirySeenSlot: 1_000n,
+        });
+        await db.pool.query("update x402_pool set committed_micros = 1000000");
+        await db.pool.query("update x402_tail set verified_slot = 1299");
+        const io = captureIo();
+        expect(
+            await cli(["manual", "resolve", String(id), "--tx", SIG(8)], io, { rpc: absentRpc() }),
+        ).toBe(1);
+        expect(io.errText()).toContain("its last transaction is not yet proven absent");
+        expect((await refundOf(id)).handTx).toBeNull();
+        await db.pool.query("update x402_tail set verified_slot = 1300");
+        expect(
+            await cli(["manual", "resolve", String(id), "--tx", SIG(8)], captureIo(), {
+                rpc: absentRpc(),
+            }),
+        ).toBe(0);
+        expect(await refundOf(id)).toMatchObject({
+            state: "manual",
+            manualReason: "resolved_by_hand",
+            handTx: SIG(8),
+        });
+        expect((await readPool(db.pool)).committedMicros).toBe(700_000);
+    });
+
+    it("manual resolve <refundId> --tx refuses a 63-byte signature", async () => {
+        const o = await hotOrder();
+        const id = await row(o.id, {
+            kind: "allowance",
+            fromWallet: "allowance",
+            state: "pending",
+            amountMicros: 300_000,
+        });
+        await setControls(db.pool, { refundsHeld: true }, "leak", new Date());
+        const io = captureIo();
+        expect(await cli(["manual", "resolve", String(id), "--tx", SIG63], io)).toBe(1);
+        expect(io.errText()).toContain("not a 64-byte signature");
+        expect((await refundOf(id)).state).toBe("pending");
+    });
+
+    it("manual resolve --tx refuses a refund-wallet row and one the executor owns", async () => {
+        const o = await hotOrder({ coldTransferId: 5 });
+        const wallet = await row(o.id, {
+            kind: "partial",
+            fromWallet: "refund",
+            state: "manual",
+            amountMicros: 13_000,
+            manualReason: "refund_failed_onchain",
+        });
+        const io = captureIo();
+        expect(await cli(["manual", "resolve", String(wallet), "--tx", SIG(4)], io)).toBe(1);
+        expect(io.errText()).toContain(
+            `refund ${wallet}: a refund-wallet row: use manual resolve ${wallet} without --tx`,
+        );
+        const sent = await row((await hotOrder()).id, {
+            kind: "allowance",
+            fromWallet: "allowance",
+            state: "sent",
+            amountMicros: 1,
+        });
+        const owned = captureIo();
+        expect(await cli(["manual", "resolve", String(sent), "--tx", SIG(4)], owned)).toBe(1);
+        expect(owned.errText()).toContain(
+            `refund ${sent}: its refund is sent and the executor still owns it`,
+        );
+    });
+
+    it("manual resolve without --tx on a refund-wallet partial", async () => {
+        const o = await hotOrder({ coldTransferId: 5 });
+        const id = await row(o.id, {
+            kind: "partial",
+            fromWallet: "refund",
+            state: "manual",
+            amountMicros: 13_000,
+            manualReason: "refund_failed_onchain",
+        });
+        expect(await cli(["manual", "resolve", String(id)])).toBe(0);
+        expect(await refundOf(id)).toMatchObject({
+            state: "manual",
+            manualReason: "resolved_by_hand",
+        });
+        expect((await findOrder(db.pool, o.id))!.state).toBe("redeemed");
+        const a = await row((await hotOrder()).id, {
+            kind: "allowance",
+            fromWallet: "allowance",
+            state: "manual",
+            amountMicros: 1,
+            manualReason: "x402_refund_budget",
+        });
+        const io = captureIo();
+        expect(await cli(["manual", "resolve", String(a)], io)).toBe(1);
+        expect(io.errText()).toContain(`manual resolve ${a} --tx <signature>`);
+    });
+
+    it("manual resolve <orderId> on a hot order's row points to the refund id form", async () => {
+        const o = await hotOrder({ state: "manual", manualReason: "refund_destination_invalid" });
+        const id = await row(o.id, {
+            kind: "full",
+            fromWallet: "allowance",
+            state: "manual",
+            amountMicros: 1_013_000,
+            manualReason: "refund_destination_invalid",
+        });
+        const io = captureIo();
+        expect(await cli(["manual", "resolve", o.id], io)).toBe(1);
+        expect(io.errText()).toContain(`hot-wallet refund: use manual resolve ${id}`);
+        expect((await findOrder(db.pool, o.id))!.state).toBe("manual");
+    });
+
+    it("manual retry <orderId> resets a hot order's full row after the proof", async () => {
+        const o = await hotOrder({ state: "manual", manualReason: "refund_destination_invalid" });
+        const id = await row(o.id, {
+            kind: "full",
+            fromWallet: "allowance",
+            state: "manual",
+            amountMicros: 1_013_000,
+            manualReason: "refund_destination_invalid",
+        });
+        expect(await cli(["manual", "retry", o.id])).toBe(0);
+        expect(await refundOf(id)).toMatchObject({
+            state: "pending",
+            attempts: 0,
+            budgetWaived: true,
+            manualReason: null,
+        });
+        expect(await findOrder(db.pool, o.id)).toMatchObject({
+            state: "refunding",
+            manualReason: null,
+        });
+    });
+
+    it("manual retry <orderId> points a hot order's partial row to its refund id", async () => {
+        const o = await hotOrder({ coldTransferId: 5 });
+        const id = await row(o.id, {
+            kind: "partial",
+            fromWallet: "refund",
+            state: "manual",
+            amountMicros: 13_000,
+            manualReason: "refund_failed_onchain",
+        });
+        const io = captureIo();
+        expect(await cli(["manual", "retry", o.id], io)).toBe(1);
+        expect(io.errText()).toContain(`hot-wallet refund: use manual retry ${id}`);
+    });
+
+    it("manual retry <orderId> on a hot order whose share went to cold exits 1", async () => {
+        const o = await hotOrder({
+            state: "manual",
+            manualReason: "refund_destination_invalid",
+            coldTransferId: 5,
+        });
+        const io = captureIo();
+        expect(await cli(["manual", "retry", o.id], io)).toBe(1);
+        expect(io.errText()).toContain("share already transferred to cold; refund by hand");
+        expect(await findOrderRefund(db.pool, o.id)).toBeNull();
+    });
+
+    it("manual refund on a hot order writes a budget-waived partial and returns it to redeemed", async () => {
+        const o = await hotOrder({ state: "manual", manualReason: "refund_amount_pending" });
+        const io = captureIo();
+        expect(await cli(["manual", "refund", o.id, "13001"], io)).toBe(1);
+        expect(io.errText()).toContain(
+            "invalid_amount: above amount_micros - allowance_micros (13000)",
+        );
+        expect(await cli(["manual", "refund", o.id, "13000"])).toBe(0);
+        expect(await findOrderRefund(db.pool, o.id)).toMatchObject({
+            kind: "partial",
+            amountMicros: 13_000,
+            fromWallet: "allowance",
+            budgetWaived: true,
+        });
+        expect((await findOrder(db.pool, o.id))!.state).toBe("redeemed");
+    });
+
+    it("a retry or resolve of a row resolved by hand exits 1", async () => {
+        const o = await hotOrder();
+        const id = await row(o.id, {
+            kind: "allowance",
+            fromWallet: "allowance",
+            state: "manual",
+            amountMicros: 1,
+            manualReason: "resolved_by_hand",
+        });
+        for (const args of [
+            ["manual", "retry", String(id)],
+            ["manual", "resolve", String(id), "--tx", SIG(8)],
+        ]) {
+            const io = captureIo();
+            expect(await cli(args, io)).toBe(1);
+            expect(io.errText()).toContain(`refund ${id}: resolved by hand`);
+        }
+    });
+
+    it("takes --tx only on manual resolve", async () => {
+        for (const args of [
+            ["manual", "retry", "5", "--tx", SIG(1)],
+            ["manual", "resolve", "5", "--tx"],
+            ["manual", "resolve", "5", "--tx", SIG(1), "--tx", SIG(2)],
+            ["manual", "resolve", "0"],
+        ]) {
+            const io = captureIo();
+            expect(await cli(args, io)).toBe(2);
             expect(io.errText()).toContain("usage");
         }
     });
