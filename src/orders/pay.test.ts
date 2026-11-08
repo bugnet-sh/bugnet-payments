@@ -1209,6 +1209,7 @@ describe("allowance orders", () => {
                 log: silentLog,
                 now: () => new Date(NOW.getTime() + 60_000),
                 paid: paidDeps,
+                x402: paidDeps.x402,
             }).then(() => {}),
         );
         expect(
@@ -1255,6 +1256,7 @@ describe("allowance orders", () => {
                 log: silentLog,
                 now: () => new Date(NOW.getTime() + 60_000),
                 paid: paidDeps,
+                x402: paidDeps.x402,
             }).then(() => {}),
         );
         expect(

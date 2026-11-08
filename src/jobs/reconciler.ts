@@ -1,6 +1,7 @@
 import { signature } from "@solana/kit";
 import type pg from "pg";
 import { withTx } from "../db/pool.ts";
+import type { Settings } from "../config.ts";
 import type { Log } from "../log.ts";
 import {
     archivePayment,
@@ -8,9 +9,11 @@ import {
     lockOrder,
     lockPayment,
     setOrderState,
+    setPaymentLandedSlot,
 } from "../orders/store.ts";
 import { type Landing, readLanding } from "../solana/landing.ts";
 import type { SolanaRpc } from "../solana/rpc.ts";
+import { movePool } from "../x402/ledger.ts";
 import { onOrderPaid, type PaidDeps } from "../x402/paid.ts";
 
 export interface ReconcileDeps {
@@ -20,6 +23,7 @@ export interface ReconcileDeps {
     log: Log;
     now: () => Date;
     paid: PaidDeps | null;
+    x402: Settings["x402"];
 }
 
 export interface ReconcileReport {
@@ -57,8 +61,9 @@ export async function reconcileSettling(d: ReconcileDeps): Promise<ReconcileRepo
             continue;
         }
         let verdict: Verdict;
+        let slot: bigint | null = null;
         try {
-            verdict = await verdictFor(d, p);
+            ({ verdict, slot } = await verdictFor(d, p));
         } catch (err) {
             d.log.warn("signature status unavailable, retrying next run", {
                 orderId: p.orderId,
@@ -72,7 +77,7 @@ export async function reconcileSettling(d: ReconcileDeps): Promise<ReconcileRepo
         }
         let outcome: Outcome;
         try {
-            outcome = await apply(d, p, verdict);
+            outcome = await apply(d, p, verdict, slot);
         } catch (err) {
             d.log.error("reconcile step failed, retrying next run", { orderId: p.orderId, err });
             report.waiting++;
@@ -130,20 +135,23 @@ function wellFormed(txSignature: string): boolean {
     }
 }
 
-async function verdictFor(d: ReconcileDeps, p: Candidate): Promise<Verdict> {
-    const { landing } = await readLanding(
-        d.rpc,
-        p.txSignature,
-        p.lastValidBlockHeight,
-        d.rpcTimeoutMs,
-    );
-    return landing === "processed" || landing === "not_found" ? "waiting" : landing;
+async function verdictFor(
+    d: ReconcileDeps,
+    p: Candidate,
+): Promise<{ verdict: Verdict; slot: bigint | null }> {
+    const read = await readLanding(d.rpc, p.txSignature, p.lastValidBlockHeight, d.rpcTimeoutMs);
+    const { landing } = read;
+    return {
+        verdict: landing === "processed" || landing === "not_found" ? "waiting" : landing,
+        slot: read.landing === "landed" ? read.slot : null,
+    };
 }
 
 async function apply(
     d: ReconcileDeps,
     p: Candidate,
     verdict: Exclude<Verdict, "waiting">,
+    slot: bigint | null,
 ): Promise<Outcome> {
     return withTx(d.pool, async (c) => {
         // Payment row before order row, the order payOrder's confirmation locks them in
@@ -155,6 +163,9 @@ async function apply(
         const now = d.now();
         if (verdict === "landed") {
             await confirmPayment(c, p.orderId, now);
+            if (order.payInto === "allowance" && slot !== null) {
+                await setPaymentLandedSlot(c, p.orderId, slot);
+            }
             const paidAt = payment.createdAt;
             await setOrderState(c, p.orderId, "settling", "paid", { paidAt });
             if (order.payInto === "allowance") {
@@ -174,6 +185,9 @@ async function apply(
         }
         const state = now.getTime() >= order.expiresAt.getTime() ? "expired" : "unpaid";
         await setOrderState(c, p.orderId, "settling", state);
+        if (state === "expired" && order.allowanceMicros > 0) {
+            await movePool(c, { unpaid: -order.allowanceMicros }, d.x402, d.log);
+        }
         return { kind: "reverted", state };
     });
 }

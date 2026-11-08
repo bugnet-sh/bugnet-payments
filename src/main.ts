@@ -164,8 +164,12 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
         return run;
     };
 
-    const paid = { funding: createAllowanceFunding({ x402: s.x402, log }), x402: s.x402, log };
-    const reconcile = tracked(() => reconcileSettling({ pool, rpc, rpcTimeoutMs, log, now, paid }));
+    const funding = createAllowanceFunding({ x402: s.x402, log });
+    const paid = { funding, x402: s.x402, log };
+    const reconcile = tracked(() =>
+        reconcileSettling({ pool, rpc, rpcTimeoutMs, log, now, paid, x402: s.x402 }),
+    );
+    const sweepFunding = s.x402.allowance_wallet === "" ? null : funding;
     const first = reconcile().catch((err: unknown) =>
         log.error("job failed", { job: "reconcile", err }),
     );
@@ -176,7 +180,16 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
             s.jobs.sweep_every,
             "sweep",
             tracked(() =>
-                sweep({ pool, router: d.router, orders: s.orders, log, now, unavailableAlarmed }),
+                sweep({
+                    pool,
+                    router: d.router,
+                    orders: s.orders,
+                    funding: sweepFunding,
+                    x402: s.x402,
+                    log,
+                    now,
+                    unavailableAlarmed,
+                }),
             ),
             log,
         ),

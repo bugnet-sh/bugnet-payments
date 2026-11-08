@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import { GetOrderResponseSchema } from "../gen/bugnet/router/v1/payments_pb.ts";
-import type { Settings } from "../config.ts";
+import { stringify } from "smol-toml";
+import { parseSettings, type Settings } from "../config.ts";
 import { memoryLog, silentLog } from "../log.ts";
 import { findOrder, markEventSeen } from "../orders/store.ts";
 import type { OrderRow } from "../orders/types.ts";
@@ -9,7 +10,10 @@ import { findOrderRefund } from "../refunds/request.ts";
 import { createRouterClient } from "../router/client.ts";
 import { startFakeRouter, type FakeRouter } from "../testing/fake-router.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
-import { seedOrder, seedPayment } from "../testing/orders.ts";
+import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts";
+import { createAllowanceFunding } from "../x402/funding.ts";
+import { readPool } from "../x402/ledger.ts";
+import { seedAccount, seedFunding } from "../testing/x402.ts";
 import { sweep, type SweepDeps } from "./sweeper.ts";
 
 const MIN = 60_000;
@@ -25,6 +29,9 @@ const orders: Settings["orders"] = {
     attempts_per_order_per_minute: 5,
     min_idempotency_key_length: 16,
 };
+
+const RECIPIENT = "Bhhc3XNdjtCNr3pj2aZwhCt8pHwsU8wRL7dqJNDZEExw";
+const x402 = parseSettings(stringify({ solana: { recipient: RECIPIENT } }), "t").x402;
 
 type Answer = MessageInitShape<typeof GetOrderResponseSchema> | "error";
 
@@ -51,6 +58,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
     await db.pool.query("truncate orders cascade");
+    await db.pool.query("update x402_pool set committed_micros = 0, unpaid_micros = 0");
     calls = [];
     beforeAnswer = null;
     answer = { redeemed: false };
@@ -71,6 +79,8 @@ function deps(
             log: silentLog,
         }),
         orders,
+        funding: createAllowanceFunding({ x402, log: silentLog }),
+        x402,
         log: over.log ?? silentLog,
         now: () => now,
         unavailableAlarmed: over.alarmed ?? new Set(),
@@ -394,5 +404,93 @@ describe("abandon hints", () => {
         expect(calls).toHaveLength(0);
         expect(report.manual).toBe(0);
         expect((await stateOf(order.id)).state).toBe("redeemed");
+    });
+});
+
+describe("allowance orders", () => {
+    async function hotStart(over: Partial<OrderRow> = {}): Promise<OrderRow> {
+        const order = await redeemed({
+            payInto: "allowance",
+            amountMicros: 1_013_000,
+            allowanceMicros: 1_000_000,
+            feeMicros: 3_000,
+            ...over,
+        });
+        await seedAccount(db.pool, { id: order.id, fundedMicros: 1_000_000 });
+        await seedFunding(db.pool, {
+            accountId: order.id,
+            orderId: order.id,
+            allowanceMicros: 1_000_000,
+        });
+        await db.pool.query("update x402_pool set committed_micros = 1000000");
+        return order;
+    }
+    const voidedAt = async (orderId: string) =>
+        (await db.pool.query("select voided_at from x402_fundings where order_id = $1", [orderId]))
+            .rows[0].voided_at;
+
+    it("rule 1 expiring an unpaid allowance order lowers unpaid_micros by its allowance", async () => {
+        const { order } = await seedAllowanceOrder(db.pool, {
+            state: "unpaid",
+            createdAt: at(-5 * MIN),
+            expiresAt: t0,
+        });
+        const cold = await seedOrder(db.pool, { state: "unpaid", expiresAt: t0 });
+        await db.pool.query("update x402_pool set unpaid_micros = 1000000");
+        expect((await sweep(deps(t0))).expired).toBe(2);
+        expect((await stateOf(order.id)).state).toBe("expired");
+        expect((await stateOf(cold.order.id)).state).toBe("expired");
+        expect((await readPool(db.pool)).unpaidMicros).toBe(0);
+    });
+
+    it("an allowance order is never sent to GetOrder or refunded no_router_record", async () => {
+        const paidLong = await seedAllowanceOrder(db.pool, {
+            state: "paid",
+            paidAt: at(-31 * MIN),
+            expiresAt: at(-32 * MIN),
+        });
+        const red = await seedAllowanceOrder(db.pool, {
+            state: "redeemed",
+            paidAt: at(-10 * MIN),
+            redeemedAt: at(-10 * MIN),
+            tokenExpiresAt: t0,
+            expiresAt: at(-20 * MIN),
+        });
+        const report = await sweep(deps(at(10 * MIN)));
+        expect(calls).toEqual([]);
+        expect(report.routerChecks).toBe(0);
+        for (const o of [paidLong.order, red.order]) {
+            expect(await findOrderRefund(db.pool, o.id)).toBeNull();
+            expect((await stateOf(o.id)).state).toBe(o.state);
+        }
+    });
+
+    it("a hot start found failed and refundable follows the table", async () => {
+        const order = await hotStart();
+        answer = { redeemed: true, kind: "start", placementState: "failed", refundable: true };
+        expect((await sweep(deps(at(2 * MIN)))).refunds.router_refundable).toBe(1);
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
+            kind: "full",
+            amountMicros: 1_013_000,
+            fromWallet: "allowance",
+            reason: "router_refundable",
+        });
+        expect(await voidedAt(order.id)).not.toBeNull();
+        expect((await stateOf(order.id)).state).toBe("refunding");
+    });
+
+    it("a redeemed hot order the router never confirmed is refunded in full, nothing parked", async () => {
+        const order = await hotStart();
+        answer = { redeemed: false };
+        const report = await sweep(deps(at(2 * MIN)));
+        expect(report.refunds.no_router_record).toBe(1);
+        expect(report.manual).toBe(0);
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({
+            kind: "full",
+            amountMicros: 1_013_000,
+            fromWallet: "allowance",
+        });
+        expect(await voidedAt(order.id)).not.toBeNull();
+        expect((await readPool(db.pool)).committedMicros).toBe(0);
     });
 });

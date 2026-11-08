@@ -19,6 +19,7 @@ import { testDb, type TestDb } from "../testing/db.ts";
 import { createFakeRpc, epochAt, type FakeRpc, neverAnswers } from "../testing/fake-rpc.ts";
 import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts";
 import { createAllowanceFunding } from "../x402/funding.ts";
+import { readPool } from "../x402/ledger.ts";
 import { seedAccount } from "../testing/x402.ts";
 import { reconcileSettling, type ReconcileDeps, type ReconcileReport } from "./reconciler.ts";
 import { sweep } from "./sweeper.ts";
@@ -60,6 +61,7 @@ function deps(rpc: FakeRpc, now: Date, log: ReconcileDeps["log"] = silentLog): R
         log,
         now: () => now,
         paid: null,
+        x402: defaults.x402,
     };
 }
 
@@ -414,6 +416,8 @@ describe("reconcileSettling", () => {
                 log: silentLog,
             }),
             orders: defaults.orders,
+            funding: null,
+            x402: defaults.x402,
             log: silentLog,
             now: () => later,
             unavailableAlarmed: new Set(),
@@ -668,5 +672,73 @@ describe("a settling hot order", () => {
         expect(JSON.stringify(levels(log, "error"))).toContain(
             `hot order ${hot.id} needs PaidDeps`,
         );
+    });
+});
+
+describe("a settling hot order and the pool", () => {
+    const X = defaults.x402;
+    const paidDeps = {
+        funding: createAllowanceFunding({ x402: X, log: silentLog }),
+        x402: X,
+        log: silentLog,
+    };
+
+    async function hotSettling(recordedAt: Date, over: Partial<OrderRow> = {}) {
+        const { order } = await seedAllowanceOrder(db.pool, {
+            state: "settling",
+            payer: PAYER,
+            createdAt: new Date(recordedAt.getTime() - MIN),
+            expiresAt: new Date(recordedAt.getTime() + 4 * MIN),
+            ...over,
+        });
+        await seedAccount(db.pool, { handleSha256: order.handleSha256 });
+        const payment = await seedPayment(db.pool, order.id, {
+            txSignature: newSignature(),
+            payer: PAYER,
+            createdAt: recordedAt,
+            lastValidBlockHeight: 1_000n,
+        });
+        await db.pool.query(
+            "update x402_pool set unpaid_micros = 1000000, committed_micros = 0 where id = 1",
+        );
+        return { order, payment };
+    }
+    afterEach(async () => {
+        await db.pool.query("update x402_pool set committed_micros = 0, unpaid_micros = 0");
+    });
+
+    it("reconciler settling to expired lowers unpaid", async () => {
+        const { order } = await hotSettling(at(-10 * MIN));
+        const rpc = createFakeRpc({
+            getEpochInfo: () => epochAt(1_001n),
+            getSignatureStatuses: notFound,
+        });
+        expect((await reconcileSettling(deps(rpc, t0))).reverted).toBe(1);
+        expect((await orderOf(order.id)).state).toBe("expired");
+        expect((await readPool(db.pool)).unpaidMicros).toBe(0);
+    });
+
+    it("reconciler settling to unpaid keeps unpaid", async () => {
+        const { order } = await hotSettling(at(-MIN), { expiresAt: at(4 * MIN) });
+        const rpc = createFakeRpc({
+            getEpochInfo: () => epochAt(1_001n),
+            getSignatureStatuses: notFound,
+        });
+        await reconcileSettling(deps(rpc, t0));
+        expect((await orderOf(order.id)).state).toBe("unpaid");
+        expect((await readPool(db.pool)).unpaidMicros).toBe(1_000_000);
+    });
+
+    it("reconciler records landed_slot of a hot order payment and not of a cold one", async () => {
+        const { order } = await hotSettling(at(-MIN));
+        const slotRpc = (slot: bigint) =>
+            createFakeRpc({ getSignatureStatuses: () => ({ value: [{ ...CONFIRMED, slot }] }) });
+        expect((await reconcileSettling({ ...deps(slotRpc(555n), t0), paid: paidDeps })).paid).toBe(
+            1,
+        );
+        expect((await findPaymentByOrder(db.pool, order.id))!.landedSlot).toBe(555n);
+        const cold = await settling(at(-MIN));
+        await reconcileSettling(deps(slotRpc(556n), t0));
+        expect((await findPaymentByOrder(db.pool, cold.order.id))!.landedSlot).toBeNull();
     });
 });

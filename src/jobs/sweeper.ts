@@ -6,11 +6,15 @@ import { findOrder, lockOrder, setOrderState, updateOrderFields } from "../order
 import type { OrderRow } from "../orders/types.ts";
 import { requestRefund, type RefundReason } from "../refunds/request.ts";
 import type { RouterClient } from "../router/client.ts";
+import type { AllowanceFunding } from "../x402/funding.ts";
+import { movePool } from "../x402/ledger.ts";
 
 export interface SweepDeps {
     pool: pg.Pool;
     router: RouterClient;
     orders: Settings["orders"];
+    funding: AllowanceFunding | null;
+    x402: Settings["x402"];
     log: Log;
     now: () => Date;
     // Orders already alarmed as router_get_order_unavailable, kept for the life of the process
@@ -62,7 +66,14 @@ export async function sweep(d: SweepDeps): Promise<SweepReport> {
         reason: RefundReason,
         eligible: (o: OrderRow) => boolean,
     ): Promise<void> => {
-        if ((await requestRefund(d.pool, id, reason, { eligible })) === "created") {
+        if (
+            (await requestRefund(d.pool, id, reason, {
+                eligible,
+                funding: d.funding ?? undefined,
+                at: now,
+                log: d.log,
+            })) === "created"
+        ) {
             report.refunds[reason]++;
             d.log.info("sweeper refund requested", { orderId: id, reason });
         }
@@ -106,25 +117,38 @@ export async function sweep(d: SweepDeps): Promise<SweepReport> {
             const order = await lockOrder(c, id);
             if (order === null || order.state !== "unpaid" || order.expiresAt > now) return false;
             await setOrderState(c, id, "unpaid", "expired");
+            if (order.allowanceMicros > 0) {
+                await movePool(c, { unpaid: -order.allowanceMicros }, d.x402, d.log);
+            }
             return true;
         });
         if (expired) report.expired++;
     });
 
     // Unreachable, payOrder records paid_at only before the order expires
-    await each(await ids(d.pool, "state = 'paid' and paid_at > expires_at", []), async (id) => {
-        d.log.error("impossible late payment", { orderId: id });
-        await refund(id, "late", (o) => o.state === "paid");
-    });
+    await each(
+        await ids(
+            d.pool,
+            "state = 'paid' and paid_at > expires_at and kind in ('start', 'extend')",
+            [],
+        ),
+        async (id) => {
+            d.log.error("impossible late payment", { orderId: id });
+            await refund(id, "late", (o) => o.state === "paid");
+        },
+    );
 
     const unredeemedBefore = new Date(now.getTime() - d.orders.unredeemed_refund_after);
-    await each(await ids(d.pool, "state = 'paid' and paid_at <= $1", [unredeemedBefore]), (id) =>
-        refund(id, "unredeemed", (o) => o.state === "paid"),
+    await each(
+        await ids(d.pool, "state = 'paid' and paid_at <= $1 and kind in ('start', 'extend')", [
+            unredeemedBefore,
+        ]),
+        (id) => refund(id, "unredeemed", (o) => o.state === "paid"),
     );
 
     const graceBefore = new Date(now.getTime() - d.orders.router_grace);
-    const unconfirmed = `state = 'redeemed' and router_confirmed_at is null
-        and token_expires_at <= $1`;
+    const unconfirmed = `state = 'redeemed' and kind in ('start', 'extend')
+        and router_confirmed_at is null and token_expires_at <= $1`;
     const checks: Array<{ where: string; abandon: boolean }> = [
         {
             where: `${unconfirmed} and event_seen_at is null and abandon_at is null`,
