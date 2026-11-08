@@ -121,7 +121,7 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
             hints,
             orderKey: orderKey(secrets.orderSeed),
             claimKey: secrets.claimKey,
-            pay: (orderId, raw, signal, key) => payOrder(pay, orderId, raw, signal, key),
+            pay: (orderId, raw, signal, key, via) => payOrder(pay, orderId, raw, signal, key, via),
             x402: {
                 x402: s.x402,
                 allowanceClaim: s.router.allowance_claim,

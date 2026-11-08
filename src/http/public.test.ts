@@ -583,3 +583,77 @@ describe("public order routes", () => {
         expect(JSON.stringify(app.log.lines)).not.toContain(h.slice(0, 40));
     });
 });
+
+describe("paid_via", () => {
+    async function paidVia(id: string): Promise<string | null> {
+        const r = await app.pool.query("select paid_via from orders where id = $1", [id]);
+        return r.rows[0].paid_via;
+    }
+
+    function internalPay(body: unknown, headers: Record<string, string> = {}): Promise<Response> {
+        return fetch(`${app.internalUrl}/v1/orders`, {
+            method: "POST",
+            headers: {
+                authorization: `Bearer ${app.secrets.paymentsToken}`,
+                "content-type": "application/json",
+                ...headers,
+            },
+            body: JSON.stringify(body),
+        });
+    }
+
+    it("stores checkout for a payment to /o/{id} with Bugnet-Client: checkout", async () => {
+        const r = await pub(`/o/${order.id}`, {
+            "payment-signature": await headerFor(order),
+            "Bugnet-Client": "checkout",
+        });
+        expect(r.status).toBe(200);
+        expect(await paidVia(order.id)).toBe("checkout");
+    });
+
+    it("stores pay_cli without the header or with any other value", async () => {
+        const r = await pub(`/o/${order.id}`, { "payment-signature": await headerFor(order) });
+        expect(r.status).toBe(200);
+        expect(await paidVia(order.id)).toBe("pay_cli");
+        const other = await unpaid();
+        const o = await pub(`/o/${other.id}`, {
+            "payment-signature": await headerFor(other),
+            "bugnet-client": "Checkout",
+        });
+        expect(o.status).toBe(200);
+        expect(await paidVia(other.id)).toBe("pay_cli");
+    });
+
+    it("leaves unpaid orders without a value", async () => {
+        expect(await paidVia(order.id)).toBeNull();
+    });
+
+    it("never overwrites the value when a paid order is paid again", async () => {
+        const h = await headerFor(order);
+        await pub(`/o/${order.id}`, { "payment-signature": h, "bugnet-client": "checkout" });
+        const again = await pub(`/o/${order.id}`, { "payment-signature": h });
+        expect(again.status).toBe(200);
+        expect(await paidVia(order.id)).toBe("checkout");
+        const other = await unpaid();
+        await pub(`/o/${other.id}`, { "payment-signature": await headerFor(other) });
+        const retry = await pub(`/o/${other.id}`, {
+            "payment-signature": await headerFor(other),
+            "bugnet-client": "checkout",
+        });
+        expect(retry.status).toBe(200);
+        expect(await paidVia(other.id)).toBe("pay_cli");
+    });
+
+    it("stores pay_cli for a paid retry on POST /v1/orders, checkout only with the header", async () => {
+        for (const [headers, want] of [
+            [{}, "pay_cli"],
+            [{ "bugnet-client": "checkout" }, "checkout"],
+        ] as const) {
+            const created = await (await internalPay(create())).json();
+            const p = await signedPayment(withHints(created.paymentRequired.accepts[0]), app.payer);
+            const r = await internalPay(create({ payment: p }), headers);
+            expect((await r.json()).status).toBe("paid");
+            expect(await paidVia(created.orderId)).toBe(want);
+        }
+    });
+});

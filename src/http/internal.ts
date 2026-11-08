@@ -16,6 +16,7 @@ import {
     bearerOk,
     type Handler,
     hangupSignal,
+    paidVia,
     readBody,
     requestPath,
     sendJson,
@@ -154,7 +155,7 @@ export function createInternalHandler(d: InternalDeps): Handler {
         }
         let result;
         try {
-            result = await handleOrderRequest(d.service, body, hangupSignal(res));
+            result = await handleOrderRequest(d.service, body, hangupSignal(res), paidVia(req));
         } catch (err) {
             if (!(err instanceof RpcUnavailableError)) throw err;
             d.log.warn("x402 payee check unreachable", { errorClass: err.errorClass });

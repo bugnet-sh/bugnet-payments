@@ -24,6 +24,7 @@ import {
     type Handler,
     drainBody,
     hangupSignal,
+    paidVia,
     requestPath,
     sendJson,
 } from "./server.ts";
@@ -273,7 +274,10 @@ export function createPublicHandler(d: PublicDeps): Handler {
                 sendJson(res, 400, { refused: err.reason, orderId: id });
                 return;
             }
-            sendOutcome(res, await payOrder(d.pay, id, payment, hangupSignal(res)));
+            sendOutcome(
+                res,
+                await payOrder(d.pay, id, payment, hangupSignal(res), null, paidVia(req)),
+            );
             return;
         }
         const order = isOrderId(id) ? await findOrder(d.pool, id) : null;

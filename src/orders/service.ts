@@ -39,7 +39,7 @@ import {
     updateOrderFields,
 } from "./store.ts";
 import { claimsFor, signOrderToken } from "./token.ts";
-import type { OrderRequest, OrderResult, OrderRow, RefusalReason } from "./types.ts";
+import type { OrderRequest, OrderResult, OrderRow, PaidVia, RefusalReason } from "./types.ts";
 
 export interface OrderServiceDeps {
     pool: pg.Pool;
@@ -53,6 +53,7 @@ export interface OrderServiceDeps {
         raw: unknown,
         signal: AbortSignal,
         key: string | null,
+        via?: PaidVia,
     ) => Promise<PayOutcome>;
     x402: X402OrderDeps;
     log: Log;
@@ -210,6 +211,7 @@ export async function handleOrderRequest(
     d: OrderServiceDeps,
     body: unknown,
     signal: AbortSignal,
+    via: PaidVia = "pay_cli",
 ): Promise<OrderResult> {
     const parsed = requestSchema(d.settings.orders.max_amount_micros).safeParse(body);
     if (!parsed.success) return refused("bad_request");
@@ -238,7 +240,7 @@ export async function handleOrderRequest(
             found = { order, idempotencyHit: true };
         }
     }
-    return answerFound(d, r, found, key, signal);
+    return answerFound(d, r, found, key, signal, via);
 }
 
 class PoolFull extends Error {}
@@ -298,13 +300,14 @@ async function answerFound(
     { order, idempotencyHit }: Found,
     key: string | null,
     signal: AbortSignal,
+    via: PaidVia,
 ): Promise<OrderResult> {
     if (termsDiffer(r, order)) {
         return refused(idempotencyHit ? "idempotency_conflict" : "terms_mismatch", order.id);
     }
     let authorized = false;
     if (r.payment !== undefined) {
-        const outcome = await d.pay(order.id, r.payment, signal, key);
+        const outcome = await d.pay(order.id, r.payment, signal, key, via);
         switch (outcome.kind) {
             case "refused":
                 return outcome.charged === false

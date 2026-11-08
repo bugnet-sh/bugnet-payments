@@ -95,6 +95,9 @@ export type NewPayment = Omit<PaymentRow, "status" | "confirmedAt" | "landedSlot
     keySha256?: Buffer | null;
 };
 
+// How the paying request reached us, from its Bugnet-Client header
+export type PaidVia = "checkout" | "pay_cli";
+
 export type OrderUpdate = Partial<
     Pick<
         OrderRow,
@@ -108,7 +111,7 @@ export type OrderUpdate = Partial<
         | "coldTransferId"
         | "hotRouterRefundMicros"
         | "eventSeenAt"
-    >
+    > & { paidVia: PaidVia }
 >;
 
 // The four terms are required unless both orderId and claim are present
