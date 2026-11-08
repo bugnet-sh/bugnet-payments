@@ -32,6 +32,7 @@ import type { SolanaRpc } from "../../src/solana/rpc.ts";
 import { startFakeRouter, type FakeRouter } from "../../src/testing/fake-router.ts";
 import { makeTestPki } from "../../src/testing/pki.ts";
 import { base32Lower, serviceIdFor } from "../../src/x402/ids.ts";
+import { storePlacement } from "../../src/x402/ledger.ts";
 import type { HttpMethod, Listed } from "../../src/x402/types.ts";
 import { TEST_SELLER, type TestSeller } from "./test-seller.ts";
 
@@ -217,6 +218,7 @@ export interface X402Live {
         maxPriceMicros: number,
     ): Promise<string>;
     startOrderWithPin(svc: RunningService, pin: PinTerms): Promise<string>;
+    topUp(svc: RunningService, accountId: string, allowanceMicros: number): Promise<void>;
     sign(svc: RunningService, accountId: string, o: SignOptions): Promise<ReserveAndSignResponse>;
     terminate(svc: RunningService, accountId: string): Promise<void>;
     close(): Promise<void>;
@@ -380,6 +382,34 @@ export async function startX402Live(o: {
             });
         },
         startOrderWithPin,
+        async topUp(svc, accountId, allowanceMicros) {
+            // The fake router never sends the handle that placement.ready carries
+            const handleSha256 = randomBytes(32).toString("hex");
+            await storePlacement(svc.pool, accountId, {
+                handleSha256,
+                placementId: placementOf(accountId),
+                deadline: null,
+            });
+            const created = await postOrder<{ status: string; payUrl: string }>(
+                svc,
+                o.paymentsToken,
+                {
+                    kind: "allowance",
+                    packageId: "x402-allowance",
+                    handleSha256,
+                    amountMicros: allowanceMicros,
+                    allowanceMicros,
+                    feeMicros: 0,
+                    description: "Bugnet live test x402 top-up",
+                },
+            );
+            expect(created.status).toBe("payment_required");
+            const payload = await http.createPaymentPayload(await challenge(http, created.payUrl));
+            const paid = await fetch(created.payUrl, {
+                headers: http.encodePaymentSignatureHeader(payload),
+            });
+            expect(paid.status).toBe(200);
+        },
         async sign(svc, accountId, s) {
             const method = s.method ?? "POST";
             const url = new URL(s.url ?? TEST_SELLER.url);
