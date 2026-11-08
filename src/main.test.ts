@@ -1045,6 +1045,7 @@ describe("x402 wiring", () => {
             await until(async () => (await wire()) !== null, 5_000);
             const tx = getTransactionDecoder().decode(getBase64Encoder().encode((await wire())!));
             const msg = getCompiledTransactionMessageDecoder().decode(tx.messageBytes);
+            if (msg.version !== 0) throw new Error(`expected a v0 message, got ${msg.version}`);
             const ix = msg.instructions.find(
                 (i) => msg.staticAccounts[i.programAddressIndex] === TOKEN_PROGRAM,
             )!;
