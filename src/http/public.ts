@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { isIP } from "node:net";
 import { encodePaymentResponseHeader } from "@x402/core/http";
 import type pg from "pg";
+import { sendFont } from "../checkout/fonts.ts";
 import { CHECKOUT_CSP, renderCheckout, renderNotFound } from "../checkout/page.ts";
 import type { Log } from "../log.ts";
 import { isOrderId } from "../orders/ids.ts";
@@ -272,6 +273,7 @@ export function createPublicHandler(d: PublicDeps): Handler {
             await sendStatsPayments(req, res, d);
             return;
         }
+        if (path.startsWith("/fonts/")) return await sendFont(req, res, path, d.checkoutJsPath);
         if (path === "/checkout.js") {
             if (req.method === "GET") await sendScript(res, d.checkoutJsPath);
             else refuse(405, "method_not_allowed");

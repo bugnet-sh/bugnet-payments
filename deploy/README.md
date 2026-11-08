@@ -28,7 +28,7 @@ Build in a checkout at the release commit, with `../bugnet-proto` next to it (`p
 
 ```sh
 pnpm install --frozen-lockfile
-pnpm build    # dist/main.js, dist/cli.js, dist/checkout.js
+pnpm build    # dist/main.js, dist/cli.js, dist/checkout.js, dist/fonts/
 v=$(git rev-parse --short HEAD)
 tar czf "bugnet-payments-$v.tgz" dist migrations config vendor deploy \
     package.json pnpm-lock.yaml pnpm-workspace.yaml
@@ -36,9 +36,10 @@ tar czf "bugnet-payments-$v.tgz" dist migrations config vendor deploy \
 
 The install directory needs all of these: `dist/main.js` and `dist/cli.js` keep their packages
 external, so they need `node_modules/`; `pnpm install` needs `vendor/` (pay-kit) and the lockfile;
-the service reads `migrations/` at start and serves `dist/checkout.js`, both relative to its
-working directory; `config/` holds `example.toml`, every setting at its default; `deploy/` holds
-the unit and these notes. On the server, with Node 26 at `/usr/bin/node` and pnpm 12.6:
+the service reads `migrations/` at start and serves `dist/checkout.js` and `dist/fonts/`, all
+relative to its working directory; `config/` holds `example.toml`, every setting at its default;
+`deploy/` holds the unit and these notes. On the server, with Node 26 at `/usr/bin/node` and
+pnpm 12.6:
 
 ```sh
 sudo mkdir -p "/opt/bugnet/payments/$v"
