@@ -99,6 +99,8 @@ BUGNET_FEE_PAYER_KEY=
 BUGNET_REFUND_KEY=
 # Section 6
 BUGNET_SOLANA_RPC_URL=
+BUGNET_ALLOWANCE_KEY=
+BUGNET_X402_TLS_KEY=
 ```
 
 ```sh
@@ -306,7 +308,7 @@ connection for its lock, so keep it above the number of jobs plus the request lo
 ## 11. x402 incidents and alarms
 
 An incident writes one `x402_incidents` row (its facts in `detail`; one open row per kind and
-subject), pauses seller payments and transfers to cold, and fires `x402_incident` with its kind.
+subject), pauses seller payments, new allowance orders and transfers to cold, and fires `x402_incident` with its kind.
 Payments repairs none of them by itself, and `pnpm cli x402 resume` exits 1 while one is
 unresolved.
 
@@ -329,7 +331,7 @@ unresolved.
    `pnpm cli x402 refunds hold` (the operator's only refund hold).
 3. Cover any loss: send Bugnet's own USDC from the cold recipient to the hot USDC account, the sum
    of the open incidents' `loss_micros`. The mirror records it as an unmatched inflow; refunds that
-   went to the manual queue for a short balance can then be `manual retry`d.
+   went to the manual queue for a short balance can then be retried with `pnpm cli manual retry`.
 4. A leaked key is replaced only once the hot ledger is empty: keep the kill on and let sandboxes
    end. With refunds held, their hot refunds stay `pending`: pay each by hand from the cold
    recipient and record it with `pnpm cli manual resolve <refundId> --tx`, which takes a `pending`
@@ -358,7 +360,7 @@ accounts, `signed` rows past `unresolved_alarm_after` with `signed_at`, `signing
 | `x402_tail_lag`             | `verified_slot` more than `tail_lag_alarm_after` behind                                                                          | Check RPC health and credits; look for a dust flood in `x402_chain_txs`                                                                                                                                                    |
 | `x402_rpc_budget`           | RPC calls in an hour passed `rpc_calls_per_hour_alarm`                                                                           | Look for a dust flood or a loop; a paid RPC plan if it is real traffic                                                                                                                                                     |
 | `x402_ref_conflict`         | A repeated `ref` or a `ReportOutcome` `ref` did not match its row                                                                | Check egress for a bug or a compromise; `pnpm cli x402 kill` if it repeats                                                                                                                                                 |
-| `x402_refund_budget`        | Hot refunds passed `refund_daily_cap_micros`                                                                                     | Review the manual queue; `manual retry` each after checking                                                                                                                                                                |
+| `x402_refund_budget`        | Hot refunds passed `refund_daily_cap_micros`                                                                                     | Review the manual queue; `pnpm cli manual retry` each after checking                                                                                                                                                       |
 | `x402_pool_high`            | Allowance money held passed `pool_high_alarm_percent` of `pool_max_micros`                                                       | Look for a burst of unpaid orders from one client; raising the $50 is the founder's call                                                                                                                                   |
 | `x402_pool_drift`           | The audit's `committed_micros` differs from the stored one                                                                       | Find the cause before correcting the row                                                                                                                                                                                   |
 | `x402_audit_mismatch`       | The audit found a confirmed row missing on chain, or the balance off its sum                                                     | Find the row before correcting anything; `pnpm cli x402 pause audit` if money is unaccounted for                                                                                                                           |

@@ -157,6 +157,7 @@ export async function startService(o: StartOptions): Promise<RunningService> {
     let removeReload = () => {};
     let reload: (() => void) | null = null;
     let stopping: Promise<void> | undefined;
+    let opening: Promise<void> | undefined;
     try {
         const migrations = await migrate(pool);
         removeReload = installReload(() => {
@@ -289,7 +290,6 @@ export async function startService(o: StartOptions): Promise<RunningService> {
         const publicServer = await startServer(s.http.public_listen, http.publicHandler, log);
         closers.push(publicServer.close);
 
-        let opening: Promise<void> | undefined;
         const openListener = (w: X402Wiring, files: TlsFiles): Promise<void> =>
             (opening ??= (async () => {
                 try {
@@ -380,6 +380,8 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             pool,
             stop: () =>
                 (stopping ??= (async () => {
+                    // A listener still starting would register its closer after closeAll ran
+                    await opening?.catch(() => {});
                     await jobs.stop();
                     await closeAll();
                     removeReload();
@@ -413,14 +415,14 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
     // Each run is kept until it ends, so stop lets a running job finish before the pool closes
     const running = new Set<Promise<unknown>>();
     let stopped = false;
-    const tracked = (fn: () => Promise<unknown>) => (): Promise<unknown> => {
-        if (stopped) return Promise.resolve();
-        const run = fn();
+    const track = <T>(run: Promise<T>): Promise<T> => {
         running.add(run);
         const done = () => running.delete(run);
         run.then(done, done);
         return run;
     };
+    const tracked = (fn: () => Promise<unknown>) => (): Promise<unknown> =>
+        stopped ? Promise.resolve() : track(fn());
 
     const funding = x === null ? null : d.funding;
     const paid = funding === null ? null : { funding, x402: s.x402, log };
@@ -492,25 +494,28 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
                     missing: r.missing.length,
                 });
                 if (x === null) return;
-                await auditX402({
-                    pool,
-                    rpc,
-                    hotTokenAccount: x.hotTokenAccount,
-                    x402: s.x402,
-                    rpcTimeoutMs,
-                    log,
-                    now,
-                });
-                const tls = checkTlsFiles(x.readTls(), SERVER_NAME, now());
-                if (tls.ok) {
-                    certExpiryAlarm({
-                        serverNotAfter: tls.serverNotAfter,
-                        caNotAfter: tls.caNotAfter,
-                        clientNotAfter: x.listener()?.lastClientCertNotAfter() ?? null,
-                        beforeMs: s.x402.cert_expiry_alarm_before,
-                        now: now(),
+                try {
+                    await auditX402({
+                        pool,
+                        rpc,
+                        hotTokenAccount: x.hotTokenAccount,
+                        x402: s.x402,
+                        rpcTimeoutMs,
                         log,
+                        now,
                     });
+                } finally {
+                    const tls = checkTlsFiles(x.readTls(), SERVER_NAME, now());
+                    if (tls.ok) {
+                        certExpiryAlarm({
+                            serverNotAfter: tls.serverNotAfter,
+                            caNotAfter: tls.caNotAfter,
+                            clientNotAfter: x.listener()?.lastClientCertNotAfter() ?? null,
+                            beforeMs: s.x402.cert_expiry_alarm_before,
+                            now: now(),
+                            log,
+                        });
+                    }
                 }
             }),
             log,
@@ -543,7 +548,7 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
             ),
         );
     }
-    if (x !== null) stops.push(...startX402Jobs(d, x, tracked, refundDeps));
+    if (x !== null) stops.push(...startX402Jobs(d, x, tracked, track, refundDeps));
     return {
         async stop() {
             stopped = true;
@@ -559,6 +564,7 @@ function startX402Jobs(
     d: JobDeps,
     x: X402Wiring,
     tracked: (fn: () => Promise<unknown>) => () => Promise<unknown>,
+    track: <T>(run: Promise<T>) => Promise<T>,
     refundDeps: Omit<Parameters<typeof runRefunds>[0], "allowanceSigner" | "hotTokenAccount">,
 ): Array<() => void> {
     const { s, pool, rpc, log, now } = d;
@@ -613,14 +619,14 @@ function startX402Jobs(
         every(
             x402.fast_pass_every,
             "x402_fast_pass",
-            async () => ((await fastPassNeeded(pool)) ? fastPass() : undefined),
+            tracked(async () => ((await fastPassNeeded(pool)) ? fastPass() : undefined)),
             log,
         ),
         paced(
             "x402_mirror",
             tracked(() => x.mirrorOnce()),
             () =>
-                mirrorBusy(pool).then(
+                track(mirrorBusy(pool)).then(
                     (busy) => mirrorInterval(busy, x402),
                     () => x402.mirror_every,
                 ),

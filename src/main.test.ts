@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import type { AddressInfo } from "node:net";
+import { connect as netConnect, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { create as createMessage } from "@bufbuild/protobuf";
@@ -39,6 +39,18 @@ import { enqueueAllowanceEvent } from "./x402/outbox.ts";
 import { resetMirrorState } from "./x402/mirror.ts";
 import { parseIndex } from "./x402/index-file.ts";
 import { readTail } from "./x402/tail.ts";
+
+const slowListener = vi.hoisted(() => ({ ms: 0 }));
+vi.mock("./x402/listener.ts", async (importOriginal) => {
+    const real = await importOriginal<typeof import("./x402/listener.ts")>();
+    return {
+        ...real,
+        startSignerListener: async (...args: Parameters<typeof real.startSignerListener>) => {
+            await new Promise((r) => setTimeout(r, slowListener.ms));
+            return real.startSignerListener(...args);
+        },
+    };
+});
 
 type Tables = Record<string, Record<string, unknown>>;
 
@@ -1032,6 +1044,38 @@ describe("x402 wiring", () => {
         }
     });
 
+    it("stop waits for a listener still opening and closes it", async () => {
+        const probe = createServer();
+        await new Promise<void>((r) => probe.listen(0, "127.0.0.1", r));
+        const port = (probe.address() as AddressInfo).port;
+        await new Promise((r) => probe.close(r));
+        const certPath = path.join(mkdtempSync(path.join(tmpdir(), "bn-tls-")), "server.crt");
+        writeFileSync(certPath, "not a certificate");
+        const s = await startService({
+            settings: x402Settings({
+                x402: { tls_cert_file: certPath, listen: `127.0.0.1:${port}` },
+            }),
+            secrets: x402Secrets,
+            rpc: withBalance(chain.rpc),
+            log: silentLog,
+        });
+        writeFileSync(certPath, readFileSync(pki.serverCert));
+        slowListener.ms = 400;
+        try {
+            process.emit("SIGHUP");
+            await s.stop();
+            await new Promise((r) => setTimeout(r, 800));
+        } finally {
+            slowListener.ms = 0;
+        }
+        const open = await new Promise<boolean>((resolve) => {
+            const c = netConnect(port, "127.0.0.1");
+            c.once("connect", () => (c.destroy(), resolve(true)));
+            c.once("error", () => resolve(false));
+        });
+        expect(open).toBe(false);
+    });
+
     it("the hot executor runs with refunds.enabled false", async () => {
         const settings = x402Settings({
             refunds: { enabled: false },
@@ -1045,7 +1089,11 @@ describe("x402 wiring", () => {
         });
         try {
             const id = await seedAllowanceRefund(s.pool, 300_000);
-            await until(async () => (await rowState(s.pool, "refunds", id)) !== "pending", 5_000);
+            await until(
+                async () =>
+                    ["sent", "signed"].includes((await rowState(s.pool, "refunds", id)) ?? ""),
+                5_000,
+            );
         } finally {
             await s.stop();
         }
