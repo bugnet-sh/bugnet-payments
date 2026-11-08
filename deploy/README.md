@@ -223,12 +223,26 @@ comes up by itself once the cause is fixed. Two versions bind the same ports, so
 the old one first: `sudo systemctl disable --now bugnet-payments@<old>`, then enable the new one.
 Stopping lets running jobs finish, then closes the listeners and the database pool.
 
-Operator commands run as the service user, with the deploy settings:
+Operator commands that read the database (`manual`, `refunds`, `x402`, `keys drain --allowance`)
+run as the service user, with the deploy settings and the secrets file (`x402 ledger-check`,
+`manual retry` and `x402 status`'s chain balance need `BUGNET_SOLANA_RPC_URL`). Define `pcli` once
+per shell, in the install directory:
 
 ```sh
 cd "/opt/bugnet/payments/$v"
-sudo -u bugnet-payments node dist/cli.js -config /etc/bugnet/payments.toml manual list
+pcli() {
+    sudo sh -c 'set -a; . /etc/bugnet/payments.env; [ -z "$0" ] || . "$0"; set +a
+        exec setpriv --reuid=bugnet-payments --regid=bugnet-payments --init-groups \
+            node dist/cli.js -config /etc/bugnet/payments.toml "$@"' "${PCLI_ENV:-}" "$@"
+}
+pcli manual list
 ```
+
+Every `pcli` command in these notes and in `x402-mainnet-tests.md` means this function. Never use
+`pnpm cli` for them: without `-config` it opens `config/dev.toml`, the dev database, and the
+install directory has no `src/` for it to run. `PCLI_ENV=<absolute path>` sources one more env
+file after the secrets file, for `keys drain --allowance`, which also needs `BUGNET_TEST_PAYER_KEY`
+(a `0600` file, deleted afterwards).
 
 ## 9. Open decision 11 (founder, question 14): TLS for `pay.bugnet.sh`
 
@@ -312,7 +326,7 @@ connection for its lock, so keep it above the number of jobs plus the request lo
 
 An incident writes one `x402_incidents` row (its facts in `detail`; one open row per kind and
 subject), pauses seller payments, new allowance orders and transfers to cold, and fires `x402_incident` with its kind.
-Payments repairs none of them by itself, and `pnpm cli x402 resume` exits 1 while one is
+Payments repairs none of them by itself, and `pcli x402 resume` exits 1 while one is
 unresolved.
 
 | Kind                    | Found by                                                                     |
@@ -325,59 +339,60 @@ unresolved.
 | `late_landing`          | A payment found after it expired                                             |
 | `double_transfer`       | Two landed transactions for one refund or transfer                           |
 
-**The runbook.** `pnpm cli x402 status` and `pnpm cli x402 incident list` show every fact needed.
+**The runbook.** `pcli x402 status` and `pcli x402 incident list` show every fact needed.
 
 1. Read the incident and its transaction on an explorer. `balance_mismatch` or `mirror_gap` with
    `x402_tail_lag` firing is usually an RPC whose history lags: point `BUGNET_SOLANA_RPC_URL` at a
    provider with complete history, restart, and once the mirror verifies go to step 5.
-2. Otherwise, or if unsure: `pnpm cli x402 kill`. For a suspected key leak, also hold refunds:
-   `pnpm cli x402 refunds hold` (the operator's only refund hold).
+2. Otherwise, or if unsure: `pcli x402 kill`. For a suspected key leak, also hold refunds:
+   `pcli x402 refunds hold` (the operator's only refund hold).
 3. Cover any loss: send Bugnet's own USDC from the cold recipient to the hot USDC account, the sum
    of the open incidents' `loss_micros`. The mirror records it as an unmatched inflow; refunds that
-   went to the manual queue for a short balance can then be retried with `pnpm cli manual retry`.
+   went to the manual queue for a short balance can then be retried with `pcli manual retry`.
 4. A leaked key is replaced only once the hot ledger is empty: keep the kill on and let sandboxes
    end. With refunds held, their hot refunds stay `pending`: pay each by hand from the cold
-   recipient and record it with `pnpm cli manual resolve <refundId> --tx`, which takes a `pending`
+   recipient and record it with `pcli manual resolve <refundId> --tx`, which takes a `pending`
    row while held. Without a hold, let them confirm and do the same for any that go `manual`.
-   Then run `pnpm cli keys drain --allowance`, make a new key (`pnpm cli keys generate` with
-   `BUGNET_ALLOWANCE_KEY` cleared), set `[x402] allowance_wallet`, run `pnpm cli keys fund
---create-allowance-ata`, and restart (boot check 4 opens the new tail).
-5. `pnpm cli x402 incident resolve <id> <finding>`, then `pnpm cli x402 refunds release`, `pnpm
-cli x402 unkill` and `pnpm cli x402 resume` as they apply.
+   Then run `PCLI_ENV=<test payer env file> pcli keys drain --allowance` (section 8), make a new
+   key (`pnpm cli keys generate` with `BUGNET_ALLOWANCE_KEY` cleared), set
+   `[x402] allowance_wallet`, run `pnpm cli keys fund --create-allowance-ata`, and restart (boot
+   check 4 opens the new tail).
+5. `pcli x402 incident resolve <id> <finding>`, then `pcli x402 refunds release`,
+   `pcli x402 unkill` and `pcli x402 resume` as they apply.
 
 **Operator commands**, each acting on the database row read on every call, so no restart is
-needed: `pnpm cli x402 pause <reason>`, `resume`, `kill`, `unkill`, `block-payto <address>
+needed: `pcli x402 pause <reason>`, `resume`, `kill`, `unkill`, `block-payto <address>
 <reason>`, `unblock-payto <address>`, `service reset <account> <serviceId>` (back to `enabled`,
 `failures` 0), `refunds hold|release`, `incident list`, `incident resolve <id> <finding>`, and
 `status` (controls, pool, liabilities, chain balance, `verified_slot` lag, open and closing
 accounts, `signed` rows past `unresolved_alarm_after` with `signed_at`, `signing_slot` and
-`last_valid_block_height`, pending events, open incidents). All of them are `pnpm cli x402 ...`.
+`last_valid_block_height`, pending events, open incidents). All of them are `pcli x402 ...`.
 
 **Alarms.** Log lines with `"level":"alarm"`.
 
-| Alarm                       | When                                                                                                                             | Operator's action                                                                                                                                                                                                          |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `x402_incident`             | An incident was written, with its kind                                                                                           | Payments is paused; follow the runbook above                                                                                                                                                                               |
-| `x402_outflow_cap`          | Seller payments of the UTC day reached `outflow_daily_cap_micros`                                                                | None; it lifts at 00:00 UTC. If one payee took most of it, `pnpm cli x402 block-payto`                                                                                                                                     |
-| `x402_unresolved`           | A `signed` row unresolved `unresolved_alarm_after` after signing                                                                 | `pnpm cli x402 status` shows its `signed_at`, `signing_slot` and `last_valid_block_height`; read the hot account's history on an explorer for the next 2 minutes; check `x402_tail_lag` and the RPC. Never release by hand |
-| `x402_tail_lag`             | `verified_slot` more than `tail_lag_alarm_after` behind                                                                          | Check RPC health and credits; look for a dust flood in `x402_chain_txs`                                                                                                                                                    |
-| `x402_rpc_budget`           | RPC calls in an hour passed `rpc_calls_per_hour_alarm`                                                                           | Look for a dust flood or a loop; a paid RPC plan if it is real traffic                                                                                                                                                     |
-| `x402_ref_conflict`         | A repeated `ref` or a `ReportOutcome` `ref` did not match its row                                                                | Check egress for a bug or a compromise; `pnpm cli x402 kill` if it repeats                                                                                                                                                 |
-| `x402_refund_budget`        | Hot refunds passed `refund_daily_cap_micros`                                                                                     | Review the manual queue; `pnpm cli manual retry` each after checking                                                                                                                                                       |
-| `x402_pool_high`            | Allowance money held passed `pool_high_alarm_percent` of `pool_max_micros`                                                       | Look for a burst of unpaid orders from one client; raising the $50 is the founder's call                                                                                                                                   |
-| `x402_pool_drift`           | The audit's `committed_micros` differs from the stored one                                                                       | Find the cause before correcting the row                                                                                                                                                                                   |
-| `x402_audit_mismatch`       | The audit found a confirmed row missing on chain, or the balance off its sum                                                     | Find the row before correcting anything; `pnpm cli x402 pause audit` if money is unaccounted for                                                                                                                           |
-| `x402_cert_expiry`          | Payments' server certificate, the client CA, or the client certificate egress presents expires within `cert_expiry_alarm_before` | On the Mac that keeps the CA key, run `bugnet-dev mtls init --renew --from <the two certificate files>`, copy the two `.pem` files to the VPS, then `systemctl kill -s HUP` both services                                  |
-| `x402_reload_failed`        | An index or certificate reload was rejected                                                                                      | Fix the file and send `SIGHUP` again                                                                                                                                                                                       |
-| `x402_payee_unreliable`     | A service was marked unreliable                                                                                                  | Read the seller's hints; `block-payto` if dishonest, else `pnpm cli x402 service reset`                                                                                                                                    |
-| `x402_signer_down`          | A live check keeps the listener closed                                                                                           | Read the logged check; fix the RPC or the certificate                                                                                                                                                                      |
-| `x402_events_stuck`         | The oldest pending router event of a redeemed order is older than `events_stuck_alarm_after`                                     | Check the router; rows retry by themselves                                                                                                                                                                                 |
-| `x402_event_dropped`        | The router answered `ORDER_UNKNOWN` to an `x402_resolved`                                                                        | Check whether the start order ever reached `CreatePlacement`; nothing to resend                                                                                                                                            |
-| `x402_event_refused`        | The router refused an event as `InvalidArgument`                                                                                 | A bug in Payments or the router; fix and backfill by hand                                                                                                                                                                  |
-| `x402_close_slow`           | An account `closing` longer than `close_slow_alarm_after`                                                                        | Find its `signed` rows; check the mirror                                                                                                                                                                                   |
-| `x402_close_unverifiable`   | The close check could not reach the router for `close_unverifiable_after`                                                        | Check the router                                                                                                                                                                                                           |
-| `x402_resign_waiting`       | A hot refund or transfer waited for the re-sign proof past `resign_wait_alarm_after`                                             | Check `x402_tail_lag`; if the RPC's history is incomplete, switch `BUGNET_SOLANA_RPC_URL` and restart                                                                                                                      |
-| `x402_cold_transfer_failed` | A transfer to cold became `failed`                                                                                               | None needed: its parts go in the next one. If it repeats, check the cold recipient's USDC account                                                                                                                          |
+| Alarm                       | When                                                                                                                             | Operator's action                                                                                                                                                                                                      |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `x402_incident`             | An incident was written, with its kind                                                                                           | Payments is paused; follow the runbook above                                                                                                                                                                           |
+| `x402_outflow_cap`          | Seller payments of the UTC day reached `outflow_daily_cap_micros`                                                                | None; it lifts at 00:00 UTC. If one payee took most of it, `pcli x402 block-payto`                                                                                                                                     |
+| `x402_unresolved`           | A `signed` row unresolved `unresolved_alarm_after` after signing                                                                 | `pcli x402 status` shows its `signed_at`, `signing_slot` and `last_valid_block_height`; read the hot account's history on an explorer for the next 2 minutes; check `x402_tail_lag` and the RPC. Never release by hand |
+| `x402_tail_lag`             | `verified_slot` more than `tail_lag_alarm_after` behind                                                                          | Check RPC health and credits; look for a dust flood in `x402_chain_txs`                                                                                                                                                |
+| `x402_rpc_budget`           | RPC calls in an hour passed `rpc_calls_per_hour_alarm`                                                                           | Look for a dust flood or a loop; a paid RPC plan if it is real traffic                                                                                                                                                 |
+| `x402_ref_conflict`         | A repeated `ref` or a `ReportOutcome` `ref` did not match its row                                                                | Check egress for a bug or a compromise; `pcli x402 kill` if it repeats                                                                                                                                                 |
+| `x402_refund_budget`        | Hot refunds passed `refund_daily_cap_micros`                                                                                     | Review the manual queue; `pcli manual retry` each after checking                                                                                                                                                       |
+| `x402_pool_high`            | Allowance money held passed `pool_high_alarm_percent` of `pool_max_micros`                                                       | Look for a burst of unpaid orders from one client; raising the $50 is the founder's call                                                                                                                               |
+| `x402_pool_drift`           | The audit's `committed_micros` differs from the stored one                                                                       | Find the cause before correcting the row                                                                                                                                                                               |
+| `x402_audit_mismatch`       | The audit found a confirmed row missing on chain, or the balance off its sum                                                     | Find the row before correcting anything; `pcli x402 pause audit` if money is unaccounted for                                                                                                                           |
+| `x402_cert_expiry`          | Payments' server certificate, the client CA, or the client certificate egress presents expires within `cert_expiry_alarm_before` | On the Mac that keeps the CA key, run `bugnet-dev mtls init --renew --from <the two certificate files>`, copy the two `.pem` files to the VPS, then `systemctl kill -s HUP` both services                              |
+| `x402_reload_failed`        | An index or certificate reload was rejected                                                                                      | Fix the file and send `SIGHUP` again                                                                                                                                                                                   |
+| `x402_payee_unreliable`     | A service was marked unreliable                                                                                                  | Read the seller's hints; `block-payto` if dishonest, else `pcli x402 service reset`                                                                                                                                    |
+| `x402_signer_down`          | A live check keeps the listener closed                                                                                           | Read the logged check; fix the RPC or the certificate                                                                                                                                                                  |
+| `x402_events_stuck`         | The oldest pending router event of a redeemed order is older than `events_stuck_alarm_after`                                     | Check the router; rows retry by themselves                                                                                                                                                                             |
+| `x402_event_dropped`        | The router answered `ORDER_UNKNOWN` to an `x402_resolved`                                                                        | Check whether the start order ever reached `CreatePlacement`; nothing to resend                                                                                                                                        |
+| `x402_event_refused`        | The router refused an event as `InvalidArgument`                                                                                 | A bug in Payments or the router; fix and backfill by hand                                                                                                                                                              |
+| `x402_close_slow`           | An account `closing` longer than `close_slow_alarm_after`                                                                        | Find its `signed` rows; check the mirror                                                                                                                                                                               |
+| `x402_close_unverifiable`   | The close check could not reach the router for `close_unverifiable_after`                                                        | Check the router                                                                                                                                                                                                       |
+| `x402_resign_waiting`       | A hot refund or transfer waited for the re-sign proof past `resign_wait_alarm_after`                                             | Check `x402_tail_lag`; if the RPC's history is incomplete, switch `BUGNET_SOLANA_RPC_URL` and restart                                                                                                                  |
+| `x402_cold_transfer_failed` | A transfer to cold became `failed`                                                                                               | None needed: its parts go in the next one. If it repeats, check the cold recipient's USDC account                                                                                                                      |
 
 Hot refunds that go manual fire the existing `manual_queue`; unmatched inflows of $0.01 or more
 and late order inflows fire the existing `inflow_mismatch`.

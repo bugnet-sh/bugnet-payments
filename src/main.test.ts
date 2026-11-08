@@ -1254,4 +1254,14 @@ describe("deploy notes", () => {
             expect(readme).toContain(s);
         }
     });
+
+    it("run every database command against the deploy settings, never the dev default", () => {
+        for (const file of ["README.md", "x402-mainnet-tests.md"]) {
+            const text = readFileSync(path.join(import.meta.dirname, "..", "deploy", file), "utf8");
+            const words = text.replace(/\s+/g, " ");
+            expect(words, file).not.toMatch(/pnpm cli (x402|manual|refunds|keys drain --allowance)/);
+            expect(text, file).toContain("pcli() {");
+            expect(text, file).toContain("-config /etc/bugnet/payments.toml");
+        }
+    });
 });
