@@ -743,6 +743,123 @@ describe("cliMain hot-wallet queue", () => {
         }
     });
 
+    it("manual resolve <orderId> --tx is a usage error", async () => {
+        const o = await hotOrder({ state: "manual", manualReason: "refund_destination_invalid" });
+        const io = captureIo();
+        expect(await cli(["manual", "resolve", o.id, "--tx", SIG(1)], io)).toBe(2);
+        expect(io.errText()).toContain("--tx belongs to a refund id");
+        expect((await findOrder(db.pool, o.id))!.state).toBe("manual");
+    });
+
+    it("a landed proof says the refund was paid on chain", async () => {
+        const o = await hotOrder();
+        const id = await row(o.id, {
+            kind: "allowance",
+            fromWallet: "allowance",
+            state: "manual",
+            amountMicros: 300_000,
+            manualReason: "refund_expired_repeatedly",
+            txSignature: SIG(1),
+            expirySeenSlot: 1_000n,
+        });
+        await db.pool.query(
+            `insert into x402_chain_txs (signature, slot, delta_micros, failed, matched)
+             values ($1, 1100, 0, false, 'no_effect')`,
+            [SIG(1)],
+        );
+        for (const args of [
+            ["manual", "retry", String(id)],
+            ["manual", "resolve", String(id), "--tx", SIG(8)],
+        ]) {
+            const io = captureIo();
+            expect(await cli(args, io, { rpc: absentRpc() })).toBe(1);
+            expect(io.errText()).toContain("paid on chain");
+            expect(io.errText()).toContain("confirm path");
+            expect(io.errText()).not.toContain("not yet proven absent");
+        }
+        expect((await refundOf(id)).state).toBe("manual");
+        await db.pool.query("delete from x402_chain_txs where signature = $1", [SIG(1)]);
+    });
+
+    it("retry and resolve by refund id refuse a row whose signatures changed after the proof", async () => {
+        for (const args of [
+            (id: number) => ["manual", "retry", String(id)],
+            (id: number) => ["manual", "resolve", String(id), "--tx", SIG(8)],
+        ]) {
+            const o = await hotOrder();
+            const id = await row(o.id, {
+                kind: "allowance",
+                fromWallet: "allowance",
+                state: "manual",
+                amountMicros: 300_000,
+                manualReason: "refund_expired_repeatedly",
+                txSignature: SIG(1),
+                expirySeenSlot: 1_000n,
+            });
+            await db.pool.query("update x402_tail set verified_slot = 1300");
+            await db.pool.query("update x402_pool set committed_micros = 1000000");
+            const racing = createFakeRpc({
+                getSignatureStatuses: async () => {
+                    await db.pool.query(
+                        "update refunds set tx_signature = $2, previous_signatures = array[$3] where id = $1",
+                        [id, SIG(20 + id), SIG(1)],
+                    );
+                    return { context: { slot: 1_400n }, value: [null] };
+                },
+            });
+            const io = captureIo();
+            expect(await cli(args(id), io, { rpc: racing })).toBe(1);
+            expect(io.errText()).toContain(
+                args(id)[1] === "retry"
+                    ? `refund ${id}: changed while retrying`
+                    : `refund ${id}: changed while resolving`,
+            );
+            expect(await refundOf(id)).toMatchObject({ state: "manual", handTx: null });
+        }
+    });
+
+    it("manual retry <orderId> on a hot full row refuses a proof that is not absent", async () => {
+        const o = await hotOrder({ state: "manual", manualReason: "refund_expired_repeatedly" });
+        const id = await row(o.id, {
+            kind: "full",
+            fromWallet: "allowance",
+            state: "manual",
+            amountMicros: 1_013_000,
+            manualReason: "refund_expired_repeatedly",
+            txSignature: SIG(1),
+            expirySeenSlot: 1_000n,
+        });
+        await db.pool.query("update x402_tail set verified_slot = 1299");
+        const io = captureIo();
+        expect(await cli(["manual", "retry", o.id], io, { rpc: absentRpc() })).toBe(1);
+        expect(io.errText()).toContain(`${o.id}: its last transaction is not yet proven absent`);
+        expect((await refundOf(id)).state).toBe("manual");
+        expect((await findOrder(db.pool, o.id))!.state).toBe("manual");
+    });
+
+    it("manual retry and resolve <orderId> refuse a row resolved by hand", async () => {
+        const o = await hotOrder({ state: "manual", manualReason: "refund_destination_invalid" });
+        await row(o.id, {
+            kind: "full",
+            fromWallet: "refund",
+            state: "manual",
+            amountMicros: 1_013_000,
+            manualReason: "resolved_by_hand",
+        });
+        const cold = await manualOrder("refund_failed_onchain", "manual");
+        await db.pool.query(
+            "update refunds set manual_reason = 'resolved_by_hand' where order_id = $1",
+            [cold.id],
+        );
+        for (const id of [o.id, cold.id]) {
+            for (const verb of ["retry", "resolve"]) {
+                const io = captureIo();
+                expect(await cli(["manual", verb, id], io)).toBe(1);
+                expect(io.errText()).toContain(`${id}: resolved by hand`);
+            }
+        }
+    });
+
     it("takes --tx only on manual resolve", async () => {
         for (const args of [
             ["manual", "retry", "5", "--tx", SIG(1)],

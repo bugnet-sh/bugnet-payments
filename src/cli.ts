@@ -241,6 +241,12 @@ function needsAmount(order: OrderRow): boolean {
 
 const BY_HAND = "resolved_by_hand";
 const NOT_ABSENT = "its last transaction is not yet proven absent";
+const LANDED =
+    "its refund was paid on chain; the confirm path will record it, so retry or resolve is not needed";
+
+// Why a proof short of "absent" blocks the operator's change
+const unproven = (proof: Exclude<ResignProof, "absent">): string =>
+    proof === "landed" ? LANDED : NOT_ABSENT;
 
 function refuseRefund(io: CliIo, refundId: number, why: string): number {
     io.err(`refund ${refundId}: ${why}`);
@@ -352,16 +358,26 @@ async function retryRefund(ctx: CliContext, io: CliIo, id: number): Promise<numb
     const r = await refundForId(ctx, io, id);
     if (r === null) return 1;
     if (!(await isListed(ctx.pool, r))) return refuseRefund(io, id, "use the order-level command");
-    if (r.fromWallet === "allowance" && (await proofOf(ctx, r)) !== "absent") {
-        return refuseRefund(io, id, NOT_ABSENT);
+    let proven: string | null = null;
+    if (r.fromWallet === "allowance") {
+        const proof = await proofOf(ctx, r);
+        if (proof !== "absent") return refuseRefund(io, id, unproven(proof));
+        proven = provenKey(r);
     }
-    const res = await ctx.pool.query(
-        `update refunds set state = 'pending', attempts = 0, budget_waived = true,
-            manual_reason = null
-         where id = $1 and state = 'manual' and manual_reason is distinct from 'resolved_by_hand'`,
-        [id],
-    );
-    if (res.rowCount !== 1) return refuseRefund(io, id, "changed while retrying");
+    const done = await withTx(ctx.pool, async (c) => {
+        const now = await c.query(`select id from refunds where id = $1 for update`, [id]);
+        const cur = now.rowCount === 1 ? await findRefundById(c, id) : null;
+        if (cur === null || (proven !== null && provenKey(cur) !== proven)) return false;
+        const res = await c.query(
+            `update refunds set state = 'pending', attempts = 0, budget_waived = true,
+                manual_reason = null
+             where id = $1 and state = 'manual'
+                and manual_reason is distinct from 'resolved_by_hand'`,
+            [id],
+        );
+        return res.rowCount === 1;
+    });
+    if (!done) return refuseRefund(io, id, "changed while retrying");
     io.out(`refund ${id}: pending`);
     return 0;
 }
@@ -379,7 +395,8 @@ async function retryOrder(ctx: CliContext, io: CliIo, orderId: string): Promise<
         peek.fromWallet === "allowance" &&
         peek.manualReason !== BY_HAND
     ) {
-        if ((await proofOf(ctx, peek)) !== "absent") return refuse(io, orderId, NOT_ABSENT);
+        const proof = await proofOf(ctx, peek);
+        if (proof !== "absent") return refuse(io, orderId, unproven(proof));
         proven = provenKey(peek);
     }
     const outcome = await withTx(
@@ -488,7 +505,7 @@ async function dismissManual(
         const allowed = DISMISSABLE.join(" or ");
         return refuse(io, orderId, `manual_reason ${reason} cannot be dismissed, only ${allowed}`);
     }
-    if (!(await returnManualToRedeemed(pool, orderId, new Date(), DISMISSABLE))) {
+    if (!(await returnManualToRedeemed(pool, orderId, ctx.now(), DISMISSABLE))) {
         return refuse(io, orderId, "changed while dismissing or has a refund row");
     }
     io.out(`${orderId}: redeemed`);
@@ -502,9 +519,13 @@ async function resolveManual(
     flags: { tx?: string },
 ): Promise<number> {
     if (!isOrderId(arg)) return resolveRefund(ctx, io, Number(arg), flags.tx);
+    if (flags.tx !== undefined) {
+        return usage(io, "--tx belongs to a refund id; an order id takes manual resolve <orderId>");
+    }
     const refused = await withTx(ctx.pool, async (c) => {
         const order = await lockOrder(c, arg);
         const refund = order === null ? null : await findOrderRefund(c, arg);
+        if (refund?.manualReason === BY_HAND) return "resolved by hand";
         if (order?.payInto === "allowance" && refund !== null) {
             return `hot-wallet refund: use manual resolve ${refund.id}`;
         }
@@ -558,8 +579,11 @@ async function resolveRefund(
         return refuseRefund(io, id, `a refund-wallet row: use manual resolve ${id} without --tx`);
     }
     if (!isCanonicalSignature(tx)) return refuseRefund(io, id, "not a 64-byte signature");
+    let proven: string | null = null;
     if (r.state === "manual") {
-        if ((await proofOf(ctx, r)) !== "absent") return refuseRefund(io, id, NOT_ABSENT);
+        const proof = await proofOf(ctx, r);
+        if (proof !== "absent") return refuseRefund(io, id, unproven(proof));
+        proven = provenKey(r);
     } else if (r.state === "pending") {
         if (!(await readControls(pool)).refundsHeld) {
             return refuseRefund(io, id, "pending rows only while refunds are held");
@@ -567,9 +591,14 @@ async function resolveRefund(
     } else {
         return refuseRefund(io, id, `its refund is ${r.state} and the executor still owns it`);
     }
-    const done = await withTx(pool, (c) =>
-        resolveHotRefundByHand(c, id, tx, ctx.now(), ctx.settings.x402, ctx.log),
-    );
+    const done = await withTx(pool, async (c) => {
+        if (proven !== null) {
+            await c.query(`select id from refunds where id = $1 for update`, [id]);
+            const cur = await findRefundById(c, id);
+            if (cur === null || provenKey(cur) !== proven) return false;
+        }
+        return resolveHotRefundByHand(c, id, tx, ctx.now(), ctx.settings.x402, ctx.log);
+    });
     if (!done) return refuseRefund(io, id, "changed while resolving");
     io.out(`refund ${id}: resolved by hand`);
     return 0;
