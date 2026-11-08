@@ -1,6 +1,7 @@
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import type { Log } from "../log.ts";
+import { statsTotals } from "../stats/totals.ts";
 import { accountAnswer, configure, RouterUnavailableError } from "../x402/configure.ts";
 import { RpcUnavailableError } from "../x402/create.ts";
 import { parseHosts, sellerStats } from "../x402/sellers.ts";
@@ -16,6 +17,7 @@ import {
     bearerOk,
     type Handler,
     hangupSignal,
+    paidVia,
     readBody,
     requestPath,
     sendJson,
@@ -24,11 +26,14 @@ import {
 export interface InternalDeps {
     service: OrderServiceDeps;
     token: string;
+    // The router's own token, which it presents for the stats totals, empty turns the route off
+    routerToken?: string;
     events?: (raw: Buffer, h: IncomingHttpHeaders) => Promise<{ status: number; body: unknown }>;
     maxBodyBytes: number;
     log: Log;
 }
 
+const STATS_TOTALS = "/internal/v1/stats/totals";
 const ABANDON = /^\/v1\/orders\/([^/]+)\/abandon$/;
 const X402_ACCOUNT = /^\/v1\/x402\/accounts\/([^/]+)$/;
 const HANDLE = /^[0-9a-f]{64}$/;
@@ -87,10 +92,28 @@ export function createInternalHandler(d: InternalDeps): Handler {
             }
         }
     };
+    const serveStatsTotals = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+        const token = d.routerToken ?? "";
+        const noStore = { "Cache-Control": "no-store" };
+        if (token === "") {
+            sendJson(res, 404, { error: "not_found" }, noStore);
+        } else if (req.method !== "GET") {
+            sendJson(res, 405, { error: "method_not_allowed" }, { ...noStore, Allow: "GET" });
+        } else if (!bearerOk(req.headers.authorization, token)) {
+            sendJson(res, 401, { status: "refused", reason: "unauthorized" }, noStore);
+        } else {
+            const { pool, settings, now } = d.service;
+            sendJson(res, 200, await statsTotals(pool, settings, now()), noStore);
+        }
+    };
     return async (req, res) => {
         const path = requestPath(req.url);
         if (req.method === "GET" && path === "/healthz") {
             sendJson(res, 200, { ok: true });
+            return;
+        }
+        if (path === STATS_TOTALS) {
+            await serveStatsTotals(req, res);
             return;
         }
         // The router signs its events and sends no bearer token
@@ -154,7 +177,7 @@ export function createInternalHandler(d: InternalDeps): Handler {
         }
         let result;
         try {
-            result = await handleOrderRequest(d.service, body, hangupSignal(res));
+            result = await handleOrderRequest(d.service, body, hangupSignal(res), paidVia(req));
         } catch (err) {
             if (!(err instanceof RpcUnavailableError)) throw err;
             d.log.warn("x402 payee check unreachable", { errorClass: err.errorClass });

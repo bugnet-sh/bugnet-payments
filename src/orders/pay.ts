@@ -30,7 +30,7 @@ import {
 } from "./store.ts";
 import { onOrderPaid, type PaidDeps } from "../x402/paid.ts";
 import type { SignerHealth, X402Refusal } from "../x402/types.ts";
-import type { OrderRow } from "./types.ts";
+import type { OrderRow, PaidVia } from "./types.ts";
 
 export type PayOutcome =
     | { kind: "paid"; orderId: string; payer: string; signature: string }
@@ -164,6 +164,7 @@ export async function payOrder(
     raw: unknown,
     signal: AbortSignal,
     key: string | null = null,
+    via: PaidVia = "pay_cli",
 ): Promise<PayOutcome> {
     const c = await d.pool.connect();
     const tx = new Tx(c);
@@ -183,7 +184,7 @@ export async function payOrder(
         }
         const checked = await checkPayment(d, c, order, raw, signal);
         if ("kind" in checked) return checked;
-        return await settle(d, c, tx, order, checked, key, t);
+        return await settle(d, c, tx, order, checked, { key, via }, t);
     } finally {
         await tx.rollback();
         tx.release();
@@ -325,7 +326,7 @@ async function settle(
     tx: Tx,
     order: OrderRow,
     { dec, req }: Checked,
-    key: string | null,
+    { key, via }: { key: string | null; via: PaidVia },
     t: Date,
 ): Promise<PayOutcome> {
     const attempt: SettleAttempt = {
@@ -346,7 +347,11 @@ async function settle(
                 createdAt: t,
                 keySha256: keyHash(key),
             });
-            await setOrderState(c, order.id, "unpaid", "settling", { payer: dec.payer });
+            // The order was never paid, so any later paid state follows this request
+            await setOrderState(c, order.id, "unpaid", "settling", {
+                payer: dec.payer,
+                paidVia: via,
+            });
             await tx.commit();
             // The confirmation wait can take 30 s and must not hold a pool client
             tx.release();

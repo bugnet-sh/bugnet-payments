@@ -583,3 +583,156 @@ describe("public order routes", () => {
         expect(JSON.stringify(app.log.lines)).not.toContain(h.slice(0, 40));
     });
 });
+
+describe("paid_via", () => {
+    async function paidVia(id: string): Promise<string | null> {
+        const r = await app.pool.query("select paid_via from orders where id = $1", [id]);
+        return r.rows[0].paid_via;
+    }
+
+    function internalPay(body: unknown, headers: Record<string, string> = {}): Promise<Response> {
+        return fetch(`${app.internalUrl}/v1/orders`, {
+            method: "POST",
+            headers: {
+                authorization: `Bearer ${app.secrets.paymentsToken}`,
+                "content-type": "application/json",
+                ...headers,
+            },
+            body: JSON.stringify(body),
+        });
+    }
+
+    it("stores checkout for a payment to /o/{id} with Bugnet-Client: checkout", async () => {
+        const r = await pub(`/o/${order.id}`, {
+            "payment-signature": await headerFor(order),
+            "Bugnet-Client": "checkout",
+        });
+        expect(r.status).toBe(200);
+        expect(await paidVia(order.id)).toBe("checkout");
+    });
+
+    it("stores pay_cli without the header or with any other value", async () => {
+        const r = await pub(`/o/${order.id}`, { "payment-signature": await headerFor(order) });
+        expect(r.status).toBe(200);
+        expect(await paidVia(order.id)).toBe("pay_cli");
+        const other = await unpaid();
+        const o = await pub(`/o/${other.id}`, {
+            "payment-signature": await headerFor(other),
+            "bugnet-client": "Checkout",
+        });
+        expect(o.status).toBe(200);
+        expect(await paidVia(other.id)).toBe("pay_cli");
+    });
+
+    it("leaves unpaid orders without a value", async () => {
+        expect(await paidVia(order.id)).toBeNull();
+    });
+
+    it("never overwrites the value when a paid order is paid again", async () => {
+        const h = await headerFor(order);
+        await pub(`/o/${order.id}`, { "payment-signature": h, "bugnet-client": "checkout" });
+        const again = await pub(`/o/${order.id}`, { "payment-signature": h });
+        expect(again.status).toBe(200);
+        expect(await paidVia(order.id)).toBe("checkout");
+        const other = await unpaid();
+        await pub(`/o/${other.id}`, { "payment-signature": await headerFor(other) });
+        const retry = await pub(`/o/${other.id}`, {
+            "payment-signature": await headerFor(other),
+            "bugnet-client": "checkout",
+        });
+        expect(retry.status).toBe(200);
+        expect(await paidVia(other.id)).toBe("pay_cli");
+    });
+
+    it("stores pay_cli for a paid retry on POST /v1/orders, checkout only with the header", async () => {
+        for (const [headers, want] of [
+            [{}, "pay_cli"],
+            [{ "bugnet-client": "checkout" }, "checkout"],
+        ] as const) {
+            const created = await (await internalPay(create())).json();
+            const p = await signedPayment(withHints(created.paymentRequired.accepts[0]), app.payer);
+            const r = await internalPay(create({ payment: p }), headers);
+            expect((await r.json()).status).toBe("paid");
+            expect(await paidVia(created.orderId)).toBe(want);
+        }
+    });
+});
+
+describe("public payment list", () => {
+    const PATH = "/api/stats/payments";
+
+    async function paidThroughRoute(): Promise<OrderRow> {
+        const o = await unpaid();
+        const r = await pub(`/o/${o.id}`, {
+            "payment-signature": await headerFor(o),
+            "bugnet-client": "checkout",
+        });
+        expect(r.status).toBe(200);
+        return o;
+    }
+
+    it("answers the page without a token, cacheable for 30 s", async () => {
+        const o = await paidThroughRoute();
+        const r = await pub(PATH);
+        expect(r.status).toBe(200);
+        expect(r.headers.get("cache-control")).toBe("public, max-age=30");
+        expect(r.headers.get("content-type")).toBe("application/json");
+        expect(r.headers.get("x-content-type-options")).toBe("nosniff");
+        const body = await r.json();
+        expect(Object.keys(body)).toEqual(["items", "next"]);
+        const payment = (await findPaymentByOrder(app.pool, o.id))!;
+        expect(body.items).toContainEqual({
+            at: app.now.get().toISOString(),
+            kind: "sandbox",
+            amountMicros: o.amountMicros,
+            method: "checkout",
+            wallet: app.payer.address,
+            tx: payment.txSignature,
+        });
+    });
+
+    it("answers HEAD with the same headers and no body", async () => {
+        const r = await fetch(`${app.publicOrigin}${PATH}`, {
+            method: "HEAD",
+            headers: { "x-forwarded-for": freshIp() },
+        });
+        expect(r.status).toBe(200);
+        expect(r.headers.get("cache-control")).toBe("public, max-age=30");
+        expect(await r.text()).toBe("");
+    });
+
+    it("pages with before and ignores every other query parameter", async () => {
+        const first = await (await pub(PATH)).json();
+        const again = await (await pub(`${PATH}?limit=1&after=x&before=`)).json();
+        expect(again).toEqual(first);
+    });
+
+    it("answers 400 bad_cursor for a cursor that does not decode or is too long", async () => {
+        for (const before of ["nope!", "e30", "a".repeat(201)]) {
+            const r = await pub(`${PATH}?before=${before}`);
+            expect(r.status).toBe(400);
+            expect(r.headers.get("cache-control")).toBe("no-store");
+            expect(await r.json()).toEqual({ error: "bad_cursor" });
+        }
+    });
+
+    it("answers 405 with Allow to any method but GET and HEAD", async () => {
+        for (const method of ["POST", "PUT", "DELETE"]) {
+            const r = await fetch(`${app.publicOrigin}${PATH}`, {
+                method,
+                headers: { "x-forwarded-for": freshIp() },
+            });
+            expect(r.status).toBe(405);
+            expect(r.headers.get("allow")).toBe("GET, HEAD");
+            expect(await r.json()).toEqual({ error: "method_not_allowed" });
+        }
+    });
+
+    it("counts against the per-IP limit of the other public routes", async () => {
+        for (let i = 0; i < 60; i++) {
+            expect((await pub(PATH, { "x-forwarded-for": "10.9.9.9" })).status).toBe(200);
+        }
+        const limited = await pub(PATH, { "x-forwarded-for": "10.9.9.9" });
+        expect(limited.status).toBe(429);
+    });
+});

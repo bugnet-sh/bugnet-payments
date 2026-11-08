@@ -450,3 +450,79 @@ describe("x402 routes", () => {
         expect((await iget("/v1/x402/nothing")).status).toBe(404);
     });
 });
+
+describe("stats totals route", () => {
+    const PATH = "/internal/v1/stats/totals";
+    const asRouter = () => ({ authorization: `Bearer ${app.secrets.routerToken}` });
+
+    it("answers the totals with no-store for the router token", async () => {
+        const r = await raw(PATH, { method: "GET", headers: asRouter() });
+        expect(r.status).toBe(200);
+        expect(r.headers.get("cache-control")).toBe("no-store");
+        expect(r.headers.get("content-type")).toBe("application/json");
+        const body = await r.json();
+        expect(body).toMatchObject({
+            version: 1,
+            totals: expect.any(Object),
+            refunds: expect.any(Object),
+            limits: {
+                "order.max_micros": app.settings.orders.max_amount_micros,
+                "x402.max_allowance_micros": app.settings.x402.max_allowance_per_sandbox_micros,
+                "x402.max_price_per_call_micros": app.settings.x402.max_price_per_call_micros,
+            },
+        });
+        expect(body.byKind.map((k: { kind: string }) => k.kind)).toEqual([
+            "sandbox",
+            "extend",
+            "x402_allowance",
+            "x402_fee",
+        ]);
+        for (const d of body.daily) expect(d.day <= "2030-01-01").toBe(true);
+    });
+
+    it("answers 401 without the router token, with a wrong one and with the payments token", async () => {
+        for (const authorization of [
+            undefined,
+            "Bearer wrong",
+            `Bearer ${app.secrets.paymentsToken}`,
+        ]) {
+            const r = await raw(PATH, {
+                method: "GET",
+                headers: authorization === undefined ? {} : { authorization },
+            });
+            expect(r.status).toBe(401);
+            expect(await r.json()).toEqual({ status: "refused", reason: "unauthorized" });
+        }
+    });
+
+    it("answers 405 to any method but GET", async () => {
+        for (const method of ["POST", "HEAD", "PUT"]) {
+            const r = await raw(PATH, { method, headers: asRouter() });
+            expect(r.status).toBe(405);
+            expect(r.headers.get("allow")).toBe("GET");
+        }
+    });
+
+    it("answers 404 when no router token is configured", async () => {
+        const s = await startServer(
+            "127.0.0.1:0",
+            createInternalHandler({
+                service: {} as OrderServiceDeps,
+                token: "t",
+                routerToken: "",
+                maxBodyBytes: 1024,
+                log: memoryLog(),
+            }),
+            memoryLog(),
+        );
+        try {
+            const r = await fetch(`http://127.0.0.1:${s.port}${PATH}`, {
+                headers: { authorization: "Bearer " },
+            });
+            expect(r.status).toBe(404);
+            expect(await r.json()).toEqual({ error: "not_found" });
+        } finally {
+            await s.close();
+        }
+    });
+});

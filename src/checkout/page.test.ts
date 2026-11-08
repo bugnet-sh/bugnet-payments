@@ -253,5 +253,7 @@ describe("checkout routes", () => {
         expect(app.rpc.calls.sendTransaction).toBe(1);
         const status = await (await get(app, `/o/${order.id}/status`)).json();
         expect(status).toMatchObject({ orderId: order.id, state: "paid" });
+        const via = await app.pool.query("select paid_via from orders where id = $1", [order.id]);
+        expect(via.rows).toEqual([{ paid_via: "checkout" }]);
     });
 });

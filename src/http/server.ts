@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Log } from "../log.ts";
+import type { PaidVia } from "../orders/types.ts";
 
 export type Handler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
 
@@ -175,4 +176,9 @@ export function bearerOk(header: string | undefined, token: string): boolean {
     if (m === null) return false;
     const digest = (s: string) => createHash("sha256").update(s).digest();
     return timingSafeEqual(digest(m[1]!), digest(token));
+}
+
+// Self-reported by the checkout page, which is enough for stats
+export function paidVia(req: IncomingMessage): PaidVia {
+    return req.headers["bugnet-client"] === "checkout" ? "checkout" : "pay_cli";
 }

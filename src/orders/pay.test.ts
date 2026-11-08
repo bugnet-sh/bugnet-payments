@@ -820,6 +820,27 @@ describe("payOrder", () => {
         );
     });
 
+    it("records how the order was paid with the settling commit, before confirmation", async () => {
+        const consoleError = quietConsole();
+        const pending = createFakeRpc({
+            getSignatureStatuses: () => {
+                throw new Error("rpc down");
+            },
+        });
+        const out = await payOrder(
+            { ...d, settler: settlerOn(pending) },
+            order.id,
+            p,
+            sig(),
+            null,
+            "checkout",
+        );
+        expect(out).toEqual({ kind: "settling", orderId: order.id });
+        const r = await db.pool.query("select paid_via from orders where id = $1", [order.id]);
+        expect(r.rows).toEqual([{ paid_via: "checkout" }]);
+        expect(consoleError).toHaveBeenCalled();
+    });
+
     it("answers settling when the settler throws after the settling commit", async () => {
         const throwing: Settler = {
             feePayer: FEE_PAYER,

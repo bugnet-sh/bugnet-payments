@@ -39,6 +39,7 @@ const COLUMNS: Record<string, string> = {
     hotRouterRefundMicros: "hot_router_refund_micros",
     abandonReason: "abandon_reason",
     abandonAt: "abandon_at",
+    paidVia: "paid_via",
 };
 
 interface OrderDbRow extends pg.QueryResultRow {

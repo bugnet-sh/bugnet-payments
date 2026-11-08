@@ -257,6 +257,8 @@ What the terminator must do, because Payments limits requests per client address
   `["127.0.0.1", "::1"]`. If the terminator connects from another address, list exactly that
   address and nothing a client can reach Payments from directly, or a client could choose its own
   rate-limit key.
+- **The stats page.** The website's Caddy routes `bugnet.sh/api/stats/payments*` to
+  `127.0.0.1:8450`, before `bugnet.sh/api/stats*` to the router (data-plane 15.x, bugnet-d7).
 
 ## 10. x402 signer
 

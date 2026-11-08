@@ -59,6 +59,7 @@ describe("schema", () => {
                 { version: "00001_init.sql" },
                 { version: "00002_payment_key.sql" },
                 { version: "00003_x402.sql" },
+                { version: "00004_paid_via.sql" },
             ]);
         } finally {
             await fresh.close();
@@ -97,6 +98,19 @@ describe("schema", () => {
             );
         expect((await insert()).rowCount).toBe(1);
         expect((await insert()).rowCount).toBe(0);
+    });
+
+    it("orders take a null, checkout or pay_cli paid_via and nothing else", async () => {
+        const id = "ord_eeeeeeeeeeeeeeeeeeeeeeeeee";
+        await insertOrder(id);
+        const set = (v: string | null) =>
+            db.pool.query("update orders set paid_via = $2 where id = $1", [id, v]);
+        const read = await db.pool.query("select paid_via from orders where id = $1", [id]);
+        expect(read.rows).toEqual([{ paid_via: null }]);
+        await set("checkout");
+        await set("pay_cli");
+        await set(null);
+        expect(await codeOf(set("browser"))).toBe("23514");
     });
 
     it("orders reject an unknown state and an extend without handle", async () => {

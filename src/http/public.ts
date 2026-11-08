@@ -11,6 +11,8 @@ import { findOrder } from "../orders/store.ts";
 import type { OrderRow, OrderState } from "../orders/types.ts";
 import type { RateLimiter } from "../ratelimit.ts";
 import type { BlockhashCache } from "../solana/blockhash.ts";
+import { decodeCursor } from "../stats/cursor.ts";
+import { statsPayments } from "../stats/payments.ts";
 import { SOLANA_MAINNET } from "../solana/constants.ts";
 import {
     type ChallengeContext,
@@ -24,6 +26,7 @@ import {
     type Handler,
     drainBody,
     hangupSignal,
+    paidVia,
     requestPath,
     sendJson,
 } from "./server.ts";
@@ -45,6 +48,7 @@ export interface PublicDeps {
 }
 
 const ORDER_PATH = /^\/o\/([^/]+)(\/status)?$/;
+const STATS_PAYMENTS = "/api/stats/payments";
 
 function unreachable(state: never): never {
     throw new Error(`unhandled order state ${String(state)}`);
@@ -213,6 +217,27 @@ function sendOutcome(res: ServerResponse, out: PayOutcome): void {
     }
 }
 
+async function sendStatsPayments(
+    req: IncomingMessage,
+    res: ServerResponse,
+    d: PublicDeps,
+): Promise<void> {
+    const common = { "X-Content-Type-Options": "nosniff" };
+    const noStore = { ...common, "Cache-Control": "no-store" };
+    if (req.method !== "GET" && req.method !== "HEAD") {
+        sendJson(res, 405, { error: "method_not_allowed" }, { ...noStore, Allow: "GET, HEAD" });
+        return;
+    }
+    const raw = URL.parse(req.url ?? "/", "http://local")?.searchParams.get("before") ?? "";
+    const before = raw === "" ? null : decodeCursor(raw);
+    if (before === null && raw !== "") {
+        sendJson(res, 400, { error: "bad_cursor" }, noStore);
+        return;
+    }
+    const page = await statsPayments(d.pool, before, d.now());
+    sendJson(res, 200, page, { ...common, "Cache-Control": "public, max-age=30" });
+}
+
 export function createPublicHandler(d: PublicDeps): Handler {
     return async (req, res) => {
         const path = requestPath(req.url);
@@ -241,6 +266,10 @@ export function createPublicHandler(d: PublicDeps): Handler {
         }
         if (!limit.ok) {
             refuse(429, "too_many_requests", { "Retry-After": String(limit.retryAfterSeconds) });
+            return;
+        }
+        if (path === STATS_PAYMENTS) {
+            await sendStatsPayments(req, res, d);
             return;
         }
         if (path === "/checkout.js") {
@@ -273,7 +302,10 @@ export function createPublicHandler(d: PublicDeps): Handler {
                 sendJson(res, 400, { refused: err.reason, orderId: id });
                 return;
             }
-            sendOutcome(res, await payOrder(d.pay, id, payment, hangupSignal(res)));
+            sendOutcome(
+                res,
+                await payOrder(d.pay, id, payment, hangupSignal(res), null, paidVia(req)),
+            );
             return;
         }
         const order = isOrderId(id) ? await findOrder(d.pool, id) : null;
