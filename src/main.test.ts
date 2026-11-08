@@ -1011,6 +1011,27 @@ describe("x402 wiring", () => {
         }
     });
 
+    it("a SIGHUP with the TLS files still bad alarms x402_reload_failed and opens no listener", async () => {
+        const log = memoryLog();
+        const certPath = path.join(mkdtempSync(path.join(tmpdir(), "bn-tls-")), "server.crt");
+        writeFileSync(certPath, "not a certificate");
+        const s = await startService({
+            settings: x402Settings({ x402: { tls_cert_file: certPath } }),
+            secrets: x402Secrets,
+            rpc: withBalance(chain.rpc),
+            log,
+        });
+        try {
+            expect(s.x402Port).toBeNull();
+            process.emit("SIGHUP");
+            const alarms = log.lines.filter((l) => l.alarm === "x402_reload_failed");
+            expect(alarms).toHaveLength(1);
+            expect(alarms[0]?.problem).toBe("tls_cert_file does not parse");
+        } finally {
+            await s.stop();
+        }
+    });
+
     it("the hot executor runs with refunds.enabled false", async () => {
         const settings = x402Settings({
             refunds: { enabled: false },

@@ -328,10 +328,21 @@ export async function startService(o: StartOptions): Promise<RunningService> {
                 const next = w.readTls();
                 if (signer.current !== null) {
                     if (signer.current.reload(next)) w.gate.record("tls", "pass");
-                } else if (checkTlsFiles(next, SERVER_NAME, now()).ok) {
+                } else {
+                    const check = checkTlsFiles(next, SERVER_NAME, now());
+                    if (!check.ok) {
+                        log.alarm("x402_reload_failed", { file: "tls", problem: check.problem });
+                        return;
+                    }
                     openListener(w, next).then(
                         () => w.gate.record("tls", "pass"),
-                        (err: unknown) => log.error("x402 listener failed to start", { err }),
+                        (err: unknown) => {
+                            log.error("x402 listener failed to start", { err });
+                            log.alarm("x402_reload_failed", {
+                                file: "tls",
+                                problem: err instanceof Error ? err.message : String(err),
+                            });
+                        },
                     );
                 }
             };
