@@ -281,4 +281,15 @@ export async function refuseUnfinishedAllowanceOrders(pool: pg.Pool): Promise<vo
             `[x402] allowance_wallet is empty while ${n} allowance order(s) are not finished: set it back to the allowance wallet's address`,
         );
     }
+    const refunds = await pool.query<{ n: string }>(
+        `select count(*) as n from refunds
+         where from_wallet = 'allowance' and state <> 'confirmed'
+           and manual_reason is distinct from 'resolved_by_hand'`,
+    );
+    const open = Number(refunds.rows[0]!.n);
+    if (open > 0) {
+        throw new BootCheckError(
+            `[x402] allowance_wallet is empty while ${open} allowance refund(s) are not finished: set it back to the allowance wallet's address`,
+        );
+    }
 }

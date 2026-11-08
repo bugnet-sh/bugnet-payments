@@ -28,7 +28,7 @@ import { testSigner } from "./testing/keys.ts";
 import { memoryLog } from "./log.ts";
 import { makeTestPki } from "./testing/pki.ts";
 import { seedOrder, seedPayment } from "./testing/orders.ts";
-import { seedAccount, TEST_PAYTO } from "./testing/x402.ts";
+import { seedAccount, seedFunding, TEST_PAYTO } from "./testing/x402.ts";
 import { openIncidents } from "./x402/incidents.ts";
 import { SignerGate } from "./x402/listener.ts";
 import { transferableParts } from "./x402/liabilities.ts";
@@ -413,7 +413,9 @@ describe("x402BootChecks", () => {
         await openTail(db.pool, await usdcAta(allowance.address), 0n, 100n, T0);
         const rpc = createFakeRpc({ getAccountInfo: () => Promise.reject(new Error("rpc down")) });
         const d = x402Deps();
+        const record = vi.spyOn(d.gate, "record");
         await expect(x402BootChecks(rpc, d)).resolves.toBeDefined();
+        expect(record).toHaveBeenCalledWith("token_account", "error", "read failed");
         expect(d.gate.open()).toBe(false);
         expect(await openIncidents(db.pool)).toEqual([]);
     });
@@ -479,5 +481,49 @@ describe("x402BootChecks", () => {
         const err = await refuseUnfinishedAllowanceOrders(db.pool).catch((e: unknown) => e);
         expect(err).toBeInstanceOf(BootCheckError);
         expect((err as Error).message).toMatch(/while 1 allowance order\(s\) are not finished/);
+    });
+
+    it("counts an allowance order funded through x402_fundings by its account's state", async () => {
+        const start = await seedOrder(db.pool, { kind: "start", state: "refunded" });
+        await seedAccount(db.pool, { id: start.order.id, state: "closed", closedAt: T0 });
+        await seedFunding(db.pool, { accountId: start.order.id });
+        await expect(refuseUnfinishedAllowanceOrders(db.pool)).resolves.toBeUndefined();
+    });
+
+    it("refuses a top-up order whose account is still open", async () => {
+        const start = await seedOrder(db.pool, { kind: "start", state: "refunded" });
+        await seedAccount(db.pool, { id: start.order.id });
+        await seedFunding(db.pool, { accountId: start.order.id });
+        await expect(refuseUnfinishedAllowanceOrders(db.pool)).rejects.toThrow(
+            /while 1 allowance order\(s\) are not finished/,
+        );
+    });
+
+    it("refuses an unresolved allowance refund even when every account is closed", async () => {
+        const { order } = await seedOrder(db.pool, { kind: "start", state: "refunded" });
+        await seedAccount(db.pool, { id: order.id, state: "closed", closedAt: T0 });
+        const insert = (state: string, reason: string | null, kind: string) =>
+            db.pool.query(
+                `insert into refunds (order_id, kind, reason, amount_micros, destination, payer,
+                    state, from_wallet, manual_reason)
+                 values ($1, $2, $3, 1000, 'dest', 'payer', $4, 'allowance', $5)`,
+                [
+                    order.id,
+                    kind,
+                    kind === "allowance" ? "x402_unspent" : "x402_closed",
+                    state,
+                    reason,
+                ],
+            );
+        await insert("sent", null, "allowance");
+        const err = await refuseUnfinishedAllowanceOrders(db.pool).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(BootCheckError);
+        expect((err as Error).message).toMatch(/while 1 allowance refund\(s\) are not finished/);
+        await db.pool.query(
+            "update refunds set state = 'manual', manual_reason = 'resolved_by_hand'",
+        );
+        await expect(refuseUnfinishedAllowanceOrders(db.pool)).resolves.toBeUndefined();
+        await db.pool.query("update refunds set state = 'confirmed', manual_reason = null");
+        await expect(refuseUnfinishedAllowanceOrders(db.pool)).resolves.toBeUndefined();
     });
 });
