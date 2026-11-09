@@ -472,7 +472,7 @@ describe("payOrder", () => {
         const lh = {
             programAddress: LIGHTHOUSE_PROGRAM,
             accounts: [{ address: FEE_PAYER, role: AccountRole.READONLY }],
-            data: new Uint8Array([0]),
+            data: new Uint8Array([6, 4, 2, 3, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
         };
         const out = await payOrder(
             d,
@@ -516,7 +516,7 @@ describe("payOrder", () => {
         data: new Uint8Array(Buffer.from(hex, "hex")),
     });
     const phantomPayment = async (
-        over: { computeUnitLimit?: number; leading?: Instruction[] } = {},
+        over: { computeUnitLimit?: number; leading?: Instruction[]; trailing?: Instruction[] } = {},
     ) => {
         const payerAta = await usdcAta(payer.address);
         const payToAta = await usdcAta(address(req.payTo));
@@ -527,13 +527,39 @@ describe("payOrder", () => {
                 assertion(payerAta, PHANTOM.payerBefore),
                 assertion(FEE_PAYER, PHANTOM.feePayer),
             ],
-            extraInstructions: [assertion(payerAta, PHANTOM.payerAfter)],
+            extraInstructions: [assertion(payerAta, PHANTOM.payerAfter), ...(over.trailing ?? [])],
         });
     };
+    // MemoryWrite (0) takes a payer that funds a new account, so naming the fee payer would drain it
+    const memoryWrite = assertion(FEE_PAYER, "00" + "00".repeat(16));
+    const emptyLighthouse = assertion(FEE_PAYER, "");
 
     it("pays Phantom's real layout, assertions before and after the transfer", async () => {
         const out = await payOrder(d, order.id, await phantomPayment(), sig());
         expect(out).toMatchObject({ kind: "paid", orderId: order.id });
+    });
+
+    it.each([
+        ["a trailing MemoryWrite naming the fee payer", { trailing: [memoryWrite] }],
+        ["a trailing MemoryClose naming the fee payer", { trailing: [assertion(FEE_PAYER, "01")] }],
+        ["a trailing Lighthouse instruction with no data", { trailing: [emptyLighthouse] }],
+    ])("refuses Phantom's layout plus %s", async (_, over) => {
+        const out = await payOrder(d, order.id, await phantomPayment(over), sig());
+        expect(out).toMatchObject({ kind: "refused", reason: "payment_invalid" });
+        expect(rpc.calls.sendTransaction ?? 0).toBe(0);
+    });
+
+    it("refuses a leading MemoryWrite naming the fee payer", async () => {
+        const payerAta = await usdcAta(payer.address);
+        const out = await payOrder(
+            d,
+            order.id,
+            await phantomPayment({
+                leading: [memoryWrite, assertion(payerAta, PHANTOM.payerBefore)],
+            }),
+            sig(),
+        );
+        expect(out).toMatchObject({ kind: "refused", reason: "payment_invalid" });
     });
 
     it("still refuses a compute limit above the cap in Phantom's layout", async () => {

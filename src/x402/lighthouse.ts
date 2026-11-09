@@ -1,6 +1,7 @@
 // Phantom adds Lighthouse assertions when it signs, before and after the transfer, and on a public
-// site they can name the fee payer. Lighthouse only reads the accounts it asserts on, so after the
-// two compute budget instructions they may reference the fee payer; any other instruction is refused
+// site they can name the fee payer. An assertion only reads the account it checks, so after the two
+// compute budget instructions one may name the fee payer. Lighthouse's MemoryWrite and MemoryClose
+// spend from a payer account, so they and every other instruction naming the fee payer are refused
 import {
     getBase64Encoder,
     getCompiledTransactionMessageDecoder,
@@ -10,6 +11,8 @@ import { LIGHTHOUSE_PROGRAM } from "../solana/constants.ts";
 
 // The compute unit limit and price, which always come first
 const BUDGET_INSTRUCTIONS = 2;
+// Lighthouse instructions 0 and 1 are MemoryWrite and MemoryClose, every later one asserts
+const FIRST_ASSERTION = 2;
 
 export const FEE_PAYER_IN_ACCOUNTS =
     "invalid_exact_svm_payload_transaction_fee_payer_included_in_instruction_accounts";
@@ -38,7 +41,9 @@ export function feePayerOnlyInLighthouse(transaction: unknown, feePayer: string)
             ix.programAddressIndex === feePayerIndex ||
             (ix.accountIndices ?? []).includes(feePayerIndex);
         if (!names) continue;
+        const kind = ix.data?.[0];
         if (position < BUDGET_INSTRUCTIONS || program !== LIGHTHOUSE_PROGRAM) return false;
+        if (kind === undefined || kind < FIRST_ASSERTION) return false;
         named = true;
     }
     return named;
