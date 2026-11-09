@@ -10,7 +10,7 @@ index 252fe1e7c56988e92ebadc1cede07e14e164e49e..05fb7e1a2bd1ac779aba52ea7aa39f70
 -    if (instructions.length < transferIndex + 1 || instructions.length > transferIndex + 5) {
 +    const baseTransferIndex = staticTransferIndex(compiled.version);
 +    let transferIndex = baseTransferIndex;
-+    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95") transferIndex += 1;
++    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95" && (instructions[transferIndex].data?.[0] ?? 0) >= 2) transferIndex += 1;
 +    if (instructions.length < transferIndex + 1 || instructions.slice(transferIndex + 1).filter((ix) => ix.programAddress.toString() !== "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95").length > 4 || instructions.length > transferIndex + 1 + 16) {
        return false;
      }
@@ -22,7 +22,7 @@ index 252fe1e7c56988e92ebadc1cede07e14e164e49e..05fb7e1a2bd1ac779aba52ea7aa39f70
 -    const transferIndex = staticTransferIndex(compiled.version);
 +    const baseTransferIndex = staticTransferIndex(compiled.version);
 +    let transferIndex = baseTransferIndex;
-+    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95") transferIndex += 1;
++    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95" && (instructions[transferIndex].data?.[0] ?? 0) >= 2) transferIndex += 1;
      if (compiled.version === 1) {
        const violation = checkTransactionV1Budget(
          readTransactionV1Config(compiled),
@@ -50,7 +50,7 @@ index 252fe1e7c56988e92ebadc1cede07e14e164e49e..05fb7e1a2bd1ac779aba52ea7aa39f70
 -    const transferIndex = staticTransferIndex(compiled.version);
 +    const baseTransferIndex = staticTransferIndex(compiled.version);
 +    let transferIndex = baseTransferIndex;
-+    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95") transferIndex += 1;
++    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95" && (instructions[transferIndex].data?.[0] ?? 0) >= 2) transferIndex += 1;
      if (compiled.version === 1) {
        const violation = checkTransactionV1Budget(
          readTransactionV1Config(compiled),
@@ -82,7 +82,7 @@ index 69a0c77e9cf9405f2b6fdc119335e81b5a1fc74b..d5c445c75492642d3d63d6e83904c2cf
 -    const transferIndex = staticTransferIndex(compiled.version);
 +    const baseTransferIndex = staticTransferIndex(compiled.version);
 +    let transferIndex = baseTransferIndex;
-+    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95") transferIndex += 1;
++    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95" && (instructions[transferIndex].data?.[0] ?? 0) >= 2) transferIndex += 1;
      if (compiled.version === 1) {
        const violation = checkTransactionV1Budget(
          readTransactionV1Config(compiled),
@@ -115,7 +115,7 @@ index 8fa1feadd98a3eb522fb1e079a3bf4a003ad92c6..63a4942fe756aa96ca1a81f7008a8bbb
 -    if (instructions.length < transferIndex + 1 || instructions.length > transferIndex + 5) {
 +    const baseTransferIndex = staticTransferIndex(compiled.version);
 +    let transferIndex = baseTransferIndex;
-+    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95") transferIndex += 1;
++    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95" && (instructions[transferIndex].data?.[0] ?? 0) >= 2) transferIndex += 1;
 +    if (instructions.length < transferIndex + 1 || instructions.slice(transferIndex + 1).filter((ix) => ix.programAddress.toString() !== "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95").length > 4 || instructions.length > transferIndex + 1 + 16) {
        return false;
      }
@@ -127,7 +127,7 @@ index 8fa1feadd98a3eb522fb1e079a3bf4a003ad92c6..63a4942fe756aa96ca1a81f7008a8bbb
 -    const transferIndex = staticTransferIndex(compiled.version);
 +    const baseTransferIndex = staticTransferIndex(compiled.version);
 +    let transferIndex = baseTransferIndex;
-+    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95") transferIndex += 1;
++    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95" && (instructions[transferIndex].data?.[0] ?? 0) >= 2) transferIndex += 1;
      if (compiled.version === 1) {
        const violation = checkTransactionV1Budget(
          readTransactionV1Config(compiled),
@@ -155,7 +155,7 @@ index 8fa1feadd98a3eb522fb1e079a3bf4a003ad92c6..63a4942fe756aa96ca1a81f7008a8bbb
 -    const transferIndex = staticTransferIndex(compiled.version);
 +    const baseTransferIndex = staticTransferIndex(compiled.version);
 +    let transferIndex = baseTransferIndex;
-+    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95") transferIndex += 1;
++    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95" && (instructions[transferIndex].data?.[0] ?? 0) >= 2) transferIndex += 1;
      if (compiled.version === 1) {
        const violation = checkTransactionV1Budget(
          readTransactionV1Config(compiled),

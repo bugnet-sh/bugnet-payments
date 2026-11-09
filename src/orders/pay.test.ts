@@ -562,6 +562,24 @@ describe("payOrder", () => {
         expect(out).toMatchObject({ kind: "refused", reason: "payment_invalid" });
     });
 
+    it.each([
+        ["MemoryWrite", "00" + "00".repeat(16)],
+        ["MemoryClose", "01"],
+        ["Lighthouse instruction with no data", ""],
+    ])("refuses a leading %s that names only the payer's account", async (_, hex) => {
+        const payerAta = await usdcAta(payer.address);
+        const out = await payOrder(
+            d,
+            order.id,
+            await phantomPayment({
+                leading: [assertion(payerAta, hex), assertion(payerAta, PHANTOM.payerBefore)],
+            }),
+            sig(),
+        );
+        expect(out).toMatchObject({ kind: "refused", reason: "payment_invalid" });
+        expect(rpc.calls.sendTransaction ?? 0).toBe(0);
+    });
+
     it("still refuses a compute limit above the cap in Phantom's layout", async () => {
         const out = await payOrder(
             d,
