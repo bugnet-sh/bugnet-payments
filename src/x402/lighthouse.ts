@@ -43,3 +43,40 @@ export function feePayerOnlyInLighthouse(transaction: unknown, feePayer: string)
     }
     return named;
 }
+
+export interface InstructionView {
+    program: string;
+    accounts: string[];
+    data: string;
+}
+
+// What a refused payment carried, for the log: the transaction lacks the fee payer's signature,
+// so nobody can broadcast it from the log, and it shows what a wallet added
+export function describePayment(raw: unknown): {
+    transaction?: string;
+    version?: string;
+    instructions?: InstructionView[];
+} {
+    const payload = (raw as { payload?: { transaction?: unknown } } | null)?.payload;
+    const transaction = payload?.transaction;
+    if (typeof transaction !== "string") return {};
+    try {
+        const { messageBytes } = getTransactionDecoder().decode(
+            getBase64Encoder().encode(transaction),
+        );
+        const message = getCompiledTransactionMessageDecoder().decode(messageBytes);
+        if (!("instructions" in message)) return { transaction, version: String(message.version) };
+        const accounts = message.staticAccounts;
+        return {
+            transaction,
+            version: String(message.version),
+            instructions: message.instructions.map((ix) => ({
+                program: accounts[ix.programAddressIndex] ?? `#${ix.programAddressIndex}`,
+                accounts: (ix.accountIndices ?? []).map((i) => accounts[i] ?? `#${i}`),
+                data: Buffer.from(ix.data ?? new Uint8Array()).toString("hex"),
+            })),
+        };
+    } catch {
+        return { transaction };
+    }
+}

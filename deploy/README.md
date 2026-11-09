@@ -32,7 +32,7 @@ pnpm build    # dist/main.js, dist/cli.js, dist/checkout.js, dist/fonts/
 v=$(git rev-parse --short HEAD)
 # On macOS, without these tar adds hidden ._ metadata files that unpack on Linux as real files
 COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -czf "bugnet-payments-$v.tgz" \
-    dist migrations config vendor deploy package.json pnpm-lock.yaml pnpm-workspace.yaml
+    dist migrations config vendor patches deploy package.json pnpm-lock.yaml pnpm-workspace.yaml
 tar tzf "bugnet-payments-$v.tgz" | grep -c '/\._\|^\._' # must print 0
 ```
 

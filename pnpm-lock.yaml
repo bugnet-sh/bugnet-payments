@@ -165,6 +165,9 @@ settings:
 overrides:
   mppx: 0.8.15
 
+patchedDependencies:
+  '@x402/svm@2.30.0': 39243a9b6ef47a635738e835573b3c66073f798fc271d3ac0753617eeb6faa38
+
 importers:
 
   .:
@@ -207,7 +210,7 @@ importers:
         version: 2.30.0
       '@x402/svm':
         specifier: 2.30.0
-        version: 2.30.0(@solana/kit@8.6.0(typescript@6.0.3))(@solana/sysvars@8.6.0(typescript@6.0.3))(typescript@6.0.3)
+        version: 2.30.0(patch_hash=39243a9b6ef47a635738e835573b3c66073f798fc271d3ac0753617eeb6faa38)(@solana/kit@8.6.0(typescript@6.0.3))(@solana/sysvars@8.6.0(typescript@6.0.3))(typescript@6.0.3)
       pg:
         specifier: 8.23.1
         version: 8.23.1
@@ -3153,7 +3156,7 @@ snapshots:
     dependencies:
       zod: 4.6.7
 
-  '@x402/svm@2.30.0(@solana/kit@8.6.0(typescript@6.0.3))(@solana/sysvars@8.6.0(typescript@6.0.3))(typescript@6.0.3)':
+  '@x402/svm@2.30.0(patch_hash=39243a9b6ef47a635738e835573b3c66073f798fc271d3ac0753617eeb6faa38)(@solana/kit@8.6.0(typescript@6.0.3))(@solana/sysvars@8.6.0(typescript@6.0.3))(typescript@6.0.3)':
     dependencies:
       '@noble/hashes': 1.8.0
       '@solana-program/compute-budget': 0.18.1(@solana/kit@8.6.0(typescript@6.0.3))

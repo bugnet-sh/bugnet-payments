@@ -3,6 +3,7 @@ import { DurationSchema, TimestampSchema } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
     AccountRole,
+    address,
     getBase64Encoder,
     getSignatureFromTransaction,
     getTransactionDecoder,
@@ -478,6 +479,63 @@ describe("payOrder", () => {
             sig(),
         );
         expect(out).toMatchObject({ kind: "paid", orderId: order.id });
+    });
+
+    // Phantom on a public site appends one assertion per account it guards, the fee payer's included
+    const lighthouseAssertions = (n: number) =>
+        Array.from({ length: n }, (_, i) => ({
+            programAddress: LIGHTHOUSE_PROGRAM,
+            accounts: [{ address: FEE_PAYER, role: AccountRole.READONLY }],
+            data: new Uint8Array([8, i, 0, 0, 0, 0, 0, 0, 0, 0]),
+        }));
+
+    it.each([3, 4, 5])("pays with %i trailing Lighthouse assertions", async (n) => {
+        const out = await payOrder(
+            d,
+            order.id,
+            await signedPayment(req, payer, { extraInstructions: lighthouseAssertions(n) }),
+            sig(),
+        );
+        expect(out).toMatchObject({ kind: "paid", orderId: order.id });
+    });
+
+    it("refuses more than 16 trailing instructions, Lighthouse or not", async () => {
+        const out = await payOrder(
+            d,
+            order.id,
+            await signedPayment(req, payer, { extraInstructions: lighthouseAssertions(17) }),
+            sig(),
+        );
+        expect(out).toMatchObject({ kind: "refused", reason: "payment_invalid" });
+        expect(rpc.calls.sendTransaction ?? 0).toBe(0);
+    });
+
+    it("refuses a trailing transfer out of the fee payer and logs the transaction", async () => {
+        const log = memoryLog();
+        const drain = {
+            programAddress: address("11111111111111111111111111111111"),
+            accounts: [
+                { address: FEE_PAYER, role: AccountRole.WRITABLE },
+                { address: payer.address, role: AccountRole.WRITABLE },
+            ],
+            data: new Uint8Array([2, 0, 0, 0, 0, 202, 154, 59, 0, 0, 0, 0]),
+        };
+        const out = await payOrder(
+            { ...d, log },
+            order.id,
+            await signedPayment(req, payer, {
+                extraInstructions: [...lighthouseAssertions(2), drain],
+            }),
+            sig(),
+        );
+        expect(out).toMatchObject({ kind: "refused", reason: "payment_invalid" });
+        expect(rpc.calls.sendTransaction ?? 0).toBe(0);
+        const line = log.lines.find((l) => l.msg === "payment refused") as
+            { transaction?: string; instructions?: { program: string }[] } | undefined;
+        expect(typeof line?.transaction).toBe("string");
+        expect(line?.instructions?.map((i) => i.program)).toContain(
+            "11111111111111111111111111111111",
+        );
     });
 
     it("refuses any other program that names the fee payer", async () => {

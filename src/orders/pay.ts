@@ -16,7 +16,11 @@ import {
     type PayRefusal,
 } from "../x402/decode.ts";
 import { findAccountByHandle } from "../x402/ledger.ts";
-import { FEE_PAYER_IN_ACCOUNTS, feePayerOnlyInLighthouse } from "../x402/lighthouse.ts";
+import {
+    describePayment,
+    FEE_PAYER_IN_ACCOUNTS,
+    feePayerOnlyInLighthouse,
+} from "../x402/lighthouse.ts";
 import type { SettleAttempt, Settler } from "../x402/settler.ts";
 import {
     confirmPayment,
@@ -166,6 +170,29 @@ export async function payOrder(
     signal: AbortSignal,
     key: string | null = null,
     via: PaidVia = "pay_cli",
+): Promise<PayOutcome> {
+    const out = await payOrderOnce(d, orderId, raw, signal, key, via);
+    // A refused transaction is kept in the log so the wallet's additions can be read afterwards
+    if (out.kind === "refused" && LOGGED_REFUSALS.has(out.reason)) {
+        d.log.warn("payment refused", {
+            orderId,
+            reason: out.reason,
+            code: out.code ?? null,
+            ...describePayment(raw),
+        });
+    }
+    return out;
+}
+
+const LOGGED_REFUSALS: ReadonlySet<string> = new Set(["payment_invalid", "payment_malformed"]);
+
+async function payOrderOnce(
+    d: PayDeps,
+    orderId: string,
+    raw: unknown,
+    signal: AbortSignal,
+    key: string | null,
+    via: PaidVia,
 ): Promise<PayOutcome> {
     const c = await d.pool.connect();
     const tx = new Tx(c);
