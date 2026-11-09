@@ -80,9 +80,10 @@ ensure_user() {
 
 install_code() {
     local tgz=$1 v=$2
+    # The script's umask is 077 for the secrets, so the code folders get their modes explicitly
+    install -d -o root -g root -m 0755 /opt/bugnet "$OPT" "$OPT/$v"
     if [ ! -f "$OPT/$v/dist/main.js" ]; then
         say "unpacking $v into $OPT/$v"
-        mkdir -p "$OPT/$v"
         tar xzf "$tgz" -C "$OPT/$v"
     fi
     if [ ! -d "$OPT/$v/node_modules" ]; then
