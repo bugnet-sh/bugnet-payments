@@ -30,7 +30,7 @@ export function feePayerOnlyInLighthouse(transaction: unknown, feePayer: string)
     if (!("instructions" in message)) return false;
     const accounts = message.staticAccounts;
     const feePayerIndex = accounts.indexOf(feePayer as (typeof accounts)[number]);
-    if (feePayerIndex === -1) return true;
+    if (feePayerIndex === -1) return false;
     let named = false;
     for (const [position, ix] of message.instructions.entries()) {
         const program = accounts[ix.programAddressIndex];
