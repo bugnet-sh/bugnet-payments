@@ -465,7 +465,7 @@ describe("payOrder", () => {
         expect(rpc.calls.simulateTransaction).toBe(0);
     });
 
-    it("refuses a Lighthouse instruction that references the fee payer", async () => {
+    it("pays when a trailing Lighthouse assertion names the fee payer, as Phantom adds", async () => {
         const lh = {
             programAddress: LIGHTHOUSE_PROGRAM,
             accounts: [{ address: FEE_PAYER, role: AccountRole.READONLY }],
@@ -475,6 +475,21 @@ describe("payOrder", () => {
             d,
             order.id,
             await signedPayment(req, payer, { extraInstructions: [lh] }),
+            sig(),
+        );
+        expect(out).toMatchObject({ kind: "paid", orderId: order.id });
+    });
+
+    it("refuses any other program that names the fee payer", async () => {
+        const other = {
+            programAddress: TOKEN_PROGRAM,
+            accounts: [{ address: FEE_PAYER, role: AccountRole.READONLY }],
+            data: new Uint8Array([0]),
+        };
+        const out = await payOrder(
+            d,
+            order.id,
+            await signedPayment(req, payer, { extraInstructions: [other] }),
             sig(),
         );
         expect(out).toMatchObject({

@@ -16,6 +16,7 @@ import {
     type PayRefusal,
 } from "../x402/decode.ts";
 import { findAccountByHandle } from "../x402/ledger.ts";
+import { FEE_PAYER_IN_ACCOUNTS, feePayerOnlyInLighthouse } from "../x402/lighthouse.ts";
 import type { SettleAttempt, Settler } from "../x402/settler.ts";
 import {
     confirmPayment,
@@ -278,7 +279,14 @@ async function checkPayment(
         bindX402ExactCredential(dec.payload, req);
     } catch (err) {
         if (!(err instanceof InvalidProofError)) throw err;
-        return refused(order.id, 422, "payment_invalid", { code: err.code });
+        // pay-kit runs this check last, so the accepted terms already matched the order
+        const lighthouseOnly =
+            err.code === FEE_PAYER_IN_ACCOUNTS &&
+            feePayerOnlyInLighthouse(
+                (dec.payload.payload as { transaction?: unknown } | undefined)?.transaction,
+                d.challenge.feePayer,
+            );
+        if (!lighthouseOnly) return refused(order.id, 422, "payment_invalid", { code: err.code });
     }
     let packageId = order.packageId;
     let kind = order.kind;
