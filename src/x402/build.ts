@@ -29,6 +29,8 @@ export interface BuildOptions {
     computeUnitLimit?: number;
     computeUnitPriceMicroLamports?: bigint;
     memo?: string;
+    // Placed before the transfer, where a wallet such as Phantom inserts its own assertions
+    leadingInstructions?: readonly Instruction[];
     extraInstructions?: readonly Instruction[];
 }
 
@@ -79,6 +81,7 @@ export async function buildPaymentTransaction(
                     getSetComputeUnitPriceInstruction({
                         microLamports: opts.computeUnitPriceMicroLamports ?? 1n,
                     }),
+                    ...(opts.leadingInstructions ?? []),
                     transfer,
                     memoInstruction,
                     ...(opts.extraInstructions ?? []),

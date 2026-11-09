@@ -4,6 +4,8 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import {
     AccountRole,
     address,
+    type Address,
+    type Instruction,
     getBase64Encoder,
     getSignatureFromTransaction,
     getTransactionDecoder,
@@ -499,6 +501,66 @@ describe("payOrder", () => {
         expect(out).toMatchObject({ kind: "paid", orderId: order.id });
     });
 
+    // Captured from Phantom paying a public test page on 2026-11-09: three assertions before the
+    // transfer, one after the memo, and the compute limit raised to 33,839
+    const PHANTOM = {
+        payTo: "0a04030300000600000000000000000508",
+        payerBefore:
+            "06040303010001a500000000000000000819c1e966e37a830762ed2e0555522bfdd67c8549cc16777de5ec0c177125506f00a501",
+        feePayer: "06040203000001000000000000000000",
+        payerAfter: "0a0404022c46290000000000040300000600000000000000000508",
+    };
+    const assertion = (account: Address, hex: string) => ({
+        programAddress: LIGHTHOUSE_PROGRAM,
+        accounts: [{ address: account, role: AccountRole.READONLY }],
+        data: new Uint8Array(Buffer.from(hex, "hex")),
+    });
+    const phantomPayment = async (
+        over: { computeUnitLimit?: number; leading?: Instruction[] } = {},
+    ) => {
+        const payerAta = await usdcAta(payer.address);
+        const payToAta = await usdcAta(address(req.payTo));
+        return signedPayment(req, payer, {
+            computeUnitLimit: over.computeUnitLimit ?? 33_839,
+            leadingInstructions: over.leading ?? [
+                assertion(payToAta, PHANTOM.payTo),
+                assertion(payerAta, PHANTOM.payerBefore),
+                assertion(FEE_PAYER, PHANTOM.feePayer),
+            ],
+            extraInstructions: [assertion(payerAta, PHANTOM.payerAfter)],
+        });
+    };
+
+    it("pays Phantom's real layout, assertions before and after the transfer", async () => {
+        const out = await payOrder(d, order.id, await phantomPayment(), sig());
+        expect(out).toMatchObject({ kind: "paid", orderId: order.id });
+    });
+
+    it("still refuses a compute limit above the cap in Phantom's layout", async () => {
+        const out = await payOrder(
+            d,
+            order.id,
+            await phantomPayment({ computeUnitLimit: 50_001 }),
+            sig(),
+        );
+        expect(out).toMatchObject({ kind: "refused", reason: "payment_invalid" });
+    });
+
+    it("refuses an instruction before the transfer that isn't Lighthouse", async () => {
+        const memoFirst = {
+            programAddress: address("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"),
+            accounts: [],
+            data: new Uint8Array([1]),
+        };
+        const out = await payOrder(
+            d,
+            order.id,
+            await phantomPayment({ leading: [memoFirst] }),
+            sig(),
+        );
+        expect(out).toMatchObject({ kind: "refused", reason: "payment_invalid" });
+    });
+
     it("refuses more than 16 trailing instructions, Lighthouse or not", async () => {
         const out = await payOrder(
             d,
@@ -531,8 +593,8 @@ describe("payOrder", () => {
         expect(out).toMatchObject({ kind: "refused", reason: "payment_invalid" });
         expect(rpc.calls.sendTransaction ?? 0).toBe(0);
         const line = log.lines.find((l) => l.msg === "payment refused") as
-            { transaction?: string; instructions?: { program: string }[] } | undefined;
-        expect(typeof line?.transaction).toBe("string");
+            { refusedTransaction?: string; instructions?: { program: string }[] } | undefined;
+        expect(typeof line?.refusedTransaction).toBe("string");
         expect(line?.instructions?.map((i) => i.program)).toContain(
             "11111111111111111111111111111111",
         );

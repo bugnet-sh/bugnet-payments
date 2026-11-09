@@ -1,17 +1,32 @@
 diff --git a/dist/cjs/exact/facilitator/index.js b/dist/cjs/exact/facilitator/index.js
-index 252fe1e7c56988e92ebadc1cede07e14e164e49e..8eef07894edf36f48475f00691f182a3ac303a26 100644
+index 252fe1e7c56988e92ebadc1cede07e14e164e49e..05fb7e1a2bd1ac779aba52ea7aa39f70de234d29 100644
 --- a/dist/cjs/exact/facilitator/index.js
 +++ b/dist/cjs/exact/facilitator/index.js
-@@ -1291,7 +1291,7 @@ var ExactSvmScheme = class {
+@@ -1290,8 +1290,10 @@ var ExactSvmScheme = class {
+   hasStaticTransferLayout(transaction) {
      const compiled = compiledMessageDecoder.decode(transaction.messageBytes);
      const instructions = (0, import_kit5.decompileTransactionMessage)(compiled).instructions ?? [];
-     const transferIndex = staticTransferIndex(compiled.version);
+-    const transferIndex = staticTransferIndex(compiled.version);
 -    if (instructions.length < transferIndex + 1 || instructions.length > transferIndex + 5) {
++    const baseTransferIndex = staticTransferIndex(compiled.version);
++    let transferIndex = baseTransferIndex;
++    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95") transferIndex += 1;
 +    if (instructions.length < transferIndex + 1 || instructions.slice(transferIndex + 1).filter((ix) => ix.programAddress.toString() !== "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95").length > 4 || instructions.length > transferIndex + 1 + 16) {
        return false;
      }
      const transferIx = instructions[transferIndex];
-@@ -1579,7 +1579,7 @@ var ExactSvmScheme = class {
+@@ -1559,7 +1561,9 @@ var ExactSvmScheme = class {
+    */
+   async verifyStaticPath(transaction, compiled, decompiled, exactSvmPayload, requirements, signerAddresses) {
+     const instructions = decompiled.instructions ?? [];
+-    const transferIndex = staticTransferIndex(compiled.version);
++    const baseTransferIndex = staticTransferIndex(compiled.version);
++    let transferIndex = baseTransferIndex;
++    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95") transferIndex += 1;
+     if (compiled.version === 1) {
+       const violation = checkTransactionV1Budget(
+         readTransactionV1Config(compiled),
+@@ -1579,14 +1583,14 @@ var ExactSvmScheme = class {
          };
        }
      }
@@ -20,7 +35,26 @@ index 252fe1e7c56988e92ebadc1cede07e14e164e49e..8eef07894edf36f48475f00691f182a3
        return {
          isValid: false,
          invalidReason: ErrTransactionInstructionsLength,
-@@ -1979,7 +1979,7 @@ var ExactSvmSchemeV1 = class {
+         payer: ""
+       };
+     }
+-    if (transferIndex === 2) {
++    if (baseTransferIndex === 2) {
+       try {
+         this.verifyComputeLimitInstruction(instructions[0]);
+         this.verifyComputePriceInstruction(instructions[1]);
+@@ -1962,7 +1966,9 @@ var ExactSvmSchemeV1 = class {
+       };
+     }
+     const instructions = decompiled.instructions ?? [];
+-    const transferIndex = staticTransferIndex(compiled.version);
++    const baseTransferIndex = staticTransferIndex(compiled.version);
++    let transferIndex = baseTransferIndex;
++    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95") transferIndex += 1;
+     if (compiled.version === 1) {
+       const violation = checkTransactionV1Budget(
+         readTransactionV1Config(compiled),
+@@ -1979,14 +1985,14 @@ var ExactSvmSchemeV1 = class {
          };
        }
      }
@@ -29,11 +63,30 @@ index 252fe1e7c56988e92ebadc1cede07e14e164e49e..8eef07894edf36f48475f00691f182a3
        return {
          isValid: false,
          invalidReason: "invalid_exact_svm_payload_transaction_instructions_length",
+         payer: ""
+       };
+     }
+-    if (transferIndex === 2) {
++    if (baseTransferIndex === 2) {
+       try {
+         this.verifyComputeLimitInstruction(instructions[0]);
+         this.verifyComputePriceInstruction(instructions[1]);
 diff --git a/dist/cjs/exact/v1/facilitator/index.js b/dist/cjs/exact/v1/facilitator/index.js
-index 69a0c77e9cf9405f2b6fdc119335e81b5a1fc74b..35030b04dfc5540f21d4e62c2070ebdff2dc8ed5 100644
+index 69a0c77e9cf9405f2b6fdc119335e81b5a1fc74b..d5c445c75492642d3d63d6e83904c2cf27934a42 100644
 --- a/dist/cjs/exact/v1/facilitator/index.js
 +++ b/dist/cjs/exact/v1/facilitator/index.js
-@@ -542,7 +542,7 @@ var ExactSvmSchemeV1 = class {
+@@ -525,7 +525,9 @@ var ExactSvmSchemeV1 = class {
+       };
+     }
+     const instructions = decompiled.instructions ?? [];
+-    const transferIndex = staticTransferIndex(compiled.version);
++    const baseTransferIndex = staticTransferIndex(compiled.version);
++    let transferIndex = baseTransferIndex;
++    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95") transferIndex += 1;
+     if (compiled.version === 1) {
+       const violation = checkTransactionV1Budget(
+         readTransactionV1Config(compiled),
+@@ -542,14 +544,14 @@ var ExactSvmSchemeV1 = class {
          };
        }
      }
@@ -42,20 +95,43 @@ index 69a0c77e9cf9405f2b6fdc119335e81b5a1fc74b..35030b04dfc5540f21d4e62c2070ebdf
        return {
          isValid: false,
          invalidReason: "invalid_exact_svm_payload_transaction_instructions_length",
+         payer: ""
+       };
+     }
+-    if (transferIndex === 2) {
++    if (baseTransferIndex === 2) {
+       try {
+         this.verifyComputeLimitInstruction(instructions[0]);
+         this.verifyComputePriceInstruction(instructions[1]);
 diff --git a/dist/esm/chunk-CUM4W6LX.mjs b/dist/esm/chunk-CUM4W6LX.mjs
-index 8fa1feadd98a3eb522fb1e079a3bf4a003ad92c6..e72aa796f64b0a54e4a4fb9decb53797afe28eea 100644
+index 8fa1feadd98a3eb522fb1e079a3bf4a003ad92c6..63a4942fe756aa96ca1a81f7008a8bbb20516650 100644
 --- a/dist/esm/chunk-CUM4W6LX.mjs
 +++ b/dist/esm/chunk-CUM4W6LX.mjs
-@@ -513,7 +513,7 @@ var ExactSvmScheme = class {
+@@ -512,8 +512,10 @@ var ExactSvmScheme = class {
+   hasStaticTransferLayout(transaction) {
      const compiled = compiledMessageDecoder.decode(transaction.messageBytes);
      const instructions = decompileTransactionMessage(compiled).instructions ?? [];
-     const transferIndex = staticTransferIndex(compiled.version);
+-    const transferIndex = staticTransferIndex(compiled.version);
 -    if (instructions.length < transferIndex + 1 || instructions.length > transferIndex + 5) {
++    const baseTransferIndex = staticTransferIndex(compiled.version);
++    let transferIndex = baseTransferIndex;
++    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95") transferIndex += 1;
 +    if (instructions.length < transferIndex + 1 || instructions.slice(transferIndex + 1).filter((ix) => ix.programAddress.toString() !== "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95").length > 4 || instructions.length > transferIndex + 1 + 16) {
        return false;
      }
      const transferIx = instructions[transferIndex];
-@@ -801,7 +801,7 @@ var ExactSvmScheme = class {
+@@ -781,7 +783,9 @@ var ExactSvmScheme = class {
+    */
+   async verifyStaticPath(transaction, compiled, decompiled, exactSvmPayload, requirements, signerAddresses) {
+     const instructions = decompiled.instructions ?? [];
+-    const transferIndex = staticTransferIndex(compiled.version);
++    const baseTransferIndex = staticTransferIndex(compiled.version);
++    let transferIndex = baseTransferIndex;
++    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95") transferIndex += 1;
+     if (compiled.version === 1) {
+       const violation = checkTransactionV1Budget(
+         readTransactionV1Config(compiled),
+@@ -801,14 +805,14 @@ var ExactSvmScheme = class {
          };
        }
      }
@@ -64,7 +140,26 @@ index 8fa1feadd98a3eb522fb1e079a3bf4a003ad92c6..e72aa796f64b0a54e4a4fb9decb53797
        return {
          isValid: false,
          invalidReason: ErrTransactionInstructionsLength,
-@@ -1215,7 +1215,7 @@ var ExactSvmSchemeV1 = class {
+         payer: ""
+       };
+     }
+-    if (transferIndex === 2) {
++    if (baseTransferIndex === 2) {
+       try {
+         this.verifyComputeLimitInstruction(instructions[0]);
+         this.verifyComputePriceInstruction(instructions[1]);
+@@ -1198,7 +1202,9 @@ var ExactSvmSchemeV1 = class {
+       };
+     }
+     const instructions = decompiled.instructions ?? [];
+-    const transferIndex = staticTransferIndex(compiled.version);
++    const baseTransferIndex = staticTransferIndex(compiled.version);
++    let transferIndex = baseTransferIndex;
++    while (transferIndex < baseTransferIndex + 8 && transferIndex < instructions.length - 1 && instructions[transferIndex].programAddress.toString() === "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95") transferIndex += 1;
+     if (compiled.version === 1) {
+       const violation = checkTransactionV1Budget(
+         readTransactionV1Config(compiled),
+@@ -1215,14 +1221,14 @@ var ExactSvmSchemeV1 = class {
          };
        }
      }
@@ -73,3 +168,11 @@ index 8fa1feadd98a3eb522fb1e079a3bf4a003ad92c6..e72aa796f64b0a54e4a4fb9decb53797
        return {
          isValid: false,
          invalidReason: "invalid_exact_svm_payload_transaction_instructions_length",
+         payer: ""
+       };
+     }
+-    if (transferIndex === 2) {
++    if (baseTransferIndex === 2) {
+       try {
+         this.verifyComputeLimitInstruction(instructions[0]);
+         this.verifyComputePriceInstruction(instructions[1]);
