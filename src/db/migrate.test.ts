@@ -1,3 +1,6 @@
+import { copyFile, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { testDb, type TestDb } from "../testing/db.ts";
 import { memoryLog } from "../log.ts";
@@ -63,6 +66,23 @@ describe("schema", () => {
             ]);
         } finally {
             await fresh.close();
+        }
+    });
+
+    it("skips macOS ._ metadata files and anything not named NNNNN_name.sql", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "migrations-"));
+        try {
+            for (const f of await readdir("migrations")) {
+                await copyFile(path.join("migrations", f), path.join(dir, f));
+            }
+            const appleDouble = Buffer.from([
+                0, 5, 22, 7, 0, 2, 0, 0, 77, 97, 99, 32, 79, 83, 32, 88,
+            ]);
+            await writeFile(path.join(dir, "._00001_init.sql"), appleDouble);
+            await writeFile(path.join(dir, "notes.sql"), "select broken from nowhere");
+            expect(await migrate(db.pool, dir)).toBe(0);
+        } finally {
+            await rm(dir, { recursive: true, force: true });
         }
     });
 

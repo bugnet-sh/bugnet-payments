@@ -30,8 +30,10 @@ Build in a checkout at the release commit, with `../bugnet-proto` next to it (`p
 pnpm install --frozen-lockfile
 pnpm build    # dist/main.js, dist/cli.js, dist/checkout.js, dist/fonts/
 v=$(git rev-parse --short HEAD)
-tar czf "bugnet-payments-$v.tgz" dist migrations config vendor deploy \
-    package.json pnpm-lock.yaml pnpm-workspace.yaml
+# On macOS, without these tar adds hidden ._ metadata files that unpack on Linux as real files
+COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -czf "bugnet-payments-$v.tgz" \
+    dist migrations config vendor deploy package.json pnpm-lock.yaml pnpm-workspace.yaml
+tar tzf "bugnet-payments-$v.tgz" | grep -c '/\._\|^\._' # must print 0
 ```
 
 The install directory needs all of these: `dist/main.js` and `dist/cli.js` keep their packages

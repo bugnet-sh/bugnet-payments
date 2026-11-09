@@ -4,9 +4,11 @@ import type pg from "pg";
 import { withTx } from "./pool.ts";
 
 const MIGRATION_LOCK = 724_001;
+const MIGRATION_FILE = /^\d{5}_[a-z0-9_]+\.sql$/;
 
 export async function migrate(pool: pg.Pool, dir = "migrations"): Promise<number> {
-    const files = (await readdir(dir)).filter((f) => f.endsWith(".sql")).sort();
+    // Only NNNNN_name.sql: a tar made on macOS can add ._ metadata files that end in .sql too
+    const files = (await readdir(dir)).filter((f) => MIGRATION_FILE.test(f)).sort();
     return withTx(pool, async (c) => {
         await c.query("select pg_advisory_xact_lock($1)", [MIGRATION_LOCK]);
         await c.query(
