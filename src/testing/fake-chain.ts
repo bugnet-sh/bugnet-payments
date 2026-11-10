@@ -2,6 +2,7 @@ import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from "
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
+    AccountRole,
     type Address,
     address,
     appendTransactionMessageInstructions,
@@ -12,6 +13,7 @@ import {
     getAddressDecoder,
     getAddressEncoder,
     getBase58Decoder,
+    getBase58Encoder,
     getBase64EncodedWireTransaction,
     getBase64Encoder,
     getCompiledTransactionMessageDecoder,
@@ -28,11 +30,18 @@ import {
     type Transaction,
 } from "@solana/kit";
 import { getSetComputeUnitPriceInstruction } from "@solana-program/compute-budget";
-import { getApproveInstruction, getTransferCheckedInstruction } from "@solana-program/token";
+import {
+    ASSOCIATED_TOKEN_PROGRAM_ADDRESS,
+    getApproveInstruction,
+    getCreateAssociatedTokenIdempotentInstructionAsync,
+    getTransferCheckedInstruction,
+} from "@solana-program/token";
 import { isRecord } from "../is-record.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { MEMO_PROGRAM, TOKEN_PROGRAM, USDC_DECIMALS, USDC_MINT } from "../solana/constants.ts";
 import { createRpc, type SolanaRpc } from "../solana/rpc.ts";
+
+export type BadAnswer = { meta: "null" } | { dropTokenEntryFor: string };
 
 export interface FakeChain {
     url: string;
@@ -58,6 +67,8 @@ export interface FakeChain {
     hideFromIndex(signature: string, ms: number): void;
     lagNode(slots: number, o?: { refuse?: boolean; methods?: readonly string[] }): void;
     failNext(): void;
+    // The destination is created first in the same transaction when createDestinationFor names
+    // its owner, paid by feePayer, as a wallet does when it sends to an account that is not there
     transfer(o: {
         authority: KeyPairSigner;
         feePayer: KeyPairSigner;
@@ -66,21 +77,70 @@ export interface FakeChain {
         micros: bigint;
         memo?: string;
         lifetime?: { blockhash: string; lastValidBlockHeight: bigint };
+        createDestinationFor?: string;
     }): Promise<string>;
     withholdTransaction(signature: string, times: number): void;
     calls(): { method: string; params: unknown[] }[];
     close(): Promise<void>;
+    accountExists(address: string): boolean;
+    // null: the node gives no block time for transactions landing from now on
+    setBlockTime(seconds: number | null): void;
+    withholdBlockTime(slot: bigint, times: number): void;
+    createAta(o: { owner: string; payer: KeyPairSigner }): Promise<string>;
+    // An exchange batch: one signer, one transaction, several credits
+    transferMany(o: {
+        from: KeyPairSigner;
+        to: readonly { tokenAccount: string; micros: bigint }[];
+    }): Promise<string>;
+    // A pool vault moved by CPI, or a delegate: the vault's owner does not sign
+    vaultTransfer(o: {
+        vault: string;
+        to: string;
+        micros: bigint;
+        signer: KeyPairSigner;
+    }): Promise<string>;
+    lamports(address: string): bigint;
+    fundLamports(address: string, lamports: bigint): void;
+    // History padding: names the accounts read-only and moves nothing
+    noOp(o: {
+        touching: string | readonly string[];
+        signer: KeyPairSigner;
+        fail?: boolean;
+    }): Promise<string>;
+    preflight(on: boolean): void;
+    // A node lacking that history
+    hideFromStatus(signature: string): void;
+    // A pruned endpoint
+    pruneHistoryBefore(slot: bigint | null): void;
+    undecodable(signature: string): void;
+    // One backend's wrong answer behind an endpoint that mixes backends
+    badAnswer(signature: string, times: number, o: BadAnswer): void;
 }
 
 const GENESIS_SLOT = 1_000n;
 const HEIGHT_OFFSET = 100n;
 const BLOCKHASH_LIFE = 150n;
 const OUTSIDE_FUNDS = 10n ** 12n;
+const TOKEN_ACCOUNT_RENT = 2_039_280n;
 const MIN_CONTEXT_SLOT_NOT_REACHED = -32016;
+const BLOCK_NOT_AVAILABLE = -32004;
 const spkiEd25519Prefix = Buffer.from("302a300506032b6570032100", "hex");
 const TOKEN_TRANSFER = 3;
 const TOKEN_APPROVE = 4;
+const TOKEN_CLOSE_ACCOUNT = 9;
 const TOKEN_TRANSFER_CHECKED = 12;
+const ATA_CREATE = 0;
+const ATA_CREATE_IDEMPOTENT = 1;
+const SYSTEM_TRANSFER = 2;
+const SYSTEM_PROGRAM = "11111111111111111111111111111111";
+const ATA_PROGRAM: string = ASSOCIATED_TOKEN_PROGRAM_ADDRESS;
+
+const fakeProgram = (name: string): Address =>
+    getAddressDecoder().decode(createHash("sha256").update(`fake-chain ${name} program`).digest());
+// Stand-ins for programs FakeChain does not run: one moves a vault's tokens by CPI, one only
+// names accounts
+const VAULT_PROGRAM = fakeProgram("vault");
+const NOOP_PROGRAM = fakeProgram("noop");
 
 interface Account {
     owner: string;
@@ -88,12 +148,41 @@ interface Account {
     state: "initialized" | "frozen";
     delegate: string | null;
     closeAuthority: string | null;
+    // Set by setTokenAccount: the account exists at every slot unless a landed close says otherwise
+    base: boolean;
 }
 
 interface Delta {
     account: string;
     slot: bigint;
     amount: bigint;
+}
+
+interface TokenEntry {
+    amount: bigint;
+    owner: string;
+}
+
+interface StoredInstruction {
+    program: string;
+    accounts: string[];
+    data: Uint8Array;
+}
+
+interface Working {
+    exists: boolean;
+    owner: string;
+    amount: bigint;
+    delegate: string | null;
+    state: "initialized" | "frozen";
+    closeAuthority: string | null;
+}
+
+interface Applied {
+    err: unknown;
+    tokens: Map<string, Working>;
+    lamports: Map<string, bigint>;
+    inner: { index: number; instructions: StoredInstruction[] }[];
 }
 
 interface Stored {
@@ -110,11 +199,12 @@ interface Stored {
         numReadonlyNonSignerAccounts: number;
     };
     recentBlockhash: string;
-    instructions: { program: string; accounts: string[]; data: Uint8Array }[];
+    instructions: StoredInstruction[];
+    inner: Applied["inner"];
     err: unknown;
-    pre: Map<number, bigint>;
-    post: Map<number, bigint>;
-    blockTime: number;
+    pre: Map<number, TokenEntry>;
+    post: Map<number, TokenEntry>;
+    blockTime: number | null;
 }
 
 class RpcError extends Error {
@@ -148,6 +238,29 @@ function decodeMessage(tx: Transaction) {
     if (compiled.version !== 0) throw new Error("fake chain: only v0 transactions");
     return compiled;
 }
+
+function readMessage(tx: Transaction) {
+    const compiled = decodeMessage(tx);
+    const keys = [...compiled.staticAccounts] as string[];
+    const instructions: StoredInstruction[] = compiled.instructions.map((ix) => ({
+        program: keys[ix.programAddressIndex]!,
+        accounts: (ix.accountIndices ?? []).map((i) => keys[i]!),
+        data: new Uint8Array(ix.data ?? []),
+    }));
+    return { compiled, keys, instructions };
+}
+
+const u64 = (n: bigint): Uint8Array => {
+    const b = Buffer.alloc(8);
+    b.writeBigUInt64LE(n);
+    return b;
+};
+
+const u32 = (n: number): Uint8Array => {
+    const b = Buffer.alloc(4);
+    b.writeUInt32LE(n);
+    return b;
+};
 
 function readBody(req: IncomingMessage): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -188,18 +301,48 @@ export async function startFakeChain(
     let lagRefuses = true;
     let lagMethods: readonly string[] | undefined;
     let failNextFlag = false;
+    let preflightOn = false;
+    let prunedBefore: bigint | null = null;
     let seq = 0;
+    let outsideNonce = 0;
     const accounts = new Map<string, Account>();
+    const life = new Map<string, { slot: bigint; exists: boolean }[]>();
     const deltas: Delta[] = [];
+    const lamportGenesis = new Map<string, bigint>();
+    const lamportDeltas: Delta[] = [];
     const txs: Stored[] = [];
     const bySignature = new Map<string, Stored>();
     const sentOnRpc: Stored[] = [];
     const hidden = new Map<string, number>();
     const withheld = new Map<string, number>();
+    const hiddenFromStatus = new Set<string>();
+    const undecodables = new Set<string>();
+    const badAnswers = new Map<string, { left: number; kind: BadAnswer }>();
+    const withheldTxTime = new Map<bigint, number>();
+    const withheldBlockTime = new Map<bigint, number>();
     const requests: { method: string; params: unknown[] }[] = [];
     const heights = new Map<string, bigint>([
         [blockhashOf(GENESIS_SLOT), GENESIS_SLOT - HEIGHT_OFFSET],
     ]);
+    const atas = new Map<string, string>();
+
+    let blockTimeSetting: number | null | undefined;
+    let lastSetTime: number | undefined;
+    const slotTimes = new Map<bigint, number>();
+    const defaultTime = () => lastSetTime ?? Math.floor(Date.now() / 1000);
+    function slotTime(s: bigint): number {
+        let t = slotTimes.get(s);
+        if (t === undefined) {
+            t = defaultTime();
+            slotTimes.set(s, t);
+        }
+        return t;
+    }
+    function stampBlockTime(): number | null {
+        if (typeof blockTimeSetting === "number") slotTimes.set(slot, blockTimeSetting);
+        const t = slotTime(slot);
+        return blockTimeSetting === null ? null : t;
+    }
 
     const heightOf = (s: bigint) => s - HEIGHT_OFFSET;
     const finalized = () => (o.autoFinalize === true ? slot : finalizedSlot);
@@ -209,6 +352,21 @@ export async function startFakeChain(
             .filter((d) => d.account === account && d.slot <= at)
             .reduce((sum, d) => sum + d.amount, accounts.get(account)?.genesis ?? 0n);
     const tipBalance = (account: string) => balanceAt(account, slot);
+    const lamportsAt = (account: string, at: bigint): bigint =>
+        lamportDeltas
+            .filter((d) => d.account === account && d.slot <= at)
+            .reduce((sum, d) => sum + d.amount, lamportGenesis.get(account) ?? 0n);
+
+    function existsAt(account: string, at: bigint): boolean {
+        const acct = accounts.get(account);
+        if (acct === undefined) return false;
+        let exists = acct.base;
+        for (const e of life.get(account) ?? []) {
+            if (e.slot > at) break;
+            exists = e.exists;
+        }
+        return exists;
+    }
 
     function setAccount(a: {
         address: string;
@@ -227,7 +385,16 @@ export async function startFakeChain(
             state: a.state ?? "initialized",
             delegate: a.delegate ?? null,
             closeAuthority: a.closeAuthority ?? null,
+            base: true,
         });
+        life.delete(a.address);
+        const held = lamportsAt(a.address, slot);
+        if (held < TOKEN_ACCOUNT_RENT) {
+            lamportGenesis.set(
+                a.address,
+                (lamportGenesis.get(a.address) ?? 0n) + TOKEN_ACCOUNT_RENT - held,
+            );
+        }
     }
 
     const outsideKeys = generateKeyPairSync("ed25519");
@@ -237,110 +404,261 @@ export async function startFakeChain(
     const outsideAta = await usdcAta(outside);
     setAccount({ address: outsideAta, owner: outside, amount: OUTSIDE_FUNDS });
 
+    // The associated token program checks the address it creates, which takes an async
+    // derivation, so a send derives its owners' addresses before it lands
+    async function deriveAtas(instructions: readonly StoredInstruction[]): Promise<void> {
+        for (const ix of instructions) {
+            const owner = ix.accounts[2];
+            if (ix.program !== ATA_PROGRAM || owner === undefined || atas.has(owner)) continue;
+            atas.set(owner, await usdcAta(address(owner)));
+        }
+    }
+
+    // Runs the instructions against the tip and returns the changes without applying them
     function apply(
         keys: string[],
         numSigners: number,
-        instructions: Stored["instructions"],
-    ): { err: unknown; working: Map<string, { amount: bigint; delegate: string | null }> } {
-        const working = new Map<string, { amount: bigint; delegate: string | null }>();
-        const load = (addr: string) => {
-            const acct = accounts.get(addr);
-            if (acct === undefined) return undefined;
-            let w = working.get(addr);
+        instructions: readonly StoredInstruction[],
+    ): Applied {
+        const tokens = new Map<string, Working>();
+        const lamports = new Map<string, bigint>();
+        const inner: Applied["inner"] = [];
+        const load = (addr: string | undefined): Working | undefined => {
+            if (addr === undefined) return undefined;
+            let w = tokens.get(addr);
             if (w === undefined) {
-                w = { amount: tipBalance(addr), delegate: acct.delegate };
-                working.set(addr, w);
+                const acct = accounts.get(addr);
+                if (acct === undefined || !existsAt(addr, slot)) return undefined;
+                w = {
+                    exists: true,
+                    owner: acct.owner,
+                    amount: tipBalance(addr),
+                    delegate: acct.delegate,
+                    state: acct.state,
+                    closeAuthority: acct.closeAuthority,
+                };
+                tokens.set(addr, w);
             }
-            return { acct, w };
+            return w.exists ? w : undefined;
         };
+        const lam = (addr: string) => lamports.get(addr) ?? lamportsAt(addr, slot);
         const signed = (addr: string | undefined) =>
             addr !== undefined && keys.indexOf(addr) >= 0 && keys.indexOf(addr) < numSigners;
-        const authorised = (
-            acct: Account,
-            w: { delegate: string | null },
-            who: string | undefined,
-        ) => signed(who) && (who === acct.owner || who === w.delegate);
-        const fail = (index: number) => ({ InstructionError: [index, { Custom: 1 }] });
+        const authorised = (w: Working, who: string | undefined) =>
+            signed(who) && (who === w.owner || who === w.delegate);
 
-        for (const [index, ix] of instructions.entries()) {
-            if (ix.program !== TOKEN_PROGRAM) continue;
-            const kind = ix.data[0];
-            if (kind === TOKEN_TRANSFER || kind === TOKEN_TRANSFER_CHECKED) {
-                const checked = kind === TOKEN_TRANSFER_CHECKED;
-                const [srcKey, second, third, fourth] = ix.accounts;
-                const dstKey = checked ? third : second;
-                const authority = checked ? fourth : third;
-                const amount = Buffer.from(ix.data).readBigUInt64LE(1);
-                if (checked && (second !== USDC_MINT || ix.data[9] !== USDC_DECIMALS)) {
-                    return { err: fail(index), working };
+        const step = (ix: StoredInstruction, index: number): boolean => {
+            const data = Buffer.from(ix.data);
+            if (ix.program === TOKEN_PROGRAM) {
+                const kind = ix.data[0];
+                if (kind === TOKEN_TRANSFER || kind === TOKEN_TRANSFER_CHECKED) {
+                    const checked = kind === TOKEN_TRANSFER_CHECKED;
+                    const [srcKey, second, third, fourth] = ix.accounts;
+                    const amount = data.readBigUInt64LE(1);
+                    if (checked && (second !== USDC_MINT || ix.data[9] !== USDC_DECIMALS)) {
+                        return false;
+                    }
+                    const src = load(srcKey);
+                    const dst = load(checked ? third : second);
+                    if (
+                        src === undefined ||
+                        dst === undefined ||
+                        src.state !== "initialized" ||
+                        dst.state !== "initialized" ||
+                        !authorised(src, checked ? fourth : third) ||
+                        src.amount < amount
+                    ) {
+                        return false;
+                    }
+                    src.amount -= amount;
+                    dst.amount += amount;
+                    return true;
                 }
-                const src = srcKey === undefined ? undefined : load(srcKey);
-                const dst = dstKey === undefined ? undefined : load(dstKey);
+                if (kind === TOKEN_APPROVE) {
+                    const [srcKey, delegate, owner] = ix.accounts;
+                    const src = load(srcKey);
+                    if (src === undefined || delegate === undefined) return false;
+                    if (!(signed(owner) && owner === src.owner)) return false;
+                    src.delegate = delegate;
+                    return true;
+                }
+                if (kind === TOKEN_CLOSE_ACCOUNT) {
+                    const [acctKey, dest, authority] = ix.accounts;
+                    const w = load(acctKey);
+                    if (
+                        w === undefined ||
+                        acctKey === undefined ||
+                        dest === undefined ||
+                        dest === acctKey ||
+                        w.state !== "initialized" ||
+                        !(signed(authority) && authority === (w.closeAuthority ?? w.owner)) ||
+                        w.amount !== 0n
+                    ) {
+                        return false;
+                    }
+                    const rent = lam(acctKey);
+                    lamports.set(acctKey, 0n);
+                    lamports.set(dest, lam(dest) + rent);
+                    w.exists = false;
+                    return true;
+                }
+                return false;
+            }
+            if (ix.program === ATA_PROGRAM) {
+                const kind = ix.data.length === 0 ? ATA_CREATE : ix.data[0];
+                const [payerKey, ataKey, ownerKey, mintKey, , tokenProgram] = ix.accounts;
+                if (
+                    (kind !== ATA_CREATE && kind !== ATA_CREATE_IDEMPOTENT) ||
+                    !signed(payerKey) ||
+                    ataKey === undefined ||
+                    ownerKey === undefined ||
+                    mintKey !== USDC_MINT ||
+                    tokenProgram !== TOKEN_PROGRAM ||
+                    atas.get(ownerKey) !== ataKey
+                ) {
+                    return false;
+                }
+                const existing = load(ataKey);
+                if (existing !== undefined) {
+                    return kind === ATA_CREATE_IDEMPOTENT && existing.owner === ownerKey;
+                }
+                tokens.set(ataKey, {
+                    exists: true,
+                    owner: ownerKey,
+                    amount: 0n,
+                    delegate: null,
+                    state: "initialized",
+                    closeAuthority: null,
+                });
+                if (lam(ataKey) < TOKEN_ACCOUNT_RENT) lamports.set(ataKey, TOKEN_ACCOUNT_RENT);
+                return true;
+            }
+            if (ix.program === SYSTEM_PROGRAM) {
+                const [from, to] = ix.accounts;
+                if (ix.data.length < 12 || data.readUInt32LE(0) !== SYSTEM_TRANSFER) return false;
+                const amount = data.readBigUInt64LE(4);
+                if (from === undefined || to === undefined || !signed(from)) return false;
+                if (load(from) !== undefined || lam(from) < amount) return false;
+                lamports.set(from, lam(from) - amount);
+                lamports.set(to, lam(to) + amount);
+                return true;
+            }
+            if (ix.program === VAULT_PROGRAM) {
+                const [vault, mint, to, vaultOwner] = ix.accounts;
+                const amount = data.readBigUInt64LE(0);
+                const src = load(vault);
+                const dst = load(to);
                 if (
                     src === undefined ||
                     dst === undefined ||
-                    src.acct.state !== "initialized" ||
-                    dst.acct.state !== "initialized" ||
-                    !authorised(src.acct, src.w, authority) ||
-                    src.w.amount < amount
+                    mint !== USDC_MINT ||
+                    src.state !== "initialized" ||
+                    dst.state !== "initialized" ||
+                    src.amount < amount
                 ) {
-                    return { err: fail(index), working };
+                    return false;
                 }
-                src.w.amount -= amount;
-                dst.w.amount += amount;
-            } else if (kind === TOKEN_APPROVE) {
-                const [srcKey, delegate, owner] = ix.accounts;
-                const src = srcKey === undefined ? undefined : load(srcKey);
-                if (
-                    src === undefined ||
-                    delegate === undefined ||
-                    !(signed(owner) && owner === src.acct.owner)
-                ) {
-                    return { err: fail(index), working };
-                }
-                src.w.delegate = delegate;
-            } else {
-                return { err: fail(index), working };
+                src.amount -= amount;
+                dst.amount += amount;
+                inner.push({
+                    index,
+                    instructions: [
+                        {
+                            program: TOKEN_PROGRAM,
+                            accounts: [vault!, mint, to!, vaultOwner!],
+                            data: new Uint8Array([
+                                TOKEN_TRANSFER_CHECKED,
+                                ...u64(amount),
+                                USDC_DECIMALS,
+                            ]),
+                        },
+                    ],
+                });
+                return true;
+            }
+            if (ix.program === NOOP_PROGRAM) return ix.data[0] !== 1;
+            return true;
+        };
+
+        for (const [index, ix] of instructions.entries()) {
+            if (!step(ix, index)) {
+                return {
+                    err: { InstructionError: [index, { Custom: 1 }] },
+                    tokens,
+                    lamports,
+                    inner,
+                };
             }
         }
-        return { err: null, working };
+        return { err: null, tokens, lamports, inner };
+    }
+
+    function commit(result: Applied) {
+        for (const [addr, w] of result.tokens) {
+            const existed = existsAt(addr, slot);
+            if (w.exists && !existed) {
+                const prior = accounts.get(addr);
+                accounts.set(addr, {
+                    owner: w.owner,
+                    // A closed account held 0, so its old genesis keeps the new one at 0
+                    genesis: prior?.genesis ?? 0n,
+                    state: "initialized",
+                    delegate: null,
+                    closeAuthority: null,
+                    base: prior?.base ?? false,
+                });
+            }
+            if (w.exists !== existed) {
+                const events = life.get(addr) ?? [];
+                events.push({ slot, exists: w.exists });
+                life.set(addr, events);
+            }
+            const diff = w.amount - tipBalance(addr);
+            if (diff !== 0n) deltas.push({ account: addr, slot, amount: diff });
+            if (w.exists) accounts.get(addr)!.delegate = w.delegate;
+        }
+        for (const [addr, value] of result.lamports) {
+            const diff = value - lamportsAt(addr, slot);
+            if (diff !== 0n) lamportDeltas.push({ account: addr, slot, amount: diff });
+        }
     }
 
     function land(tx: Transaction, wire: string, viaRpc: boolean): string {
-        const compiled = decodeMessage(tx);
-        const keys = [...compiled.staticAccounts] as string[];
+        const { compiled, keys, instructions } = readMessage(tx);
         const first = Object.values(tx.signatures)[0];
         const sig = getBase58Decoder().decode(first ?? new Uint8Array(64));
         const existing = bySignature.get(sig);
         if (existing !== undefined) return sig;
 
-        const instructions = compiled.instructions.map((ix) => ({
-            program: keys[ix.programAddressIndex]!,
-            accounts: (ix.accountIndices ?? []).map((i) => keys[i]!),
-            data: new Uint8Array(ix.data ?? []),
-        }));
         const tokenAt = instructions.findIndex((ix) => ix.program === TOKEN_PROGRAM);
-        const result = failNextFlag
+        const result: Applied = failNextFlag
             ? {
                   err: { InstructionError: [Math.max(tokenAt, 0), { Custom: 1 }] },
-                  working: new Map<string, { amount: bigint; delegate: string | null }>(),
+                  tokens: new Map(),
+                  lamports: new Map(),
+                  inner: [],
               }
             : apply(keys, compiled.header.numSignerAccounts, instructions);
         failNextFlag = false;
+        const ok = result.err === null;
 
-        const pre = new Map<number, bigint>();
-        const post = new Map<number, bigint>();
+        // A failed transaction changes nothing, so its post balances are its pre balances
+        const pre = new Map<number, TokenEntry>();
+        const post = new Map<number, TokenEntry>();
         keys.forEach((k, i) => {
-            if (!accounts.has(k)) return;
-            const before = tipBalance(k);
-            pre.set(i, before);
-            post.set(i, result.working.get(k)?.amount ?? before);
+            const acct = accounts.get(k);
+            if (acct !== undefined && existsAt(k, slot)) {
+                pre.set(i, { amount: tipBalance(k), owner: acct.owner });
+            }
+            const w = ok ? result.tokens.get(k) : undefined;
+            if (w === undefined) {
+                const before = pre.get(i);
+                if (before !== undefined) post.set(i, before);
+            } else if (w.exists) {
+                post.set(i, { amount: w.amount, owner: w.owner });
+            }
         });
-        for (const [addr, w] of result.working) {
-            const diff = w.amount - tipBalance(addr);
-            if (diff !== 0n) deltas.push({ account: addr, slot, amount: diff });
-            accounts.get(addr)!.delegate = w.delegate;
-        }
+        if (ok) commit(result);
 
         const stored: Stored = {
             signature: sig,
@@ -355,10 +673,11 @@ export async function startFakeChain(
             header: compiled.header,
             recentBlockhash: compiled.lifetimeToken,
             instructions,
+            inner: ok ? result.inner : [],
             err: result.err,
             pre,
             post,
-            blockTime: Math.floor(Date.now() / 1000),
+            blockTime: stampBlockTime(),
         };
         txs.push(stored);
         bySignature.set(sig, stored);
@@ -366,15 +685,17 @@ export async function startFakeChain(
         return sig;
     }
 
-    function sendTransaction(wire: string): string {
+    async function sendTransaction(wire: string, config: Record<string, unknown>): Promise<string> {
         let tx: Transaction;
-        let compiled: ReturnType<typeof decodeMessage>;
+        let message: ReturnType<typeof readMessage>;
         try {
             tx = getTransactionDecoder().decode(getBase64Encoder().encode(wire));
-            compiled = decodeMessage(tx);
+            message = readMessage(tx);
         } catch {
             throw new RpcError(-32602, "Invalid param: failed to deserialize transaction");
         }
+        await deriveAtas(message.instructions);
+        const { compiled, keys, instructions } = message;
         const known = heights.get(compiled.lifetimeToken);
         if (known === undefined || heightOf(slot) > known + BLOCKHASH_LIFE) {
             throw new RpcError(-32002, "Transaction simulation failed: Blockhash not found", {
@@ -390,6 +711,23 @@ export async function startFakeChain(
             const s = tx.signatures[signer as Address] ?? null;
             if (!signedBy(signer, tx.messageBytes, s)) {
                 throw new RpcError(-32003, "Transaction signature verification failure");
+            }
+        }
+        const first = Object.values(tx.signatures)[0];
+        const sig = getBase58Decoder().decode(first ?? new Uint8Array(64));
+        if (preflightOn && config.skipPreflight !== true && !bySignature.has(sig)) {
+            const simulated = apply(keys, compiled.header.numSignerAccounts, instructions);
+            if (simulated.err !== null) {
+                const [index] = (simulated.err as { InstructionError: [number, unknown] })
+                    .InstructionError;
+                const failed = `Error processing Instruction ${index}: custom program error: 0x1`;
+                throw new RpcError(-32002, `Transaction simulation failed: ${failed}`, {
+                    err: simulated.err,
+                    logs: [],
+                    accounts: null,
+                    unitsConsumed: 0,
+                    returnData: null,
+                });
             }
         }
         return land(tx, wire, true);
@@ -426,10 +764,14 @@ export async function startFakeChain(
     // A distinct price per transaction keeps two identical outside moves from sharing a signature
     const uniqueness = (): Instruction =>
         getSetComputeUnitPriceInstruction({ microLamports: BigInt(seq + 1) });
+    const outsideUniqueness = (): Instruction =>
+        getSetComputeUnitPriceInstruction({ microLamports: BigInt(++outsideNonce) });
 
     function known(addr: string): Account {
         const acct = accounts.get(addr);
-        if (acct === undefined) throw new Error(`fake chain: no token account ${addr}`);
+        if (acct === undefined || !existsAt(addr, slot)) {
+            throw new Error(`fake chain: no token account ${addr}`);
+        }
         return acct;
     }
 
@@ -448,18 +790,34 @@ export async function startFakeChain(
         return lag > 0 && (lagMethods === undefined || lagMethods.includes(method)) ? lag : 0;
     }
 
+    const lagged = (method: string, base: bigint): bigint => {
+        const at = base - BigInt(lagFor(method));
+        return at < 0n ? 0n : at;
+    };
+
     function viewSlot(method: string, commitment: unknown): bigint {
         // Kit strips an explicit finalized and injects confirmed when none is given, so a request
         // that arrives with no commitment is the finalized one, as on a real node
         const base = commitment === undefined || commitment === "finalized" ? finalized() : slot;
-        const at = base - BigInt(lagFor(method));
-        return at < 0n ? 0n : at;
+        return lagged(method, base);
+    }
+
+    function viewFor(method: string, config: Record<string, unknown>): bigint {
+        if (method === "sendTransaction") {
+            // Agave checks a send's minContextSlot against its preflight bank, which is the
+            // processed head when preflight is skipped
+            return config.skipPreflight === true
+                ? lagged(method, slot)
+                : viewSlot(method, config.preflightCommitment);
+        }
+        if (method === "getBlockTime") return viewSlot(method, "confirmed");
+        return viewSlot(method, config.commitment);
     }
 
     const statusOf = (s: bigint) => (s <= finalized() ? "finalized" : "confirmed");
 
     function tokenAccountJson(addr: string, at: bigint) {
-        const acct = known(addr);
+        const acct = accounts.get(addr)!;
         const amount = balanceAt(addr, at);
         return {
             data: {
@@ -483,24 +841,40 @@ export async function startFakeChain(
                 space: 165,
             },
             executable: false,
-            lamports: 2_039_280,
+            lamports: lamportsAt(addr, at),
             owner: TOKEN_PROGRAM,
             rentEpoch: 0,
             space: 165,
         };
     }
 
-    function tokenBalances(t: Stored, which: Map<number, bigint>) {
-        return [...which].map(([accountIndex, amount]) => ({
-            accountIndex,
-            mint: USDC_MINT,
-            owner: accounts.get(t.keys[accountIndex]!)!.owner,
-            programId: TOKEN_PROGRAM,
-            uiTokenAmount: tokenAmount(amount),
-        }));
+    function accountJson(addr: string, at: bigint) {
+        if (existsAt(addr, at)) return tokenAccountJson(addr, at);
+        const lamports = lamportsAt(addr, at);
+        if (lamports === 0n) return null;
+        return {
+            data: ["", "base64"],
+            executable: false,
+            lamports,
+            owner: SYSTEM_PROGRAM,
+            rentEpoch: 0,
+            space: 0,
+        };
     }
 
-    function parsedInstruction(ix: Stored["instructions"][number]) {
+    function tokenBalances(t: Stored, which: Map<number, TokenEntry>, drop: string | null) {
+        return [...which]
+            .filter(([accountIndex]) => t.keys[accountIndex] !== drop)
+            .map(([accountIndex, entry]) => ({
+                accountIndex,
+                mint: USDC_MINT,
+                owner: entry.owner,
+                programId: TOKEN_PROGRAM,
+                uiTokenAmount: tokenAmount(entry.amount),
+            }));
+    }
+
+    function parsedInstruction(ix: StoredInstruction) {
         if (ix.program === MEMO_PROGRAM) {
             return {
                 program: "spl-memo",
@@ -545,6 +919,34 @@ export async function startFakeChain(
                 parsed: { type: "approve", info: { source, delegate, owner, amount } },
             };
         }
+        if (ix.program === TOKEN_PROGRAM && kind === TOKEN_CLOSE_ACCOUNT) {
+            const [account, destination, owner] = ix.accounts;
+            return {
+                program: "spl-token",
+                programId: ix.program,
+                parsed: { type: "closeAccount", info: { account, destination, owner } },
+            };
+        }
+        if (ix.program === ATA_PROGRAM) {
+            const [source, account, wallet, mint, systemProgram, tokenProgram] = ix.accounts;
+            return {
+                program: "spl-associated-token-account",
+                programId: ix.program,
+                parsed: {
+                    type: ix.data[0] === ATA_CREATE_IDEMPOTENT ? "createIdempotent" : "create",
+                    info: { source, account, wallet, mint, systemProgram, tokenProgram },
+                },
+            };
+        }
+        if (ix.program === SYSTEM_PROGRAM && ix.data.length >= 12) {
+            const [source, destination] = ix.accounts;
+            const lamports = Buffer.from(ix.data).readBigUInt64LE(4);
+            return {
+                program: "system",
+                programId: ix.program,
+                parsed: { type: "transfer", info: { source, destination, lamports } },
+            };
+        }
         return {
             programId: ix.program,
             accounts: ix.accounts,
@@ -552,10 +954,28 @@ export async function startFakeChain(
         };
     }
 
-    function transactionJson(t: Stored, encoding: unknown) {
+    // A v0 prefix and a header that names five accounts with no bytes after it
+    const undecodableWire = (t: Stored) =>
+        Buffer.concat([
+            Buffer.from([1]),
+            Buffer.from(getBase58Encoder().encode(t.signature)),
+            Buffer.from([0x80, 1, 0, 0, 5]),
+        ]).toString("base64");
+
+    function transactionJson(t: Stored, encoding: unknown, drop: string | null) {
         let transaction: unknown;
+        let innerInstructions: unknown[];
         if (encoding === "base64") {
-            transaction = [t.wire, "base64"];
+            transaction = [undecodables.has(t.signature) ? undecodableWire(t) : t.wire, "base64"];
+            innerInstructions = t.inner.map((g) => ({
+                index: g.index,
+                instructions: g.instructions.map((ix) => ({
+                    programIdIndex: t.keys.indexOf(ix.program),
+                    accounts: ix.accounts.map((a) => t.keys.indexOf(a)),
+                    data: getBase58Decoder().decode(ix.data),
+                    stackHeight: 2,
+                })),
+            }));
         } else if (encoding === "jsonParsed") {
             const h = t.header;
             const writable = (i: number) =>
@@ -575,6 +995,13 @@ export async function startFakeChain(
                     instructions: t.instructions.map(parsedInstruction),
                 },
             };
+            innerInstructions = t.inner.map((g) => ({
+                index: g.index,
+                instructions: g.instructions.map((ix) => ({
+                    ...parsedInstruction(ix),
+                    stackHeight: 2,
+                })),
+            }));
         } else {
             throw new RpcError(-32602, "fake chain supports base64 and jsonParsed only");
         }
@@ -588,19 +1015,88 @@ export async function startFakeChain(
                 fee: 5000,
                 preBalances: [],
                 postBalances: [],
-                preTokenBalances: tokenBalances(t, t.pre),
-                postTokenBalances: tokenBalances(t, t.post),
-                innerInstructions: [],
+                preTokenBalances: tokenBalances(t, t.pre, drop),
+                postTokenBalances: tokenBalances(t, t.post, drop),
+                innerInstructions,
                 logMessages: [],
                 loadedAddresses: { writable: [], readonly: [] },
             },
         };
     }
 
-    function answer(method: string, params: unknown[]): unknown {
+    const takeOne = <K>(counts: Map<K, number>, key: K): boolean => {
+        const left = counts.get(key) ?? 0;
+        if (left <= 0) return false;
+        counts.set(key, left - 1);
+        return true;
+    };
+
+    function getTransaction(sig: string, config: Record<string, unknown>, view: bigint) {
+        if (takeOne(withheld, sig)) return null;
+        const t = bySignature.get(sig);
+        if (t === undefined || t.slot > view) return null;
+        const bad = badAnswers.get(sig);
+        const kind = bad !== undefined && bad.left > 0 ? bad.kind : null;
+        if (bad !== undefined && kind !== null) bad.left--;
+        const drop = kind !== null && "dropTokenEntryFor" in kind ? kind.dropTokenEntryFor : null;
+        const answer = transactionJson(t, config.encoding, drop);
+        const time = takeOne(withheldTxTime, t.slot) ? null : answer.blockTime;
+        return {
+            ...answer,
+            blockTime: time,
+            meta: kind !== null && "meta" in kind ? null : answer.meta,
+        };
+    }
+
+    function getBlockTime(params: unknown[], view: bigint): number {
+        if (params.length !== 1 || typeof params[0] !== "number") {
+            throw new RpcError(-32602, "Invalid params: getBlockTime takes the slot only");
+        }
+        const at = BigInt(params[0]);
+        if (at > view || takeOne(withheldBlockTime, at)) {
+            throw new RpcError(BLOCK_NOT_AVAILABLE, `Block not available for slot ${at}`);
+        }
+        return slotTime(at);
+    }
+
+    function getSignaturesForAddress(addr: string, config: Record<string, unknown>, view: bigint) {
+        let list = txs
+            .filter(
+                (t) =>
+                    t.slot <= view &&
+                    (prunedBefore === null || t.slot >= prunedBefore) &&
+                    t.keys.includes(addr),
+            )
+            .sort((a, b) => (a.slot === b.slot ? b.seq - a.seq : a.slot > b.slot ? -1 : 1));
+        if (typeof config.before === "string") {
+            // As on Agave, a before signature the node does not hold answers an empty page
+            const at = list.findIndex((t) => t.signature === config.before);
+            if (at < 0) return [];
+            list = list.slice(at + 1);
+        }
+        if (typeof config.until === "string") {
+            const at = list.findIndex((t) => t.signature === config.until);
+            if (at >= 0) list = list.slice(0, at);
+        }
+        const now = Date.now();
+        const limit = typeof config.limit === "number" ? config.limit : 1_000;
+        return list
+            .filter((t) => (hidden.get(t.signature) ?? 0) <= now)
+            .slice(0, limit)
+            .map((t) => ({
+                signature: t.signature,
+                slot: t.slot,
+                err: t.err,
+                memo: null,
+                blockTime: t.blockTime,
+                confirmationStatus: statusOf(t.slot),
+            }));
+    }
+
+    async function answer(method: string, params: unknown[]): Promise<unknown> {
         const last = params[params.length - 1];
         const config = isRecord(last) ? last : {};
-        const view = viewSlot(method, config.commitment);
+        const view = viewFor(method, config);
         if (
             typeof config.minContextSlot === "number" &&
             lagRefuses &&
@@ -620,6 +1116,8 @@ export async function startFakeChain(
                 return view;
             case "getBlockHeight":
                 return heightOf(view);
+            case "getBlockTime":
+                return getBlockTime(params, view);
             case "getEpochInfo":
                 return {
                     absoluteSlot: view,
@@ -643,15 +1141,20 @@ export async function startFakeChain(
                 if (config.encoding !== "jsonParsed") {
                     throw new RpcError(-32602, "fake chain supports jsonParsed only");
                 }
-                const addr = params[0] as string;
-                return {
-                    context,
-                    value: accounts.has(addr) ? tokenAccountJson(addr, view) : null,
-                };
+                return { context, value: accountJson(params[0] as string, view) };
             }
+            case "getMultipleAccounts": {
+                if (config.encoding !== "jsonParsed") {
+                    throw new RpcError(-32602, "fake chain supports jsonParsed only");
+                }
+                const addrs = params[0] as string[];
+                return { context, value: addrs.map((a) => accountJson(a, view)) };
+            }
+            case "getBalance":
+                return { context, value: lamportsAt(params[0] as string, view) };
             case "getTokenAccountBalance": {
                 const addr = params[0] as string;
-                if (!accounts.has(addr)) {
+                if (!existsAt(addr, view)) {
                     throw new RpcError(-32602, "Invalid param: could not find account");
                 }
                 return { context, value: tokenAmount(balanceAt(addr, view)) };
@@ -663,6 +1166,7 @@ export async function startFakeChain(
                     value: sigs.map((s) => {
                         const t = bySignature.get(s);
                         if (t === undefined || t.slot > viewSlot(method, "confirmed")) return null;
+                        if (hiddenFromStatus.has(s)) return null;
                         return {
                             slot: t.slot,
                             confirmations: null,
@@ -672,49 +1176,15 @@ export async function startFakeChain(
                     }),
                 };
             }
-            case "getSignaturesForAddress": {
-                const addr = params[0] as string;
-                let list = txs
-                    .filter((t) => t.slot <= view && t.keys.includes(addr))
-                    .sort((a, b) => (a.slot === b.slot ? b.seq - a.seq : a.slot > b.slot ? -1 : 1));
-                if (typeof config.before === "string") {
-                    const at = list.findIndex((t) => t.signature === config.before);
-                    if (at >= 0) list = list.slice(at + 1);
-                }
-                if (typeof config.until === "string") {
-                    const at = list.findIndex((t) => t.signature === config.until);
-                    if (at >= 0) list = list.slice(0, at);
-                }
-                const now = Date.now();
-                const limit = typeof config.limit === "number" ? config.limit : 1_000;
-                return list
-                    .filter((t) => (hidden.get(t.signature) ?? 0) <= now)
-                    .slice(0, limit)
-                    .map((t) => ({
-                        signature: t.signature,
-                        slot: t.slot,
-                        err: t.err,
-                        memo: null,
-                        blockTime: t.blockTime,
-                        confirmationStatus: statusOf(t.slot),
-                    }));
-            }
-            case "getTransaction": {
-                const sig = params[0] as string;
-                const t = bySignature.get(sig);
-                const left = withheld.get(sig) ?? 0;
-                if (left > 0) {
-                    withheld.set(sig, left - 1);
-                    return null;
-                }
-                if (t === undefined || t.slot > view) return null;
-                return transactionJson(t, config.encoding);
-            }
+            case "getSignaturesForAddress":
+                return getSignaturesForAddress(params[0] as string, config, view);
+            case "getTransaction":
+                return getTransaction(params[0] as string, config, view);
             case "sendTransaction": {
                 if (config.encoding !== "base64") {
                     throw new RpcError(-32602, "fake chain supports base64 only");
                 }
-                return sendTransaction(params[0] as string);
+                return await sendTransaction(params[0] as string, config);
             }
             default:
                 throw new RpcError(-32601, `Method not found: ${method}`);
@@ -728,7 +1198,7 @@ export async function startFakeChain(
     });
     const server = createServer((req, res) => {
         void readBody(req)
-            .then((body): unknown => {
+            .then(async (body): Promise<unknown> => {
                 let id: unknown = null;
                 try {
                     const parsed: unknown = JSON.parse(body);
@@ -738,7 +1208,7 @@ export async function startFakeChain(
                     id = parsed.id ?? null;
                     const params = Array.isArray(parsed.params) ? (parsed.params as unknown[]) : [];
                     requests.push({ method: parsed.method, params });
-                    return { jsonrpc: "2.0", id, result: answer(parsed.method, params) };
+                    return { jsonrpc: "2.0", id, result: await answer(parsed.method, params) };
                 } catch (e) {
                     if (e instanceof RpcError) return rpcError(id, e.code, e.message, e.data);
                     if (e instanceof SyntaxError) return rpcError(null, -32700, "Parse error");
@@ -769,35 +1239,24 @@ export async function startFakeChain(
         o.autoAdvanceMs === undefined ? undefined : setInterval(() => advance(1), o.autoAdvanceMs);
     timer?.unref();
 
-    async function buildAndSend(t: Parameters<FakeChain["transfer"]>[0]): Promise<string> {
-        const lifetime = t.lifetime ?? {
+    // Outside senders skip preflight, so preflight(true) only ever refuses the code under test
+    async function sendOutside(
+        feePayer: KeyPairSigner,
+        instructions: Instruction[],
+        lifetime?: { blockhash: string; lastValidBlockHeight: bigint },
+    ): Promise<string> {
+        const life = lifetime ?? {
             blockhash: blockhashOf(slot),
             lastValidBlockHeight: heightOf(slot) + BLOCKHASH_LIFE,
         };
-        const instructions: Instruction[] = [
-            getTransferCheckedInstruction({
-                source: address(t.source),
-                mint: USDC_MINT,
-                destination: address(t.destination),
-                authority: t.authority,
-                amount: t.micros,
-                decimals: USDC_DECIMALS,
-            }),
-        ];
-        if (t.memo !== undefined) {
-            instructions.push({
-                programAddress: MEMO_PROGRAM,
-                data: new TextEncoder().encode(t.memo),
-            });
-        }
         const message = pipe(
             createTransactionMessage({ version: 0 }),
-            (m) => setTransactionMessageFeePayerSigner(t.feePayer, m),
+            (m) => setTransactionMessageFeePayerSigner(feePayer, m),
             (m) =>
                 setTransactionMessageLifetimeUsingBlockhash(
                     {
-                        blockhash: blockhash(lifetime.blockhash),
-                        lastValidBlockHeight: lifetime.lastValidBlockHeight,
+                        blockhash: blockhash(life.blockhash),
+                        lastValidBlockHeight: life.lastValidBlockHeight,
                     },
                     m,
                 ),
@@ -807,8 +1266,40 @@ export async function startFakeChain(
         return await rpc
             .sendTransaction(getBase64EncodedWireTransaction(signed) as never, {
                 encoding: "base64",
+                skipPreflight: true,
             })
             .send();
+    }
+
+    const createIdempotent = async (owner: string, payer: KeyPairSigner) =>
+        await getCreateAssociatedTokenIdempotentInstructionAsync({
+            payer,
+            owner: address(owner),
+            mint: USDC_MINT,
+        });
+
+    async function buildAndSend(t: Parameters<FakeChain["transfer"]>[0]): Promise<string> {
+        const instructions: Instruction[] = [];
+        if (t.createDestinationFor !== undefined) {
+            instructions.push(await createIdempotent(t.createDestinationFor, t.feePayer));
+        }
+        instructions.push(
+            getTransferCheckedInstruction({
+                source: address(t.source),
+                mint: USDC_MINT,
+                destination: address(t.destination),
+                authority: t.authority,
+                amount: t.micros,
+                decimals: USDC_DECIMALS,
+            }),
+        );
+        if (t.memo !== undefined) {
+            instructions.push({
+                programAddress: MEMO_PROGRAM,
+                data: new TextEncoder().encode(t.memo),
+            });
+        }
+        return await sendOutside(t.feePayer, instructions, t.lifetime);
     }
 
     return {
@@ -883,6 +1374,78 @@ export async function startFakeChain(
             if (timer !== undefined) clearInterval(timer);
             server.closeAllConnections();
             await new Promise<void>((resolve) => server.close(() => resolve()));
+        },
+        accountExists: (addr) => existsAt(addr, slot),
+        setBlockTime(seconds) {
+            blockTimeSetting = seconds;
+            if (seconds !== null) lastSetTime = seconds;
+        },
+        withholdBlockTime(at, times) {
+            withheldTxTime.set(at, times);
+            withheldBlockTime.set(at, times);
+        },
+        async createAta(c) {
+            return await sendOutside(c.payer, [
+                outsideUniqueness(),
+                await createIdempotent(c.owner, c.payer),
+            ]);
+        },
+        async transferMany(m) {
+            const source = await usdcAta(m.from.address);
+            const credits = m.to.map((t) =>
+                getTransferCheckedInstruction({
+                    source,
+                    mint: USDC_MINT,
+                    destination: address(t.tokenAccount),
+                    authority: m.from,
+                    amount: t.micros,
+                    decimals: USDC_DECIMALS,
+                }),
+            );
+            return await sendOutside(m.from, [outsideUniqueness(), ...credits]);
+        },
+        async vaultTransfer(v) {
+            const vaultOwner = known(v.vault).owner;
+            const ix: Instruction = {
+                programAddress: VAULT_PROGRAM,
+                accounts: [
+                    { address: address(v.vault), role: AccountRole.WRITABLE },
+                    { address: USDC_MINT, role: AccountRole.READONLY },
+                    { address: address(v.to), role: AccountRole.WRITABLE },
+                    { address: address(vaultOwner), role: AccountRole.READONLY },
+                    { address: TOKEN_PROGRAM, role: AccountRole.READONLY },
+                ],
+                data: u64(v.micros),
+            };
+            return await sendOutside(v.signer, [outsideUniqueness(), ix]);
+        },
+        lamports: (addr) => lamportsAt(addr, slot),
+        fundLamports(addr, lamports) {
+            lamportDeltas.push({ account: addr, slot, amount: lamports });
+        },
+        async noOp(n) {
+            const touching = typeof n.touching === "string" ? [n.touching] : n.touching;
+            const ix: Instruction = {
+                programAddress: NOOP_PROGRAM,
+                accounts: touching.map((a) => ({
+                    address: address(a),
+                    role: AccountRole.READONLY,
+                })),
+                // The nonce keeps two equal noOps apart without naming one more account
+                data: new Uint8Array([n.fail === true ? 1 : 0, ...u32(++outsideNonce)]),
+            };
+            return await sendOutside(n.signer, [ix]);
+        },
+        preflight(on) {
+            preflightOn = on;
+        },
+        hideFromStatus: (sig) => hiddenFromStatus.add(sig),
+        pruneHistoryBefore(at) {
+            prunedBefore = at;
+        },
+        undecodable: (sig) => undecodables.add(sig),
+        badAnswer(sig, times, kind) {
+            badAnswers.set(sig, { left: times, kind });
         },
     };
 }

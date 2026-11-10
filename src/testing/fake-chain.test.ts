@@ -1,8 +1,11 @@
 import {
     address,
     appendTransactionMessageInstruction,
+    appendTransactionMessageInstructions,
     createTransactionMessage,
     getBase64EncodedWireTransaction,
+    getCompiledTransactionMessageDecoder,
+    type Instruction,
     pipe,
     setTransactionMessageFeePayerSigner,
     setTransactionMessageLifetimeUsingBlockhash,
@@ -13,16 +16,55 @@ import {
     isSolanaError,
     type KeyPairSigner,
     signature,
+    SOLANA_ERROR__INSTRUCTION_ERROR__CUSTOM,
+    SOLANA_ERROR__JSON_RPC__SERVER_ERROR_BLOCK_NOT_AVAILABLE,
     SOLANA_ERROR__JSON_RPC__SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED,
     SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE,
 } from "@solana/kit";
-import { getApproveInstruction } from "@solana-program/token";
+import {
+    getSetComputeUnitLimitInstruction,
+    getSetComputeUnitPriceInstruction,
+} from "@solana-program/compute-budget";
+import { getTransferSolInstruction } from "@solana-program/system";
+import {
+    getApproveInstruction,
+    getCloseAccountInstruction,
+    getCreateAssociatedTokenInstructionAsync,
+    getTransferCheckedInstruction,
+} from "@solana-program/token";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { FRESH_SEND, RESEND } from "../refunds/executor.ts";
 import { usdcAta } from "../solana/accounts.ts";
-import { USDC_MINT } from "../solana/constants.ts";
+import { TOKEN_PROGRAM, USDC_DECIMALS, USDC_MINT } from "../solana/constants.ts";
 import { buildSellerPayment, randomSellerMemo, signSellerPayment } from "../x402/build.ts";
 import { type FakeChain, startFakeChain } from "./fake-chain.ts";
 import { testSigner } from "./keys.ts";
+
+const SYSTEM_PROGRAM = "11111111111111111111111111111111";
+
+interface RawBalance {
+    accountIndex: number;
+    owner?: string;
+    programId?: string;
+    uiTokenAmount: { amount: string };
+}
+
+const isMinSlot = (e: unknown) =>
+    isSolanaError(e, SOLANA_ERROR__JSON_RPC__SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED);
+
+const parsedInfo = (account: unknown) =>
+    (account as { data: { parsed: { info: { owner: string; tokenAmount: { amount: string } } } } })
+        .data.parsed.info;
+
+function staticKeys(wireBase64: string): { keys: string[]; signers: string[] } {
+    const tx = getTransactionDecoder().decode(getBase64Encoder().encode(wireBase64));
+    const compiled = getCompiledTransactionMessageDecoder().decode(tx.messageBytes);
+    const keys = [...compiled.staticAccounts] as string[];
+    return { keys, signers: keys.slice(0, compiled.header.numSignerAccounts) };
+}
+
+const balanceFor = (list: unknown, index: number) =>
+    (list as RawBalance[]).find((b) => b.accountIndex === index);
 
 describe("fake chain", () => {
     let chain: FakeChain;
@@ -262,5 +304,386 @@ describe("fake chain", () => {
             expect(json.error?.code).toBeLessThan(0);
         }
         expect(await chain.rpc.getSlot().send()).toBe(1_000n);
+    });
+
+    async function signedWire(feePayer: KeyPairSigner, instructions: Instruction[]) {
+        const { value } = await chain.rpc.getLatestBlockhash().send();
+        const message = pipe(
+            createTransactionMessage({ version: 0 }),
+            (m) => setTransactionMessageFeePayerSigner(feePayer, m),
+            (m) => setTransactionMessageLifetimeUsingBlockhash(value, m),
+            (m) => appendTransactionMessageInstructions(instructions, m),
+        );
+        return getBase64EncodedWireTransaction(await signTransactionMessageWithSigners(message));
+    }
+    const sendWire = (wire: string, config: object = { encoding: "base64" }) =>
+        chain.rpc.sendTransaction(wire as never, config as never).send();
+    const listing = (account: string, config: object = {}) =>
+        chain.rpc
+            .getSignaturesForAddress(address(account), { commitment: "confirmed", ...config })
+            .send();
+    const transferIx = (micros: bigint) =>
+        getTransferCheckedInstruction({
+            source: address(a),
+            mint: USDC_MINT,
+            destination: address(b),
+            authority: owner,
+            amount: micros,
+            decimals: USDC_DECIMALS,
+        });
+    async function closable(micros: bigint) {
+        const closer = await testSigner(48);
+        const account = await usdcAta(closer.address);
+        chain.setTokenAccount({ address: account, owner: closer.address, amount: micros });
+        const close = getCloseAccountInstruction({
+            account: address(account),
+            destination: other.address,
+            owner: closer,
+        });
+        return { account, close };
+    }
+
+    it("getMultipleAccounts answers present, missing and system accounts", async () => {
+        const present = await usdcAta((await testSigner(41)).address);
+        chain.setTokenAccount({ address: present, owner: other.address, amount: 7_000n });
+        const missing = await usdcAta((await testSigner(42)).address);
+        const system = (await testSigner(43)).address;
+        chain.fundLamports(system, 890_880n);
+        const { value } = await chain.rpc
+            .getMultipleAccounts([address(present), address(missing), system], {
+                encoding: "jsonParsed",
+            })
+            .send();
+        expect(parsedInfo(value[0]).tokenAmount.amount).toBe("7000");
+        expect(value[1]).toBeNull();
+        expect(value[2]?.owner).toBe(SYSTEM_PROGRAM);
+        expect(value[2]?.lamports).toBe(890_880n);
+    });
+    it("minContextSlot past the view is refused", async () => {
+        chain.lagNode(5);
+        await expect(
+            chain.rpc
+                .getMultipleAccounts([address(a)], {
+                    encoding: "jsonParsed",
+                    minContextSlot: chain.slot(),
+                })
+                .send(),
+        ).rejects.toSatisfy(isMinSlot);
+        await expect(listing(a, { minContextSlot: chain.slot() })).rejects.toSatisfy(isMinSlot);
+        const { context } = await chain.rpc
+            .getMultipleAccounts([address(a)], { encoding: "jsonParsed" })
+            .send();
+        expect(context.slot).toBe(chain.slot() - 5n);
+    });
+    it("CreateIdempotent creates an empty account and repeats as a no-op", async () => {
+        const fresh = await testSigner(44);
+        const ata = await usdcAta(fresh.address);
+        expect(chain.accountExists(ata)).toBe(false);
+        const s1 = await chain.createAta({ owner: fresh.address, payer });
+        expect(chain.accountExists(ata)).toBe(true);
+        expect(chain.balance(ata)).toBe(0n);
+        const info = await chain.rpc
+            .getAccountInfo(address(ata), { encoding: "jsonParsed" })
+            .send();
+        expect(info.value?.owner).toBe(TOKEN_PROGRAM);
+        expect(parsedInfo(info.value).owner).toBe(fresh.address);
+        const s2 = await chain.createAta({ owner: fresh.address, payer });
+        expect(s2).not.toBe(s1);
+        expect(chain.submitted()).toEqual([
+            { signature: s1, slot: 1_000n, failed: false },
+            { signature: s2, slot: 1_000n, failed: false },
+        ]);
+        expect(chain.balance(ata)).toBe(0n);
+
+        const create = await getCreateAssociatedTokenInstructionAsync({
+            payer,
+            owner: fresh.address,
+            mint: USDC_MINT,
+        });
+        const s3 = await sendWire(await signedWire(payer, [create]));
+        expect(chain.submitted().find((t) => t.signature === s3)?.failed).toBe(true);
+        expect(chain.accountExists(ata)).toBe(true);
+    });
+    it("CreateIdempotent works over a prefunded address", async () => {
+        const fresh = await testSigner(44);
+        const ata = await usdcAta(fresh.address);
+        chain.fundLamports(ata, 890_880n);
+        expect(chain.accountExists(ata)).toBe(false);
+        await chain.createAta({ owner: fresh.address, payer });
+        expect(chain.accountExists(ata)).toBe(true);
+        expect(chain.lamports(ata)).toBe(2_039_280n);
+        const { value } = await chain.rpc
+            .getMultipleAccounts([address(ata)], { encoding: "jsonParsed" })
+            .send();
+        expect(value[0]?.owner).toBe(TOKEN_PROGRAM);
+        expect(parsedInfo(value[0]).owner).toBe(fresh.address);
+    });
+    it("the creating transaction has no pre balance for the new account", async () => {
+        const fresh = await testSigner(44);
+        const ata = await usdcAta(fresh.address);
+        const s = await chain.createAta({ owner: fresh.address, payer });
+        const raw = (await getTx(s))!;
+        const index = staticKeys(raw.transaction[0]).keys.indexOf(ata);
+        expect(index).toBeGreaterThan(0);
+        expect(balanceFor(raw.meta?.preTokenBalances, index)).toBeUndefined();
+        expect(balanceFor(raw.meta?.postTokenBalances, index)).toEqual(
+            expect.objectContaining({
+                owner: fresh.address,
+                programId: TOKEN_PROGRAM,
+                uiTokenAmount: expect.objectContaining({ amount: "0" }),
+            }),
+        );
+    });
+    it("CloseAccount with money fails and moves nothing", async () => {
+        const { account, close } = await closable(1n);
+        const before = chain.lamports(other.address);
+        const s = await sendWire(await signedWire(payer, [close]));
+        expect((await getTx(s))?.meta?.err).not.toBeNull();
+        expect(chain.accountExists(account)).toBe(true);
+        expect(chain.balance(account)).toBe(1n);
+        expect(chain.lamports(other.address)).toBe(before);
+    });
+    it("CloseAccount at zero removes the account and pays its rent", async () => {
+        const { account, close } = await closable(0n);
+        const before = chain.lamports(other.address);
+        const s = await sendWire(await signedWire(payer, [close]));
+        const raw = (await getTx(s))!;
+        expect(raw.meta?.err).toBeNull();
+        const index = staticKeys(raw.transaction[0]).keys.indexOf(account);
+        expect(balanceFor(raw.meta?.preTokenBalances, index)).toBeDefined();
+        expect(balanceFor(raw.meta?.postTokenBalances, index)).toBeUndefined();
+        expect(chain.accountExists(account)).toBe(false);
+        const info = await chain.rpc
+            .getAccountInfo(address(account), { encoding: "jsonParsed" })
+            .send();
+        expect(info.value).toBeNull();
+        const { value } = await chain.rpc
+            .getMultipleAccounts([address(account)], { encoding: "jsonParsed" })
+            .send();
+        expect(value[0]).toBeNull();
+        expect(chain.lamports(other.address) - before).toBe(2_039_280n);
+    });
+    it("preflight refuses a failing close without landing it", async () => {
+        const { account, close } = await closable(1n);
+        const wire = await signedWire(payer, [
+            getSetComputeUnitLimitInstruction({ units: 40_000 }),
+            getSetComputeUnitPriceInstruction({ microLamports: 10_000n }),
+            close,
+        ]);
+        chain.preflight(true);
+        let caught: unknown;
+        try {
+            await sendWire(wire, FRESH_SEND);
+        } catch (e) {
+            caught = e;
+        }
+        expect(
+            isSolanaError(
+                caught,
+                SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE,
+            ),
+        ).toBe(true);
+        const cause = (caught as { cause?: unknown }).cause;
+        expect(isSolanaError(cause, SOLANA_ERROR__INSTRUCTION_ERROR__CUSTOM)).toBe(true);
+        expect((cause as { context: { index: number } }).context.index).toBe(2);
+        expect(chain.submitted()).toEqual([]);
+
+        const s = await sendWire(wire, RESEND);
+        expect(chain.submitted()).toEqual([{ signature: s, slot: 1_000n, failed: true }]);
+        expect(chain.accountExists(account)).toBe(true);
+    });
+    it("transferMany credits two accounts in one signature", async () => {
+        const c = await usdcAta((await testSigner(41)).address);
+        chain.setTokenAccount({ address: c, owner: other.address, amount: 0n });
+        const s = await chain.transferMany({
+            from: owner,
+            to: [
+                { tokenAccount: b, micros: 30_000n },
+                { tokenAccount: c, micros: 20_000n },
+            ],
+        });
+        expect(chain.balance(b)).toBe(30_000n);
+        expect(chain.balance(c)).toBe(20_000n);
+        expect(chain.balance(a)).toBe(950_000n);
+        expect((await listing(b)).map((e) => e.signature)).toEqual([s]);
+        expect((await listing(c)).map((e) => e.signature)).toEqual([s]);
+        expect(staticKeys((await getTx(s))!.transaction[0]).signers).toEqual([owner.address]);
+    });
+    it("noOp names many accounts and moves nothing", async () => {
+        const c = await usdcAta((await testSigner(41)).address);
+        chain.setTokenAccount({ address: c, owner: other.address, amount: 5n });
+        const s = await chain.noOp({ touching: [a, b, c], signer: payer });
+        for (const account of [a, b, c]) {
+            const list = await listing(account);
+            expect(list.map((e) => [e.signature, e.err])).toEqual([[s, null]]);
+        }
+        expect([chain.balance(a), chain.balance(b), chain.balance(c)]).toEqual([
+            1_000_000n,
+            0n,
+            5n,
+        ]);
+        const failed = await chain.noOp({ touching: c, signer: payer, fail: true });
+        expect(failed).not.toBe(s);
+        expect((await listing(c))[0]?.err).not.toBeNull();
+        expect(chain.balance(c)).toBe(5n);
+    });
+    it("vaultTransfer debits an account whose owner did not sign", async () => {
+        const s = await chain.vaultTransfer({ vault: a, to: b, micros: 5_000n, signer: payer });
+        expect(chain.balance(a)).toBe(995_000n);
+        expect(chain.balance(b)).toBe(5_000n);
+        const raw = (await getTx(s))!;
+        expect(raw.meta?.err).toBeNull();
+        const { keys, signers } = staticKeys(raw.transaction[0]);
+        expect(signers).toEqual([payer.address]);
+        expect(signers).not.toContain(owner.address);
+        expect(balanceFor(raw.meta?.postTokenBalances, keys.indexOf(a))).toEqual(
+            expect.objectContaining({
+                owner: owner.address,
+                uiTokenAmount: expect.objectContaining({ amount: "995000" }),
+            }),
+        );
+    });
+    it("System Transfer and getBalance", async () => {
+        const sender = await testSigner(45);
+        const to = (await testSigner(46)).address;
+        chain.fundLamports(sender.address, 5_000_000n);
+        const transferSol = (amount: bigint) =>
+            getTransferSolInstruction({ source: sender, destination: to, amount });
+        const s = await sendWire(await signedWire(payer, [transferSol(1_000_000n)]));
+        expect((await getTx(s))?.meta?.err).toBeNull();
+        expect((await chain.rpc.getBalance(to).send()).value).toBe(1_000_000n);
+        expect(chain.lamports(sender.address)).toBe(4_000_000n);
+
+        const tooMuch = await sendWire(await signedWire(payer, [transferSol(10_000_000n)]));
+        expect((await getTx(tooMuch))?.meta?.err).not.toBeNull();
+        expect(chain.lamports(to)).toBe(1_000_000n);
+    });
+    it("setBlockTime and getBlockTime", async () => {
+        chain.setBlockTime(1_893_456_299);
+        const s = await send(10_000n);
+        const [row] = await listing(b);
+        expect(row?.blockTime).toBe(1_893_456_299n);
+        expect((await getTx(s))?.blockTime).toBe(1_893_456_299n);
+        const at = row!.slot;
+        expect(await chain.rpc.getBlockTime(at).send()).toBe(1_893_456_299n);
+
+        chain.setBlockTime(null);
+        chain.advance(1);
+        const s2 = await send(10_000n);
+        const [row2] = await listing(b);
+        expect(row2?.signature).toBe(s2);
+        expect(row2?.blockTime).toBeNull();
+        expect((await getTx(s2))?.blockTime).toBeNull();
+
+        chain.withholdBlockTime(at, 1);
+        await expect(chain.rpc.getBlockTime(at).send()).rejects.toSatisfy((e) =>
+            isSolanaError(e, SOLANA_ERROR__JSON_RPC__SERVER_ERROR_BLOCK_NOT_AVAILABLE),
+        );
+        expect(await chain.rpc.getBlockTime(at).send()).toBe(1_893_456_299n);
+
+        chain.withholdBlockTime(at, 1);
+        expect((await getTx(s))?.blockTime).toBeNull();
+        expect((await getTx(s))?.blockTime).toBe(1_893_456_299n);
+
+        chain.lagNode(5);
+        await expect(chain.rpc.getBlockTime(chain.slot()).send()).rejects.toSatisfy((e) =>
+            isSolanaError(e, SOLANA_ERROR__JSON_RPC__SERVER_ERROR_BLOCK_NOT_AVAILABLE),
+        );
+        chain.lagNode(0);
+
+        const res = await fetch(chain.url, {
+            method: "POST",
+            body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "getBlockTime",
+                params: [Number(at), { commitment: "confirmed" }],
+            }),
+        });
+        expect(((await res.json()) as { error?: { code: number } }).error?.code).toBe(-32602);
+    });
+    it("getLatestBlockhash honours minContextSlot", async () => {
+        chain.lagNode(5);
+        await expect(
+            chain.rpc.getLatestBlockhash({ minContextSlot: chain.slot() }).send(),
+        ).rejects.toSatisfy(isMinSlot);
+    });
+    it("a confirmed-pinned FRESH_SEND lands on a chain without autoFinalize", async () => {
+        const pinned = { ...FRESH_SEND, minContextSlot: chain.slot() };
+        const s = await sendWire(await signedWire(payer, [transferIx(10_000n)]), pinned);
+        expect(chain.submitted().map((t) => t.signature)).toEqual([s]);
+
+        chain.lagNode(5);
+        const lagging = await signedWire(payer, [transferIx(20_000n)]);
+        await expect(sendWire(lagging, pinned)).rejects.toSatisfy(isMinSlot);
+        chain.lagNode(0);
+
+        const resend = { ...RESEND, minContextSlot: chain.slot() };
+        const s2 = await sendWire(await signedWire(payer, [transferIx(30_000n)]), resend);
+        expect(chain.submitted().map((t) => t.signature)).toEqual([s, s2]);
+        expect(chain.balance(b)).toBe(40_000n);
+    });
+    it("pruneHistoryBefore hides older entries", async () => {
+        const sigs: string[] = [];
+        for (const micros of [1n, 2n, 3n]) {
+            chain.advance(10);
+            sigs.push(await send(micros));
+        }
+        expect((await listing(b)).map((e) => e.slot)).toEqual([1_030n, 1_020n, 1_010n]);
+        chain.pruneHistoryBefore(1_025n);
+        expect((await listing(b)).map((e) => e.signature)).toEqual([sigs[2]]);
+        expect(await listing(b, { before: signature(sigs[2]!), limit: 1 })).toEqual([]);
+        expect(await listing(b, { before: signature(sigs[1]!) })).toEqual([]);
+        chain.pruneHistoryBefore(null);
+        expect((await listing(b)).map((e) => e.signature)).toEqual([...sigs].reverse());
+    });
+    it("undecodable keeps the meta", async () => {
+        const s = await send(5_000n);
+        const keys = staticKeys((await getTx(s))!.transaction[0]).keys;
+        chain.undecodable(s);
+        const raw = (await getTx(s))!;
+        expect(() => staticKeys(raw.transaction[0])).toThrow();
+        expect(balanceFor(raw.meta?.postTokenBalances, keys.indexOf(b))).toEqual(
+            expect.objectContaining({ uiTokenAmount: expect.objectContaining({ amount: "5000" }) }),
+        );
+    });
+    it("badAnswer strips the meta for a number of answers", async () => {
+        const s = await send(5_000n);
+        chain.badAnswer(s, 1, { meta: "null" });
+        expect((await getTx(s))?.meta).toBeNull();
+        const whole = (await getTx(s))!;
+        expect(whole.meta?.postTokenBalances).toHaveLength(2);
+        const index = staticKeys(whole.transaction[0]).keys.indexOf(b);
+
+        chain.badAnswer(s, 1, { dropTokenEntryFor: b });
+        const dropped = (await getTx(s))!;
+        expect(balanceFor(dropped.meta?.preTokenBalances, index)).toBeUndefined();
+        expect(balanceFor(dropped.meta?.postTokenBalances, index)).toBeUndefined();
+        expect(dropped.meta?.postTokenBalances).toHaveLength(1);
+        expect((await getTx(s))?.meta?.postTokenBalances).toHaveLength(2);
+    });
+    it("transfer with createDestinationFor creates and credits", async () => {
+        const fresh = await testSigner(47);
+        const destination = await usdcAta(fresh.address);
+        const s = await send(6_000n, { destination, createDestinationFor: fresh.address });
+        expect(chain.accountExists(destination)).toBe(true);
+        expect(chain.balance(destination)).toBe(6_000n);
+        const raw = (await getTx(s))!;
+        expect(raw.meta?.err).toBeNull();
+        const index = staticKeys(raw.transaction[0]).keys.indexOf(destination);
+        expect(balanceFor(raw.meta?.preTokenBalances, index)).toBeUndefined();
+        expect(balanceFor(raw.meta?.postTokenBalances, index)).toEqual(
+            expect.objectContaining({
+                owner: fresh.address,
+                uiTokenAmount: expect.objectContaining({ amount: "6000" }),
+            }),
+        );
+    });
+    it("hideFromStatus answers null for a landed signature", async () => {
+        const s = await send(10_000n);
+        chain.hideFromStatus(s);
+        const { value } = await chain.rpc.getSignatureStatuses([signature(s)]).send();
+        expect(value[0]).toBeNull();
+        expect(await getTx(s)).not.toBeNull();
     });
 });
