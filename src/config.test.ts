@@ -288,6 +288,12 @@ describe("secret redaction list", () => {
         );
         expect(values).toEqual(["postgres://u:abc@h/db", "w1 w2 w3", "abc"]);
     });
+
+    it("redacts the whole RPC list and each URL in it", () => {
+        const list = "https://a.example/?k=1, https://b.example/k2,";
+        const values = secretValues({ BUGNET_SOLANA_RPC_URLS: list });
+        expect(values).toEqual([list, "https://a.example/?k=1", "https://b.example/k2"]);
+    });
 });
 
 const WALLET = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi";

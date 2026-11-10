@@ -734,6 +734,8 @@ describe("main", () => {
             BUGNET_ALLOWANCE_KEY: "allowance-key-main-test",
             BUGNET_X402_TLS_KEY: Buffer.from(PEM_MAIN_TEST).toString("base64"),
             BUGNET_TEST_PG_URL: "postgres://tester:pw-main-test@localhost:5432/postgres",
+            BUGNET_SOLANA_RPC_URLS:
+                "https://rpc-a.example/?key=main-test-a,https://rpc-b.example/b",
         });
         const values = SECRET_VARS.map((name) => env[name] ?? "");
         expect(values).not.toContain("");

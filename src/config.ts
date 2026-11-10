@@ -319,6 +319,7 @@ export const SECRET_VARS = [
     "BUGNET_ALLOWANCE_KEY",
     "BUGNET_X402_TLS_KEY",
     "BUGNET_SOLANA_RPC_URL",
+    "BUGNET_SOLANA_RPC_URLS",
     "BUGNET_TEST_PAYER_KEY",
     "BUGNET_TEST_PAYER_MNEMONIC",
     "BUGNET_RECIPIENT_KEY",
@@ -340,11 +341,13 @@ export function secretsEnv(s: Secrets): Partial<Record<(typeof SECRET_VARS)[numb
 }
 
 // What every log redacts, longest first so a secret inside another is never half scrubbed.
-// The TLS key is also redacted as the PEM text it decodes to.
+// The TLS key is also redacted as the PEM text it decodes to, and the RPC list URL by URL, since
+// an error names only the one URL it failed on.
 export function secretValues(...envs: NodeJS.ProcessEnv[]): string[] {
     const values = envs.flatMap((env) => [
         ...SECRET_VARS.map((name) => env[name] ?? ""),
         decodedPem(env.BUGNET_X402_TLS_KEY ?? ""),
+        ...(env.BUGNET_SOLANA_RPC_URLS ?? "").split(",").map((url) => url.trim()),
     ]);
     return [...new Set(values.filter((v) => v.trim() !== ""))].sort((a, b) => b.length - a.length);
 }
