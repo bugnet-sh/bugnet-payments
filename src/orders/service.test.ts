@@ -355,6 +355,67 @@ describe("redeem", () => {
         }
     });
 
+    describe("issued_at claim", () => {
+        async function redeem(on: boolean, order: Partial<OrderRow>) {
+            const flag = app.settings.router;
+            const was = flag.token_issued_at;
+            try {
+                flag.token_issued_at = on;
+                const seeded = await seedPaid(order);
+                const r = await post(app, "/v1/orders", {
+                    orderId: seeded.order.id,
+                    claim: seeded.claim,
+                });
+                expect(r.body.status).toBe("paid");
+                return tokenClaims(r.body.orderToken) as Record<string, unknown>;
+            } finally {
+                flag.token_issued_at = was;
+            }
+        }
+
+        it("is off by default, because the production router refuses unknown claims", async () => {
+            expect(app.settings.router.token_issued_at).toBe(false);
+            expect("issued_at" in (await redeem(false, {}))).toBe(false);
+        });
+
+        it("stamps a start token with the time it is signed", async () => {
+            const claims = await redeem(true, {});
+            expect(claims.issued_at).toBe(app.now.get().toISOString());
+        });
+
+        it("keeps the first redemption's time when the token is fetched again", async () => {
+            const flag = app.settings.router;
+            const was = flag.token_issued_at;
+            const start = app.now.get();
+            try {
+                flag.token_issued_at = true;
+                const seeded = await seedPaid({});
+                const body = { orderId: seeded.order.id, claim: seeded.claim };
+                const first = await post(app, "/v1/orders", body);
+                app.now.set(new Date(start.getTime() + 30_000));
+                const again = await post(app, "/v1/orders", body);
+                expect(again.body.status).toBe("paid");
+                const claims = tokenClaims(again.body.orderToken) as Record<string, unknown>;
+                expect(claims.issued_at).toBe(start.toISOString());
+                expect(claims.issued_at).toBe(
+                    (tokenClaims(first.body.orderToken) as Record<string, unknown>).issued_at,
+                );
+            } finally {
+                flag.token_issued_at = was;
+                app.now.set(start);
+            }
+        });
+
+        it("leaves an extend token without it", async () => {
+            const claims = await redeem(true, {
+                kind: "extend",
+                packageId: "ext-10m",
+                handleSha256: HANDLE,
+            });
+            expect("issued_at" in claims).toBe(false);
+        });
+    });
+
     describe("payer claims", () => {
         const b58 = (n: number, len: 32 | 64) => getBase58Decoder().decode(Buffer.alloc(len, n));
         const PAYER = b58(9, 32);

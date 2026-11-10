@@ -427,11 +427,11 @@ async function redeem(d: OrderServiceDeps, id: string, retryStale: boolean): Pro
                         tokenExpiresAt,
                     });
                     justRedeemed = true;
-                    return paid(d, c, o, tokenExpiresAt);
+                    return paid(d, c, o, tokenExpiresAt, now);
                 }
                 case "redeemed":
                     return o.tokenExpiresAt !== null && o.tokenExpiresAt.getTime() > now.getTime()
-                        ? paid(d, c, o, o.tokenExpiresAt)
+                        ? paid(d, c, o, o.tokenExpiresAt, o.redeemedAt)
                         : refused("token_expired", id);
                 default:
                     // Paid and redeemed orders only move on to refunding, refunded or manual
@@ -452,6 +452,8 @@ async function paid(
     db: Queryable,
     o: OrderRow,
     tokenExpiresAt: Date,
+    // Re-fetches of a redeemed order carry the first redemption's time, never the fetch time
+    redeemedAt: Date | null,
 ): Promise<Paid> {
     if (o.kind === "allowance") throw new Error("allowance orders carry no token");
     const payment = await findPaymentByOrder(db, o.id);
@@ -467,7 +469,13 @@ async function paid(
         orderId: o.id,
         orderToken: signOrderToken(
             d.orderKey,
-            claimsFor(o, tokenExpiresAt, d.settings.router.allowance_claim, proof),
+            claimsFor(
+                o,
+                tokenExpiresAt,
+                d.settings.router.allowance_claim,
+                proof,
+                d.settings.router.token_issued_at ? (redeemedAt ?? undefined) : undefined,
+            ),
         ),
         payer,
         kind: o.kind,

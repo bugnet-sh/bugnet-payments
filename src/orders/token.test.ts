@@ -102,6 +102,20 @@ describe("allowance_micros claim", () => {
         expect(() => claimsFor(allowance, at, true)).toThrow("allowance orders carry no token");
     });
 
+    it("adds issued_at last on a start token when given", () => {
+        const proof = { payer: PAYER, feePayer: FEE_PAYER, tx: TX };
+        const issued = new Date("2026-11-06T12:00:01.250Z");
+        const claims = claimsFor(start(), at, true, proof, issued);
+        expect(Object.keys(claims).at(-1)).toBe("issued_at");
+        expect(claims.issued_at).toBe("2026-11-06T12:00:01.250Z");
+        expect("issued_at" in claimsFor(start(), at, true, proof)).toBe(false);
+    });
+
+    it("never puts issued_at on an extend token", () => {
+        const extend = orderRow({ kind: "extend", packageId: "ext-10m", handleSha256: "ab" });
+        expect("issued_at" in claimsFor(extend, at, false, undefined, at)).toBe(false);
+    });
+
     it("puts allowance_micros last", () => {
         expect(Object.keys(claimsFor(start(), at, true))).toEqual([
             "order_id",
@@ -201,6 +215,14 @@ describe.skipIf(!existsSync(join(router, "internal/ordertoken")) || !goAvailable
             const extended = signOrderToken(key, claimsFor(extend, at, true, proof));
             expect(runGoVector(router, both, PUB, "ok", now)).toBe(0);
             expect(runGoVector(router, extended, PUB, "ok", now)).toBe(0);
+        });
+
+        it("accepts issued_at once the router has 95d7c49", () => {
+            const now = new Date("2026-11-06T12:00:00Z");
+            const proof = { payer: PAYER, feePayer: FEE_PAYER, tx: TX };
+            const claims = claimsFor(orderRow({}), at, false, proof, now);
+            const token = signOrderToken(orderKey(seed), claims);
+            expect(runGoVector(router, token, PUB, "ok", now)).toBe(0);
         });
     },
 );
