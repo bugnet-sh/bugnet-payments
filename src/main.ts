@@ -33,6 +33,7 @@ import {
 } from "./config.ts";
 import { migrate } from "./db/migrate.ts";
 import { createPool } from "./db/pool.ts";
+import { checkDepositKeys, depositKeysFrom } from "./deposits/keys.ts";
 import { createHttpApp, type HttpX402Parts } from "./http/app.ts";
 import { startServer } from "./http/server.ts";
 import { type AlarmSnapshot, checkAlarms } from "./jobs/alarms.ts";
@@ -167,6 +168,8 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             else reload();
         });
         if (s.x402.allowance_wallet === "") await refuseUnfinishedAllowanceOrders(pool);
+        const depositKeys = depositKeysFrom(secrets, s.deposits.seed_version);
+        await checkDepositKeys(pool, depositKeys);
 
         const feePayer = await loadKeypair(secrets.feePayerKey, "BUGNET_FEE_PAYER_KEY");
         const refundSigner = await loadKeypair(secrets.refundKey, "BUGNET_REFUND_KEY");

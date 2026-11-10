@@ -366,6 +366,24 @@ describe("startService", () => {
         await expect(fetch(`http://${failing.http.internal_listen}/healthz`)).rejects.toThrow();
     });
 
+    it("refuses to start while an open deposit's seed version is not loaded", async () => {
+        const { order } = await seedOrder(db.pool, { amountMicros: 50_000 });
+        await db.pool.query(
+            `insert into deposits (order_id, address, token_account, key_version, salt, created_at)
+             values ($1, 'deposit-address', 'deposit-token-account', 2, $2, now())`,
+            [order.id, Buffer.alloc(16, 1)],
+        );
+        const internal = await freePort();
+        const pub = await freePort();
+        const failing = testSettings({
+            http: { internal_listen: `127.0.0.1:${internal}`, public_listen: `127.0.0.1:${pub}` },
+        });
+        await expect(
+            startService({ settings: failing, secrets, rpc: okRpc(), log: silentLog }),
+        ).rejects.toThrow(/BUGNET_DEPOSIT_SEED for version 2 is missing while 1 deposits use it/);
+        await expect(fetch(`http://${failing.http.internal_listen}/healthz`)).rejects.toThrow();
+    });
+
     it("warns at boot when an order can be larger than the refund daily cap", async () => {
         const capWarnings = (log: ReturnType<typeof memoryLog>) =>
             log.lines.filter(
