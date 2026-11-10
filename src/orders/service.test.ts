@@ -383,6 +383,29 @@ describe("redeem", () => {
             expect(claims.issued_at).toBe(app.now.get().toISOString());
         });
 
+        it("keeps the first redemption's time when the token is fetched again", async () => {
+            const flag = app.settings.router;
+            const was = flag.token_issued_at;
+            const start = app.now.get();
+            try {
+                flag.token_issued_at = true;
+                const seeded = await seedPaid({});
+                const body = { orderId: seeded.order.id, claim: seeded.claim };
+                const first = await post(app, "/v1/orders", body);
+                app.now.set(new Date(start.getTime() + 30_000));
+                const again = await post(app, "/v1/orders", body);
+                expect(again.body.status).toBe("paid");
+                const claims = tokenClaims(again.body.orderToken) as Record<string, unknown>;
+                expect(claims.issued_at).toBe(start.toISOString());
+                expect(claims.issued_at).toBe(
+                    (tokenClaims(first.body.orderToken) as Record<string, unknown>).issued_at,
+                );
+            } finally {
+                flag.token_issued_at = was;
+                app.now.set(start);
+            }
+        });
+
         it("leaves an extend token without it", async () => {
             const claims = await redeem(true, {
                 kind: "extend",
