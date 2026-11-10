@@ -25,11 +25,11 @@ export interface RouterRequest {
 
 const COMMITMENTS: readonly string[] = ["processed", "confirmed", "finalized"];
 
-function isObject(value: unknown): value is Record<string, unknown> {
+export function isObject(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function bigintOf(value: unknown): bigint | null {
+export function bigintOf(value: unknown): bigint | null {
     if (typeof value === "bigint") return value;
     if (typeof value === "number" && Number.isSafeInteger(value)) return BigInt(value);
     return null;
