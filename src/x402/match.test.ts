@@ -5,6 +5,7 @@ import {
     compileTransaction,
     createTransactionMessage,
     getBase64EncodedWireTransaction,
+    type KeyPairSigner,
     pipe,
     setTransactionMessageFeePayer,
     setTransactionMessageLifetimeUsingBlockhash,
@@ -19,7 +20,7 @@ import { memoryLog } from "../log.ts";
 import { findPaymentByOrder } from "../orders/store.ts";
 import { findRefundById } from "../refunds/request.ts";
 import { usdcAta } from "../solana/accounts.ts";
-import { USDC_DECIMALS, USDC_MINT } from "../solana/constants.ts";
+import { TOKEN_PROGRAM, USDC_DECIMALS, USDC_MINT } from "../solana/constants.ts";
 import { startFakeChain, type FakeChain } from "../testing/fake-chain.ts";
 import { createFakeRpc } from "../testing/fake-rpc.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
@@ -43,6 +44,7 @@ import {
     parseChainTx,
     matchInTx,
     storeAndMatch,
+    usdcDeltaFor,
     type ChainTx,
     type MatchDeps,
 } from "./match.ts";
@@ -296,6 +298,156 @@ describe("parseChainTx", () => {
         expect(tx.tokenInstructions).toEqual([
             { name: "TransferChecked", writable: expect.arrayContaining([payToAta, hot]) },
         ]);
+    });
+});
+
+describe("parseChainTx: owners, signers and the fee payer", () => {
+    const DEPOSIT = "BGx7SpE3VBc356Bhn9Y2GUvkecpfPjSkSM9iRxJ63Ley";
+    const DEPOSIT_ATA = "D2mAKdUVEHvizHThmG57bTCiASiiYj5gQbMeMoyWtQo1";
+    const TOKEN_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+    const WRAPPED_SOL = "So11111111111111111111111111111111111111112";
+    let payer: KeyPairSigner;
+    let payerAta: string;
+
+    beforeEach(async () => {
+        payer = await testSigner(31);
+        payerAta = await usdcAta(payer.address);
+        chain.setTokenAccount({ address: payerAta, owner: payer.address, amount: 100_000n });
+    });
+
+    const send = (micros: bigint, o: { createDestinationFor?: string } = {}) =>
+        chain.transfer({
+            authority: payer,
+            feePayer,
+            source: payerAta,
+            destination: DEPOSIT_ATA,
+            micros,
+            ...o,
+        });
+    const rawTx = async (sig: string) =>
+        (await chain.rpc
+            .getTransaction(toSignature(sig), {
+                encoding: "base64",
+                commitment: "confirmed",
+                maxSupportedTransactionVersion: 0,
+            })
+            .send())!;
+    type Entry = { accountIndex: number; owner?: string; uiTokenAmount: { amount: string } };
+    type Edit = (list: readonly Entry[]) => unknown[];
+    const editBalances = (raw: unknown, pre: Edit, post: Edit) => {
+        const r = raw as { meta: { preTokenBalances: Entry[]; postTokenBalances: Entry[] } };
+        return {
+            ...r,
+            meta: {
+                ...r.meta,
+                preTokenBalances: pre(r.meta.preTokenBalances),
+                postTokenBalances: post(r.meta.postTokenBalances),
+            },
+        };
+    };
+    // The fee payer's index: a key with no USDC entry, so an added entry stands alone
+    const addedEntry = (o: { mint: string; programId: string; amount: string }) => ({
+        accountIndex: 0,
+        mint: o.mint,
+        owner: feePayer.address,
+        programId: o.programId,
+        uiTokenAmount: { amount: o.amount },
+    });
+
+    it("parseChainTx keeps owners, balances, signers and the fee payer", async () => {
+        chain.setTokenAccount({ address: DEPOSIT_ATA, owner: DEPOSIT, amount: 0n });
+        const tx = await readTx(await send(6_000n));
+        expect(tx.feePayer).toBe(feePayer.address);
+        expect(tx.signers[0]).toBe(feePayer.address);
+        expect(tx.signers).toHaveLength(2);
+        expect(tx.signers).toEqual(expect.arrayContaining([feePayer.address, payer.address]));
+        expect(tx.tokenAccounts.get(payerAta)).toEqual({
+            owner: payer.address,
+            pre: 100_000n,
+            post: 94_000n,
+        });
+        expect(tx.tokenAccounts.get(DEPOSIT_ATA)).toEqual({
+            owner: DEPOSIT,
+            pre: 0n,
+            post: 6_000n,
+        });
+        expect(tx.tokenAccounts.size).toBe(2);
+    });
+
+    it("an account created in the transaction has pre null", async () => {
+        const tx = await readTx(await send(6_000n, { createDestinationFor: DEPOSIT }));
+        expect(tx.tokenAccounts.get(DEPOSIT_ATA)!.pre).toBeNull();
+        expect(tx.tokenAccounts.get(DEPOSIT_ATA)).toEqual({
+            owner: DEPOSIT,
+            pre: null,
+            post: 6_000n,
+        });
+    });
+
+    it("entries of other mints are left out", async () => {
+        chain.setTokenAccount({ address: DEPOSIT_ATA, owner: DEPOSIT, amount: 0n });
+        const sig = await send(6_000n);
+        const raw = await rawTx(sig);
+        const edited = editBalances(
+            raw,
+            (l) => [...l, addedEntry({ mint: WRAPPED_SOL, programId: TOKEN_PROGRAM, amount: "0" })],
+            (l) => [...l, addedEntry({ mint: WRAPPED_SOL, programId: TOKEN_PROGRAM, amount: "5" })],
+        );
+        const tx = parseChainTx(sig, raw.slot, edited, hot);
+        expect(tx.tokenAccounts.has(feePayer.address)).toBe(false);
+        expect([...tx.tokenAccounts.keys()].sort()).toEqual([payerAta, DEPOSIT_ATA].sort());
+        expect(usdcDeltaFor(edited, feePayer.address)).toBe(0n);
+    });
+
+    it("entries under another token program are left out", async () => {
+        chain.setTokenAccount({ address: DEPOSIT_ATA, owner: DEPOSIT, amount: 0n });
+        const sig = await send(6_000n);
+        const raw = await rawTx(sig);
+        const edited = editBalances(
+            raw,
+            (l) => [...l, addedEntry({ mint: USDC_MINT, programId: TOKEN_2022, amount: "0" })],
+            (l) => [...l, addedEntry({ mint: USDC_MINT, programId: TOKEN_2022, amount: "5" })],
+        );
+        const tx = parseChainTx(sig, raw.slot, edited, hot);
+        expect(tx.tokenAccounts.has(feePayer.address)).toBe(false);
+        expect(tx.tokenAccounts.size).toBe(2);
+        expect(usdcDeltaFor(edited, feePayer.address)).toBe(0n);
+    });
+
+    it("an owner that changes inside the transaction is null", async () => {
+        chain.setTokenAccount({ address: DEPOSIT_ATA, owner: DEPOSIT, amount: 0n });
+        const sig = await send(6_000n);
+        const raw = await rawTx(sig);
+        const edited = editBalances(
+            raw,
+            (l) => [...l],
+            (l) => l.map((e) => (e.owner === payer.address ? { ...e, owner: seller.address } : e)),
+        );
+        const tx = parseChainTx(sig, raw.slot, edited, hot);
+        expect(tx.tokenAccounts.get(payerAta)).toEqual({
+            owner: null,
+            pre: 100_000n,
+            post: 94_000n,
+        });
+        expect(usdcDeltaFor(edited, payer.address)).toBe(-100_000n);
+        expect(usdcDeltaFor(edited, seller.address)).toBe(94_000n);
+    });
+
+    it("usdcDeltaFor reads an undecodable transaction", async () => {
+        chain.setTokenAccount({ address: DEPOSIT_ATA, owner: DEPOSIT, amount: 0n });
+        const sig = await send(5_000n);
+        chain.undecodable(sig);
+        const raw = await rawTx(sig);
+        expect(() => parseChainTx(sig, raw.slot, raw, hot)).toThrow();
+        expect(usdcDeltaFor(raw, DEPOSIT)).toBe(5_000n);
+        expect(usdcDeltaFor(raw, payer.address)).toBe(-5_000n);
+        expect(usdcDeltaFor(raw, seller.address)).toBe(0n);
+
+        chain.badAnswer(sig, 1, { meta: "null" });
+        expect(usdcDeltaFor(await rawTx(sig), DEPOSIT)).toBeNull();
+        const noArrays = { ...raw, meta: { ...raw.meta, preTokenBalances: undefined } };
+        expect(usdcDeltaFor(noArrays, DEPOSIT)).toBeNull();
+        expect(usdcDeltaFor(null, DEPOSIT)).toBeNull();
     });
 });
 

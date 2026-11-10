@@ -34,6 +34,13 @@ type TokenInstructionName =
     | "FreezeAccount"
     | "other";
 
+// pre is null for an account created in the transaction, post for one closed in it
+export interface TokenAccountChange {
+    owner: string | null;
+    pre: bigint | null;
+    post: bigint | null;
+}
+
 export interface ChainTx {
     signature: string;
     slot: bigint;
@@ -43,6 +50,9 @@ export interface ChainTx {
     messageHash: string;
     tokenDeltas: ReadonlyMap<string, bigint>;
     tokenInstructions: readonly { name: TokenInstructionName; writable: readonly string[] }[];
+    feePayer: string;
+    signers: readonly string[];
+    tokenAccounts: ReadonlyMap<string, TokenAccountChange>;
 }
 
 const TOKEN_INSTRUCTION_NAMES: Readonly<Record<number, TokenInstructionName>> = {
@@ -57,6 +67,8 @@ const TOKEN_INSTRUCTION_NAMES: Readonly<Record<number, TokenInstructionName>> = 
 interface RawBalance {
     accountIndex: number;
     mint: string;
+    owner?: string;
+    programId?: string;
     uiTokenAmount: { amount: string };
 }
 
@@ -73,6 +85,42 @@ function usdcBalances(list: unknown): Map<number, bigint> {
         if (b.mint === USDC_MINT) out.set(Number(b.accountIndex), BigInt(b.uiTokenAmount.amount));
     }
     return out;
+}
+
+// USDC under the Token program only. An entry without programId comes from a node that predates
+// the field, and the USDC mint is a Token program mint.
+function usdcEntries(list: unknown): Map<number, { owner: string | null; micros: bigint }> {
+    const out = new Map<number, { owner: string | null; micros: bigint }>();
+    if (!Array.isArray(list)) return out;
+    for (const b of list as RawBalance[]) {
+        if (b.mint !== USDC_MINT) continue;
+        if (b.programId !== undefined && b.programId !== TOKEN_PROGRAM) continue;
+        out.set(Number(b.accountIndex), {
+            owner: b.owner ?? null,
+            micros: BigInt(b.uiTokenAmount.amount),
+        });
+    }
+    return out;
+}
+
+// An owner changed inside the transaction names nobody, so its money is attributed to neither
+function ownerOf(pre: string | null = null, post: string | null = null): string | null {
+    if (pre !== null && post !== null && pre !== post) return null;
+    return post ?? pre;
+}
+
+// For an answer whose message cannot be decoded: the meta's token balances alone. Null when the
+// answer has no meta or no token balance lists.
+export function usdcDeltaFor(raw: unknown, owner: string): bigint | null {
+    if (!isRecord(raw) || !isRecord(raw.meta)) return null;
+    const { preTokenBalances, postTokenBalances } = raw.meta;
+    if (!Array.isArray(preTokenBalances) || !Array.isArray(postTokenBalances)) return null;
+    const held = (list: unknown[]): bigint => {
+        let sum = 0n;
+        for (const e of usdcEntries(list).values()) if (e.owner === owner) sum += e.micros;
+        return sum;
+    };
+    return held(postTokenBalances) - held(preTokenBalances);
 }
 
 // getTransaction with encoding base64, so meta carries the token balances and inner instructions
@@ -130,6 +178,21 @@ export function parseChainTx(
         tokenDeltas.set(account, (post.get(index) ?? 0n) - (pre.get(index) ?? 0n));
     }
 
+    const preEntries = usdcEntries(meta.preTokenBalances);
+    const postEntries = usdcEntries(meta.postTokenBalances);
+    const tokenAccounts = new Map<string, TokenAccountChange>();
+    for (const index of new Set([...preEntries.keys(), ...postEntries.keys()])) {
+        const account = accounts[index];
+        if (account === undefined) continue;
+        const before = preEntries.get(index);
+        const after = postEntries.get(index);
+        tokenAccounts.set(account, {
+            owner: ownerOf(before?.owner, after?.owner),
+            pre: before?.micros ?? null,
+            post: after?.micros ?? null,
+        });
+    }
+
     const tokenInstructions: { name: TokenInstructionName; writable: string[] }[] = [];
     const add = (programIndex: number, indices: readonly number[], data: Uint8Array) => {
         if (accounts[programIndex] !== TOKEN_PROGRAM) return;
@@ -162,6 +225,9 @@ export function parseChainTx(
         messageHash: transactionMessageHash(tx),
         tokenDeltas,
         tokenInstructions,
+        feePayer: statics[0]!,
+        signers: statics.slice(0, header.numSignerAccounts),
+        tokenAccounts,
     };
 }
 
