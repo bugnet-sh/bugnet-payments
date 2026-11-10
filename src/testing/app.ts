@@ -124,6 +124,8 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
         rpcUrl: "",
         allowanceKey: keypairSecret(ALLOWANCE_SEED, allowance),
         x402TlsKey: "",
+        depositSeed: null,
+        depositSeedPrevious: null,
     };
     const rpc = createFakeRpc({
         getAccountInfo: () => usdcAccountAnswer(TEST_PAYTO),

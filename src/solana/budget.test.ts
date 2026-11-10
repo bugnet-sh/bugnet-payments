@@ -39,6 +39,21 @@ describe("countingRpc", () => {
         expect(line).toMatchObject({ calls: 2, limitPerHour: 1 });
     });
 
+    it("countingRpc names its alarm", async () => {
+        const log = memoryLog();
+        const rpc = countingRpc(createFakeRpc(), {
+            limitPerHour: 1,
+            log,
+            now: () => 0,
+            alarm: "deposit_rpc_budget",
+        });
+        await rpc.getBlockHeight().send();
+        await rpc.getBlockHeight().send();
+        const alarms = log.lines.filter((l) => l.level === "alarm");
+        expect(alarms).toHaveLength(1);
+        expect(alarms[0]).toMatchObject({ alarm: "deposit_rpc_budget", calls: 2, limitPerHour: 1 });
+    });
+
     it("keeps a send at exactly one hour in the window and drops it after", async () => {
         let t = 0;
         const log = memoryLog();

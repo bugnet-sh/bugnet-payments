@@ -30,7 +30,14 @@ export type AlarmName =
     | "x402_close_slow"
     | "x402_close_unverifiable"
     | "x402_resign_waiting"
-    | "x402_cold_transfer_failed";
+    | "x402_cold_transfer_failed"
+    | "deposit_review"
+    | "deposit_unknown_debit"
+    | "deposit_index_lag"
+    | "deposit_capacity"
+    | "deposit_create_churn"
+    | "deposit_fee_budget"
+    | "deposit_rpc_budget";
 
 type Fields = Record<string, unknown>;
 

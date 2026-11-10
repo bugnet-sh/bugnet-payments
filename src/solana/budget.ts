@@ -5,8 +5,14 @@ const HOUR_MS = 3_600_000;
 
 export function countingRpc(
     rpc: SolanaRpc,
-    o: { limitPerHour: number; log: Log; now: () => number },
+    o: {
+        limitPerHour: number;
+        log: Log;
+        now: () => number;
+        alarm?: "x402_rpc_budget" | "deposit_rpc_budget";
+    },
 ): SolanaRpc {
+    const alarm = o.alarm ?? "x402_rpc_budget";
     const sends: number[] = [];
     let head = 0;
     let alarmed = false;
@@ -23,7 +29,7 @@ export function countingRpc(
             alarmed = false;
         } else if (!alarmed) {
             alarmed = true;
-            o.log.alarm("x402_rpc_budget", { calls, limitPerHour: o.limitPerHour });
+            o.log.alarm(alarm, { calls, limitPerHour: o.limitPerHour });
         }
     };
     const counted = (fn: unknown, self: unknown) => {

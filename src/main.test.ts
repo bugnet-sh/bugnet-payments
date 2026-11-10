@@ -221,6 +221,7 @@ function envFor(rpcUrl: string, over: Record<string, string | undefined> = {}): 
         BUGNET_PAYMENTS_TOKEN: secrets.paymentsToken,
         BUGNET_ORDER_PRIVATE_KEY: secrets.orderSeed.toString("base64"),
         BUGNET_CLAIM_KEY: secrets.claimKey.toString("base64"),
+        BUGNET_DEPOSIT_SEED: Buffer.alloc(32, 9).toString("base64"),
         BUGNET_FEE_PAYER_KEY: secrets.feePayerKey,
         BUGNET_REFUND_KEY: secrets.refundKey,
         BUGNET_SOLANA_RPC_URL: rpcUrl,
@@ -291,6 +292,8 @@ beforeAll(async () => {
         rpcUrl: "",
         allowanceKey: "",
         x402TlsKey: "",
+        depositSeed: Buffer.alloc(32, 9),
+        depositSeedPrevious: null,
     };
 });
 afterAll(async () => {
@@ -591,6 +594,7 @@ describe("startService", () => {
             rpcUrl: "https://rpc.example/?api-key=start-test",
             allowanceKey: "allowance-key-start-test",
             x402TlsKey: PEM_MAIN_TEST,
+            depositSeedPrevious: Buffer.alloc(32, 14),
         };
         vi.stubEnv("BUGNET_TEST_PAYER_MNEMONIC", "abandon ability able, about above absent");
         const values = [
@@ -736,6 +740,8 @@ describe("main", () => {
             BUGNET_TEST_PG_URL: "postgres://tester:pw-main-test@localhost:5432/postgres",
             BUGNET_SOLANA_RPC_URLS:
                 "https://rpc-a.example/?key=main-test-a,https://rpc-b.example/b",
+            BUGNET_DEPOSIT_SEED: Buffer.alloc(32, 12).toString("base64"),
+            BUGNET_DEPOSIT_SEED_PREVIOUS: Buffer.alloc(32, 13).toString("base64"),
         });
         const values = SECRET_VARS.map((name) => env[name] ?? "");
         expect(values).not.toContain("");

@@ -25,6 +25,8 @@ import {
     generateSecrets,
     type PlannedTx,
     parseEnvText,
+    retireDepositSeed,
+    rotateDepositSeed,
     testSellerDrainPlan,
     testSellerPlan,
     writeTestSellerEnv,
@@ -167,7 +169,7 @@ describe("keys generate", () => {
         expect(io.outText()).toContain("added=none");
     });
 
-    it("adds only the three service secrets to a .env shaped like the founder's", async () => {
+    it("adds only the service secrets to a .env shaped like the founder's", async () => {
         const fee = await generateExportableKeypair();
         const refund = await generateExportableKeypair();
         const cold = await generateExportableKeypair();
@@ -185,7 +187,7 @@ describe("keys generate", () => {
         const io = captureIo();
         expect(await cliMain(["keys", "generate", "--env", p], {}, io)).toBe(0);
         expect(io.outText()).toContain(
-            "added=BUGNET_ORDER_PRIVATE_KEY,BUGNET_CLAIM_KEY,BUGNET_PAYMENTS_TOKEN",
+            "added=BUGNET_ORDER_PRIVATE_KEY,BUGNET_CLAIM_KEY,BUGNET_PAYMENTS_TOKEN,BUGNET_DEPOSIT_SEED",
         );
         expect(io.outText()).toContain("test_payer=Hh8QwFUA6MtVu1qAoq12ucvFHNwCcVTV7hpWjeY1Hztb");
         expect(io.outText()).toContain(`fee_payer=${fee.signer.address}`);
@@ -209,6 +211,7 @@ describe("keys generate", () => {
             BUGNET_ORDER_PRIVATE_KEY: Buffer.alloc(32, 1).toString("base64"),
             BUGNET_CLAIM_KEY: Buffer.alloc(32, 2).toString("base64"),
             BUGNET_PAYMENTS_TOKEN: "token",
+            BUGNET_DEPOSIT_SEED: Buffer.alloc(32, 3).toString("base64"),
             BUGNET_ALLOWANCE_KEY: await k(),
             ...over,
         };
@@ -236,6 +239,160 @@ describe("keys generate", () => {
 
     it("first generate on a fresh file adds BUGNET_ALLOWANCE_KEY too", async () => {
         expect((await generateSecrets(tmpEnv("", 0o600))).added).toContain("BUGNET_ALLOWANCE_KEY");
+    });
+});
+
+describe("deposit seed commands", () => {
+    const A = Buffer.alloc(32, 7).toString("base64");
+    const CURRENT = Buffer.alloc(32, 8).toString("base64");
+    const THIRD = Buffer.alloc(32, 9).toString("base64");
+    const DRAINING = "BUGNET_DEPOSIT_SEED_PREVIOUS is set: a rotation is still draining";
+    const printed = (...ios: ReturnType<typeof captureIo>[]) =>
+        ios.map((io) => io.outText() + io.errText()).join("\n");
+
+    it("generate writes BUGNET_DEPOSIT_SEED", async () => {
+        const p = tmpEnv("", 0o600);
+        const io = captureIo();
+        expect(await cliMain(["keys", "generate", "--env", p], {}, io)).toBe(0);
+        const seed = parseEnv(readFileSync(p, "utf8")).BUGNET_DEPOSIT_SEED!;
+        expect(seed).toHaveLength(44);
+        expect(Buffer.from(seed, "base64")).toHaveLength(32);
+        expect(Buffer.from(seed, "base64").toString("base64")).toBe(seed);
+        expect(printed(io)).not.toContain(seed);
+        expect(await cliMain(["keys", "generate", "--env", p], {}, captureIo())).toBe(0);
+        expect(parseEnv(readFileSync(p, "utf8")).BUGNET_DEPOSIT_SEED).toBe(seed);
+    });
+
+    it("rotate-deposit-seed moves the seed and makes a new one", async () => {
+        const text = [
+            "# keep this comment",
+            "BUGNET_CLAIM_KEY=claim",
+            `BUGNET_DEPOSIT_SEED=${A}`,
+            "BUGNET_FEE_PAYER_KEY=fee",
+            "",
+        ].join("\n");
+        const p = tmpEnv(text, 0o644);
+        const io = captureIo();
+        expect(await cliMain(["keys", "rotate-deposit-seed", "--env", p], {}, io)).toBe(0);
+        const after = readFileSync(p, "utf8");
+        const env = parseEnv(after);
+        expect(env.BUGNET_DEPOSIT_SEED_PREVIOUS).toBe(A);
+        const fresh = env.BUGNET_DEPOSIT_SEED!;
+        expect(fresh).not.toBe(A);
+        expect(Buffer.from(fresh, "base64")).toHaveLength(32);
+        expect(Buffer.from(fresh, "base64").toString("base64")).toBe(fresh);
+        expect(statSync(p).mode & 0o777).toBe(0o600);
+        const others = (t: string) => t.split("\n").filter((l) => !l.startsWith("BUGNET_DEPOSIT"));
+        expect(others(after)).toEqual(others(text));
+
+        const again = captureIo();
+        expect(await cliMain(["keys", "rotate-deposit-seed", "--env", p], {}, again)).toBe(1);
+        expect(again.errText()).toContain(DRAINING);
+        expect(() => rotateDepositSeed(p)).toThrow(DRAINING);
+        expect(readFileSync(p, "utf8")).toBe(after);
+        for (const value of [A, fresh]) expect(printed(io, again)).not.toContain(value);
+    });
+
+    it("rotate-deposit-seed fills an empty previous line in place", () => {
+        const text = `BUGNET_DEPOSIT_SEED=${A}\nBUGNET_DEPOSIT_SEED_PREVIOUS=\nBUGNET_CLAIM_KEY=c\n`;
+        const p = tmpEnv(text, 0o600);
+        rotateDepositSeed(p);
+        const lines = readFileSync(p, "utf8").split("\n");
+        expect(lines[1]).toBe(`BUGNET_DEPOSIT_SEED_PREVIOUS=${A}`);
+        expect(lines.slice(2)).toEqual(["BUGNET_CLAIM_KEY=c", ""]);
+    });
+
+    it("rotate-deposit-seed refuses an empty seed and needs --env", async () => {
+        const text = "BUGNET_DEPOSIT_SEED=\n";
+        const p = tmpEnv(text, 0o600);
+        const io = captureIo();
+        expect(await cliMain(["keys", "rotate-deposit-seed", "--env", p], {}, io)).toBe(1);
+        expect(io.errText()).toContain("BUGNET_DEPOSIT_SEED is empty");
+        expect(readFileSync(p, "utf8")).toBe(text);
+        const usage = captureIo();
+        expect(await cliMain(["keys", "rotate-deposit-seed"], {}, usage)).toBe(2);
+        expect(usage.errText()).toContain("keys rotate-deposit-seed needs --env FILE");
+    });
+
+    it("retire-deposit-seed archives, then removes the previous seed", async () => {
+        const text = [
+            "# keep this comment",
+            `BUGNET_DEPOSIT_SEED=${CURRENT}`,
+            `BUGNET_DEPOSIT_SEED_PREVIOUS=${A}`,
+            "BUGNET_CLAIM_KEY=claim",
+            "",
+        ].join("\n");
+        const removed = text.replace(`BUGNET_DEPOSIT_SEED_PREVIOUS=${A}\n`, "");
+        const p = tmpEnv(text, 0o600);
+        const archive = join(dir, `archive-${counter++}`);
+        const args = (version = "1") => [
+            "keys",
+            "retire-deposit-seed",
+            "--env",
+            p,
+            "--archive",
+            archive,
+            "--version",
+            version,
+        ];
+        const io = captureIo();
+        expect(await cliMain(args(), {}, io)).toBe(0);
+        expect(readFileSync(archive, "utf8")).toBe(`BUGNET_DEPOSIT_SEED_V1=${A}\n`);
+        expect(statSync(archive).mode & 0o777).toBe(0o600);
+        expect(readFileSync(p, "utf8")).toBe(removed);
+        expect(statSync(p).mode & 0o777).toBe(0o600);
+
+        // A run that stopped between the two writes
+        writeFileSync(p, text);
+        const resumed = captureIo();
+        expect(await cliMain(args(), {}, resumed)).toBe(0);
+        expect(readFileSync(archive, "utf8")).toBe(`BUGNET_DEPOSIT_SEED_V1=${A}\n`);
+        expect(readFileSync(p, "utf8")).toBe(removed);
+
+        const nothing = captureIo();
+        expect(await cliMain(args(), {}, nothing)).toBe(0);
+        expect(nothing.outText()).toBe("nothing to retire");
+        expect(readFileSync(archive, "utf8")).toBe(`BUGNET_DEPOSIT_SEED_V1=${A}\n`);
+        expect(readFileSync(p, "utf8")).toBe(removed);
+
+        const bad = captureIo();
+        expect(await cliMain(args("0"), {}, bad)).toBe(2);
+        expect(bad.errText()).toContain("--version needs a whole number of at least 1");
+        for (const value of [A, CURRENT]) {
+            expect(printed(io, resumed, nothing, bad)).not.toContain(value);
+        }
+    });
+
+    it("retire-deposit-seed appends to an archive of earlier versions", () => {
+        const p = tmpEnv(
+            `BUGNET_DEPOSIT_SEED=${CURRENT}\nBUGNET_DEPOSIT_SEED_PREVIOUS=${A}\n`,
+            0o600,
+        );
+        const archive = tmpEnv(`BUGNET_DEPOSIT_SEED_V1=${THIRD}`, 0o644);
+        retireDepositSeed({ envPath: p, archivePath: archive, version: 2 });
+        expect(readFileSync(archive, "utf8")).toBe(
+            `BUGNET_DEPOSIT_SEED_V1=${THIRD}\nBUGNET_DEPOSIT_SEED_V2=${A}\n`,
+        );
+        expect(statSync(archive).mode & 0o777).toBe(0o600);
+        expect(readFileSync(p, "utf8")).toBe(`BUGNET_DEPOSIT_SEED=${CURRENT}\n`);
+    });
+
+    it("retire-deposit-seed refuses a version archived with another value", async () => {
+        const text = `BUGNET_DEPOSIT_SEED=${CURRENT}\nBUGNET_DEPOSIT_SEED_PREVIOUS=${A}\n`;
+        const p = tmpEnv(text, 0o600);
+        const kept = `BUGNET_DEPOSIT_SEED_V1=${THIRD}\n`;
+        const archive = tmpEnv(kept, 0o600);
+        const message = "BUGNET_DEPOSIT_SEED_V1 is already archived with another value";
+        expect(() => retireDepositSeed({ envPath: p, archivePath: archive, version: 1 })).toThrow(
+            message,
+        );
+        const io = captureIo();
+        const args = ["--env", p, "--archive", archive, "--version", "1"];
+        expect(await cliMain(["keys", "retire-deposit-seed", ...args], {}, io)).toBe(1);
+        expect(io.errText()).toContain(message);
+        expect(readFileSync(p, "utf8")).toBe(text);
+        expect(readFileSync(archive, "utf8")).toBe(kept);
+        for (const value of [A, CURRENT, THIRD]) expect(printed(io)).not.toContain(value);
     });
 });
 

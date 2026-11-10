@@ -73,6 +73,8 @@ async function liveTables(dbUrl: string, eventSeed: Buffer): Promise<Tables> {
         },
         database: { ...dev.database, url: dbUrl },
         router: { ...dev.router, event_public_key: orderPublicKeyBase64(eventSeed) },
+        // These runs pay by wallet and x402, so they need no BUGNET_DEPOSIT_SEED
+        deposits: { ...dev.deposits, enabled: false },
     };
 }
 
