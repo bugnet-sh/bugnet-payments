@@ -10,7 +10,10 @@ import {
     STATE_LABELS,
     type StatusDeps,
     stateStep,
+    WalletError,
     type WalletPort,
+    walletError,
+    walletErrorStep,
     watchOrder,
 } from "./flow.ts";
 
@@ -45,7 +48,9 @@ function portFor(w: Wallet): WalletPort {
     let account: WalletAccount | undefined;
     return {
         async connect() {
-            const { accounts } = await connector.connect();
+            const { accounts } = await connector.connect().catch((e: unknown) => {
+                throw walletError(w.name, e);
+            });
             account = accounts.find((a) => a.chains.includes(MAINNET)) ?? accounts[0];
             if (account === undefined) throw new Error("the wallet shared no account");
             return account;
@@ -53,7 +58,10 @@ function portFor(w: Wallet): WalletPort {
         async signTransaction(i) {
             if (account === undefined) throw new Error("the wallet is not connected");
             // The wallet expects its own account object back, not the plain address
-            return [...(await signer.signTransaction({ ...i, account }))];
+            const signed = await signer.signTransaction({ ...i, account }).catch((e: unknown) => {
+                throw walletError(w.name, e);
+            });
+            return [...signed];
         },
     };
 }
@@ -138,8 +146,17 @@ function startPayment(root: HTMLElement, v: View): void {
         try {
             step = pageStep(await payWithWallet({ ...v.status, wallet: portFor(wallet) }));
         } catch (err) {
-            const reason = err instanceof Error ? err.message : String(err);
-            step = { message: `the payment did not go through: ${reason}`, payAfterMs: 0 };
+            if (err instanceof WalletError) {
+                step = walletErrorStep(err, root.dataset.amount ?? "the order amount");
+            } else if (err instanceof TypeError) {
+                step = {
+                    message: "could not reach Bugnet. Check your connection, then press Pay again",
+                    payAfterMs: 0,
+                };
+            } else {
+                const reason = err instanceof Error ? err.message : String(err);
+                step = { message: `the payment did not go through: ${reason}`, payAfterMs: 0 };
+            }
         }
         offerPayAfter(await show(v, step));
         busy = false;
