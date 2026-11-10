@@ -18,7 +18,15 @@ import { TEST_BLOCKHASH, TEST_LVBH } from "../testing/fake-rpc.ts";
 import { testSigner } from "../testing/keys.ts";
 import { buildPaymentTransaction } from "../x402/build.ts";
 import { requirementsFor } from "../x402/challenge.ts";
-import { pageStep, payWithWallet, stateStep, type WalletPort, watchOrder } from "./flow.ts";
+import {
+    pageStep,
+    payWithWallet,
+    stateStep,
+    walletError,
+    walletErrorStep,
+    type WalletPort,
+    watchOrder,
+} from "./flow.ts";
 
 const id = "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa";
 const orderUrl = `https://pay.bugnet.sh/o/${id}`;
@@ -681,5 +689,37 @@ describe("stateStep", () => {
         expect(stateStep(undefined)).toEqual({
             message: "could not confirm the payment, refresh this page in a minute",
         });
+    });
+});
+
+describe("walletErrorStep", () => {
+    it("names the wallet and the likely cause for Phantom's bare Unexpected error", () => {
+        const e = walletError("Phantom", { code: -32603, message: "Unexpected error" });
+        expect(e.code).toBe(-32603);
+        const step = walletErrorStep(e, "$0.05");
+        expect(step.message).toBe(
+            'Phantom stopped the payment ("Unexpected error"). This usually means the account ' +
+                "holds less than $0.05 USDC on Solana. Add USDC or pick another account, then press Pay again",
+        );
+        expect(step.payAfterMs).toBe(0);
+    });
+    it("reads an Error without a code the same way", () => {
+        const step = walletErrorStep(walletError("Solflare", new Error("boom")), "$1.00");
+        expect(step.message).toContain('Solflare stopped the payment ("boom")');
+        expect(step.message).toContain("less than $1.00 USDC on Solana");
+    });
+    it("says the user declined for 4001", () => {
+        const e = Object.assign(new Error("User rejected the request."), { code: 4001 });
+        expect(walletErrorStep(walletError("Phantom", e), "$0.05").message).toBe(
+            "you declined the payment in Phantom. Press Pay to try again",
+        );
+    });
+    it("asks to unlock for 4100 and to close the open request for -32002", () => {
+        expect(walletErrorStep(walletError("Phantom", { code: 4100 }), "$0.05").message).toBe(
+            "Phantom did not share an account. Unlock Phantom, allow this page, then press Pay again",
+        );
+        expect(walletErrorStep(walletError("Phantom", { code: -32002 }), "$0.05").message).toBe(
+            "Phantom already has a request open. Close it in Phantom, then press Pay again",
+        );
     });
 });

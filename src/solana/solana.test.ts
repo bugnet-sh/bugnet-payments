@@ -9,6 +9,9 @@ import {
     pipe,
     setTransactionMessageFeePayerSigner,
     setTransactionMessageLifetimeUsingBlockhash,
+    SOLANA_ERROR__JSON_RPC__SERVER_ERROR_NODE_UNHEALTHY,
+    SOLANA_ERROR__RPC__TRANSPORT_HTTP_ERROR,
+    SolanaError,
     signTransactionMessageWithSigners,
 } from "@solana/kit";
 import { getTransferSolInstruction } from "@solana-program/system";
@@ -26,7 +29,7 @@ import { inspectTokenAccount } from "./accounts.ts";
 import { MEMO_PROGRAM, TOKEN_PROGRAM, USDC_MINT } from "./constants.ts";
 import { generateExportableKeypair, loadKeypair } from "./keys.ts";
 import { readLanding } from "./landing.ts";
-import { createRpc } from "./rpc.ts";
+import { createRpc, rpcErrorFields } from "./rpc.ts";
 
 describe("constants", () => {
     it("pins the program addresses", () => {
@@ -36,6 +39,34 @@ describe("constants", () => {
     });
     it("builds an rpc without connecting", () => {
         expect(createRpc("https://rpc.invalid")).toBeDefined();
+    });
+});
+
+describe("rpcErrorFields", () => {
+    it("keeps the code and HTTP status of an RPC error, never its message", () => {
+        const err = new SolanaError(SOLANA_ERROR__RPC__TRANSPORT_HTTP_ERROR, {
+            headers: new Headers(),
+            message: "https://mainnet.helius-rpc.com/?api-key=secret",
+            statusCode: 429,
+        });
+        const fields = rpcErrorFields(err);
+        expect(fields).toEqual({ err: "SolanaError", code: 8100002, status: 429 });
+        expect(JSON.stringify(fields)).not.toContain("secret");
+    });
+    it("keeps the code of a JSON-RPC server error", () => {
+        const err = new SolanaError(SOLANA_ERROR__JSON_RPC__SERVER_ERROR_NODE_UNHEALTHY, {
+            numSlotsBehind: 5,
+        });
+        expect(rpcErrorFields(err)).toEqual({
+            err: "SolanaError",
+            code: SOLANA_ERROR__JSON_RPC__SERVER_ERROR_NODE_UNHEALTHY,
+        });
+    });
+    it("names any other error", () => {
+        expect(rpcErrorFields(new DOMException("t", "TimeoutError"))).toEqual({
+            err: "TimeoutError",
+        });
+        expect(rpcErrorFields("x")).toEqual({ err: "error" });
     });
 });
 

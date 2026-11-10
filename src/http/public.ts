@@ -1,6 +1,5 @@
 import { readFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { isIP } from "node:net";
 import { encodePaymentResponseHeader } from "@x402/core/http";
 import type pg from "pg";
 import { sendFont } from "../checkout/fonts.ts";
@@ -24,6 +23,7 @@ import {
 import { PaymentRefusal, parsePaymentHeader } from "../x402/decode.ts";
 import {
     BodyTooLarge,
+    clientIp,
     type Handler,
     drainBody,
     hangupSignal,
@@ -94,22 +94,6 @@ function closedAnswer(
         default:
             return unreachable(state);
     }
-}
-
-function unmapped(address: string | undefined): string {
-    const rest = (address ?? "").replace(/^::ffff:/i, "");
-    return isIP(rest) === 4 ? rest : (address ?? "");
-}
-
-export function clientIp(req: IncomingMessage, trusted: readonly string[]): string {
-    const socket = unmapped(req.socket.remoteAddress);
-    if (!trusted.includes(socket)) return socket;
-    const forwarded = req.headers["x-forwarded-for"];
-    const last = (Array.isArray(forwarded) ? forwarded.join(",") : forwarded)
-        ?.split(",")
-        .at(-1)
-        ?.trim();
-    return last ? unmapped(last) : socket;
 }
 
 function paymentHeader(req: IncomingMessage): string | undefined {

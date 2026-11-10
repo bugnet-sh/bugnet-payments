@@ -4,7 +4,7 @@ import type pg from "pg";
 import type { Settings } from "../config.ts";
 import type { Queryable } from "../db/pool.ts";
 import type { Log } from "../log.ts";
-import { deadline, type SolanaRpc } from "../solana/rpc.ts";
+import { deadline, rpcErrorFields, type SolanaRpc } from "../solana/rpc.ts";
 import { parseChainTx } from "./match.ts";
 
 export interface FastPassDeps {
@@ -143,7 +143,7 @@ export async function runFastPass(
         } catch (err) {
             d.log.warn("x402 fast pass skipped a transaction it could not read", {
                 signature: sig,
-                err: err instanceof Error ? err.name : "error",
+                ...rpcErrorFields(err),
             });
             continue;
         }

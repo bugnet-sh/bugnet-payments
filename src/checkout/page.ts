@@ -155,6 +155,7 @@ body {
 :focus-visible { outline: var(--ring) solid var(--accent); outline-offset: var(--ring); }
 :focus:not(:focus-visible) { outline: none; }
 a { color: inherit; text-decoration: none; }
+::selection { background: var(--accent); color: var(--accent-ink); }
 button { font: inherit; color: inherit; border-radius: 0; }
 
 /* An inset shadow draws the hairline, so the band stays exactly --nav tall */
@@ -413,7 +414,7 @@ export async function renderCheckout(v: CheckoutView): Promise<string> {
     else if (v.state === "settling") tail = MESSAGE;
     return page(
         `Pay ${amount} to Bugnet`,
-        `<main id="checkout" class="box" data-order-id="${id}" data-state="${v.state}">
+        `<main id="checkout" class="box" data-order-id="${id}" data-state="${v.state}" data-amount="${amount}">
 <h1 class="description">${escapeHtml(v.description)}</h1>
 <p class="amount">
 <span class="amount-value">${amount}</span>

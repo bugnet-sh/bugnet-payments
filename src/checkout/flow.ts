@@ -224,6 +224,59 @@ export async function payWithWallet(d: PayFlowDeps): Promise<PayFlowResult> {
     return outcome(d, submitted);
 }
 
+// A wallet's own refusal, kept apart from Bugnet's errors so the page can name the wallet
+export class WalletError extends Error {
+    constructor(
+        readonly wallet: string,
+        readonly code: number | undefined,
+        said: string,
+    ) {
+        super(said);
+        this.name = "WalletError";
+    }
+}
+
+export function walletError(wallet: string, err: unknown): WalletError {
+    const code =
+        isRecord(err) || err instanceof Error ? (err as { code?: unknown }).code : undefined;
+    const said =
+        err instanceof Error
+            ? err.message
+            : isRecord(err) && typeof err.message === "string"
+              ? err.message
+              : String(err);
+    return new WalletError(wallet, typeof code === "number" ? code : undefined, said);
+}
+
+// Codes follow EIP-1193, which Wallet Standard wallets reuse. Phantom answers "Unexpected error"
+// when its own simulation fails, most often because the account lacks USDC
+export function walletErrorStep(e: WalletError, amount: string): PageStep {
+    const w = e.wallet;
+    switch (e.code) {
+        case 4001:
+            return {
+                message: `you declined the payment in ${w}. Press Pay to try again`,
+                payAfterMs: 0,
+            };
+        case 4100:
+            return {
+                message: `${w} did not share an account. Unlock ${w}, allow this page, then press Pay again`,
+                payAfterMs: 0,
+            };
+        case -32002:
+            return {
+                message: `${w} already has a request open. Close it in ${w}, then press Pay again`,
+                payAfterMs: 0,
+            };
+    }
+    return {
+        message:
+            `${w} stopped the payment ("${e.message}"). This usually means the account holds ` +
+            `less than ${amount} USDC on Solana. Add USDC or pick another account, then press Pay again`,
+        payAfterMs: 0,
+    };
+}
+
 export function stateStep(state: PublicState | undefined): PageStep {
     switch (state) {
         case undefined:

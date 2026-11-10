@@ -78,6 +78,13 @@ describe("checkout page", () => {
         expect(html).toContain('id="wallets"');
     });
 
+    it("selects text in the accent green and carries the amount for the wallet messages", async () => {
+        const html = await renderCheckout({ ...view, amountMicros: 50_000 });
+        expect(html).toContain(
+            "::selection { background: var(--accent); color: var(--accent-ink); }",
+        );
+        expect(html).toContain('data-amount="$0.05"');
+    });
     it("wears the brand: title, header, fonts, copy button and footer", async () => {
         const html = await renderCheckout({ ...view, amountMicros: 50_000 });
         expect(html).toContain("<title>Pay $0.05 to Bugnet</title>");

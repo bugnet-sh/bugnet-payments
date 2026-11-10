@@ -153,7 +153,12 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
     );
     const internal = await startServer(settings.http.internal_listen, http.internalHandler, log);
     stops.push(() => internal.close());
-    const publicServer = await startServer(settings.http.public_listen, http.publicHandler, log);
+    const publicServer = await startServer(
+        settings.http.public_listen,
+        http.publicHandler,
+        log,
+        settings.http.trusted_proxies,
+    );
     return {
         publicOrigin: `http://127.0.0.1:${publicServer.port}`,
         internalUrl: `http://127.0.0.1:${internal.port}`,

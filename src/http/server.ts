@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import { type AddressInfo, isIP } from "node:net";
 import type { Log } from "../log.ts";
 import type { PaidVia } from "../orders/types.ts";
 
@@ -53,10 +53,27 @@ export function hangupSignal(res: ServerResponse): AbortSignal {
     return ac.signal;
 }
 
+function unmapped(address: string | undefined): string {
+    const rest = (address ?? "").replace(/^::ffff:/i, "");
+    return isIP(rest) === 4 ? rest : (address ?? "");
+}
+
+export function clientIp(req: IncomingMessage, trusted: readonly string[]): string {
+    const socket = unmapped(req.socket.remoteAddress);
+    if (!trusted.includes(socket)) return socket;
+    const forwarded = req.headers["x-forwarded-for"];
+    const last = (Array.isArray(forwarded) ? forwarded.join(",") : forwarded)
+        ?.split(",")
+        .at(-1)
+        ?.trim();
+    return last ? unmapped(last) : socket;
+}
+
 export async function startServer(
     listen: string,
     handler: Handler,
     log: Log,
+    trustedProxies: readonly string[] = [],
 ): Promise<{ port: number; close(): Promise<void> }> {
     const server = createServer({ maxHeaderSize: 64 * 1024 }, (req, res) => {
         const started = performance.now();
@@ -66,7 +83,7 @@ export async function startServer(
                 path: requestPath(req.url),
                 status: res.writableFinished ? res.statusCode : CLIENT_CLOSED,
                 ms: Math.round(performance.now() - started),
-                ip: req.socket.remoteAddress,
+                ip: clientIp(req, trustedProxies),
             });
         });
         handler(req, res).catch((err: unknown) => {
