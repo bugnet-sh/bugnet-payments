@@ -234,7 +234,7 @@ const settingsSchema = z
                 mirror_page_size: count.default(1000),
                 mirror_rescan_slots: count.default(300),
                 balance_mismatch_after: duration.prefault("2m"),
-                tail_lag_alarm_after: duration.prefault("60s"),
+                tail_lag_alarm_after: duration.prefault("3m"),
                 rpc_calls_per_hour_alarm: count.default(5000),
                 signer_check_stale_after: duration.prefault("2m"),
                 unresolved_alarm_after: duration.prefault("10m"),

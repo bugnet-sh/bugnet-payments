@@ -339,7 +339,7 @@ const X402_DEFAULTS = {
     mirror_page_size: 1_000,
     mirror_rescan_slots: 300,
     balance_mismatch_after: 120_000,
-    tail_lag_alarm_after: 60_000,
+    tail_lag_alarm_after: 180_000,
     rpc_calls_per_hour_alarm: 5_000,
     signer_check_stale_after: 120_000,
     unresolved_alarm_after: 600_000,

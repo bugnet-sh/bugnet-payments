@@ -191,8 +191,27 @@ describe("runMirror", () => {
         const broken = { ...d, rpc };
         await expect(runMirror(broken)).rejects.toThrow();
         expect(alarms("x402_tail_lag")).toHaveLength(0);
-        clock = new Date(NOW.getTime() + 60_001);
+        clock = new Date(NOW.getTime() + 180_001);
         await expect(runMirror(broken)).rejects.toThrow();
+        expect(alarms("x402_tail_lag")).toHaveLength(1);
+    });
+
+    it("one failed rpc call on the idle cycle after a verified run raises no x402_tail_lag", async () => {
+        const down = new Proxy(chain.rpc, {
+            get: () => () => ({
+                send: async () => {
+                    throw new Error("rpc down");
+                },
+            }),
+        });
+        clock = new Date(NOW.getTime() + x402.mirror_idle_every + 190);
+        expect(await runMirror({ ...d, rpc: down })).toMatchObject({
+            verified: false,
+            reason: "rpc",
+        });
+        expect(alarms("x402_tail_lag")).toHaveLength(0);
+        clock = new Date(NOW.getTime() + x402.tail_lag_alarm_after + 1);
+        await runMirror({ ...d, rpc: down });
         expect(alarms("x402_tail_lag")).toHaveLength(1);
     });
 
@@ -250,7 +269,7 @@ describe("runMirror", () => {
         expect((await paymentRow(expiring.id)).state).toBe("signed");
         expect(await incidents()).toEqual([]);
         expect(alarms("x402_tail_lag")).toHaveLength(0);
-        clock = new Date(NOW.getTime() + 60_001);
+        clock = new Date(NOW.getTime() + 180_001);
         const small = { ...d, x402: { ...x402, mirror_page_size: 10 } };
         await runMirror(small);
         expect(alarms("x402_tail_lag")).toHaveLength(1);
