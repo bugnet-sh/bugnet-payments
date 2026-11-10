@@ -14,6 +14,7 @@ export interface OrderClaims {
     payer?: string;
     fee_payer?: string;
     tx?: string;
+    issued_at?: string;
 }
 
 export interface PaymentProof {
@@ -46,6 +47,7 @@ export function claimsFor(
     expiresAt: Date,
     allowanceClaim: boolean,
     proof?: PaymentProof,
+    issuedAt?: Date,
 ): OrderClaims {
     if (order.kind === "allowance") throw new Error("allowance orders carry no token");
     const claims: OrderClaims = {
@@ -67,6 +69,8 @@ export function claimsFor(
         claims.fee_payer = proof.feePayer;
         claims.tx = proof.tx;
     }
+    // The router measures its start target from it on start tokens only
+    if (order.kind === "start" && issuedAt !== undefined) claims.issued_at = issuedAt.toISOString();
     return claims;
 }
 

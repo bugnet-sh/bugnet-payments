@@ -175,6 +175,7 @@ const settingsSchema = z
                 get_order: z.boolean().default(false),
                 allowance_claim: z.boolean().default(false),
                 token_payer_claims: z.boolean().default(false),
+                token_issued_at: z.boolean().default(false),
                 event_public_key: key32.default(""),
             })
             .strict()

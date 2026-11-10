@@ -467,7 +467,13 @@ async function paid(
         orderId: o.id,
         orderToken: signOrderToken(
             d.orderKey,
-            claimsFor(o, tokenExpiresAt, d.settings.router.allowance_claim, proof),
+            claimsFor(
+                o,
+                tokenExpiresAt,
+                d.settings.router.allowance_claim,
+                proof,
+                d.settings.router.token_issued_at ? d.now() : undefined,
+            ),
         ),
         payer,
         kind: o.kind,
