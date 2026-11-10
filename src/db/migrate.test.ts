@@ -58,11 +58,13 @@ describe("schema", () => {
             const r = await fresh.pool.query(
                 "select version from schema_migrations order by version",
             );
-            expect(r.rows).toEqual([
+            // Later migrations may follow 00005; these five come first, in this order
+            expect(r.rows.slice(0, 5)).toEqual([
                 { version: "00001_init.sql" },
                 { version: "00002_payment_key.sql" },
                 { version: "00003_x402.sql" },
                 { version: "00004_paid_via.sql" },
+                { version: "00005_deposits.sql" },
             ]);
         } finally {
             await fresh.close();

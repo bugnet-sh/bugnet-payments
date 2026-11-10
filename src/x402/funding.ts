@@ -199,7 +199,7 @@ export function createAllowanceFunding(d: { x402: Settings["x402"]; log: Log }):
                 `insert into refunds (order_id, kind, reason, amount_micros, destination, payer,
                     state, from_wallet, created_at)
                  values ($1, 'allowance', 'x402_unspent', $2, $3, $4, 'pending', 'allowance', $5)
-                 on conflict (order_id, kind) do nothing returning id`,
+                 on conflict (order_id, kind, part) do nothing returning id`,
                 [f.orderId, share, f.sourceTokenAccount, f.payer, at],
             );
             if (row.rows.length !== 1) throw new Error(`allowance refund of ${f.orderId} exists`);

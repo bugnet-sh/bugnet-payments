@@ -7,7 +7,7 @@ import type { AllowanceFunding } from "../x402/funding.ts";
 import { lockAccount } from "../x402/ledger.ts";
 import { decideHotFullRefund, writeHotPartial } from "./hot.ts";
 
-export type RefundKind = "full" | "partial" | "allowance";
+export type RefundKind = "full" | "partial" | "allowance" | "deposit";
 export type RefundWallet = "refund" | "allowance";
 export type RefundReason =
     | "unredeemed"
@@ -18,7 +18,8 @@ export type RefundReason =
     | "operator"
     | "x402_unspent"
     | "x402_ceiling"
-    | "x402_closed";
+    | "x402_closed"
+    | "deposit_held";
 
 export interface RefundRow {
     id: number;
@@ -45,6 +46,8 @@ export interface RefundRow {
     signingSlot: bigint | null;
     budgetWaived: boolean;
     handTx: string | null;
+    part: number;
+    depositSignature: string | null;
 }
 
 export interface RefundDbRow extends pg.QueryResultRow {
@@ -72,6 +75,8 @@ export interface RefundDbRow extends pg.QueryResultRow {
     signing_slot: string | number | bigint | null;
     budget_waived: boolean;
     hand_tx: string | null;
+    part: number;
+    deposit_signature: string | null;
 }
 
 const slot = (v: string | number | bigint | null): bigint | null => (v === null ? null : BigInt(v));
@@ -103,6 +108,8 @@ export function toRefund(r: RefundDbRow): RefundRow {
         signingSlot: slot(r.signing_slot),
         budgetWaived: r.budget_waived,
         handTx: r.hand_tx,
+        part: r.part,
+        depositSignature: r.deposit_signature,
     };
 }
 

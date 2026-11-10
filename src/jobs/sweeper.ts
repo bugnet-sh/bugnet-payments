@@ -46,6 +46,7 @@ export async function sweep(d: SweepDeps): Promise<SweepReport> {
             x402_unspent: 0,
             x402_ceiling: 0,
             x402_closed: 0,
+            deposit_held: 0,
         },
         routerChecks: 0,
         manual: 0,

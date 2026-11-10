@@ -96,7 +96,7 @@ export type NewPayment = Omit<PaymentRow, "status" | "confirmedAt" | "landedSlot
 };
 
 // How the paying request reached us, from its Bugnet-Client header
-export type PaidVia = "checkout" | "pay_cli";
+export type PaidVia = "checkout" | "pay_cli" | "transfer";
 
 export type OrderUpdate = Partial<
     Pick<

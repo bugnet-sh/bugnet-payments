@@ -85,7 +85,7 @@ async function hotPartial(
             `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
                 from_wallet, budget_waived, created_at)
              values ($1, 'partial', 'router_refundable', $2, $3, $4, 'pending', $5, $6, $7)
-             on conflict (order_id, kind) do nothing`,
+             on conflict (order_id, kind, part) do nothing`,
             [
                 order.id,
                 share,
