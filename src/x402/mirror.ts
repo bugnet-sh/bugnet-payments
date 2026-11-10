@@ -6,7 +6,7 @@ import type { Log } from "../log.ts";
 import { setPaymentLandedSlot } from "../orders/store.ts";
 import { readTokenAccount, type TokenAccountInfo } from "../solana/accounts.ts";
 import { TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
-import { deadline, type SolanaRpc } from "../solana/rpc.ts";
+import { deadline, rpcErrorFields, type SolanaRpc } from "../solana/rpc.ts";
 import { recordIncident, type IncidentFact } from "./incidents.ts";
 import { liabilitiesAt } from "./liabilities.ts";
 import { alarmUnresolved, applyExpiry, parseChainTx, matchInTx, type MatchDeps } from "./match.ts";
@@ -77,7 +77,7 @@ async function rpcCall<T>(
         return await call(deadline(d.rpcTimeoutMs));
     } catch (err) {
         d.log.warn("x402 mirror rpc call failed", {
-            err: err instanceof Error ? err.name : "error",
+            ...rpcErrorFields(err),
         });
         throw new RpcFailure();
     }

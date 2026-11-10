@@ -19,7 +19,7 @@ import type { Log } from "../log.ts";
 import type { RouterClient } from "../router/client.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { isCanonicalSignature } from "../solana/base58.ts";
-import type { SolanaRpc } from "../solana/rpc.ts";
+import { rpcErrorFields, type SolanaRpc } from "../solana/rpc.ts";
 import {
     buildSellerPayment,
     randomSellerMemo,
@@ -426,7 +426,7 @@ export async function reserveAndSign(d: SignerDeps, req: ReserveAndSignRequest):
     } catch (err) {
         log.warn("x402 signing failed", {
             paymentId: id,
-            err: err instanceof Error ? err.name : "unknown",
+            ...rpcErrorFields(err),
         });
         return failed("payments_unavailable");
     }

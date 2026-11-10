@@ -18,7 +18,7 @@ import { lockPayment, setPaymentLandedSlot } from "../orders/store.ts";
 import type { X402ResolvedInput } from "../router/client.ts";
 import { confirmHotRefund } from "../refunds/hot.ts";
 import { TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
-import { deadline, type SolanaRpc } from "../solana/rpc.ts";
+import { deadline, rpcErrorFields, type SolanaRpc } from "../solana/rpc.ts";
 import { recordIncident, type IncidentFact } from "./incidents.ts";
 import { lockAccount } from "./ledger.ts";
 import { enqueueX402Resolved } from "./outbox.ts";
@@ -599,7 +599,7 @@ async function checkLanded(
     } catch (err) {
         d.log.warn("x402 expiry could not check a landed payment", {
             paymentId: row.id,
-            err: err instanceof Error ? err.name : "error",
+            ...rpcErrorFields(err),
         });
         return true;
     }

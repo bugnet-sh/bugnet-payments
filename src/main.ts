@@ -289,7 +289,12 @@ export async function startService(o: StartOptions): Promise<RunningService> {
 
         const internal = await startServer(s.http.internal_listen, http.internalHandler, log);
         closers.push(internal.close);
-        const publicServer = await startServer(s.http.public_listen, http.publicHandler, log);
+        const publicServer = await startServer(
+            s.http.public_listen,
+            http.publicHandler,
+            log,
+            s.http.trusted_proxies,
+        );
         closers.push(publicServer.close);
 
         const openListener = (w: X402Wiring, files: TlsFiles): Promise<void> =>

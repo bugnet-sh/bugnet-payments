@@ -22,7 +22,8 @@ import { signedPayment } from "../testing/payment.ts";
 import { seedAccount } from "../testing/x402.ts";
 import { setControls } from "../x402/controls.ts";
 import { requirementsFor } from "../x402/challenge.ts";
-import { clientIp, publicState } from "./public.ts";
+import { publicState } from "./public.ts";
+import { clientIp } from "./server.ts";
 
 let app: TestApp;
 let order: OrderRow;
