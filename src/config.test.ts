@@ -227,6 +227,19 @@ describe("[solana.rpc] settings", () => {
         ).toThrow("solana.rpc.first_attempt_timeouts.getSlot: at most solana.rpc.attempt_timeout");
     });
 
+    it("first_attempt_timeouts names table methods", () => {
+        const toml = rpcToml(`[solana.rpc.first_attempt_timeouts]\ngetVoteAccounts = "1s"`);
+        expect(() => parseSettings(toml, "t")).toThrow(
+            "solana.rpc.first_attempt_timeouts.getVoteAccounts: not a routed method",
+        );
+        for (const key of ["toString", "constructor"]) {
+            const inherited = rpcToml(`[solana.rpc.first_attempt_timeouts]\n${key} = "1s"`);
+            expect(() => parseSettings(inherited, "t")).toThrow(
+                `solana.rpc.first_attempt_timeouts.${key}: not a routed method`,
+            );
+        }
+    });
+
     it("max_slot_lag is from 1 to 80", () => {
         for (const lag of [81, 0]) {
             expect(() => parseSettings(rpcToml(`max_slot_lag = ${lag}`), "t")).toThrow(

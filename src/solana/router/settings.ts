@@ -5,6 +5,7 @@
  */
 import { isIP } from "node:net";
 import { z } from "zod";
+import { METHODS } from "./methods.ts";
 
 export const MAX_RPC_URLS = 6;
 
@@ -96,7 +97,13 @@ export const rpcSettingsSchema: z.ZodType<RpcSettings> = z
     .strict()
     .superRefine((rpc, ctx) => {
         for (const [method, ms] of Object.entries(rpc.first_attempt_timeouts)) {
-            if (ms > rpc.attempt_timeout) {
+            if (!Object.hasOwn(METHODS, method)) {
+                ctx.addIssue({
+                    code: "custom",
+                    path: ["first_attempt_timeouts", method],
+                    message: "not a routed method",
+                });
+            } else if (ms > rpc.attempt_timeout) {
                 ctx.addIssue({
                     code: "custom",
                     path: ["first_attempt_timeouts", method],
