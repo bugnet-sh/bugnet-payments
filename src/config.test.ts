@@ -6,6 +6,7 @@ import {
     loadSettings,
     parseSettings,
     readSecrets,
+    rpcUrlsOf,
     SECRET_VARS,
     secretsEnv,
     secretValues,
@@ -23,6 +24,39 @@ function settings(router: Partial<Settings["router"]> = {}): Settings {
     const s = parseSettings(`[solana]\nrecipient = "${ADDR}"`, "t.toml");
     return { ...s, router: { ...s.router, ...router } };
 }
+
+const RPC_DEFAULTS = {
+    attempt_timeout: 3000,
+    first_attempt_timeouts: {
+        getAccountInfo: 1000,
+        getBalance: 1000,
+        getBlockHeight: 1000,
+        getEpochInfo: 1000,
+        getLatestBlockhash: 1000,
+        getMultipleAccounts: 1500,
+        getSlot: 1000,
+        getTokenAccountBalance: 1000,
+        simulateTransaction: 1500,
+    },
+    max_attempts: 3,
+    max_slot_lag: 50,
+    probe_every: 60000,
+    history_check_every: 3600000,
+    breaker_failures: 5,
+    breaker_open: 30000,
+    all_down_alarm_after: 30000,
+    lag_alarm_after: 120000,
+    limited_alarm_after: 300000,
+    background_share: 0.6,
+    usage_flush_every: 60000,
+    snapshot_every: 15000,
+};
+
+function rpcToml(lines: string): string {
+    return `[solana]\nrecipient = "${ADDR}"\n[solana.rpc]\n${lines}`;
+}
+
+const X_DOMAIN_LIST = "https://one.x.example/?api-key=k1,https://two.x.example/v2/k2";
 
 function validEnv(overrides: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = {
@@ -168,6 +202,52 @@ describe("parseSettings", () => {
     });
 });
 
+describe("[solana.rpc] settings", () => {
+    it("rpc defaults", () => {
+        const rpc = parseSettings(`[solana]\nrecipient = "${ADDR}"`, "t.toml").solana.rpc;
+        expect(rpc).toEqual(RPC_DEFAULTS);
+        expect(rpc).not.toHaveProperty("absence_quorum");
+        expect(rpc).not.toHaveProperty("send_fanout");
+    });
+
+    it("example.toml parses to the rpc defaults", () => {
+        const text = readFileSync("config/example.toml", "utf8");
+        const filled = text.replace('recipient = ""', `recipient = "${ADDR}"`);
+        expect(parseSettings(filled, "example.toml").solana.rpc).toEqual(RPC_DEFAULTS);
+    });
+
+    it("the TOML holds no endpoint list", () => {
+        const toml = `[solana]\nrecipient = "${ADDR}"\n[[solana.rpc.endpoints]]\nurl = "https://a.example"`;
+        expect(() => parseSettings(toml, "t")).toThrow("unknown key solana.rpc.endpoints");
+    });
+
+    it("first attempt timeouts stay within attempt_timeout", () => {
+        expect(() =>
+            parseSettings(rpcToml(`[solana.rpc.first_attempt_timeouts]\ngetSlot = "4s"`), "t"),
+        ).toThrow("solana.rpc.first_attempt_timeouts.getSlot: at most solana.rpc.attempt_timeout");
+    });
+
+    it("max_slot_lag is from 1 to 80", () => {
+        for (const lag of [81, 0]) {
+            expect(() => parseSettings(rpcToml(`max_slot_lag = ${lag}`), "t")).toThrow(
+                "from 1 to 80",
+            );
+        }
+        expect(parseSettings(rpcToml("max_slot_lag = 80"), "t").solana.rpc.max_slot_lag).toBe(80);
+    });
+
+    it("background_share is bounded", () => {
+        for (const share of ["0", "1.5"]) {
+            expect(() => parseSettings(rpcToml(`background_share = ${share}`), "t")).toThrow(
+                /solana.rpc.background_share/,
+            );
+        }
+        expect(
+            parseSettings(rpcToml("background_share = 1"), "t").solana.rpc.background_share,
+        ).toBe(1);
+    });
+});
+
 describe("readSecrets", () => {
     it("decodes the 32-byte keys and keeps the rest as given", () => {
         const s = readSecrets(validEnv(), settings());
@@ -177,7 +257,90 @@ describe("readSecrets", () => {
         expect(s.routerToken).toBe(ROUTER_TOKEN);
         expect(s.feePayerKey).toBe("fee-payer-key");
         expect(s.refundKey).toBe("refund-key");
-        expect(s.rpcUrl).toBe("https://rpc.example/?api-key=k");
+        expect(s.rpcUrls).toEqual(["https://rpc.example/?api-key=k"]);
+    });
+
+    it("readSecrets reads the list in order", () => {
+        const env = validEnv({
+            BUGNET_SOLANA_RPC_URL: undefined,
+            BUGNET_SOLANA_RPC_URLS: "https://a.example/?api-key=k1,https://b.example/v2/k2",
+        });
+        const s = readSecrets(env, settings());
+        expect(s.rpcUrls).toEqual(["https://a.example/?api-key=k1", "https://b.example/v2/k2"]);
+        expect(s.rpcUrlsFrom).toBe("BUGNET_SOLANA_RPC_URLS");
+        expect(s.rpcSingleIgnored).toBe(false);
+    });
+
+    it("without the list, the single URL is used", () => {
+        for (const env of [validEnv(), validEnv({ BUGNET_SOLANA_RPC_URLS: "  " })]) {
+            const s = readSecrets(env, settings());
+            expect(s.rpcUrls).toEqual(["https://rpc.example/?api-key=k"]);
+            expect(s.rpcUrlsFrom).toBe("BUGNET_SOLANA_RPC_URL");
+            expect(s.rpcSingleIgnored).toBe(false);
+        }
+    });
+
+    it("the list wins over the single URL", () => {
+        const env = validEnv({ BUGNET_SOLANA_RPC_URLS: "https://a.example/,https://b.example/" });
+        const s = readSecrets(env, settings());
+        expect(s.rpcUrls).toEqual(["https://a.example/", "https://b.example/"]);
+        expect(s.rpcUrlsFrom).toBe("BUGNET_SOLANA_RPC_URLS");
+        expect(s.rpcSingleIgnored).toBe(true);
+    });
+
+    it("one RPC variable must be set", () => {
+        expect(() =>
+            readSecrets(validEnv({ BUGNET_SOLANA_RPC_URL: undefined }), settings()),
+        ).toThrow("BUGNET_SOLANA_RPC_URLS or BUGNET_SOLANA_RPC_URL must be set");
+        expect(() => rpcUrlsOf({ BUGNET_SOLANA_RPC_URL: " " })).toThrow(
+            new ConfigError("BUGNET_SOLANA_RPC_URLS or BUGNET_SOLANA_RPC_URL must be set"),
+        );
+    });
+
+    it("the single URL holds one URL", () => {
+        const single = (url: string) => () =>
+            readSecrets(validEnv({ BUGNET_SOLANA_RPC_URL: url }), settings());
+        expect(single("https://a.example,https://b.example")).toThrow(
+            "BUGNET_SOLANA_RPC_URL must hold one URL; put a list in BUGNET_SOLANA_RPC_URLS",
+        );
+        expect(single("http://a.example")).toThrow(
+            "BUGNET_SOLANA_RPC_URL must be an https URL (http only on a loopback host)",
+        );
+    });
+
+    it("list problems reach the ConfigError by position", () => {
+        const env = validEnv({
+            BUGNET_SOLANA_RPC_URLS: "https://a.example/?api-key=SECRETKEY1,http://b.example",
+        });
+        let message = "";
+        try {
+            readSecrets(env, settings());
+        } catch (e) {
+            expect(e).toBeInstanceOf(ConfigError);
+            message = (e as Error).message;
+        }
+        expect(message).toContain("BUGNET_SOLANA_RPC_URLS rpc2 must be an https URL");
+        expect(message).not.toContain("SECRETKEY1");
+        expect(message).not.toContain("b.example");
+    });
+
+    it("the list check runs in readSecrets", () => {
+        const s = parseSettings(rpcToml("absence_quorum = 2"), "t");
+        expect(() => readSecrets(validEnv({ BUGNET_SOLANA_RPC_URLS: X_DOMAIN_LIST }), s)).toThrow(
+            "solana.rpc.absence_quorum: 2 needs URLs on 2 different domains",
+        );
+    });
+
+    it("rpcUrlsOf reads the URLs by the same rules", () => {
+        expect(rpcUrlsOf({ BUGNET_SOLANA_RPC_URLS: X_DOMAIN_LIST })).toEqual(
+            X_DOMAIN_LIST.split(","),
+        );
+        expect(rpcUrlsOf({ BUGNET_SOLANA_RPC_URL: "https://a.example/" })).toEqual([
+            "https://a.example/",
+        ]);
+        expect(() => rpcUrlsOf({ BUGNET_SOLANA_RPC_URLS: "https://a.example,nope" })).toThrow(
+            new ConfigError("BUGNET_SOLANA_RPC_URLS rpc2 is not a URL"),
+        );
     });
 
     it("names every bad secret and never echoes a value", () => {
@@ -274,10 +437,18 @@ describe("secret redaction list", () => {
     });
 
     it("gives every loaded secret back in its variable's form", () => {
-        const env = validEnv({ BUGNET_ALLOWANCE_KEY: "", BUGNET_X402_TLS_KEY: "" });
-        const secrets = readSecrets(env, settings());
-        expect(secretsEnv(secrets)).toEqual(env);
-        expect(Object.keys(secretsEnv(secrets))).toHaveLength(Object.keys(secrets).length);
+        const single = validEnv({ BUGNET_ALLOWANCE_KEY: "", BUGNET_X402_TLS_KEY: "" });
+        const list = validEnv({
+            BUGNET_ALLOWANCE_KEY: "",
+            BUGNET_X402_TLS_KEY: "",
+            BUGNET_SOLANA_RPC_URL: undefined,
+            BUGNET_SOLANA_RPC_URLS: "https://a.example/?api-key=k1,https://b.example/v2/k2",
+        });
+        for (const env of [single, list]) {
+            const secrets = readSecrets(env, settings());
+            expect(secretsEnv(secrets)).toEqual(env);
+            expect(Object.keys(secretsEnv(secrets))).toHaveLength(Object.keys(env).length);
+        }
     });
 
     it("keeps each set secret once, longest first, and nothing else", () => {
@@ -290,9 +461,39 @@ describe("secret redaction list", () => {
     });
 
     it("redacts the whole RPC list and each URL in it", () => {
-        const list = "https://a.example/?k=1, https://b.example/k2,";
-        const values = secretValues({ BUGNET_SOLANA_RPC_URLS: list });
-        expect(values).toEqual([list, "https://a.example/?k=1", "https://b.example/k2"]);
+        const a = "https://a.example/?k=0123456789abcdef0123";
+        const b = "https://b.example/v2/abcdefghijklmnop1234";
+        const list = `${a}, ${b},`;
+        expect(secretValues({ BUGNET_SOLANA_RPC_URLS: list })).toEqual([
+            list,
+            a,
+            b,
+            "0123456789abcdef0123",
+            "abcdefghijklmnop1234",
+            "a.example",
+            "b.example",
+        ]);
+    });
+
+    it("secretValues redacts each URL, its key and its host", () => {
+        const url = "https://one.x.example/?api-key=0123456789abcdef0123";
+        expect(secretValues({ BUGNET_SOLANA_RPC_URL: url })).toEqual([
+            url,
+            "0123456789abcdef0123",
+            "one.x.example",
+        ]);
+        const loopback = "http://127.0.0.1:8899/abcdefghijklmnop1234";
+        expect(secretValues({ BUGNET_SOLANA_RPC_URL: loopback })).toEqual([
+            loopback,
+            "abcdefghijklmnop1234",
+        ]);
+    });
+
+    it("secretValues never throws on an item that is not a URL", () => {
+        const env = { BUGNET_SOLANA_RPC_URLS: "nope,x.example/?api-key=0123456789abcdef0123" };
+        let values: string[] = [];
+        expect(() => (values = secretValues(env))).not.toThrow();
+        expect(values).toContain("x.example/?api-key=0123456789abcdef0123");
     });
 });
 

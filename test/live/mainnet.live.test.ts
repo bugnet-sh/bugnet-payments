@@ -23,7 +23,7 @@ import type { PaymentPayload, PaymentRequired } from "@x402/core/types";
 import { toFacilitatorSvmSigner } from "@x402/svm";
 import { ExactSvmScheme as ExactSvmFacilitator } from "@x402/svm/exact/facilitator";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { readSecrets, type Secrets, type Settings } from "../../src/config.ts";
+import { readSecrets, type Secrets, secretValues, type Settings } from "../../src/config.ts";
 import { auditInflows } from "../../src/jobs/audit.ts";
 import { loadTestPayer } from "../../src/keys/test-payer.ts";
 import { jsonLog, type Log } from "../../src/log.ts";
@@ -252,28 +252,18 @@ describe("mainnet", () => {
         db = await testDb();
         settings = await liveSettings(db.url, eventSeed);
         secrets = readSecrets(process.env, settings);
-        const hidden = [
-            secrets.rpcUrl,
-            secrets.paymentsToken,
-            secrets.routerToken,
-            secrets.feePayerKey,
-            secrets.refundKey,
-            process.env.BUGNET_TEST_PAYER_KEY,
-            process.env.BUGNET_TEST_PAYER_MNEMONIC,
-            process.env.BUGNET_RECIPIENT_KEY,
-            process.env.BUGNET_ORDER_PRIVATE_KEY,
-            process.env.BUGNET_CLAIM_KEY,
-        ].filter(Boolean) as string[];
+        // Every URL of the list, its key parts and its host, with every other secret variable
+        const hidden = secretValues(process.env);
         log = jsonLog("payments", { secrets: hidden });
         finding = jsonLog("live-finding", { secrets: hidden, write: printLine });
         // The facilitator writes RPC errors with console.error
         restoreConsole = routeConsole(log);
-        rpc = createRpc(secrets.rpcUrl);
+        rpc = createRpc(secrets.rpcUrls[0]!);
         testPayer = (await loadTestPayer(process.env))!;
         feePayer = await loadKeypair(secrets.feePayerKey, "BUGNET_FEE_PAYER_KEY");
         refundWallet = await loadKeypair(secrets.refundKey, "BUGNET_REFUND_KEY");
         recipientAta = await usdcAta(address(settings.solana.recipient));
-        http = payClient(testPayer, secrets.rpcUrl);
+        http = payClient(testPayer, secrets.rpcUrls[0]!);
         stale = (await rpc.getLatestBlockhash({ commitment: "confirmed" }).send()).value;
         svc = await startService({ settings, secrets, log });
     }, 120_000);

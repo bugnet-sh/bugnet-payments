@@ -30,7 +30,11 @@ export type AlarmName =
     | "x402_close_slow"
     | "x402_close_unverifiable"
     | "x402_resign_waiting"
-    | "x402_cold_transfer_failed";
+    | "x402_cold_transfer_failed"
+    | "rpc_endpoint_down"
+    | "rpc_all_endpoints_down"
+    | "rpc_endpoint_lag"
+    | "rpc_absence_unconfirmed";
 
 type Fields = Record<string, unknown>;
 
@@ -55,6 +59,7 @@ export const REDACTED_KEYS: ReadonlySet<string> = new Set([
     "seed",
     "mnemonic",
     "rpcUrl",
+    "rpcUrls",
     "wire",
     "wireTx",
     "transaction",

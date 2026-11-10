@@ -171,7 +171,7 @@ export async function startService(o: StartOptions): Promise<RunningService> {
         const feePayer = await loadKeypair(secrets.feePayerKey, "BUGNET_FEE_PAYER_KEY");
         const refundSigner = await loadKeypair(secrets.refundKey, "BUGNET_REFUND_KEY");
         const x402On = s.x402.allowance_wallet !== "";
-        const rpc0 = o.rpc ?? createRpc(secrets.rpcUrl);
+        const rpc0 = o.rpc ?? createRpc(secrets.rpcUrls[0]!);
         const rpc = x402On
             ? countingRpc(rpc0, {
                   limitPerHour: s.x402.rpc_calls_per_hour_alarm,

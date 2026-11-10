@@ -109,6 +109,29 @@ describe("test loggers", () => {
         expect(REDACTED_KEYS.has("mnemonic")).toBe(true);
         expect(REDACTED_KEYS.has("orderId")).toBe(false);
     });
+
+    it("rpcUrls is a redacted key", () => {
+        const out: string[] = [];
+        jsonLog("payments", { write: (l) => out.push(l) }).info("rpc", {
+            rpcUrls: ["https://a.example/?api-key=k1"],
+        });
+        expect(JSON.parse(out[0]!).rpcUrls).toBe("[redacted]");
+        expect(out[0]).not.toContain("a.example");
+    });
+});
+
+describe("rpc alarms", () => {
+    it("knows every rpc alarm of 10.2", () => {
+        const names: AlarmName[] = [
+            "rpc_endpoint_down",
+            "rpc_all_endpoints_down",
+            "rpc_endpoint_lag",
+            "rpc_absence_unconfirmed",
+        ];
+        const log = memoryLog();
+        for (const n of names) log.alarm(n, { endpoint: "rpc2" });
+        expect(log.lines.map((l) => [l.alarm, l.endpoint])).toEqual(names.map((n) => [n, "rpc2"]));
+    });
 });
 
 describe("x402 alarms", () => {

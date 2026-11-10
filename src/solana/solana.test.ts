@@ -30,6 +30,7 @@ import { MEMO_PROGRAM, TOKEN_PROGRAM, USDC_MINT } from "./constants.ts";
 import { generateExportableKeypair, loadKeypair } from "./keys.ts";
 import { readLanding } from "./landing.ts";
 import { createRpc, rpcErrorFields } from "./rpc.ts";
+import { RpcRouterError } from "./router/errors.ts";
 
 describe("constants", () => {
     it("pins the program addresses", () => {
@@ -67,6 +68,23 @@ describe("rpcErrorFields", () => {
             err: "TimeoutError",
         });
         expect(rpcErrorFields("x")).toEqual({ err: "error" });
+    });
+    it("rpcErrorFields names a router error", () => {
+        expect(rpcErrorFields(new RpcRouterError("stale"))).toEqual({
+            err: "RpcRouterError",
+            reason: "stale",
+        });
+        const partial = { value: [null] };
+        expect(rpcErrorFields(new RpcRouterError("absence_unconfirmed", "rpc2", partial))).toEqual({
+            err: "RpcRouterError",
+            reason: "absence_unconfirmed",
+        });
+        const refused = Object.assign(new Error("connect https://a.example/?api-key=k1"), {
+            code: "ECONNREFUSED",
+        });
+        const fields = rpcErrorFields(new TypeError("fetch failed", { cause: refused }));
+        expect(fields).toEqual({ err: "TypeError", cause: "ECONNREFUSED" });
+        expect(JSON.stringify(fields)).not.toContain("a.example");
     });
 });
 

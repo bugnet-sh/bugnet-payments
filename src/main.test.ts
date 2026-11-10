@@ -181,7 +181,7 @@ async function stateOf(orderId: string): Promise<string | undefined> {
     return (await findOrder(db.pool, orderId))?.state;
 }
 
-// main builds its own RPC from BUGNET_SOLANA_RPC_URL, so its tests answer JSON-RPC over HTTP
+// main builds its own RPC from the first RPC URL, so its tests answer JSON-RPC over HTTP
 async function rpcStub(withAccounts: boolean): Promise<{ url: string; close(): Promise<void> }> {
     const server = createServer((req, res) => {
         let body = "";
@@ -288,7 +288,9 @@ beforeAll(async () => {
         claimKey: Buffer.alloc(32, 2),
         feePayerKey: await secretKey(5),
         refundKey: await secretKey(6),
-        rpcUrl: "",
+        rpcUrls: [],
+        rpcUrlsFrom: "BUGNET_SOLANA_RPC_URL",
+        rpcSingleIgnored: false,
         allowanceKey: "",
         x402TlsKey: "",
     };
@@ -588,7 +590,7 @@ describe("startService", () => {
         const all: Secrets = {
             ...secrets,
             routerToken: "router-token-start-test",
-            rpcUrl: "https://rpc.example/?api-key=start-test",
+            rpcUrls: ["https://rpc.example/?api-key=start-test"],
             allowanceKey: "allowance-key-start-test",
             x402TlsKey: PEM_MAIN_TEST,
         };
@@ -688,6 +690,19 @@ describe("main", () => {
         });
     });
 
+    it("main names a URL without its scheme by position", async () => {
+        const lines = captureStderr();
+        const env = envFor("http://127.0.0.1:1", {
+            BUGNET_SOLANA_RPC_URLS: "x.example/?api-key=0123456789abcdef0123",
+        });
+        expect(await main(["-config", writeConfig()], env)).toBe(1);
+        expect(lines).toHaveLength(1);
+        expect(parsed(lines)[0]).toMatchObject({ level: "error", msg: "configuration invalid" });
+        expect(String(parsed(lines)[0]!.reason)).toContain("rpc1 is not a URL");
+        expect(lines[0]).not.toContain("0123456789abcdef0123");
+        expect(lines[0]).not.toContain("x.example");
+    });
+
     it("logs a failed boot check as one line and returns 1", async () => {
         const rpc = await rpcStub(false);
         const lines = captureStderr();
@@ -734,8 +749,9 @@ describe("main", () => {
             BUGNET_ALLOWANCE_KEY: "allowance-key-main-test",
             BUGNET_X402_TLS_KEY: Buffer.from(PEM_MAIN_TEST).toString("base64"),
             BUGNET_TEST_PG_URL: "postgres://tester:pw-main-test@localhost:5432/postgres",
-            BUGNET_SOLANA_RPC_URLS:
-                "https://rpc-a.example/?key=main-test-a,https://rpc-b.example/b",
+            // The list wins, so the stub is the list of one and the single URL is only redacted
+            BUGNET_SOLANA_RPC_URLS: rpc.url,
+            BUGNET_SOLANA_RPC_URL: "https://rpc-b.example/b",
         });
         const values = SECRET_VARS.map((name) => env[name] ?? "");
         expect(values).not.toContain("");

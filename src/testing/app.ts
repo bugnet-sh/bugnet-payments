@@ -121,7 +121,9 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
         claimKey: randomBytes(32),
         feePayerKey: keypairSecret(FEE_PAYER_SEED, feePayer),
         refundKey: "",
-        rpcUrl: "",
+        rpcUrls: [],
+        rpcUrlsFrom: "BUGNET_SOLANA_RPC_URL",
+        rpcSingleIgnored: false,
         allowanceKey: keypairSecret(ALLOWANCE_SEED, allowance),
         x402TlsKey: "",
     };
