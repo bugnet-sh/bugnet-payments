@@ -662,6 +662,10 @@ class Router {
         else report = o.timers ? await this.boot() : await this.checkAll(true);
         const wrong = report.endpoints.find((c) => c.genesis === "wrong");
         if (wrong !== undefined) throw new RpcRouterError("wrong_network", wrong.name);
+        if (this.mode === "routed") {
+            const endpoints = this.endpoints.map((ep) => ep.name);
+            this.deps.log.info("rpc router started", { endpoints });
+        }
         if (o.timers) this.startTimer();
         return report;
     }
@@ -764,6 +768,15 @@ class Router {
                 const first = await this.runChecks(ep, all, probe, signal);
                 const again = erroredParts(first);
                 if (!rerun || again.size === 0 || signal.aborted) return first;
+                // A rerun into a Retry-After would meet another 429; one past the cap never runs
+                const cooling = ep.limits.endpointCoolingUntil() - this.deps.now();
+                if (cooling > 0) {
+                    try {
+                        await this.wait(cooling, signal);
+                    } catch {
+                        return first;
+                    }
+                }
                 return merged(first, await this.runChecks(ep, this.runParts(again), probe, signal));
             });
             return { endpoints: await Promise.all(checks) };
@@ -826,9 +839,10 @@ class Router {
         return set;
     }
 
-    // The hourly run brings the errored checks along; before it, only they run (spec 9)
+    // The hourly run brings the errored checks along; before it, only they run (spec 9). Like a
+    // probe, a run waits out a Retry-After, which its calls would only meet with 429s (6.3)
     private dueParts(ep: Endpoint, now: number): Set<CheckPart> | null {
-        if (ep.checking !== null) return null;
+        if (ep.checking !== null || ep.limits.endpointCoolingUntil() !== 0) return null;
         const hourly = ep.hourlyAt !== null && now >= ep.hourlyAt;
         const retry = ep.retry !== null && now >= ep.retry.at;
         if (!hourly && !retry) return null;

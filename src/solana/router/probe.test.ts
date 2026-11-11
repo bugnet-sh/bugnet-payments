@@ -710,6 +710,35 @@ describe("history checks", () => {
         expect(snap(t, "rpc1").consistent).toBe("yes");
     });
 
+    it("an hourly run waits out a cooldown", async () => {
+        const t = routed(2);
+        await t.router.start({ timers: false });
+        const first = historyCalls(t.a);
+        tweak(t, t.a, (m, _p, n) =>
+            m === "getSlot" && n === 0 ? httpFail(429, { "retry-after": "60" }) : undefined,
+        );
+        t.clock.ms = HOUR - 1_000;
+        expect(await reaches(t, "getSlot")).toEqual(["a", "b"]);
+        await tickAt(t, HOUR);
+        expect(historyCalls(t.a)).toBe(first);
+        await tickAt(t, HOUR + 60_000);
+        expect(historyCalls(t.a)).toBe(2 * first);
+    });
+
+    it("a CLI rerun waits out a cooldown within the cap", async () => {
+        const t = routed(2);
+        let rerunAt: number | null = null;
+        tweak(t, t.b, (m, _p, n) => {
+            if (m !== "getSignatureStatuses") return undefined;
+            if (n === 0) return httpFail(429, { "retry-after": "5" });
+            rerunAt ??= t.clock.ms;
+            return undefined;
+        });
+        const report = await t.router.start({ timers: false });
+        expect(report.endpoints[1]!.history).toBe("ok");
+        expect(rerunAt).toBe(5_000);
+    });
+
     it("an errored hourly run keeps consistent: yes", async () => {
         for (const fail of [() => httpFail(429), () => stall()]) {
             const t = routed(2);
@@ -891,6 +920,19 @@ describe("unreachable endpoints", () => {
         tweak(t, t.a, () => undefined);
         await tickAt(t, 60_000);
         expect(await reaches(t, "getSlot")).toEqual(["a"]);
+    });
+});
+
+describe("start line", () => {
+    it("a routed start names its positions", async () => {
+        const t = routed(2);
+        await t.router.start({ timers: false });
+        expect(lines(t, "info", "rpc router started")).toEqual([
+            { level: "info", msg: "rpc router started", endpoints: ["rpc1", "rpc2"] },
+        ]);
+        const single = routed(1);
+        await single.router.start({ timers: false });
+        expect(lines(single, "info")).toEqual([]);
     });
 });
 
