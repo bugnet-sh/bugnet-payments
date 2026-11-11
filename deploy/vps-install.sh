@@ -6,6 +6,8 @@
 #   vps-install.sh --mtls <staging dir>   server certificate and key from bugnet-dev mtls init
 #   vps-install.sh --pubkeys              order_token_public_key and the four wallet addresses
 #   vps-install.sh --start                checks the settings, then starts the installed version
+#   vps-install.sh --rpc-urls             reads one BUGNET_SOLANA_RPC_URLS line on stdin into
+#                                         payments.env; deploy/push-rpc-urls.sh sends it
 #
 # Every step can run again. It prints addresses and variable names, never a secret value.
 set -euo pipefail
@@ -13,7 +15,7 @@ umask 077
 
 ETC=/etc/bugnet
 TOML=$ETC/payments.toml
-ENV_FILE=$ETC/payments.env
+ENV_FILE=${BUGNET_PAYMENTS_ENV:-$ETC/payments.env}
 ROUTER_ENV=$ETC/router.env
 RELEASE_FILE=$ETC/payments.release
 OPT=/opt/bugnet/payments
@@ -29,8 +31,6 @@ die() {
     exit 1
 }
 say() { echo "== $*"; }
-
-[ "$(id -u)" = 0 ] || die "run as root"
 
 installed_version() {
     [ -f "$RELEASE_FILE" ] || die "no installed version yet, run the install step with the tarball first"
@@ -258,7 +258,7 @@ do_install() {
     ensure_index "$index"
     ensure_unit "$v"
     do_pubkeys
-    say "next: fund the wallets, set BUGNET_SOLANA_RPC_URL in $ENV_FILE (sudoedit), run --mtls, then --start"
+    say "next: fund the wallets, copy BUGNET_SOLANA_RPC_URLS with deploy/push-rpc-urls.sh, run --mtls, then --start"
 }
 
 do_mtls() {
@@ -282,6 +282,71 @@ do_mtls() {
     fi
 }
 
+# One line on stdin: BUGNET_SOLANA_RPC_URLS= and comma-separated URLs, with nothing a shell
+# loading the env file would split or run. Messages name the variable only, never a URL.
+rpc_list_ok() {
+    local line="" value
+    IFS= read -r line || true
+    case $line in
+    BUGNET_SOLANA_RPC_URLS=*) ;;
+    *)
+        echo "expected a BUGNET_SOLANA_RPC_URLS line" >&2
+        return 1
+        ;;
+    esac
+    value=${line#BUGNET_SOLANA_RPC_URLS=}
+    case $value in
+    *[[:space:]\&\;\|\<\>\(\)\$\`\'\"\\]*)
+        echo "BUGNET_SOLANA_RPC_URLS holds a space or a shell character; fix the line in the local .env" >&2
+        return 1
+        ;;
+    esac
+    if [ -z "${value//,/}" ]; then
+        echo "BUGNET_SOLANA_RPC_URLS holds no URL" >&2
+        return 1
+    fi
+}
+
+# The list when it is set, else the single URL; the list itself must pass rpc_list_ok
+rpc_env_ok() {
+    local file=$1
+    if grep -q '^BUGNET_SOLANA_RPC_URLS=.' "$file" 2>/dev/null; then
+        grep '^BUGNET_SOLANA_RPC_URLS=.' "$file" | tail -n 1 | rpc_list_ok
+        return
+    fi
+    grep -q '^BUGNET_SOLANA_RPC_URL=.' "$file" 2>/dev/null && return 0
+    echo "$file has no BUGNET_SOLANA_RPC_URLS" >&2
+    return 1
+}
+
+# Replaces the list line with the one on stdin; the single URL line stays for a rollback
+write_rpc_list() {
+    local file=$1 input tmp n
+    input=$(cat)
+    if [ -z "$input" ] || [[ $input == *$'\n'* ]]; then
+        echo "expected one BUGNET_SOLANA_RPC_URLS line on stdin" >&2
+        return 1
+    fi
+    printf '%s\n' "$input" | rpc_list_ok || return 1
+    tmp=$(mktemp "$file.XXXXXX")
+    grep -v '^BUGNET_SOLANA_RPC_URLS=' "$file" >"$tmp" || true
+    printf '%s\n' "$input" >>"$tmp"
+    cat "$tmp" >"$file"
+    rm -f "$tmp"
+    n=$(printf '%s' "${input#BUGNET_SOLANA_RPC_URLS=}" | tr ',' '\n' | grep -c . || true)
+    echo "BUGNET_SOLANA_RPC_URLS set in $file: $n URL$([ "$n" = 1 ] || echo s)"
+}
+
+do_rpc_urls() {
+    [ -f "$ENV_FILE" ] || die "$ENV_FILE does not exist; run the install step first"
+    write_rpc_list "$ENV_FILE" || die "the RPC list was not changed"
+    chown root:root "$ENV_FILE"
+    chmod 0600 "$ENV_FILE"
+    if [ -f "$RELEASE_FILE" ] && systemctl is-active --quiet "bugnet-payments@$(installed_version)"; then
+        say "run pcli rpc probe, then --start"
+    fi
+}
+
 do_pubkeys() {
     local recipient
     say "public values (no secrets)"
@@ -295,7 +360,8 @@ do_start() {
     local v ok=1 old
     v=$(installed_version)
     grep -q '<' "$TOML" && { echo "fill the <...> values in $TOML" >&2; ok=0; }
-    for name in BUGNET_SOLANA_RPC_URL BUGNET_PAYMENTS_TOKEN BUGNET_PAYMENTS_ROUTER_TOKEN \
+    rpc_env_ok "$ENV_FILE" || ok=0
+    for name in BUGNET_PAYMENTS_TOKEN BUGNET_PAYMENTS_ROUTER_TOKEN \
         BUGNET_ORDER_PRIVATE_KEY BUGNET_CLAIM_KEY BUGNET_FEE_PAYER_KEY BUGNET_REFUND_KEY \
         BUGNET_ALLOWANCE_KEY BUGNET_X402_TLS_KEY; do
         env_has "$name" || { echo "$ENV_FILE has no $name" >&2; ok=0; }
@@ -325,6 +391,7 @@ do_start() {
 
 main() {
     local tgz="" recipient="" event_key="" router_url="" index="" mode=install mtls=""
+    [ "$(id -u)" = 0 ] || die "run as root"
     [ $# -gt 0 ] || die "usage: see the comment at the top of this file"
     while [ $# -gt 0 ]; do
         case $1 in
@@ -335,6 +402,7 @@ main() {
         --mtls) mode=mtls; mtls=${2:?}; shift 2 ;;
         --pubkeys) mode=pubkeys; shift ;;
         --start) mode=start; shift ;;
+        --rpc-urls) mode=rpc_urls; shift ;;
         -*) die "unknown option $1" ;;
         *) tgz=$1; shift ;;
         esac
@@ -344,7 +412,9 @@ main() {
     mtls) do_mtls "$mtls" ;;
     pubkeys) do_pubkeys ;;
     start) do_start ;;
+    rpc_urls) do_rpc_urls ;;
     esac
 }
 
-main "$@"
+# A test sources the script with VPS_INSTALL_LIB=1 and calls one function, as a non-root user
+[ "${VPS_INSTALL_LIB:-0}" = 1 ] || main "$@"

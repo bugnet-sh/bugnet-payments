@@ -28,7 +28,7 @@ describe("jsonLog", () => {
     });
 
     it("scrubs configured secret strings from messages and errors", () => {
-        const rpc = "https://mainnet.helius-rpc.com/?api-key=K";
+        const rpc = "https://rpc1.example/?api-key=K";
         const { out, log } = capture({ secrets: [rpc] });
         log.error(`fetch ${rpc} failed`, { err: new Error(`POST ${rpc}: 429`) });
         expect(out[0]).not.toContain("api-key=K");
