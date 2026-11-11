@@ -2148,6 +2148,25 @@ describe("deposits commands", () => {
         );
     });
 
+    it("--moving only lists deposits with a move in flight", async () => {
+        for (const [id, state] of [
+            [ORDER_A, "sent"],
+            [ORDER_B, "confirmed"],
+        ] as const) {
+            await seedDeposit(id, { order: { state: "expired" }, deposit: { state: "closed" } });
+            await seedMove(id, {
+                kind: "close",
+                state,
+                txSignature: SIG(state === "sent" ? 64 : 65),
+            });
+        }
+        const io = captureIo();
+        expect(await cli(["deposits", "list", "--moving"], io)).toBe(0);
+        const lines = io.outText().split("\n");
+        expect(lines).toHaveLength(1);
+        expect(lines[0]!.startsWith(`${ORDER_A} state=closed `)).toBe(true);
+    });
+
     it("show prints shares and refund parts", async () => {
         const orderId = newOrderId();
         await seedDeposit(orderId, { order: { state: "refunding" }, deposit: { state: "done" } });

@@ -99,6 +99,8 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
     writeFileSync(join(root, "probe.out"), READY_PROBE);
     writeFileSync(join(root, "probe.exit"), "0");
     writeFileSync(join(root, "list.out"), "");
+    writeFileSync(join(root, "all.out"), "");
+    writeFileSync(join(root, "moving.out"), "");
     writeFileSync(log, "");
     const env = envFile(o.env ?? keysEnv());
     const fakes: Record<string, string> = {
@@ -119,6 +121,8 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
             `"") cat "${root}/usage" >&2; exit 2 ;;`,
             `*" rpc probe") cat "${root}/probe.out"; exit "$(cat "${root}/probe.exit")" ;;`,
             `*" deposits list --version "*) cat "${root}/list.out" ;;`,
+            `*" deposits list --moving") cat "${root}/moving.out" ;;`,
+            `*" deposits list") cat "${root}/all.out" ;;`,
             '"keys show --no-balances") echo "allowance=Allowance1111" ;;',
             `"keys rotate-deposit-seed --env "*) echo "BUGNET_DEPOSIT_SEED_PREVIOUS=${SEED}" >> "$4" ;;`,
             `"keys retire-deposit-seed --env "*" --remove-previous") cat > "${root}/stdin"`,
@@ -417,6 +421,93 @@ describe("vps-install.sh deposits", () => {
         }
         expect(readFileSync(server.toml, "utf8")).toBe(before);
         expect(server.calls().some((c) => c.startsWith("systemctl"))).toBe(false);
+    });
+
+    it("--deposits remove refuses while deposits are on or money could still move", () => {
+        const doneLine = "ord_d state=done received=1 returned=1 kept=0 review=0 held=0 reason=-\n";
+        const cases: [string, string, string, string][] = [
+            [
+                "[solana]\n\n[deposits]\nenabled = true\n",
+                "",
+                "",
+                "deposits are on; run --deposits off first",
+            ],
+            ...["open", "settling", "draining"].map((state): [string, string, string, string] => [
+                "[solana]\n\n[deposits]\nenabled = false\n",
+                `${doneLine}ord_a state=${state} received=1 returned=0 kept=0 review=0 held=0 reason=-\n`,
+                "",
+                "deposits open, settling or draining: 1; with a move in flight: 0",
+            ]),
+            [
+                "[solana]\n\n[deposits]\nenabled = false\n",
+                `${doneLine}ord_c state=closed received=1 returned=0 kept=0 review=0 held=0 reason=-\n`,
+                "ord_c state=closed received=1 returned=0 kept=0 review=0 held=0 reason=-\n",
+                "deposits open, settling or draining: 0; with a move in flight: 1",
+            ],
+        ];
+        for (const [toml, all, moving, message] of cases) {
+            const server = fakeServer({ active: true });
+            writeFileSync(server.toml, toml);
+            writeFileSync(join(server.root, "all.out"), all);
+            writeFileSync(join(server.root, "moving.out"), moving);
+            const r = server.run("main --deposits remove");
+            expect(r.code).toBe(1);
+            expect(r.err).toContain(message);
+            expect(readFileSync(server.toml, "utf8")).toBe(toml);
+            expect(server.calls().some((c) => c.startsWith("systemctl"))).toBe(false);
+        }
+    });
+
+    it("--deposits remove takes [deposits] out by a rename, restarts nothing, and --start then refuses", () => {
+        const server = fakeServer({ active: true });
+        writeFileSync(
+            server.toml,
+            '[solana]\nrecipient = "R"\n\n[deposits]\nenabled = false\nseed_version = 2\n\n[limits]\nx = 1\n',
+        );
+        writeFileSync(
+            join(server.root, "all.out"),
+            "ord_c state=closed received=1 returned=1 kept=0 review=0 held=0 reason=-\n" +
+                "ord_d state=done received=1 returned=1 kept=0 review=0 held=0 reason=-\n",
+        );
+        const ino = statSync(server.toml).ino;
+        let r = server.run("main --deposits remove");
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        expect(readFileSync(server.toml, "utf8")).toBe(
+            '[solana]\nrecipient = "R"\n\n[limits]\nx = 1\n',
+        );
+        expect(statSync(server.toml).ino).not.toBe(ino);
+        expect(statSync(server.toml).mode & 0o777).toBe(0o644);
+        expect(server.calls()).toEqual([
+            `bugnet-payments -config ${server.toml} deposits list`,
+            `bugnet-payments -config ${server.toml} deposits list --moving`,
+        ]);
+
+        // This release would read the missing section as deposits on
+        r = server.run("main --start");
+        expect(r.code).toBe(1);
+        expect(r.err).toContain(
+            `${server.toml} has no [deposits]; run --deposits off to add it back`,
+        );
+        expect(server.calls().some((c) => c.startsWith("systemctl restart"))).toBe(false);
+
+        r = server.run("main --deposits remove");
+        expect(r.code).toBe(0);
+        expect(r.out).toContain("has no [deposits]");
+
+        r = server.run("main --deposits off");
+        expect(r.code).toBe(0);
+        expect(readFileSync(server.toml, "utf8")).toContain("\n[deposits]\nenabled = false\n");
+        expect(server.calls()).toContain("systemctl restart bugnet-payments@v9");
+    });
+
+    it("deposits_set gives a section it adds enabled = false", () => {
+        const server = fakeServer();
+        writeFileSync(server.toml, "[solana]\n");
+        expect(server.run("deposits_set seed_version 2").code).toBe(0);
+        expect(readFileSync(server.toml, "utf8")).toBe(
+            "[solana]\n\n[deposits]\nseed_version = 2\nenabled = false\n",
+        );
     });
 
     it("the install step adds [deposits] enabled = false once", () => {

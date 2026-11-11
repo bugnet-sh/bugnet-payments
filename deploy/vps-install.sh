@@ -11,6 +11,9 @@
 #                                         payments.env; deploy/push-rpc-urls.sh sends it
 #   vps-install.sh --deposits on|off      sets [deposits] enabled and restarts the running version;
 #                                         on needs the RPC router release and a passing rpc probe
+#   vps-install.sh --deposits remove      before a rollback below the deposits release: removes
+#                                         [deposits] once deposits are off and no deposit is open,
+#                                         settling, draining or has a move in flight
 #   vps-install.sh --rotate-deposit-seed  makes a new deposit seed; the old one stays as
 #                                         BUGNET_DEPOSIT_SEED_PREVIOUS until it is retired
 #   vps-install.sh --retire-deposit-seed - [--remove-previous]
@@ -217,7 +220,8 @@ toml_set() {
 
 # Sets one unquoted value (a boolean or a number) inside [deposits]. Unlike toml_set it adds the
 # key, and the section, when they are missing, since --deposits and the rotation own these keys.
-# The file is read twice; each pass starts outside every section.
+# A section it adds states enabled = false, as the install step's does, because a missing enabled
+# reads as true. The file is read twice; each pass starts outside every section.
 deposits_set() {
     local key=$1 value=$2
     # shellcheck disable=SC2016
@@ -233,7 +237,12 @@ deposits_set() {
         cur == "[deposits]" && $0 ~ "^" key "[[:space:]]*=" { print key " = " val; next }
         { print }
         $0 == "[deposits]" && !has { print key " = " val }
-        END { if (!sec) { print ""; print "[deposits]"; print key " = " val } }
+        END {
+            if (!sec) {
+                print ""; print "[deposits]"; print key " = " val
+                if (key != "enabled") print "enabled = false"
+            }
+        }
     ' "$TOML" "$TOML"
 }
 
@@ -476,6 +485,12 @@ do_start() {
     local v ok=1 old
     v=$(installed_version)
     grep -q '<' "$TOML" && { echo "fill the <...> values in $TOML" >&2; ok=0; }
+    # This release reads a missing [deposits] as enabled = true, which after --deposits remove would
+    # turn deposits on unasked
+    if ! grep -q '^\[deposits\]' "$TOML"; then
+        echo "$TOML has no [deposits]; run --deposits off to add it back" >&2
+        ok=0
+    fi
     rpc_env_ok "$ENV_FILE" || ok=0
     for name in BUGNET_PAYMENTS_TOKEN BUGNET_PAYMENTS_ROUTER_TOKEN \
         BUGNET_ORDER_PRIVATE_KEY BUGNET_CLAIM_KEY BUGNET_FEE_PAYER_KEY BUGNET_REFUND_KEY \
@@ -563,13 +578,42 @@ deposits_gate_ok() {
     return 1
 }
 
+# A release without deposits refuses payments.toml while it holds [deposits], so a rollback below
+# the deposits release removes the section first. Such a release watches no deposit, so this
+# refuses while money could still move: deposits on (a page view would open one), a deposit open,
+# settling or draining, or a move in flight. Closed deposits may stay: late money sent to them
+# waits for a roll forward and goes back with deposits return-late. It restarts nothing, since
+# this release would read the missing section as deposits on.
+deposits_remove() {
+    local list n moving m
+    if ! grep -q '^\[deposits\]' "$TOML"; then
+        say "$TOML has no [deposits]"
+        return 0
+    fi
+    [ "$(deposits_get enabled)" = false ] || die "deposits are on; run --deposits off first"
+    list=$(svc_cli deposits list </dev/null) || die "pcli deposits list failed; [deposits] was not removed"
+    n=$(printf '%s\n' "$list" | grep -cE ' state=(open|settling|draining) ' || true)
+    moving=$(svc_cli deposits list --moving </dev/null) || die "pcli deposits list failed; [deposits] was not removed"
+    m=$(printf '%s' "$moving" | grep -c . || true)
+    if [ "$n" != 0 ] || [ "$m" != 0 ]; then
+        die "deposits open, settling or draining: $n; with a move in flight: $m; [deposits] was not removed"
+    fi
+    # shellcheck disable=SC2016
+    toml_rewrite '/^\[/ { skip = ($0 ~ /^\[deposits(\]|\.)/) } !skip { print }' "$TOML"
+    say "removed [deposits] from $TOML; now install the older release and run its --start"
+}
+
 do_deposits() {
     local want=$1 out rc=0
     case $want in
-    on | off) ;;
-    *) die "--deposits takes on or off" ;;
+    on | off | remove) ;;
+    *) die "--deposits takes on, off or remove" ;;
     esac
     no_rotation_halfway
+    if [ "$want" = remove ]; then
+        deposits_remove
+        return
+    fi
     if [ "$want" = on ]; then
         if ! release_has_probe; then
             echo "deposits need the RPC router release; install it first" >&2

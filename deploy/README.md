@@ -254,7 +254,7 @@ through a pipe, to `vps-install.sh --rpc-urls`.
 Nobody edits `/etc/bugnet/payments.env` by hand. `rpc1` is the first URL in every log, alarm and
 `pcli` line. The single `BUGNET_SOLANA_RPC_URL` is read only while the list is unset or blank,
 and stays for a rollback to a release without the router; from the deposits release on, such a
-rollback also needs `[deposits]` gone from `payments.toml` (section 8).
+rollback first needs `vps-install.sh --deposits remove` (section 8).
 
 - No spaces, quotes, comment or shell character on the line: `pcli` and the install script load
   the file with the shell, which would split the line and print part of it. A comma inside a URL
@@ -368,9 +368,23 @@ from this release's install step on:
 
 - run `--start` right after the install step. Until then the older version still runs, but a
   crash or a reboot leaves it unable to start. `--start` stops it and starts this release;
-- a rollback to a release without deposits first needs `[deposits]` removed from
-  `payments.toml`. No script step removes it, and nobody edits the file by hand, so there is no
-  rollback below this release yet: fix forward.
+- a rollback to a release without deposits first needs `vps-install.sh --deposits remove`
+  (below).
+
+**Rollback below the deposits release.** Run `vps-install.sh --deposits off` first, then:
+
+1. `vps-install.sh --deposits remove`. It asks the database through `pcli deposits list` and
+   refuses while deposits are on, any deposit is `open`, `settling` or `draining`, or any deposit
+   has a move in flight (`pcli deposits list --moving`), since the older release watches none of
+   them. Otherwise it removes `[deposits]` from `payments.toml` by an atomic rename and restarts
+   nothing. When it refuses, wait for those deposits to finish and run it again.
+2. At once, the older release's own `deploy/vps-install.sh` with its tarball, then its `--start`
+   (this release's install step would add `[deposits]` back). Until then this release must not
+   restart: it reads the missing section as deposits on. Its `--start` refuses with
+   `payments.toml has no [deposits]`; `--deposits off` adds the section back.
+
+`closed` deposits may stay: late money sent to them waits for a roll forward, then goes back with
+`pcli deposits return-late` (section 12).
 
 To turn deposits on:
 
@@ -672,10 +686,10 @@ allowance wallet, money already swept, or review money already carried to the re
 
 **Operator commands** (all `pcli`, section 8):
 
-- `deposits list [--state S] [--review] [--version N]`: one line per deposit,
+- `deposits list [--state S] [--review] [--version N] [--moving]`: one line per deposit,
   `<orderId> state=<s> received= returned= kept= review= held= reason=`, amounts in micros.
   `review` is review money still in the deposit, `held` is review money carried to the refund
-  float.
+  float. `--moving` lists only deposits with a move in flight.
 - `deposits show <orderId>`: the deposit, its transfers with owner and source, its moves with
   their signatures, its holds, and for a shared payment its shares and every refund part.
 - `deposits retry <orderId>`: clears the review reason and puts the deposit's manual sweep back to

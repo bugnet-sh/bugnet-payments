@@ -118,8 +118,9 @@ const USAGE = [
     "  x402 ledger-check <accountId>            check an account's rows against the chain",
     "  rpc status [--outcomes]                  each RPC endpoint's health, from the service",
     "  rpc probe                                check every RPC endpoint now",
-    "  deposits list [--state S] [--review] [--version N]",
-    "                                           one line per deposit and its money",
+    "  deposits list [--state S] [--review] [--version N] [--moving]",
+    "                                           one line per deposit and its money;",
+    "                                           --moving: only those with a move in flight",
     "  deposits show <orderId>                  transfers, moves, shares and refund parts",
     "  deposits retry <orderId>                 clear review, requeue the manual sweep",
     "  deposits return-to <orderId> <signature> <tokenAccount> [--signed FILE]",
@@ -171,6 +172,7 @@ type FlagName =
     | "--outcomes"
     | "--state"
     | "--review"
+    | "--moving"
     | "--version"
     | "--signed"
     | "--signature"
@@ -181,6 +183,7 @@ interface Flags {
     outcomes?: boolean;
     state?: string;
     review?: boolean;
+    moving?: boolean;
     version?: string;
     signed?: string;
     signatures?: string[];
@@ -192,7 +195,7 @@ const DEPOSIT_STATES: readonly string[] = ["open", "settling", "draining", "clos
 // A switch takes no value; only --signature may be given more than once
 const FLAG_SPECS: Record<
     FlagName,
-    | { switch: "outcomes" | "review" }
+    | { switch: "outcomes" | "review" | "moving" }
     | {
           key: "tx" | "state" | "version" | "signed" | "archive" | "signatures";
           valid: (s: string) => boolean;
@@ -202,6 +205,7 @@ const FLAG_SPECS: Record<
     "--tx": { key: "tx", valid: () => true, what: "a signature" },
     "--outcomes": { switch: "outcomes" },
     "--review": { switch: "review" },
+    "--moving": { switch: "moving" },
     "--state": { key: "state", valid: (s) => DEPOSIT_STATES.includes(s), what: "a deposit state" },
     "--version": { key: "version", valid: isCount, what: "a key version" },
     "--signed": { key: "signed", valid: (s) => s !== "", what: "a file" },
@@ -268,7 +272,7 @@ const DB_COMMANDS = new Map<string, DbCommand>([
     ["rpc probe", { params: [], run: rpcProbe }],
     [
         "deposits list",
-        { params: [], flags: ["--state", "--review", "--version"], run: depositsList },
+        { params: [], flags: ["--state", "--review", "--version", "--moving"], run: depositsList },
     ],
     ["deposits show", { params: ["orderId"], run: depositsShow }],
     ["deposits retry", { params: ["orderId"], run: depositsRetry }],
@@ -1331,9 +1335,15 @@ async function depositsList(
          left join deposit_moves m on m.id = t.move_id
          left join refunds r on r.id = t.refund_id
          where ($1::text is null or d.state = $1) and ($2::int is null or d.key_version = $2)
+            and (not $3::boolean or exists (select 1 from deposit_moves x
+                where x.order_id = d.order_id and x.state in ('pending', 'signed', 'sent')))
          group by d.order_id
          order by d.created_at, d.order_id`,
-        [flags.state ?? null, flags.version === undefined ? null : Number(flags.version)],
+        [
+            flags.state ?? null,
+            flags.version === undefined ? null : Number(flags.version),
+            flags.moving === true,
+        ],
     );
     for (const r of rows) {
         const flagged =
