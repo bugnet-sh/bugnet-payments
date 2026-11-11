@@ -1,6 +1,6 @@
 import { address } from "@solana/kit";
 import type pg from "pg";
-import { loadSettings, secretValues, type Settings } from "./config.ts";
+import { loadSettings, rpcUrlsOf, secretValues, type Settings } from "./config.ts";
 import { createPool, withTx, type Queryable } from "./db/pool.ts";
 import { isKeysCommand, KEYS_USAGE, runKeys } from "./keys/commands.ts";
 import { jsonLog, type Log } from "./log.ts";
@@ -18,7 +18,15 @@ import {
 } from "./refunds/request.ts";
 import { usdcAta } from "./solana/accounts.ts";
 import { isCanonicalAddress, isCanonicalSignature } from "./solana/base58.ts";
-import { createRpc, type SolanaRpc } from "./solana/rpc.ts";
+import { cliRouter } from "./solana/cli-router.ts";
+import {
+    domainOf,
+    type CheckReport,
+    type RouterDeps,
+    type RouterSnapshot,
+} from "./solana/router/index.ts";
+import type { RoutedRpc, SolanaRpc } from "./solana/rpc.ts";
+import { readSnapshot } from "./solana/rpc-store.ts";
 import { blockPayTo, readControls, setControls, unblockPayTo } from "./x402/controls.ts";
 import { type AllowanceFunding, createAllowanceFunding } from "./x402/funding.ts";
 import { openIncidents, resolveIncident } from "./x402/incidents.ts";
@@ -66,6 +74,8 @@ const USAGE = [
     "  x402 incident resolve <id> <finding>     close an incident with what was found",
     "  x402 status                              controls, pool, balances and open facts",
     "  x402 ledger-check <accountId>            check an account's rows against the chain",
+    "  rpc status [--outcomes]                  each RPC endpoint's health, from the service",
+    "  rpc probe                                check every RPC endpoint now",
     KEYS_USAGE,
 ].join("\n");
 
@@ -100,9 +110,13 @@ const PARAMS: Record<Param, { valid: (s: string) => boolean; what: string }> = {
     incidentId: { valid: isCount, what: "an incident id" },
 };
 
+export { cliRouter };
+
 export interface CliOptions {
     rpc?: SolanaRpc;
     now?: () => Date;
+    // Tests map each list position to their own endpoint
+    rpcTransportFor?: RouterDeps["transportFor"];
 }
 
 interface CliContext {
@@ -111,18 +125,25 @@ interface CliContext {
     log: Log;
     now: () => Date;
     funding: AllowanceFunding;
-    rpc(): SolanaRpc;
-    rpcOrNull(): SolanaRpc | null;
+    env: NodeJS.ProcessEnv;
+    rpcTransportFor?: RouterDeps["transportFor"];
+    // Built and started on first use, then reused for the rest of the command
+    rpc(): Promise<SolanaRpc>;
+    rpcOrNull(): Promise<SolanaRpc | null>;
 }
+
+const NO_RPC = "BUGNET_SOLANA_RPC_URLS or BUGNET_SOLANA_RPC_URL must be set";
+// The service writes its snapshot every 15 s; older ones may be from a stopped service
+const SNAPSHOT_FRESH_MS = 60_000;
 
 interface DbCommand {
     params: readonly Param[];
-    flags?: readonly "--tx"[];
+    flags?: readonly ("--tx" | "--outcomes")[];
     run(
         ctx: CliContext,
         io: CliIo,
         args: readonly string[],
-        flags: { tx?: string },
+        flags: { tx?: string; outcomes?: boolean },
     ): Promise<number>;
 }
 
@@ -147,6 +168,8 @@ const DB_COMMANDS = new Map<string, DbCommand>([
     ["x402 incident resolve", { params: ["incidentId", "text"], run: x402IncidentResolve }],
     ["x402 status", { params: [], run: x402StatusCommand }],
     ["x402 ledger-check", { params: ["accountId"], run: x402LedgerCheck }],
+    ["rpc status", { params: [], flags: ["--outcomes"], run: rpcStatus }],
+    ["rpc probe", { params: [], run: rpcProbe }],
 ]);
 
 export async function cliMain(
@@ -159,6 +182,7 @@ export async function cliMain(
     if (args === null) return usage(io, "-config needs a file");
     const [group, action, ...keysWords] = args.words;
     if (isKeysCommand(group)) return runKeys(action, keysWords, env, io, args.config);
+    const configFile = args.config ?? DEFAULT_CONFIG;
     let cmd: DbCommand | undefined;
     let used = 0;
     for (const n of [3, 2]) {
@@ -168,7 +192,11 @@ export async function cliMain(
     }
     if (cmd === undefined) return usage(io);
     let rest = args.words.slice(used);
-    const flags: { tx?: string } = {};
+    const flags: { tx?: string; outcomes?: boolean } = {};
+    if (cmd.flags?.includes("--outcomes") && rest.includes("--outcomes")) {
+        flags.outcomes = true;
+        rest = rest.filter((w) => w !== "--outcomes");
+    }
     if (cmd.flags?.includes("--tx")) {
         const at = rest.indexOf("--tx");
         if (at !== -1) {
@@ -184,24 +212,43 @@ export async function cliMain(
         if (!valid(rest[i]!)) return usage(io, `${JSON.stringify(rest[i])} is not ${what}`);
     }
     let pool: pg.Pool | undefined;
+    let routed: Promise<RoutedRpc | null> | undefined;
     try {
-        const settings = loadSettings(args.config);
+        const settings = loadSettings(configFile);
         const log = jsonLog("payments-cli", { secrets: secretValues(env), write: io.err });
-        pool = createPool(settings.database.url, log);
-        const url = env.BUGNET_SOLANA_RPC_URL ?? "";
+        const db = createPool(settings.database.url, log);
+        pool = db;
+        const openRouter = (): Promise<RoutedRpc | null> =>
+            (routed ??= (async () => {
+                const r = cliRouter(env, settings.solana.rpc, {
+                    log,
+                    rpcTimeoutMs: settings.solana.rpc_timeout,
+                    pool: db,
+                    recipientAta: await usdcAta(address(settings.solana.recipient)),
+                    ...(o.rpcTransportFor === undefined ? {} : { transportFor: o.rpcTransportFor }),
+                });
+                if (r === null) return null;
+                await r.router.start({ timers: false });
+                await warnOtherList(db, r, log, o.now ?? (() => new Date()));
+                return r;
+            })());
         const ctx: CliContext = {
-            pool,
+            pool: db,
             settings,
             log,
             now: o.now ?? (() => new Date()),
             funding: createAllowanceFunding({ x402: settings.x402, log }),
-            rpc() {
+            env,
+            ...(o.rpcTransportFor === undefined ? {} : { rpcTransportFor: o.rpcTransportFor }),
+            async rpc() {
                 if (o.rpc !== undefined) return o.rpc;
-                if (url === "") throw new Error("BUGNET_SOLANA_RPC_URL must be set");
-                return createRpc(url);
+                const r = await openRouter();
+                if (r === null) throw new Error(NO_RPC);
+                return r.rpc;
             },
-            rpcOrNull() {
-                return o.rpc ?? (url === "" ? null : createRpc(url));
+            async rpcOrNull() {
+                if (o.rpc !== undefined) return o.rpc;
+                return (await openRouter())?.rpc ?? null;
             },
         };
         return await cmd.run(ctx, io, rest, flags);
@@ -209,13 +256,33 @@ export async function cliMain(
         io.err(`error: ${err instanceof Error ? err.message : String(err)}`);
         return 1;
     } finally {
+        // The router flushes its usage into the pool, so it stops first
+        const r = await routed?.catch(() => null);
+        await r?.router.stop();
         await pool?.end();
     }
 }
 
-function splitConfig(argv: readonly string[]): { config: string; words: string[] } | null {
+// A shell that dropped part of the list while loading the env file shows here, by count only
+async function warnOtherList(
+    pool: pg.Pool,
+    r: RoutedRpc,
+    log: Log,
+    now: () => Date,
+): Promise<void> {
+    const stored = await readSnapshot(pool).catch(() => null);
+    if (stored === null) return;
+    if (now().getTime() - stored.writtenAt.getTime() >= SNAPSHOT_FRESH_MS) return;
+    const mine = r.router.snapshot().endpoints.length;
+    const theirs = stored.snapshot.endpoints.length;
+    if (stored.snapshot.mode === r.router.mode && mine === theirs) return;
+    log.warn(`rpc the CLI reads ${mine} URL${mine === 1 ? "" : "s"}, the service ${theirs}`);
+}
+
+// config is null when no -config was given, so the keys commands can tell
+function splitConfig(argv: readonly string[]): { config: string | null; words: string[] } | null {
     const at = argv.findIndex((a) => a === "-config" || a === "--config");
-    if (at === -1) return { config: DEFAULT_CONFIG, words: [...argv] };
+    if (at === -1) return { config: null, words: [...argv] };
     const config = argv[at + 1];
     if (config === undefined) return null;
     return { config, words: [...argv.slice(0, at), ...argv.slice(at + 2)] };
@@ -282,7 +349,7 @@ async function proofOf(ctx: CliContext, r: RefundRow): Promise<ResignProof> {
     if (r.txSignature === null) return "absent";
     return resignProof(
         ctx.pool,
-        ctx.rpc(),
+        await ctx.rpc(),
         { signatures: [r.txSignature, ...r.previousSignatures], expirySeenSlot: r.expirySeenSlot },
         ctx.settings.x402,
         ctx.settings.solana.rpc_timeout,
@@ -792,7 +859,7 @@ async function x402StatusCommand(ctx: CliContext, io: CliIo): Promise<number> {
     const hot = wallet === "" ? null : await usdcAta(address(wallet));
     for (const line of await x402Status(
         ctx.pool,
-        ctx.rpcOrNull(),
+        await ctx.rpcOrNull(),
         hot,
         ctx.settings.x402,
         ctx.now(),
@@ -809,12 +876,177 @@ async function x402LedgerCheck(
 ): Promise<number> {
     const result = await ledgerCheck(
         ctx.pool,
-        ctx.rpc(),
+        await ctx.rpc(),
         accountId,
         ctx.settings.solana.rpc_timeout,
     );
     for (const line of result.lines) io.out(line);
     return result.ok ? 0 : 1;
+}
+
+async function rpcStatus(
+    ctx: CliContext,
+    io: CliIo,
+    _args: readonly string[],
+    flags: { outcomes?: boolean },
+): Promise<number> {
+    const stored = await readSnapshot(ctx.pool);
+    if (stored === null) {
+        io.err("no router snapshot: is the service running?");
+        return 1;
+    }
+    const lines = formatRpcStatus(
+        stored.snapshot,
+        stored.writtenAt,
+        ctx.now(),
+        flags.outcomes === true,
+    );
+    for (const line of lines) io.out(line);
+    return 0;
+}
+
+export function formatRpcStatus(
+    s: RouterSnapshot,
+    writtenAt: Date,
+    now: Date,
+    outcomes: boolean,
+): string[] {
+    const age = Math.round((now.getTime() - writtenAt.getTime()) / 1000);
+    const lines = [
+        `snapshot: ${writtenAt.toISOString()} (age ${age}s${age * 1000 > SNAPSHOT_FRESH_MS ? ", stale" : ""})`,
+        `serving: ${s.serving ?? "none"}  domains: ${s.domains}  quorum: ${s.absenceQuorum}  copies: ${s.sendFanout}`,
+    ];
+    for (const e of s.endpoints) {
+        const background =
+            e.monthRequests === 0 ? 0 : Math.round((e.monthBackground * 100) / e.monthRequests);
+        lines.push(
+            [
+                e.name,
+                `state: ${stateText(e.state, e.untilMs, now)}`,
+                `roles: ${e.roles.join(" ")}`,
+                `latency: ${Math.round(e.latencyMs)}ms`,
+                `errors: ${Math.round(e.errorRate * 100)}%`,
+                `slot: ${e.confirmedSlot ?? "none"}`,
+                `lag: ${e.lag ?? "none"}`,
+                `month: ${e.monthRequests}`,
+                `background: ${background}%`,
+                `limits: ${limitsText(e.limits)}`,
+                `genesis: ${e.checks.genesis}`,
+                `history: ${e.checks.history}`,
+                `consistent: ${e.consistent}`,
+                `pinned-accounts: ${e.checks.pinnedAccounts}`,
+                `pinned-signatures: ${e.checks.pinnedSignatures}`,
+            ].join("  "),
+        );
+    }
+    if (outcomes) {
+        for (const e of s.endpoints) {
+            for (const [method, counts] of Object.entries(e.outcomes)) {
+                const parts = Object.entries(counts).map(([outcome, n]) => `${outcome}: ${n}`);
+                lines.push(`  ${e.name} ${method}  ${parts.join("  ")}`);
+            }
+        }
+    }
+    return lines;
+}
+
+function stateText(state: string, untilMs: number | null, now: Date): string {
+    if (state === "wrong_network") return "wrong-network";
+    if ((state === "cooling" || state === "open") && untilMs !== null) {
+        return `${state} ${Math.max(0, Math.ceil((untilMs - now.getTime()) / 1000))}s`;
+    }
+    return state;
+}
+
+function limitsText(limits: Readonly<Record<string, number>>): string {
+    const entries = Object.entries(limits);
+    if (entries.length === 0) return "none";
+    entries.sort(([a], [b]) => (a === "*" ? -1 : b === "*" ? 1 : a.localeCompare(b)));
+    return entries.map(([m, n]) => `${m === "*" ? "all" : m} ${n}/10s`).join(", ");
+}
+
+// A probe is not traffic: no usage store, verdicts read only, and no start()
+async function rpcProbe(ctx: CliContext, io: CliIo): Promise<number> {
+    const r = cliRouter(ctx.env, ctx.settings.solana.rpc, {
+        log: ctx.log,
+        rpcTimeoutMs: ctx.settings.solana.rpc_timeout,
+        pool: ctx.pool,
+        recipientAta: await usdcAta(address(ctx.settings.solana.recipient)),
+        usage: false,
+        verdictsReadOnly: true,
+        ...(ctx.rpcTransportFor === undefined ? {} : { transportFor: ctx.rpcTransportFor }),
+    });
+    if (r === null) {
+        io.err(NO_RPC);
+        return 1;
+    }
+    try {
+        const report = await r.router.check();
+        const snap = r.router.snapshot();
+        const consistent: Record<string, string> = {};
+        for (const e of snap.endpoints) consistent[e.name] = e.consistent;
+        const urls = rpcUrlsOf(ctx.env);
+        const ready = new Set<string>();
+        report.endpoints.forEach((c, i) => {
+            if (c.history === "ok" && consistent[c.name] === "yes") ready.add(domainOf(urls[i]!));
+        });
+        const quorum =
+            r.router.mode === "single" ? null : { ready: ready.size, needed: snap.absenceQuorum };
+        for (const line of formatRpcProbe(report, consistent, quorum)) io.out(line);
+        return probeFails(report, consistent, quorum) ? 1 : 0;
+    } finally {
+        await r.router.stop();
+    }
+}
+
+export function formatRpcProbe(
+    r: CheckReport,
+    consistent: Readonly<Record<string, string>>,
+    quorum: { ready: number; needed: number } | null,
+): string[] {
+    const lines = r.endpoints.map((c) =>
+        [
+            c.name,
+            `genesis: ${c.genesis}${c.genesisError === null ? "" : ` ${c.genesisError}`}`,
+            `pinned-accounts: ${c.pinnedAccounts}`,
+            `pinned-signatures: ${c.pinnedSignatures}`,
+            `history: ${c.history}`,
+            `consistent: ${consistent[c.name] ?? "unknown"}`,
+            `slot: ${c.slot ?? "none"}`,
+            `latency: ${c.latencyMs === null ? "none" : `${Math.round(c.latencyMs)}ms`}`,
+        ].join("  "),
+    );
+    lines.push(
+        quorum === null
+            ? "quorum: off (one URL)"
+            : `quorum: ${quorum.ready} of ${quorum.needed} domains ready`,
+    );
+    const listings = r.endpoints
+        .filter(
+            (c) =>
+                consistent[c.name] === "yes" && c.history === "ok" && c.pinnedSignatures === "ok",
+        )
+        .map((c) => c.name);
+    lines.push(`listings: ${listings.length === 0 ? "none" : listings.join(" ")}`);
+    return lines;
+}
+
+// A missing history or consistent: no alone still serves reads, sends and found answers
+function probeFails(
+    r: CheckReport,
+    consistent: Readonly<Record<string, string>>,
+    quorum: { ready: number; needed: number } | null,
+): boolean {
+    for (const c of r.endpoints) {
+        if (c.genesis === "wrong" || c.genesis === "error") return true;
+        if (c.history === "error") return true;
+        if (consistent[c.name] === "yes") {
+            for (const pinned of [c.pinnedAccounts, c.pinnedSignatures]) {
+                if (pinned === "ignored" || pinned === "error") return true;
+            }
+        }
+    }
+    return quorum !== null && quorum.ready < quorum.needed;
 }
 
 if (import.meta.main) {

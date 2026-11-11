@@ -4,7 +4,19 @@ import { join } from "node:path";
 import { getBase58Decoder } from "@solana/kit";
 import { stringify } from "smol-toml";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { type CliOptions, cliMain } from "./cli.ts";
+import { type CliOptions, cliMain, formatRpcStatus } from "./cli.ts";
+import {
+    type FakeHandler,
+    fakeEndpoint,
+    httpFail,
+    rpcFail,
+    rpcOk,
+    signatureStatus,
+    statusesAnswer,
+} from "./solana/router/testing.ts";
+import { MAINNET_GENESIS, type RouterSnapshot } from "./solana/router/index.ts";
+import { pgSnapshotStore } from "./solana/rpc-store.ts";
+import type { EndpointSnapshot } from "./solana/router/transport.ts";
 import { silentLog } from "./log.ts";
 import { findOrder } from "./orders/store.ts";
 import type { OrderRow } from "./orders/types.ts";
@@ -1108,5 +1120,281 @@ describe("the x402 operator commands", () => {
             expect(await cli(["x402", "ledger-check", account.id], io)).toBe(1);
             expect(io.errText()).toContain("BUGNET_SOLANA_RPC_URL must be set");
         });
+    });
+});
+
+describe("rpc commands", () => {
+    const NOW = new Date("2026-11-10T14:00:20.000Z");
+    function endpoint(over: Partial<EndpointSnapshot> = {}): EndpointSnapshot {
+        return {
+            name: "rpc1",
+            roles: ["read", "history", "send"],
+            state: "ok",
+            untilMs: null,
+            latencyMs: 84,
+            errorRate: 0,
+            inflight: 0,
+            confirmedSlot: "467621707",
+            lag: 0,
+            consistent: "yes",
+            limits: {},
+            monthRequests: 412334,
+            monthBackground: 127824,
+            hourRequests: 10,
+            laneRequests: { money: 5, background: 5 },
+            outcomes: {},
+            checks: { genesis: "ok", history: "ok", pinnedAccounts: "ok", pinnedSignatures: "ok" },
+            lastError: null,
+            ...over,
+        };
+    }
+    function snapshot(endpoints: EndpointSnapshot[]): RouterSnapshot {
+        return {
+            at: NOW.getTime(),
+            mode: endpoints.length > 1 ? "routed" : "single",
+            serving: "rpc1",
+            domains: 3,
+            absenceQuorum: 2,
+            sendFanout: 1,
+            endpoints,
+        };
+    }
+    const fiveSecondsAgo = new Date(NOW.getTime() - 5_000);
+
+    it("rpc status prints one line per endpoint", () => {
+        expect(formatRpcStatus(snapshot([endpoint()]), fiveSecondsAgo, NOW, false)).toEqual([
+            "snapshot: 2026-11-10T14:00:15.000Z (age 5s)",
+            "serving: rpc1  domains: 3  quorum: 2  copies: 1",
+            "rpc1  state: ok  roles: read history send  latency: 84ms  errors: 0%  slot: 467621707  lag: 0  month: 412334  background: 31%  limits: none  genesis: ok  history: ok  consistent: yes  pinned-accounts: ok  pinned-signatures: ok",
+        ]);
+    });
+
+    it("rpc status shows cooling with its seconds", () => {
+        const e = endpoint({ state: "cooling", untilMs: NOW.getTime() + 7_000 });
+        const [, , line] = formatRpcStatus(snapshot([e]), fiveSecondsAgo, NOW, false);
+        expect(line).toContain("state: cooling 7s");
+    });
+
+    it("rpc status shows an inconsistent endpoint", () => {
+        const e = endpoint({
+            consistent: "no",
+            roles: ["read", "send"],
+            checks: {
+                genesis: "ok",
+                history: "missing",
+                pinnedAccounts: "ok",
+                pinnedSignatures: "ok",
+            },
+        });
+        const [, , line] = formatRpcStatus(snapshot([e]), fiveSecondsAgo, NOW, false);
+        expect(line).toContain("consistent: no");
+        expect(line).toContain("roles: read send");
+        expect(line).toContain("history: missing");
+    });
+
+    it("rpc status shows learned limits", () => {
+        const e = endpoint({ limits: { getTransaction: 8, "*": 80 } });
+        const [, , line] = formatRpcStatus(snapshot([e]), fiveSecondsAgo, NOW, false);
+        expect(line).toContain("limits: all 80/10s, getTransaction 8/10s");
+    });
+
+    it("rpc status marks an old snapshot", () => {
+        const old = new Date(NOW.getTime() - 300_000);
+        const [first] = formatRpcStatus(snapshot([endpoint()]), old, NOW, false);
+        expect(first).toMatch(/\(age 300s, stale\)$/);
+    });
+
+    it("rpc status --outcomes adds one line per method", () => {
+        const e = endpoint({ outcomes: { getSlot: { ok: 2, http_429: 1 } } });
+        expect(formatRpcStatus(snapshot([e]), fiveSecondsAgo, NOW, true).at(-1)).toBe(
+            "  rpc1 getSlot  ok: 2  http_429: 1",
+        );
+    });
+
+    it("rpc status without a snapshot", async () => {
+        await db.pool.query("delete from rpc_health");
+        const io = captureIo();
+        expect(await cli(["rpc", "status"], io)).toBe(1);
+        expect(io.errText()).toContain("no router snapshot: is the service running?");
+    });
+
+    // A healthy mainnet node at slot 500 that knows every signature it is asked about
+    function checkNode(label: string, over: Record<string, FakeHandler> = {}) {
+        const at = 500n;
+        return fakeEndpoint(label, (method, params, payload) => {
+            const own = over[method];
+            if (own !== undefined) return own(method, params, payload);
+            const last = params.at(-1);
+            const pin =
+                typeof last === "object" && last !== null
+                    ? (last as { minContextSlot?: unknown }).minContextSlot
+                    : undefined;
+            if (typeof pin === "bigint" && pin > at) {
+                return rpcFail(-32016, "Minimum context slot has not been reached", {
+                    contextSlot: at,
+                });
+            }
+            switch (method) {
+                case "getGenesisHash":
+                    return rpcOk(MAINNET_GENESIS);
+                case "getEpochInfo":
+                    return rpcOk({
+                        absoluteSlot: at,
+                        blockHeight: at - 100n,
+                        epoch: 0n,
+                        slotIndex: at,
+                        slotsInEpoch: 432_000n,
+                        transactionCount: 0n,
+                    });
+                case "getIdentity":
+                    return rpcOk({ identity: `node-${label}` });
+                case "getSignatureStatuses":
+                    return statusesAnswer(
+                        at,
+                        (params[0] as string[]).map(() => signatureStatus(400n, "finalized")),
+                    );
+                case "getTransaction":
+                    return rpcOk({ slot: 400n });
+                case "getSignaturesForAddress":
+                    return rpcOk(Array.from({ length: 1_000 }, (_, i) => ({ signature: `s${i}` })));
+                default:
+                    return rpcOk({ context: { slot: at }, value: null });
+            }
+        });
+    }
+    const TWO = { BUGNET_SOLANA_RPC_URLS: "https://a.example/,https://b.example/" };
+    async function probe(
+        env: NodeJS.ProcessEnv,
+        nodes: ReturnType<typeof checkNode>[],
+    ): Promise<{ code: number; out: string[]; text: string }> {
+        const io = captureIo();
+        const code = await cliMain(["-config", config, "rpc", "probe"], env, io, {
+            rpcTransportFor: (name) => nodes[Number(name.slice(3)) - 1]!.transport,
+        });
+        return { code, out: io.outText().split("\n"), text: io.outText() + io.errText() };
+    }
+
+    it("rpc probe prints each check", async () => {
+        const r = await probe(TWO, [checkNode("a"), checkNode("b")]);
+        expect(r.out[0]).toMatch(
+            /^rpc1 {2}genesis: ok {2}pinned-accounts: ok {2}pinned-signatures: ok {2}history: ok {2}consistent: yes {2}slot: 500 {2}latency: \d+ms$/,
+        );
+        expect(r.out.slice(-2)).toEqual(["quorum: 2 of 2 domains ready", "listings: rpc1 rpc2"]);
+        expect(r.code).toBe(0);
+    });
+
+    it("rpc probe prints a wrong genesis and fails", async () => {
+        const devnet = checkNode("a", {
+            getGenesisHash: () => rpcOk("EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"),
+        });
+        const r = await probe(TWO, [devnet, checkNode("b")]);
+        expect(r.out.some((l) => l.startsWith("rpc1  genesis: wrong"))).toBe(true);
+        expect(r.out.some((l) => l.startsWith("rpc2  genesis: ok  pinned-accounts: ok"))).toBe(
+            true,
+        );
+        expect(r.code).toBe(1);
+    });
+
+    it("rpc probe names a genesis error", async () => {
+        const broken = checkNode("a", { getGenesisHash: () => httpFail(400) });
+        const r = await probe(TWO, [broken, checkNode("b")]);
+        expect(r.out[0]).toMatch(/^rpc1 {2}genesis: error http_400/);
+        expect(r.code).toBe(1);
+    });
+
+    it("rpc probe fails when the quorum is short", async () => {
+        let flip = false;
+        const flipping = checkNode("b", {
+            getSignatureStatuses: (_m, params) => {
+                flip = !flip;
+                return statusesAnswer(
+                    500n,
+                    (params[0] as string[]).map(() =>
+                        flip ? signatureStatus(400n, "finalized") : null,
+                    ),
+                );
+            },
+        });
+        const r = await probe(TWO, [checkNode("a"), flipping]);
+        expect(r.out).toContain("quorum: 1 of 2 domains ready");
+        expect(r.code).toBe(1);
+    });
+
+    it("rpc probe in single mode", async () => {
+        const r = await probe({ BUGNET_SOLANA_RPC_URL: "https://a.example/" }, [checkNode("a")]);
+        expect(r.out.slice(-2)).toEqual(["quorum: off (one URL)", "listings: rpc1"]);
+        expect(r.code).toBe(0);
+    });
+
+    it("rpc probe never prints a URL", async () => {
+        const r = await probe(TWO, [checkNode("a"), checkNode("b")]);
+        expect(r.text).not.toContain("a.example");
+        expect(r.text).not.toContain("b.example");
+    });
+
+    it("the CLI names list problems by position", async () => {
+        const io = captureIo();
+        const env = {
+            BUGNET_SOLANA_RPC_URLS: "https://a.example/?api-key=SECRETKEY1,http://b.example",
+        };
+        expect(await cliMain(["-config", config, "rpc", "probe"], env, io)).toBe(1);
+        expect(io.errText()).toContain(
+            "BUGNET_SOLANA_RPC_URLS rpc2 must be an https URL (http only on a loopback host)",
+        );
+        const all = io.outText() + io.errText();
+        expect(all).not.toContain("SECRETKEY1");
+        expect(all).not.toContain("b.example");
+    });
+
+    it("the CLI flushes usage before closing the pool", async () => {
+        const chain = await startFakeChain();
+        try {
+            await db.pool.query("delete from rpc_usage");
+            const io = captureIo();
+            const env = { BUGNET_SOLANA_RPC_URL: chain.url };
+            expect(await cliMain(["-config", config, "x402", "status"], env, io)).toBe(0);
+            const rows = await db.pool.query<{ endpoint: string }>(
+                "select endpoint from rpc_usage",
+            );
+            expect(rows.rows.map((r) => r.endpoint)).toContain("rpc1");
+        } finally {
+            await chain.close();
+        }
+    });
+
+    it("the CLI warns when it reads another list than the service", async () => {
+        const chain = await startFakeChain();
+        try {
+            const three = snapshot([
+                endpoint(),
+                endpoint({ name: "rpc2" }),
+                endpoint({ name: "rpc3" }),
+            ]);
+            const env = { BUGNET_SOLANA_RPC_URL: chain.url };
+            await pgSnapshotStore(db.pool, () => new Date(Date.now() - 5_000)).write(three);
+            const fresh = captureIo();
+            await cliMain(["-config", config, "x402", "status"], env, fresh);
+            expect(fresh.errText()).toContain("rpc the CLI reads 1 URL, the service 3");
+
+            await pgSnapshotStore(db.pool, () => new Date(Date.now() - 300_000)).write(three);
+            const old = captureIo();
+            await cliMain(["-config", config, "x402", "status"], env, old);
+            expect(old.errText()).not.toContain("rpc the CLI reads");
+        } finally {
+            await chain.close();
+        }
+    });
+
+    it("keys commands work without a config file", async () => {
+        const chain = await startFakeChain();
+        try {
+            const io = captureIo();
+            const env = { BUGNET_SOLANA_RPC_URL: chain.url };
+            expect(await cliMain(["keys", "show"], env, io)).toBe(0);
+            expect(io.errText()).not.toContain("ConfigError");
+            expect(chain.calls().some((c) => c.method === "getGenesisHash")).toBe(true);
+        } finally {
+            await chain.close();
+        }
     });
 });
