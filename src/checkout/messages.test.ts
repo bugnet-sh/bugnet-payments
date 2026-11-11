@@ -106,6 +106,28 @@ describe("deposit lines", () => {
         ).toBe("Received $0.03. Send $0.02 more to the same address by 14:05.");
     });
 
+    it("an order paid by deposit and then refunded reads Refunded, never Paid", () => {
+        for (const extraMicros of [0, 5_000]) {
+            expect(
+                line(
+                    { status: "paid", receivedMicros: 50_000, remainingMicros: 0, extraMicros },
+                    "refunded",
+                ),
+            ).toEqual({
+                label: "Refunded",
+                message: "This order's payment was returned to the wallet that paid.",
+                extra: [],
+            });
+        }
+        expect(
+            line({ status: "paid", receivedMicros: 50_000, remainingMicros: 0 }, "paid"),
+        ).toEqual({
+            label: "Paid",
+            message: "Paid. Go back to your agent; it continues on its own.",
+            extra: [],
+        });
+    });
+
     it("partial with a blocked sender's money returning adds M13", () => {
         const r = line({
             status: "partial",

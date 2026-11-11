@@ -151,6 +151,7 @@ function keptLine(v: NonNullable<StatusView["deposit"]>, c: MessageContext): str
 }
 
 const P2 = "The payment is confirming on Solana. This page updates when it lands.";
+const P3 = "This order's payment was returned to the wallet that paid.";
 
 // The deposit section's Amount row, its Copy value, the QR's alt and caption and the exchange
 // note. Once part of the price has arrived they name what is left, as the QR does (spec 14.2):
@@ -198,6 +199,11 @@ export function depositLine(
             message = "Time is up. Checking for a transfer sent in the last moments.";
             break;
         case "paid":
+            // Paid by deposit, then refunded: the order's state, never "Paid" (spec 8.3)
+            if (v.state === "refunded") {
+                message = P3;
+                break;
+            }
             if (d.extraMicros > 0) {
                 message =
                     d.returningMicros > 0
@@ -256,7 +262,11 @@ export function depositLine(
             `${amountLabel(d.reviewMicros)} arrived in a way Bugnet cannot return on its own. It is safe. To get it back, write to ${SUPPORT} with order ${c.orderId} and a message signed by the sending wallet.`,
         );
     }
-    return { label: STATUS_LABELS[d.status] ?? STATE_LABELS[v.state], message, extra };
+    const label =
+        d.status === "paid" && v.state === "refunded"
+            ? STATE_LABELS.refunded
+            : (STATUS_LABELS[d.status] ?? STATE_LABELS[v.state]);
+    return { label, message, extra };
 }
 
 // W35, while money already sits at the address and the order still takes a wallet payment
@@ -505,10 +515,7 @@ export function stateStep(s: PublicState | undefined, c: MessageContext): PageSt
                 state: s,
             };
         case "refunded":
-            return {
-                message: "This order's payment was returned to the wallet that paid.",
-                state: s,
-            };
+            return { message: P3, state: s };
         case "review":
             return {
                 message: `This payment needs a check by hand. The money is safe. Write to ${SUPPORT} with order ${c.orderId}.`,
