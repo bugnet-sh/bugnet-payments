@@ -308,7 +308,8 @@ interface DepositMemory {
     lastRead: PlanRead | null;
     readAtMs: number | null;
     scanDue: boolean;
-    // Early CheckPayer answers, kept for the deposit's life in this process (spec 10.1)
+    // Early CheckPayer answers, kept for the deposit's life in this process (spec 10.1); an
+    // unavailable router is no answer, so that owner may be asked again within the cap
     early: Map<string, PayerCheck>;
     earlyAsked: number;
     // What the hard stop's progress rule compares: recorded transfers and the held slot
@@ -320,6 +321,9 @@ interface JobMemory {
     deposits: Map<string, DepositMemory>;
     highestSlot: bigint;
     alarmedAt: Map<HourlyAlarm, number>;
+    // The deposits the current scan round has served. A round outlasts a tick, so when more
+    // deposits need a scan than one scan_time_box covers, the next tick serves the rest first.
+    scanRound: Set<string>;
 }
 
 // A new DepositWatch is a new process: everything here is rebuilt from the database
@@ -328,7 +332,7 @@ const memories = new WeakMap<DepositWatch, JobMemory>();
 function jobMemory(watch: DepositWatch): JobMemory {
     let m = memories.get(watch);
     if (m === undefined) {
-        m = { deposits: new Map(), highestSlot: 0n, alarmedAt: new Map() };
+        m = { deposits: new Map(), highestSlot: 0n, alarmedAt: new Map(), scanRound: new Set() };
         memories.set(watch, m);
     }
     return m;
@@ -648,8 +652,9 @@ function noteProgress(m: DepositMemory, ledger: Ledger, nowMs: number): void {
 /**
  * Spec 6.4 steps 4 and 5: unpaid deposits before their grace ends first, earliest deadline first,
  * then the rest; one scan call per deposit per round, until every scan is done or the tick has
- * spent scan_time_box. A scan that stops keeps its listing and goes on next tick. Past the day's
- * budget only unpaid deposits before their grace ends are scanned.
+ * spent scan_time_box. A scan that stops keeps its listing and goes on next tick, and so does the
+ * round: deposits it has already served wait until the others have had their call. Past the
+ * day's budget only unpaid deposits before their grace ends are scanned.
  */
 async function runScans(
     c: TickContext,
@@ -683,14 +688,21 @@ async function runScans(
     };
     const results = new Map<string, ScanResult>();
     const stepped = new Set<string>();
+    const served = c.job.scanRound;
     const start = d.now().getTime();
     let active = queue;
     rounds: while (active.length > 0) {
+        if (active.every((item) => served.has(item.deposit.orderId))) served.clear();
         const next: typeof active = [];
         for (const item of active) {
-            if (d.now().getTime() - start >= cfg.scan_time_box) break rounds;
             const { orderId } = item.deposit;
+            if (served.has(orderId)) {
+                next.push(item);
+                continue;
+            }
+            if (d.now().getTime() - start >= cfg.scan_time_box) break rounds;
             const m = c.job.deposits.get(orderId)!;
+            served.add(orderId);
             stepped.add(orderId);
             try {
                 const step = await scanStep(scanDeps, item.deposit, m.trail);
@@ -708,6 +720,8 @@ async function runScans(
         }
         active = next;
     }
+    // Every scan ended within the box, so no deposit is owed a turn
+    if (active.length === 0) served.clear();
     for (const orderId of stepped) {
         const ledger = await depositLedger(d.pool, orderId);
         if (ledger !== null) noteProgress(c.job.deposits.get(orderId)!, ledger, c.nowMs);
@@ -759,7 +773,7 @@ async function planInput(
         rented = await rentHolding(d.pool, d.feePayer.address);
         unpaidCreateLeft =
             BigInt(cfg.unpaid_create_lamports_per_hour) -
-            (await unpaidCreateLamports(d.pool, new Date(c.nowMs - HOUR_MS)));
+            (await unpaidCreateLamports(d.pool, new Date(c.nowMs - HOUR_MS), cfg));
         const failedCreates = ledger.moves.filter(
             (m) => m.kind === "create" && m.state === "failed",
         ).length;
@@ -840,7 +854,7 @@ async function earlyChecks(
             { payer: owner, feePayer: d.challengeFeePayer, ...target },
             AbortSignal.timeout(d.rpcTimeoutMs),
         );
-        m.early.set(owner, check);
+        if (check.verdict !== "unavailable") m.early.set(owner, check);
     }
     const rows = open.flatMap((t) => {
         const check = m.early.get(t.sourceOwner!);
@@ -856,7 +870,7 @@ async function earlyChecks(
         ];
     });
     if (rows.length === 0) return false;
-    await withTx(
+    const returned = await withTx(
         d.pool,
         async (tx) => {
             await lockDeposit(tx, order.id);
@@ -866,18 +880,17 @@ async function earlyChecks(
                 [order.id, rows.map((r) => r.signature)],
             );
             const stillOpen = new Set(still.map((r) => r.signature));
-            await setTransferOutcomes(
-                tx,
-                order.id,
-                rows.filter((r) => stillOpen.has(r.signature)),
-            );
+            const open = rows.filter((r) => stillOpen.has(r.signature));
+            await setTransferOutcomes(tx, order.id, open);
+            return open;
         },
         d.log,
     );
-    c.tick.blockedEarly += rows.length;
+    if (returned.length === 0) return true;
+    c.tick.blockedEarly += returned.length;
     d.log.info("deposit money of a blocked payer goes back", {
         orderId: order.id,
-        signatures: rows.map((r) => r.signature),
+        signatures: returned.map((r) => r.signature),
     });
     return true;
 }
@@ -1082,10 +1095,14 @@ async function signPlanned(c: TickContext, moveDeps: MoveDeps): Promise<void> {
 }
 
 /**
- * Spec 6.6: the hard stop waits for a scan that is catching up. Near the stop, it moves to
- * now + expire_hard_after when the latest read is above the ledger by at least what the price
- * still lacks, the scan made progress within expire_hard_after, and the new stop stays within
+ * Spec 6.6: the hard stop waits for a scan that is catching up. It moves to now +
+ * expire_hard_after when the latest read is above the ledger by at least what the price still
+ * lacks, the scan made progress within expire_hard_after, and the new stop stays within
  * expire_hard_max of the first time the job saw the grace pass.
+ *
+ * It moves once the stop is within half of expire_hard_after, not on every tick, so each move
+ * raises one deposit_index_lag. Half a window ahead is far wider than the gap between two ticks,
+ * which the sweeper's own clock could otherwise fall into and expire an order that is being paid.
  */
 async function pushHardStops(c: TickContext, watched: readonly DepositRow[]): Promise<void> {
     const { d, cfg } = c;
@@ -1102,7 +1119,7 @@ async function pushHardStops(c: TickContext, watched: readonly DepositRow[]): Pr
         if (ledger.deposit.state !== "open") continue;
         const { expiryDueAt, hardStopAt } = ledger.deposit;
         if (expiryDueAt === null || hardStopAt === null) continue;
-        if (c.nowMs < hardStopAt.getTime() - cfg.busy_every) continue;
+        if (hardStopAt.getTime() - c.nowMs > cfg.expire_hard_after / 2) continue;
         const pushed = c.nowMs + cfg.expire_hard_after;
         if (pushed > expiryDueAt.getTime() + cfg.expire_hard_max) continue;
         const unrecorded =

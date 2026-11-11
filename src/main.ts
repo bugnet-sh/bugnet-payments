@@ -679,18 +679,38 @@ function startDepositJob(
         queue,
     };
     const deps = { ...base, ...sweepHooks(base) };
-    const run = tracked(() => singleRunner(pool, RUNNER_KEYS.deposits, () => runDepositTick(deps)));
+    let running = false;
+    // A wake while a tick runs would find the lock taken and be skipped, so the paced loop runs
+    // again as soon as that tick ends instead of after busy_every
+    let wokenMeanwhile = false;
+    const run = tracked(async () => {
+        running = true;
+        try {
+            return await singleRunner(pool, RUNNER_KEYS.deposits, () => runDepositTick(deps));
+        } finally {
+            running = false;
+        }
+    });
     w.watch.wake.run = () => {
+        if (running) {
+            wokenMeanwhile = true;
+            return;
+        }
         run().catch((err: unknown) => log.error("job failed", { job: "deposits", err }));
     };
     const stop = paced(
         "deposits",
         run,
-        () =>
-            track(depositsBusy(pool, w.watch, now(), cfg, queue.dayUsed().fraction)).then(
+        () => {
+            if (wokenMeanwhile) {
+                wokenMeanwhile = false;
+                return Promise.resolve(0);
+            }
+            return track(depositsBusy(pool, w.watch, now(), cfg, queue.dayUsed().fraction)).then(
                 (busy) => depositInterval(busy, cfg),
                 () => cfg.idle_every,
-            ),
+            );
+        },
         log,
     );
     return () => {

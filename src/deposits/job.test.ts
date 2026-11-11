@@ -8,6 +8,7 @@ import { parseSettings, type Settings } from "../config.ts";
 import { withTx } from "../db/pool.ts";
 import { PayerVerdict } from "../gen/bugnet/router/v1/payments_pb.ts";
 import { ipKey, viewerHash } from "../http/ipkey.ts";
+import { depositLamports } from "../jobs/alarms.ts";
 import { reconcileSettling } from "../jobs/reconciler.ts";
 import { sweep } from "../jobs/sweeper.ts";
 import { memoryLog, silentLog } from "../log.ts";
@@ -41,6 +42,7 @@ import {
     type ViewerFacts,
 } from "./job.ts";
 import { DepositKeys } from "./keys.ts";
+import { moveFeeLamports } from "./moves.ts";
 import { TxCache } from "./scan.ts";
 import { sweepHooks } from "./settle.ts";
 import {
@@ -922,6 +924,50 @@ describe("the scan queue", () => {
         // The next tick goes on fetching where the last one stopped, with no new listing
         expect(firsts.slice(1)).toEqual(["getTransaction", "getTransaction"]);
     });
+
+    it("the scan round goes on across ticks, so no deposit starves", async () => {
+        const ids = Array.from({ length: 6 }, () => newOrderId()).sort();
+        const deps: DepositRow[] = [];
+        for (const [i, id] of ids.entries()) {
+            const expiresAt = new Date(at("00:10:00").getTime() + i * MIN);
+            deps.push(await deposit(id, { over: { expiresAt } }));
+        }
+        const viewAll = () => {
+            for (const [i, id] of ids.entries()) {
+                view(id, `198.51.100.${i + 1}`, { needsCreate: false });
+            }
+        };
+        await ticks(2, 3_000, viewAll);
+        // Every deposit gets a transfer and padding that takes many scan calls to fetch
+        for (const [i, dep] of deps.entries()) {
+            await send((["A", "B", "C", "D", "E", "F"] as const)[i]!, 2_000n, dep.orderId);
+            for (let n = 0; n < 10; n++) {
+                await chain.noOp({ touching: dep.tokenAccount, signer: owners.H });
+            }
+        }
+        chain.advance(1);
+
+        // A box that admits two scan calls a tick
+        cfg = { ...cfg, scan_time_box: 200 };
+        perCallMs = 100;
+        const listed = new Set<string>();
+        for (let i = 0; i < 3; i++) {
+            const before = chain.calls().length;
+            await ticks(1, 3_000, viewAll);
+            const scans = chain
+                .calls()
+                .slice(before)
+                .filter(
+                    (c) => c.method === "getSignaturesForAddress" || c.method === "getTransaction",
+                );
+            expect(scans.length).toBeLessThanOrEqual(2);
+            for (const c of scans) {
+                if (c.method === "getSignaturesForAddress") listed.add(String(c.params[0]));
+            }
+        }
+        // Each scan's first call is its listing: all six had theirs within three ticks
+        expect([...listed].sort()).toEqual(deps.map((d) => d.tokenAccount).sort());
+    });
 });
 
 describe("the daily budget", () => {
@@ -1036,6 +1082,20 @@ describe("early blocked check", () => {
         expect(checks).toHaveLength(cfg.max_split_owners + 1);
     });
 
+    it("an owner the router could not check is asked again", async () => {
+        await deposit();
+        verdicts.set(owners.B.address, "unavailable");
+        const b1 = await send("B", 2_000n);
+        const viewA = () => view(ORDER_A, "203.0.113.7", { needsCreate: false });
+        await ticks(1, 3_000, viewA);
+        expect(checks.map((x) => x.payer)).toEqual([owners.B.address]);
+        expect((await transferOf(b1)).outcome).toBe("open");
+        verdicts.set(owners.B.address, "blocked");
+        await ticks(1, 3_000, viewA);
+        expect(checks.map((x) => x.payer)).toEqual([owners.B.address, owners.B.address]);
+        expect(await transferOf(b1)).toMatchObject({ outcome: "return", reason: "payer_blocked" });
+    });
+
     it("an allowance order's early check sends extend", async () => {
         await allowanceReady();
         verdicts.set(owners.B.address, "blocked");
@@ -1136,6 +1196,61 @@ describe("the hard stop and a scan that is catching up", () => {
         expect((await findPaymentByOrder(db.pool, ORDER_A))!.createdAt).toEqual(PAID_AT);
         expect((await transferOf(a1)).outcome).toBe("paid");
     }, 300_000);
+
+    it("a push never loses the race with the sweeper", async () => {
+        await deposit();
+        await ticks(2);
+        const a1 = await send("A", 50_000n);
+        chain.withholdTransaction(a1, 10_000);
+        await send("C", 1_000n);
+        await updateDeposit(db.pool, ORDER_A, {
+            expiryDueAt: at("00:16:00"),
+            hardStopAt: at("00:21:00"),
+            expiryMinSlot: chain.slot(),
+        });
+        // This tick starts just before the stop's last busy_every. Ticks come busy_every after
+        // the previous one ends, so the next one starts after the stop, when the sweeper may
+        // already have run.
+        clock = new Date(at("00:21:00").getTime() - cfg.busy_every - 1);
+        perCallMs = 100;
+        busyView();
+        await tick();
+        expect((await ledgerOf()).transfers).toHaveLength(1);
+        clock = at("00:21:00");
+        expect((await sweep(sweepDeps(clock))).expired).toBe(0);
+        expect((await orderOf()).state).toBe("unpaid");
+        expect((await depositOf()).hardStopAt!.getTime()).toBeGreaterThan(at("00:21:00").getTime());
+        expect(alarms("deposit_index_lag").filter((l) => "hardStopAt" in l)).toHaveLength(1);
+    });
+
+    it("a scan that stalls after progress lets the sweeper expire the order", async () => {
+        await deposit();
+        await ticks(2);
+        const a1 = await send("A", 50_000n);
+        chain.withholdTransaction(a1, 100_000);
+        await send("C", 1_000n);
+        clock = at("00:20:00");
+        await updateDeposit(db.pool, ORDER_A, {
+            expiryDueAt: at("00:16:00"),
+            hardStopAt: at("00:21:00"),
+            expiryMinSlot: chain.slot(),
+        });
+        // C1 is recorded at 00:20:00, and after it nothing more is
+        busyView();
+        await tick();
+        expect((await ledgerOf()).transfers).toHaveLength(1);
+        while (clock < at("00:30:00")) {
+            later(10_000);
+            await tick();
+        }
+        // The last move is within expire_hard_after of the last progress, and the stop comes
+        // expire_hard_after after it
+        const stop = (await depositOf()).hardStopAt!;
+        expect(stop.getTime()).toBeLessThanOrEqual(at("00:20:00").getTime() + 2 * 5 * MIN);
+        expect((await sweep(sweepDeps(new Date(stop.getTime() - 1)))).expired).toBe(0);
+        expect((await sweep(sweepDeps(stop))).expired).toBe(1);
+        expect((await orderOf()).state).toBe("expired");
+    });
 
     it("with the scan making no progress, the sweeper expires the order", async () => {
         await deposit();
@@ -1408,6 +1523,10 @@ describe("flows on FakeChain", () => {
             5,
             cfg.idle_every,
         );
+        // The close waited for held reads that kept the balance still
+        const stable = (await depositOf()).stableSince;
+        expect(stable).not.toBeNull();
+        expect(stable!.getTime()).toBeLessThanOrEqual(clock.getTime() - cfg.busy_every);
         const close = (await movesOf()).find((m) => m.kind === "close")!;
         expect(close).toMatchObject({ closeTo: feePayer.address, amountMicros: 0 });
         await until(async () => (await depositOf()).state === "closed", 5, cfg.idle_every);
@@ -1505,6 +1624,7 @@ describe("flows on FakeChain", () => {
 
     it("a closed deposit forgets its rent payer", async () => {
         const dep = await paidAndClosed();
+        const closedAt = clock;
         const stranger = owners.F;
         const strangerBefore = chain.lamports(stranger.address);
         const feePayerBefore = chain.lamports(feePayer.address);
@@ -1522,5 +1642,14 @@ describe("flows on FakeChain", () => {
         // The rent goes back to the stranger who paid it, none of it to Bugnet's fee payer
         expect(chain.lamports(stranger.address) - strangerBefore).toBe(2_039_280n);
         expect(chain.lamports(feePayer.address)).toBe(feePayerBefore);
+        // The fee payer alarm counts the late return's fee and no rent back for it
+        const spent = await depositLamports(
+            db.pool,
+            closedAt,
+            new Date(clock.getTime() + 1),
+            feePayer.address,
+            cfg,
+        );
+        expect(spent).toBe(moveFeeLamports({ kind: "return", preflightRefusedAt: null }, cfg));
     });
 });

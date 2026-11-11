@@ -7,6 +7,7 @@ import { newOrderId } from "../orders/ids.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
 import { seedOrder } from "../testing/orders.ts";
 import { DepositKeys, depositSeed32 } from "./keys.ts";
+import { createAndCloseLamports } from "./plan.ts";
 import {
     clearHolds,
     deletePendingMove,
@@ -22,6 +23,7 @@ import {
     putHold,
     setTransferOutcomes,
     sharesOf,
+    unpaidCreateLamports,
     updateDeposit,
     watchedDeposits,
 } from "./store.ts";
@@ -319,6 +321,23 @@ describe("moves", () => {
         expect(await moveIdOf(o.id, "A1")).toBe(String(signed.id));
         const kept = await db.pool.query("select 1 from deposit_moves where id = $1", [signed.id]);
         expect(kept.rows).toHaveLength(1);
+    });
+});
+
+describe("the unpaid-create budget", () => {
+    it("prices each create with its close as the planner does", async () => {
+        const { order: o } = await fresh();
+        // Later than any other test's moves, so only this create counts
+        const since = new Date("2040-01-01T00:00:00Z");
+        await db.pool.query(
+            "insert into deposit_moves (order_id, kind, created_at) values ($1, 'create', $2)",
+            [o.id, since],
+        );
+        const defaults = parseSettings(`[solana]\nrecipient = "${RECIPIENT}"`, "t.toml").deposits;
+        expect(await unpaidCreateLamports(db.pool, since, defaults)).toBe(15_800n);
+        const dear = { ...defaults, compute_unit_price_micro_lamports: 100_000 };
+        expect(createAndCloseLamports(dear)).toBeGreaterThan(15_800n);
+        expect(await unpaidCreateLamports(db.pool, since, dear)).toBe(createAndCloseLamports(dear));
     });
 });
 

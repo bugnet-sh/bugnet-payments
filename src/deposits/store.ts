@@ -12,6 +12,7 @@ import type { OrderRow } from "../orders/types.ts";
 import { type RefundDbRow, type RefundRow, toRefund } from "../refunds/request.ts";
 import type { DepositKeys } from "./keys.ts";
 import { moveFeeLamports } from "./moves.ts";
+import { createAndCloseLamports } from "./plan.ts";
 import type {
     DepositRow,
     HoldRow,
@@ -583,8 +584,6 @@ export async function clearHolds(c: pg.PoolClient, orderId: string): Promise<voi
 }
 
 const IN_FLIGHT_SQL = "('pending', 'signed', 'sent')";
-// A create, with the close it will need: 3 signatures and 2 priority fees at the defaults (spec 5)
-const UNPAID_CREATE_LAMPORTS = 15_800n;
 
 /**
  * Fees of metered moves (returns and closes that do not close to the fee payer) and of every
@@ -658,9 +657,14 @@ export async function rentedBy(
     return { ipRented: rows[0]!.ip, blockRented: rows[0]!.block };
 }
 
-// Creates since then whose deposit holds no transfer, with the close each will need; a create in
-// flight counts already, so viewers in one tick cannot together pass the budget
-export async function unpaidCreateLamports(db: Queryable, since: Date): Promise<bigint> {
+// Creates since then whose deposit holds no transfer, each with the close it will need, priced
+// as the planner prices the budget it compares against; a create in flight counts already, so
+// viewers in one tick cannot together pass the budget
+export async function unpaidCreateLamports(
+    db: Queryable,
+    since: Date,
+    cfg: Pick<Settings["deposits"], "compute_unit_limit" | "compute_unit_price_micro_lamports">,
+): Promise<bigint> {
     const { rows } = await db.query<{ n: number }>(
         `select count(*)::int as n from deposit_moves m
          where m.kind = 'create'
@@ -669,5 +673,5 @@ export async function unpaidCreateLamports(db: Queryable, since: Date): Promise<
             and not exists (select 1 from deposit_transfers t where t.order_id = m.order_id)`,
         [since],
     );
-    return BigInt(rows[0]!.n) * UNPAID_CREATE_LAMPORTS;
+    return BigInt(rows[0]!.n) * createAndCloseLamports(cfg);
 }

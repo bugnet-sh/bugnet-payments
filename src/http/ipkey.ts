@@ -11,7 +11,6 @@ export interface IpKey {
     block: string | null;
 }
 
-const MAPPED_V4 = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i;
 const VIEWER_DOMAIN = "bugnet/viewer/v1/";
 
 function hextets(address: string): string[] | null {
@@ -36,10 +35,14 @@ function prefixKey(parts: readonly string[], count: number): string {
 }
 
 export function ipKey(ip: string): IpKey {
-    const mapped = MAPPED_V4.exec(ip)?.[1];
-    if (mapped !== undefined) return { key: mapped, block: null };
     const parts = isIPv6(ip) ? hextets(ip) : null;
     if (parts === null) return { key: ip, block: null };
+    // An IPv4-mapped address, dotted or in hex, is that IPv4 client, not a shared /64
+    const n = parts.map((h) => Number.parseInt(h, 16));
+    if (n.slice(0, 5).every((x) => x === 0) && n[5] === 0xffff) {
+        const [hi, lo] = [n[6]!, n[7]!];
+        return { key: `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`, block: null };
+    }
     return { key: prefixKey(parts, 4), block: prefixKey(parts, 3) };
 }
 

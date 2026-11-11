@@ -17,6 +17,8 @@ describe("ipKey", () => {
     it("keys an IPv4-mapped IPv6 address by its IPv4 address", () => {
         expect(ipKey("::ffff:203.0.113.7")).toEqual({ key: "203.0.113.7", block: null });
         expect(ipKey("::FFFF:203.0.113.7")).toEqual({ key: "203.0.113.7", block: null });
+        expect(ipKey("::ffff:cb00:7107")).toEqual({ key: "203.0.113.7", block: null });
+        expect(ipKey("0:0:0:0:0:ffff:cb00:7107")).toEqual({ key: "203.0.113.7", block: null });
     });
 
     it("keeps an address it cannot read as one key", () => {
