@@ -1,4 +1,5 @@
 import { signature } from "@solana/kit";
+import { RpcRouterError } from "./router/errors.ts";
 import { deadline, type SolanaRpc } from "./rpc.ts";
 
 export type Landing = "landed" | "onchain_failed" | "processed" | "not_found" | "blockhash_expired";
@@ -13,6 +14,30 @@ type Status = {
     err: unknown;
     slot: bigint;
 } | null;
+
+interface Statuses {
+    context: { slot: bigint };
+    value: readonly Status[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null;
+}
+
+// The real statuses that answered before the router could prove an absence: their positive
+// entries decide as from any answer, their nulls are unproven
+function partialOf(err: unknown): Statuses | null {
+    if (!(err instanceof RpcRouterError) || err.reason !== "absence_unconfirmed") return null;
+    const result = isRecord(err.partial) ? err.partial.result : undefined;
+    if (!isRecord(result) || !isRecord(result.context)) return null;
+    const { value } = result;
+    if (typeof result.context.slot !== "bigint" || !Array.isArray(value)) return null;
+    const entries: unknown[] = value;
+    if (!entries.every((s) => s === null || (isRecord(s) && typeof s.slot === "bigint"))) {
+        return null;
+    }
+    return { context: { slot: result.context.slot }, value: entries as Status[] };
+}
 
 // A processed-only result can still be dropped with its fork, so it decides nothing
 function settled(status: Status): status is NonNullable<Status> {
@@ -40,9 +65,19 @@ export async function readLanding(
 ): Promise<LandingRead> {
     const epoch = await rpc.getEpochInfo({ commitment: "finalized" }).send(deadline(timeoutMs));
     const signatures = [txSignature, ...earlier];
-    const { context, value } = await rpc
-        .getSignatureStatuses(signatures.map(signature), { searchTransactionHistory: true })
-        .send(deadline(timeoutMs));
+    let answer: Statuses;
+    let unproven: RpcRouterError | null = null;
+    try {
+        answer = await rpc
+            .getSignatureStatuses(signatures.map(signature), { searchTransactionHistory: true })
+            .send(deadline(timeoutMs));
+    } catch (err) {
+        const partial = partialOf(err);
+        if (partial === null) throw err;
+        answer = partial;
+        unproven = err as RpcRouterError;
+    }
+    const { context, value } = answer;
     const statuses: Status[] = signatures.map((_, i) => value[i] ?? null);
     const landed = statuses.findIndex((s) => settled(s) && s.err === null);
     if (landed !== -1)
@@ -51,6 +86,11 @@ export async function readLanding(
     if (settled(status)) return { landing: "onchain_failed", slot: status.slot };
     if (status !== null || earlierStatuses.some((s) => s !== null && !settled(s))) {
         return { landing: "processed" };
+    }
+    // An unproven null may only lead to a wait or a resend of the same bytes, never to a re-sign
+    if (unproven !== null) {
+        if (epoch.blockHeight <= lastValidBlockHeight) return { landing: "not_found" };
+        throw unproven;
     }
     const expired = epoch.blockHeight > lastValidBlockHeight && context.slot >= epoch.absoluteSlot;
     return { landing: expired ? "blockhash_expired" : "not_found" };

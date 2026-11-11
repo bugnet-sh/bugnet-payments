@@ -8,6 +8,8 @@ import {
     SOLANA_ERROR__RPC__TRANSPORT_HTTP_ERROR,
     SolanaError,
 } from "@solana/kit";
+import type { Status } from "./absence.ts";
+import type { Commitment } from "./payload.ts";
 import { endpointName, type RpcSettings, rpcSettingsSchema } from "./settings.ts";
 import type { RouterDeps, RouterLog } from "./transport.ts";
 
@@ -74,6 +76,18 @@ export function rpcFail(code: number, message: string, data?: unknown): unknown 
             ? { code: BigInt(code), message }
             : { code: BigInt(code), message, data };
     return { jsonrpc: "2.0", id: 1n, error };
+}
+
+export function signatureStatus(
+    slot: bigint,
+    confirmationStatus: Commitment,
+    err: unknown = null,
+): NonNullable<Status> {
+    return { slot, confirmations: null, err, confirmationStatus };
+}
+
+export function statusesAnswer(slot: bigint, value: readonly Status[]): unknown {
+    return rpcOk({ context: { slot }, value });
 }
 
 export function httpFail(statusCode: number, headers: Record<string, string> = {}): never {

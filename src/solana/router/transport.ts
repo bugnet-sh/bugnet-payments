@@ -9,6 +9,7 @@ import {
     type RpcTransport,
     SOLANA_ERROR__RPC__TRANSPORT_HTTP_ERROR,
 } from "@solana/kit";
+import { hasNull, mergeStatuses, statusesOf, type StatusesAnswer } from "./absence.ts";
 import { classifyAnswer, classifyThrown, type Outcome } from "./classify.ts";
 import { type Consistency, ConsistencyBook, type DisagreeReason } from "./consistency.ts";
 import { RpcRouterError } from "./errors.ts";
@@ -34,6 +35,9 @@ export const MAX_WAIT_MS = 1_000;
 
 const HOUR_MS = 3_600_000;
 const ENDPOINT_SCOPE = "*";
+const ABSENCE_ALARM_EVERY_MS = 600_000;
+// Transaction history is not available from this node
+const NO_HISTORY = -32011;
 
 export type RouterAlarm =
     "rpc_endpoint_down" | "rpc_all_endpoints_down" | "rpc_endpoint_lag" | "rpc_absence_unconfirmed";
@@ -299,6 +303,8 @@ class Router {
     private readonly slots: SlotBook;
     private readonly book: ConsistencyBook;
     private readonly list: { domains: number; absenceQuorum: number; sendFanout: number };
+    // Unconfirmed absences since the last rpc_absence_unconfirmed alarm
+    private absenceAlarm: { at: number | null; count: number } = { at: null, count: 0 };
 
     constructor(
         private readonly s: RpcSettings,
@@ -389,6 +395,9 @@ class Router {
             if (step.kind === "answer") {
                 if (step.ok && req.spec.nullRetry && lacksTransaction(step.answer)) {
                     return this.askAgain(ep, step.answer, req, payload, signal, lane, run);
+                }
+                if (step.ok && req.method === "getSignatureStatuses" && req.searchHistory) {
+                    return this.confirmAbsence(ep, step.answer, req, payload, signal, lane, run);
                 }
                 return step.answer;
             }
@@ -526,6 +535,7 @@ class Router {
         const { answer } = a;
         const floors = this.floorsOf(req);
         this.observe(ep, req, answer);
+        this.remember(ep, req, answer);
         const o = classifyAnswer(req.method, answer);
         const error = rpcErrorOf(answer);
         if (o.kind === "ok") {
@@ -650,6 +660,87 @@ class Router {
         return step.kind === "answer" && step.ok ? step.answer : firstAnswer;
     }
 
+    // Spec 8.4: a null counts only once consistent endpoints on absence_quorum domains returned
+    // it. A status found by any endpoint decides its entry, an inconsistent one's too
+    private async confirmAbsence(
+        first: Endpoint,
+        firstAnswer: unknown,
+        req: RouterRequest,
+        payload: unknown,
+        signal: AbortSignal | undefined,
+        lane: Lane,
+        run: Run,
+    ): Promise<unknown> {
+        let merged = statusesOf(firstAnswer);
+        if (merged === null || !hasNull(merged)) return firstAnswer;
+        const received = [{ name: first.name, answer: merged }];
+        const counted = new Set<string>();
+        if (this.votes(first)) counted.add(first.domain);
+        const voter = (v: EndpointView) =>
+            v.consistent && !counted.has(this.endpoint(v.name).domain);
+        while (counted.size < this.list.absenceQuorum && hasNull(merged)) {
+            const ep = await this.nextVoter(req, lane, run, voter, signal);
+            if (ep === null) throw this.unconfirmed(counted.size, merged);
+            run.tried.add(ep.name);
+            const timeoutMs = this.s.attempt_timeout;
+            const a = await this.attempt(ep, req, payload, signal, lane, timeoutMs);
+            const step = this.settle(ep, req, a, run, null, timeoutMs, signal);
+            const answer = step.kind === "answer" && step.ok ? statusesOf(step.answer) : null;
+            if (answer === null) continue;
+            const both = mergeStatuses(merged, answer);
+            if (both === "conflict") {
+                const other = received.find((r) => mergeStatuses(r.answer, answer) === "conflict");
+                this.deps.log.warn("rpc endpoints disagree on a status", {
+                    endpoints: [other?.name ?? first.name, ep.name],
+                });
+                throw new RpcRouterError("status_conflict");
+            }
+            merged = both;
+            received.push({ name: ep.name, answer });
+            if (this.votes(ep)) counted.add(ep.domain);
+        }
+        return merged;
+    }
+
+    // The caller's abort ends the search: what answered so far is the unconfirmed absence
+    private async nextVoter(
+        req: RouterRequest,
+        lane: Lane,
+        run: Run,
+        fits: (v: EndpointView) => boolean,
+        signal: AbortSignal | undefined,
+    ): Promise<Endpoint | null> {
+        for (;;) {
+            if (signal?.aborted) return null;
+            const next = this.pick(req, lane, run, fits);
+            if (next.kind === "try") return next.ep;
+            if (next.kind === "stop") return null;
+            try {
+                await this.wait(next.ms, signal);
+            } catch (err) {
+                if (signal?.aborted) return null;
+                throw err;
+            }
+            run.waited += next.ms;
+        }
+    }
+
+    private votes(ep: Endpoint): boolean {
+        return this.book.state(ep.name) === "yes";
+    }
+
+    // At most one alarm per 10 min, counting the unconfirmed absences since the last one
+    private unconfirmed(domainsAnswered: number, partial: StatusesAnswer): RpcRouterError {
+        const now = this.deps.now();
+        this.absenceAlarm.count += 1;
+        const { at, count } = this.absenceAlarm;
+        if (at === null || now - at >= ABSENCE_ALARM_EVERY_MS) {
+            this.deps.log.alarm("rpc_absence_unconfirmed", { count, domainsAnswered });
+            this.absenceAlarm = { at: now, count: 0 };
+        }
+        return new RpcRouterError("absence_unconfirmed", undefined, partial);
+    }
+
     // Spec 7.4: the last JSON-RPC error answer, else a refusal for its slot, else the last
     // thrown error
     private fail(run: Run): unknown {
@@ -659,10 +750,16 @@ class Router {
         throw new RpcRouterError("no_endpoint");
     }
 
-    private pick(req: RouterRequest, lane: Lane, run: Run): Choice {
+    private pick(
+        req: RouterRequest,
+        lane: Lane,
+        run: Run,
+        fits: (v: EndpointView) => boolean = () => true,
+    ): Choice {
         const now = this.deps.now();
         const views = this.views(req, lane);
-        const untried = (list: EndpointView[]) => list.filter((v) => !run.tried.has(v.name));
+        const untried = (list: EndpointView[]) =>
+            list.filter((v) => !run.tried.has(v.name) && fits(v));
         const listed = untried(choose(req, views, { now, lane }));
         const first = listed[0];
         if (first?.breaker === "closed") return { kind: "try", ep: this.endpoint(first.name) };
@@ -781,6 +878,52 @@ class Router {
     private disagree(name: string, reason: DisagreeReason): void {
         const before = this.book.state(name);
         this.book.disagree(name, reason);
+        this.marked(name, before, reason);
+    }
+
+    // Spec 8.10: a confirmed or finalized answer is remembered, and a later null or -32011 of a
+    // history read for the same signature marks the endpoint, whose null then is no vote
+    private remember(ep: Endpoint, req: RouterRequest, answer: unknown): void {
+        const signatures = req.signatures;
+        if (signatures.length === 0) return;
+        const transaction = req.method === "getTransaction";
+        if (rpcErrorOf(answer)?.code === NO_HISTORY) {
+            if (transaction || req.searchHistory) this.missing(ep, signatures);
+            return;
+        }
+        if (transaction) {
+            if (!isObject(answer) || !("result" in answer)) return;
+            if (answer.result !== null) this.book.found(ep.name, signatures[0]!);
+            // A finalized read of a transaction that is only confirmed so far is null by right
+            else if (req.commitment === "confirmed") this.missing(ep, signatures);
+            return;
+        }
+        const statuses = statusesOf(answer);
+        if (statuses === null) return;
+        const nulls: string[] = [];
+        statuses.result.value.forEach((status, i) => {
+            const signature = signatures[i];
+            if (signature === undefined) return;
+            if (status === null) {
+                if (req.searchHistory) nulls.push(signature);
+            } else if (
+                status.confirmationStatus === "confirmed" ||
+                status.confirmationStatus === "finalized"
+            ) {
+                this.book.found(ep.name, signature);
+            }
+        });
+        this.missing(ep, nulls);
+    }
+
+    private missing(ep: Endpoint, signatures: readonly string[]): void {
+        const before = this.book.state(ep.name);
+        for (const signature of signatures) this.book.nullFor(ep.name, signature);
+        this.marked(ep.name, before, "found_then_missing");
+    }
+
+    // One warn when an endpoint becomes inconsistent, not on every later contradiction
+    private marked(name: string, before: Consistency, reason: DisagreeReason): void {
         if (before !== "no" && this.book.state(name) === "no") {
             this.deps.log.warn("rpc endpoint answers inconsistently", { endpoint: name, reason });
         }

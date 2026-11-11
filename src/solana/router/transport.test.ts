@@ -1,6 +1,7 @@
 import type { RpcTransport } from "@solana/kit";
 import { describe, expect, it } from "vitest";
 import { epochAt } from "../../testing/fake-rpc.ts";
+import type { Status } from "./absence.ts";
 import { RpcRouterError } from "./errors.ts";
 import { isObject } from "./payload.ts";
 import type { RpcSettings } from "./settings.ts";
@@ -12,7 +13,9 @@ import {
     netFail,
     rpcFail,
     rpcOk,
+    signatureStatus as S,
     stall,
+    statusesAnswer,
     testDeps,
     type TestDeps,
     testRpcSettings,
@@ -1002,6 +1005,235 @@ describe("limits and lanes", () => {
         expect(open.clock.ms).toBe(0);
         expect(open.a.calls).toHaveLength(5);
         expect(open.b.calls.at(-1)!.method).toBe("getSignaturesForAddress");
+    });
+});
+
+describe("absence quorum", () => {
+    const SIG = "sig1";
+    const searching = [[SIG], { searchTransactionHistory: true }];
+    const failed = { InstructionError: [2n, { Custom: 1n }] };
+
+    // Statuses at the clock's slot, or at slot when given; every other method as a caught-up node
+    function statuses(t: Setup, value: Status[], slot?: bigint): FakeHandler {
+        return chain(t.clock, {
+            getSignatureStatuses: () => statusesAnswer(slot ?? slotAt(t.clock.ms), value),
+        });
+    }
+
+    function valueOf(answer: unknown): unknown {
+        return (resultOf(answer) as { value: unknown }).value;
+    }
+
+    function absenceAlarms(t: TestDeps): Record<string, unknown>[] {
+        return alarms(t).filter((l) => l.alarm === "rpc_absence_unconfirmed");
+    }
+
+    it("a null is confirmed by a second domain", async () => {
+        const t = setup(2);
+        t.a.answer(statuses(t, [null], 1_000n));
+        t.b.answer(statuses(t, [null], 999n));
+        const answer = await call(t.router, "getSignatureStatuses", searching);
+        expect(valueOf(answer)).toEqual([null]);
+        expect((resultOf(answer) as { context: { slot: bigint } }).context.slot).toBe(999n);
+        expect(t.b.calls).toHaveLength(1);
+    });
+
+    it("a status found by the second domain wins", async () => {
+        const t = setup(2);
+        t.a.answer(statuses(t, [null]));
+        t.b.answer(statuses(t, [S(7n, "confirmed")]));
+        const answer = await call(t.router, "getSignatureStatuses", searching);
+        expect((valueOf(answer) as Status[])[0]?.confirmationStatus).toBe("confirmed");
+    });
+
+    it("same-domain endpoints do not make a quorum", async () => {
+        const t = setup(3, {}, { urls: ONE_DOMAIN });
+        t.a.answer(statuses(t, [null]));
+        t.b.answer(statuses(t, [null]));
+        t.c.answer(() => netFail());
+        const e = await rejection(call(t.router, "getSignatureStatuses", searching));
+        expect(reasonOf(e)).toBe("absence_unconfirmed");
+        expect(t.b.calls).toHaveLength(0);
+        expect(absenceAlarms(t)).toEqual([
+            {
+                level: "alarm",
+                msg: "rpc_absence_unconfirmed",
+                alarm: "rpc_absence_unconfirmed",
+                count: 1,
+                domainsAnswered: 1,
+            },
+        ]);
+    });
+
+    it("no second domain fails closed", async () => {
+        const t = setup(2);
+        t.a.answer(statuses(t, [null]));
+        t.b.answer(() => netFail());
+        const e = await rejection(call(t.router, "getSignatureStatuses", searching));
+        expect(reasonOf(e)).toBe("absence_unconfirmed");
+    });
+
+    it("an inconsistent endpoint's null never counts", async () => {
+        const t = setup(3);
+        setCheckState(t.router, "rpc1", { consistent: "no" });
+        for (const ep of [t.a, t.b, t.c]) ep.answer(statuses(t, [null]));
+        expect(valueOf(await call(t.router, "getSignatureStatuses", searching))).toEqual([null]);
+        for (const ep of [t.a, t.b, t.c]) expect(ep.calls).toHaveLength(1);
+
+        const down = setup(3);
+        setCheckState(down.router, "rpc1", { consistent: "no" });
+        down.a.answer(statuses(down, [null]));
+        down.b.answer(statuses(down, [null]));
+        down.c.answer(() => netFail());
+        const e = await rejection(call(down.router, "getSignatureStatuses", searching));
+        expect(reasonOf(e)).toBe("absence_unconfirmed");
+        expect(absenceAlarms(down).at(-1)).toMatchObject({ domainsAnswered: 1 });
+    });
+
+    it("an inconsistent endpoint's status still decides its entry", async () => {
+        const t = setup(3);
+        setCheckState(t.router, "rpc1", { consistent: "no" });
+        const found = statusesAnswer(slotAt(0), [S(7n, "finalized")]);
+        t.a.answer(chain(t.clock, { getSignatureStatuses: () => found }));
+        expect(await call(t.router, "getSignatureStatuses", searching)).toBe(found);
+        expect(t.b.calls).toHaveLength(0);
+    });
+
+    it("quorum 1 still needs a consistent endpoint", async () => {
+        const t = setup(3, { absence_quorum: 1 });
+        setCheckState(t.router, "rpc1", { consistent: "no" });
+        for (const ep of [t.a, t.b, t.c]) ep.answer(statuses(t, [null]));
+        expect(valueOf(await call(t.router, "getSignatureStatuses", searching))).toEqual([null]);
+        expect(t.b.calls).toHaveLength(1);
+        expect(t.c.calls).toHaveLength(0);
+    });
+
+    it("a null after a found answer marks the endpoint", async () => {
+        const t = setup(3);
+        t.a.answer(statuses(t, [S(7n, "finalized")]));
+        await call(t.router, "getSignatureStatuses", searching);
+        expect(t.b.calls).toHaveLength(0);
+        for (const ep of [t.a, t.b, t.c]) ep.answer(statuses(t, [null]));
+        expect(valueOf(await call(t.router, "getSignatureStatuses", searching))).toEqual([null]);
+        expect(t.log.lines.filter((l) => l.msg === "rpc endpoint answers inconsistently")).toEqual([
+            {
+                level: "warn",
+                msg: "rpc endpoint answers inconsistently",
+                endpoint: "rpc1",
+                reason: "found_then_missing",
+            },
+        ]);
+        expect(snap(t.router, "rpc1").consistent).toBe("no");
+        expect(t.b.calls).toHaveLength(1);
+        expect(t.c.calls).toHaveLength(1);
+    });
+
+    it("-32011 after a found answer marks the endpoint", async () => {
+        const t = setup(3);
+        t.a.answer(statuses(t, [S(7n, "confirmed")]));
+        await call(t.router, "getSignatureStatuses", searching);
+        t.a.answer(() => rpcFail(-32011, "Transaction history is not available from this node"));
+        t.b.answer(statuses(t, [S(7n, "finalized")]));
+        await call(t.router, "getSignatureStatuses", searching);
+        expect(snap(t.router, "rpc1").consistent).toBe("no");
+    });
+
+    it("a transaction found at confirmed and later null marks the endpoint", async () => {
+        const confirmed = [SIG, { commitment: "confirmed", encoding: "json" }];
+        const finalized = [SIG, { encoding: "json" }];
+        const t = setup(2);
+        await call(t.router, "getTransaction", confirmed);
+        t.a.answer(() => rpcOk(null));
+        // Null at finalized is a confirmed transaction that has not finalized yet
+        await call(t.router, "getTransaction", finalized);
+        expect(snap(t.router, "rpc1").consistent).toBe("yes");
+        await call(t.router, "getTransaction", confirmed);
+        expect(snap(t.router, "rpc1").consistent).toBe("no");
+    });
+
+    it("the alarm repeats at most every 10 minutes", async () => {
+        const t = setup(2);
+        t.a.answer(statuses(t, [null]));
+        t.b.answer(() => netFail());
+        for (const ms of [0, 150_000, 300_000]) {
+            t.clock.ms = ms;
+            await rejection(call(t.router, "getSignatureStatuses", searching));
+        }
+        expect(absenceAlarms(t)).toHaveLength(1);
+        t.clock.ms = 660_000;
+        await rejection(call(t.router, "getSignatureStatuses", searching));
+        expect(absenceAlarms(t)).toHaveLength(2);
+        expect(absenceAlarms(t)[1]).toMatchObject({ count: 3, domainsAnswered: 1 });
+    });
+
+    it("no null, no second call", async () => {
+        const t = setup(2);
+        t.a.answer(statuses(t, [S(5n, "finalized")]));
+        await call(t.router, "getSignatureStatuses", searching);
+        expect(t.b.calls).toHaveLength(0);
+    });
+
+    it("statuses without history are never confirmed", async () => {
+        const t = setup(2);
+        t.a.answer(statuses(t, [null]));
+        expect(valueOf(await call(t.router, "getSignatureStatuses", [[SIG]]))).toEqual([null]);
+        expect(t.b.calls).toHaveLength(0);
+    });
+
+    it("quorum 1 keeps one answer", async () => {
+        const t = setup(2, { absence_quorum: 1 });
+        const missing = statusesAnswer(slotAt(0), [null]);
+        t.a.answer(chain(t.clock, { getSignatureStatuses: () => missing }));
+        expect(await call(t.router, "getSignatureStatuses", searching)).toBe(missing);
+        expect(t.b.calls).toHaveLength(0);
+    });
+
+    it("a conflict throws", async () => {
+        const t = setup(2);
+        t.a.answer(statuses(t, [S(5n, "confirmed"), null]));
+        t.b.answer(statuses(t, [S(5n, "confirmed", failed), null]));
+        const e = await rejection(
+            call(t.router, "getSignatureStatuses", [[SIG, "sig2"], searching[1]]),
+        );
+        expect(reasonOf(e)).toBe("status_conflict");
+        expect(t.log.lines.filter((l) => l.msg === "rpc endpoints disagree on a status")).toEqual([
+            {
+                level: "warn",
+                msg: "rpc endpoints disagree on a status",
+                endpoints: ["rpc1", "rpc2"],
+            },
+        ]);
+    });
+
+    it("an unconfirmed absence carries the answers received", async () => {
+        const t = setup(2);
+        const value = [S(5n, "confirmed"), null];
+        t.a.answer(statuses(t, value, 10n));
+        t.b.answer(() => netFail());
+        const e = await rejection(
+            call(t.router, "getSignatureStatuses", [[SIG, "sig2"], searching[1]]),
+        );
+        expect(reasonOf(e)).toBe("absence_unconfirmed");
+        expect((e as RpcRouterError).partial).toMatchObject({ result: { context: { slot: 10n } } });
+        expect(valueOf((e as RpcRouterError).partial)).toEqual(value);
+    });
+
+    it("the caller's abort ends the quorum ask as an unconfirmed absence", async () => {
+        const t = setup(2);
+        t.a.answer(statuses(t, [S(5n, "confirmed"), null]));
+        t.b.answer(() => stall());
+        const caller = new AbortController();
+        const answer = call(
+            t.router,
+            "getSignatureStatuses",
+            [[SIG, "sig2"], searching[1]],
+            caller.signal,
+        );
+        await until(() => t.b.calls.length === 1);
+        caller.abort(new Error("caller gave up"));
+        const e = await rejection(answer);
+        expect(reasonOf(e)).toBe("absence_unconfirmed");
+        expect(valueOf((e as RpcRouterError).partial)).toEqual([S(5n, "confirmed"), null]);
     });
 });
 
