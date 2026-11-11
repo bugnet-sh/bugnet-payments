@@ -466,6 +466,11 @@ describe("address-first page", () => {
         expect(html).toContain(">15:00</time>");
     });
 
+    it("time left shows only while the order takes money", async () => {
+        expect(await renderCheckout({ ...offered, state: "paid" })).not.toContain('id="time-left"');
+        expect(await renderCheckout(offered)).toContain('id="time-left"');
+    });
+
     it("the card is centered", async () => {
         const html = await renderCheckout(offered);
         expect(html).toContain("min-height: 100dvh");

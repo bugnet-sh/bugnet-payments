@@ -191,6 +191,8 @@ button { font: inherit; color: inherit; border-radius: 0; }
     width: calc(100% - 2 * var(--pad));
     max-width: var(--column);
     margin-inline: auto;
+    /* As flex items of the body they would otherwise never shrink below their widest line */
+    min-width: 0;
 }
 /* Auto margins center the card, and fall to zero when it is taller than the screen */
 .box {
@@ -249,6 +251,14 @@ code {
     font-size: var(--ui-size);
     white-space: nowrap;
 }
+/* A payment address is read and compared by eye, so it wraps instead of hiding its end */
+#deposit dd code {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    overflow-x: visible;
+    font-size: var(--fine-size);
+}
+#deposit .qr { margin-top: var(--space-4); }
 .copy {
     display: grid;
     flex-shrink: 0;
@@ -492,7 +502,11 @@ ${copyButton(v.orderId)}
 </dd></div>
 <div><dt>Status</dt>
 <dd id="state" class="state" data-state="${v.state}">${STATE_LABELS[v.state]}</dd></div>
-<div><dt>Time left</dt><dd><time id="time-left" datetime="${expires}">${timeLeft(v.expiresAt, v.now)}</time> <span id="until"></span></dd></div>
+${
+    v.state === "unpaid"
+        ? `<div><dt>Time left</dt><dd><time id="time-left" datetime="${expires}">${timeLeft(v.expiresAt, v.now)}</time> <span id="until"></span></dd></div>`
+        : ""
+}
 </dl>
 ${tail}
 ${NOSCRIPT}
