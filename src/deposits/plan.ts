@@ -212,7 +212,9 @@ function meterAllows(c: Ctx, payer: string | null): boolean {
 }
 
 // The unpaid-create budget counts a create together with the close it will need (spec 5)
-function createAndCloseLamports(cfg: PlanInput["cfg"]): bigint {
+export function createAndCloseLamports(
+    cfg: Pick<Settings["deposits"], "compute_unit_limit" | "compute_unit_price_micro_lamports">,
+): bigint {
     const units = BigInt(cfg.compute_unit_limit) * BigInt(cfg.compute_unit_price_micro_lamports);
     const priority = (units + 999_999n) / 1_000_000n;
     return SIGNATURE_LAMPORTS * 3n + priority * 2n;

@@ -1,6 +1,8 @@
 import type pg from "pg";
 import { withTx } from "../db/pool.ts";
 import type { Settings } from "../config.ts";
+import { lockDeposit } from "../deposits/store.ts";
+import type { DepositState } from "../deposits/types.ts";
 import type { Log } from "../log.ts";
 import { findOrder, lockOrder, setOrderState, updateOrderFields } from "../orders/store.ts";
 import type { OrderRow } from "../orders/types.ts";
@@ -31,6 +33,24 @@ export interface SweepReport {
 type ManualReason = "no_event_unverifiable" | "abandon_unverifiable" | "refund_amount_pending";
 
 const UNAVAILABLE_ALARM_AFTER_MS = 30 * 60_000;
+// A deposit the job still watches holds its order open until the hard stop (spec 6.6)
+const LIVE: ReadonlySet<DepositState> = new Set(["open", "settling"]);
+const NO_LIVE_DEPOSIT = `not exists (select 1 from deposits d where d.order_id = orders.id
+    and d.state in ('open', 'settling') and (d.hard_stop_at is null or d.hard_stop_at > $1))`;
+
+// The caller holds the order's lock and has checked that it is unpaid; the pool releases the
+// allowance the order reserved
+export async function expireUnpaidOrder(
+    c: pg.PoolClient,
+    order: OrderRow,
+    x402: Settings["x402"],
+    log: Log,
+): Promise<void> {
+    await setOrderState(c, order.id, "unpaid", "expired");
+    if (order.allowanceMicros > 0) {
+        await movePool(c, { unpaid: -order.allowanceMicros }, x402, log);
+    }
+}
 
 export async function sweep(d: SweepDeps): Promise<SweepReport> {
     const now = d.now();
@@ -113,18 +133,27 @@ export async function sweep(d: SweepDeps): Promise<SweepReport> {
         });
     };
 
-    await each(await ids(d.pool, "state = 'unpaid' and expires_at <= $1", [now]), async (id) => {
-        const expired = await withTx(d.pool, async (c) => {
-            const order = await lockOrder(c, id);
-            if (order === null || order.state !== "unpaid" || order.expiresAt > now) return false;
-            await setOrderState(c, id, "unpaid", "expired");
-            if (order.allowanceMicros > 0) {
-                await movePool(c, { unpaid: -order.allowanceMicros }, d.x402, d.log);
+    await each(
+        await ids(d.pool, `state = 'unpaid' and expires_at <= $1 and ${NO_LIVE_DEPOSIT}`, [now]),
+        async (id) => {
+            const expired = await withTx(d.pool, async (c) => {
+                const order = await lockOrder(c, id);
+                if (order === null || order.state !== "unpaid") return null;
+                if (order.expiresAt > now) return null;
+                const deposit = await lockDeposit(c, id);
+                const live = deposit !== null && LIVE.has(deposit.state);
+                if (live && (deposit.hardStopAt === null || deposit.hardStopAt > now)) return null;
+                await expireUnpaidOrder(c, order, d.x402, d.log);
+                return { hardStop: live };
+            });
+            if (expired === null) return;
+            report.expired++;
+            // The deposit job had no read it could trust before the hard stop came
+            if (expired.hardStop) {
+                d.log.alarm("deposit_review", { orderId: id, reason: "expired_unchecked" });
             }
-            return true;
-        });
-        if (expired) report.expired++;
-    });
+        },
+    );
 
     // Unreachable, payOrder records paid_at only before the order expires
     await each(

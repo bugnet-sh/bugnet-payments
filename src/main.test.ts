@@ -29,6 +29,8 @@ import {
     X402SignerService,
 } from "./gen/bugnet/payments/v1/x402_pb.ts";
 import { indexHolder, installReload, main, routeConsole, startService } from "./main.ts";
+import { depositKeysFrom } from "./deposits/keys.ts";
+import { ensureDeposit, findDeposit } from "./deposits/store.ts";
 import { findOrder } from "./orders/store.ts";
 import { orderPublicKeyBase64 } from "./orders/token.ts";
 import { usdcAta } from "./solana/accounts.ts";
@@ -50,6 +52,20 @@ import { parseIndex } from "./x402/index-file.ts";
 import { readTail } from "./x402/tail.ts";
 
 const slowListener = vi.hoisted(() => ({ ms: 0 }));
+const pacedJobs = vi.hoisted(() => [] as string[]);
+vi.mock("./jobs/every.ts", async (importOriginal) => {
+    const real = await importOriginal<typeof import("./jobs/every.ts")>();
+    return {
+        ...real,
+        paced: (
+            name: string,
+            ...rest: Parameters<typeof real.paced> extends [string, ...infer R] ? R : never
+        ) => {
+            pacedJobs.push(name);
+            return real.paced(name, ...rest);
+        },
+    };
+});
 vi.mock("./x402/listener.ts", async (importOriginal) => {
     const real = await importOriginal<typeof import("./x402/listener.ts")>();
     return {
@@ -599,6 +615,52 @@ describe("startService", () => {
             await until(async () => (await stateOf(expiring.order.id)) === "expired", 5_000);
             await until(async () => (await stateOf(refunding.order.id)) === "refunded", 5_000);
             await until(async () => log.lines.some((l) => l.alarm === "fee_payer_sol_low"), 5_000);
+        } finally {
+            await s.stop();
+        }
+    });
+
+    it("startService wires the deposit job whenever a seed is loaded", async () => {
+        const cases = [
+            { enabled: true, seed: Buffer.alloc(32, 9), wired: true },
+            { enabled: false, seed: Buffer.alloc(32, 9), wired: true },
+            { enabled: false, seed: null, wired: false },
+        ];
+        for (const c of cases) {
+            pacedJobs.length = 0;
+            const s = await startService({
+                settings: testSettings({ deposits: { enabled: c.enabled } }),
+                secrets: { ...secrets, depositSeed: c.seed },
+                rpc: okRpc(),
+                log: silentLog,
+            });
+            try {
+                expect(pacedJobs.includes("deposits")).toBe(c.wired);
+            } finally {
+                await s.stop();
+            }
+        }
+    });
+
+    it("the deposit job marks a deposit past its grace with allowance_wallet empty", async () => {
+        const now = Date.now();
+        const { order } = await seedOrder(db.pool, {
+            createdAt: new Date(now - 20 * MIN),
+            expiresAt: new Date(now - 5 * MIN),
+        });
+        const keys = depositKeysFrom(secrets, 1)!;
+        await ensureDeposit(db.pool, keys, order, new Date(now - 20 * MIN));
+        const s = await startService({
+            settings: testSettings({ deposits: { enabled: false, busy_every: "50ms" } }),
+            secrets,
+            rpc: okRpc(),
+            log: silentLog,
+        });
+        try {
+            await until(
+                async () => (await findDeposit(db.pool, order.id))?.expiryDueAt != null,
+                5_000,
+            );
         } finally {
             await s.stop();
         }

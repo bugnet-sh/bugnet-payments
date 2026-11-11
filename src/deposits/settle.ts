@@ -139,8 +139,12 @@ export async function settleDeposit(
     return await signSweep(d, order, ledger, plan, readSlot);
 }
 
-// The router answers any kind but start or extend as invalid, so a top-up is checked as extend
-async function targetOf(d: SettleDeps, order: OrderRow): Promise<Target | null> {
+// The router answers any kind but start or extend as invalid, so a top-up is checked as extend.
+// The job's early blocked check asks with the same kind and package.
+export async function targetOf(
+    d: Pick<SettleDeps, "pool" | "log">,
+    order: OrderRow,
+): Promise<Target | null> {
     if (order.kind !== "allowance") return { packageId: order.packageId, kind: order.kind };
     const account = await findAccountByHandle(d.pool, order.handleSha256 ?? "");
     if (account === null) {

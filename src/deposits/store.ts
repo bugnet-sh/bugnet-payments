@@ -6,10 +6,12 @@
  */
 import { randomBytes } from "node:crypto";
 import type pg from "pg";
+import type { Settings } from "../config.ts";
 import type { Queryable } from "../db/pool.ts";
 import type { OrderRow } from "../orders/types.ts";
 import { type RefundDbRow, type RefundRow, toRefund } from "../refunds/request.ts";
 import type { DepositKeys } from "./keys.ts";
+import { moveFeeLamports } from "./moves.ts";
 import type {
     DepositRow,
     HoldRow,
@@ -578,4 +580,94 @@ export async function putHold(c: pg.PoolClient, h: HoldRow): Promise<void> {
 
 export async function clearHolds(c: pg.PoolClient, orderId: string): Promise<void> {
     await c.query("delete from deposit_holds where order_id = $1", [orderId]);
+}
+
+const IN_FLIGHT_SQL = "('pending', 'signed', 'sent')";
+// A create, with the close it will need: 3 signatures and 2 priority fees at the defaults (spec 5)
+const UNPAID_CREATE_LAMPORTS = 15_800n;
+
+/**
+ * Fees of metered moves (returns and closes that do not close to the fee payer) and of every
+ * failed move since then (spec 11.5). Moves still in flight count too, so deposits planned in
+ * one tick cannot together pass the budget before any of them lands.
+ */
+export async function meteredLamports(
+    db: Queryable,
+    since: Date,
+    feePayer: string,
+    cfg: Pick<Settings["deposits"], "compute_unit_limit" | "compute_unit_price_micro_lamports">,
+): Promise<bigint> {
+    const { rows } = await db.query<Pick<MoveDbRow, "kind" | "preflight_refused_at">>(
+        `select kind, preflight_refused_at from deposit_moves
+         where (state = 'failed' and failed_at >= $1)
+            or (kind in ('return', 'close') and not (closes and close_to is not distinct from $2)
+                and ((state = 'confirmed' and confirmed_at >= $1)
+                    or (state in ${IN_FLIGHT_SQL} and created_at >= $1)))`,
+        [since, feePayer],
+    );
+    let sum = 0n;
+    for (const r of rows) {
+        sum += moveFeeLamports({ kind: r.kind, preflightRefusedAt: r.preflight_refused_at }, cfg);
+    }
+    return sum;
+}
+
+// Metered returns planned for each sending owner since then
+export async function ownerReturns(
+    db: Queryable,
+    since: Date,
+    feePayer: string,
+): Promise<Map<string, number>> {
+    const { rows } = await db.query<{ payer: string; n: number }>(
+        `select payer, count(*)::int as n from deposit_moves
+         where kind = 'return' and created_at >= $1
+            and not (closes and close_to is not distinct from $2)
+         group by payer`,
+        [since, feePayer],
+    );
+    return new Map(rows.map((r) => [r.payer, r.n]));
+}
+
+// Rent Bugnet paid, or is about to pay with a create in flight, on a deposit that still takes
+// money; draining deposits close as soon as their returns land, so they are not counted (spec 5)
+const RENTED = `d.state in ('open', 'settling')
+    and (d.rent_payer = $1 or exists (select 1 from deposit_moves m
+        where m.order_id = d.order_id and m.kind = 'create' and m.state in ${IN_FLIGHT_SQL}))`;
+
+export async function rentHolding(db: Queryable, feePayer: string): Promise<number> {
+    const { rows } = await db.query<{ n: number }>(
+        `select count(*)::int as n from deposits d where ${RENTED}`,
+        [feePayer],
+    );
+    return rows[0]!.n;
+}
+
+export async function rentedBy(
+    db: Queryable,
+    viewerKey: string | null,
+    viewerBlock: string | null,
+    feePayer: string,
+): Promise<{ ipRented: number; blockRented: number }> {
+    const { rows } = await db.query<{ ip: number; block: number }>(
+        `select count(*) filter (where d.viewer_key = $2)::int as ip,
+            count(*) filter (where d.viewer_block = $3)::int as block
+         from deposits d
+         where (d.viewer_key = $2 or d.viewer_block = $3) and ${RENTED}`,
+        [feePayer, viewerKey, viewerBlock],
+    );
+    return { ipRented: rows[0]!.ip, blockRented: rows[0]!.block };
+}
+
+// Creates since then whose deposit holds no transfer, with the close each will need; a create in
+// flight counts already, so viewers in one tick cannot together pass the budget
+export async function unpaidCreateLamports(db: Queryable, since: Date): Promise<bigint> {
+    const { rows } = await db.query<{ n: number }>(
+        `select count(*)::int as n from deposit_moves m
+         where m.kind = 'create'
+            and ((m.state = 'confirmed' and m.confirmed_at >= $1)
+                or (m.state in ${IN_FLIGHT_SQL} and m.created_at >= $1))
+            and not exists (select 1 from deposit_transfers t where t.order_id = m.order_id)`,
+        [since],
+    );
+    return BigInt(rows[0]!.n) * UNPAID_CREATE_LAMPORTS;
 }

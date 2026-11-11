@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { memoryLog } from "../log.ts";
 import { createFakeRpc } from "../testing/fake-rpc.ts";
-import { countingRpc } from "./budget.ts";
+import { countingRpc, rpcCounter } from "./budget.ts";
 import type { SolanaRpc } from "./rpc.ts";
 
 describe("countingRpc", () => {
@@ -52,6 +52,24 @@ describe("countingRpc", () => {
         const alarms = log.lines.filter((l) => l.level === "alarm");
         expect(alarms).toHaveLength(1);
         expect(alarms[0]).toMatchObject({ alarm: "deposit_rpc_budget", calls: 2, limitPerHour: 1 });
+    });
+
+    it("one counter shared by two clients counts the calls of both", async () => {
+        const log = memoryLog();
+        const counter = rpcCounter({
+            limitPerHour: 1,
+            log,
+            now: () => 0,
+            alarm: "deposit_rpc_budget",
+        });
+        const a = countingRpc(createFakeRpc(), counter);
+        const b = countingRpc(createFakeRpc(), counter);
+        await a.getBlockHeight().send();
+        expect(log.lines).toHaveLength(0);
+        await b.getBlockHeight().send();
+        expect(log.lines.filter((l) => l.level === "alarm")).toEqual([
+            expect.objectContaining({ alarm: "deposit_rpc_budget", calls: 2, limitPerHour: 1 }),
+        ]);
     });
 
     it("keeps a send at exactly one hour in the window and drops it after", async () => {

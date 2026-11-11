@@ -3,35 +3,46 @@ import type { SolanaRpc } from "./rpc.ts";
 
 const HOUR_MS = 3_600_000;
 
-export function countingRpc(
-    rpc: SolanaRpc,
-    o: {
-        limitPerHour: number;
-        log: Log;
-        now: () => number;
-        alarm?: "x402_rpc_budget" | "deposit_rpc_budget";
-    },
-): SolanaRpc {
+export interface RpcCounter {
+    record(): void;
+}
+
+export interface RpcCounterOptions {
+    limitPerHour: number;
+    log: Log;
+    now: () => number;
+    alarm?: "x402_rpc_budget" | "deposit_rpc_budget";
+}
+
+// One counter may wrap several clients, so the deposit job's two lanes share one hourly count
+export function rpcCounter(o: RpcCounterOptions): RpcCounter {
     const alarm = o.alarm ?? "x402_rpc_budget";
     const sends: number[] = [];
     let head = 0;
     let alarmed = false;
-    const record = () => {
-        const now = o.now();
-        while (head < sends.length && now - sends[head]! > HOUR_MS) head++;
-        if (head > 1024) {
-            sends.splice(0, head);
-            head = 0;
-        }
-        sends.push(now);
-        const calls = sends.length - head;
-        if (calls <= o.limitPerHour) {
-            alarmed = false;
-        } else if (!alarmed) {
-            alarmed = true;
-            o.log.alarm(alarm, { calls, limitPerHour: o.limitPerHour });
-        }
+    return {
+        record() {
+            const now = o.now();
+            while (head < sends.length && now - sends[head]! > HOUR_MS) head++;
+            if (head > 1024) {
+                sends.splice(0, head);
+                head = 0;
+            }
+            sends.push(now);
+            const calls = sends.length - head;
+            if (calls <= o.limitPerHour) {
+                alarmed = false;
+            } else if (!alarmed) {
+                alarmed = true;
+                o.log.alarm(alarm, { calls, limitPerHour: o.limitPerHour });
+            }
+        },
     };
+}
+
+export function countingRpc(rpc: SolanaRpc, o: RpcCounterOptions | RpcCounter): SolanaRpc {
+    const counter = "record" in o ? o : rpcCounter(o);
+    const record = () => counter.record();
     const counted = (fn: unknown, self: unknown) => {
         return (...args: unknown[]) => {
             record();

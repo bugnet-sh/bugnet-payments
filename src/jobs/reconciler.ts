@@ -2,6 +2,7 @@ import { signature } from "@solana/kit";
 import type pg from "pg";
 import { withTx } from "../db/pool.ts";
 import type { Settings } from "../config.ts";
+import { lockDeposit, updateDeposit } from "../deposits/store.ts";
 import type { Log } from "../log.ts";
 import {
     archivePayment,
@@ -24,6 +25,7 @@ export interface ReconcileDeps {
     now: () => Date;
     paid: PaidDeps | null;
     x402: Settings["x402"];
+    deposits: Pick<Settings["deposits"], "expire_hard_after">;
 }
 
 export interface ReconcileReport {
@@ -116,6 +118,7 @@ async function candidates(db: pg.Pool, now: Date): Promise<Candidate[]> {
         `select p.order_id, p.tx_signature, p.last_valid_block_height
          from payments p join orders o on o.id = p.order_id
          where o.state = 'settling' and p.created_at < $1::timestamptz - interval '45 seconds'
+            and o.paid_via is distinct from 'transfer'
          order by p.created_at, p.order_id`,
         [now],
     );
@@ -183,8 +186,18 @@ async function apply(
         if (!(await archivePayment(c, p.orderId, verdict))) {
             throw new Error(`payment of order ${p.orderId} is ${payment.status}, not settling`);
         }
-        const state = now.getTime() >= order.expiresAt.getTime() ? "expired" : "unpaid";
+        const late = now.getTime() >= order.expiresAt.getTime();
+        // A deposit's on-time money must not go back as unpaid before the job's pinned checks
+        // ran, so the deposit job or the sweeper's hard stop expires the order instead
+        const deposit = late ? await lockDeposit(c, p.orderId) : null;
+        const live = deposit !== null && deposit.state !== "done";
+        const state = late && !live ? "expired" : "unpaid";
         await setOrderState(c, p.orderId, "settling", state);
+        if (live) {
+            await updateDeposit(c, p.orderId, {
+                hardStopAt: new Date(now.getTime() + d.deposits.expire_hard_after),
+            });
+        }
         if (state === "expired" && order.allowanceMicros > 0) {
             await movePool(c, { unpaid: -order.allowanceMicros }, d.x402, d.log);
         }

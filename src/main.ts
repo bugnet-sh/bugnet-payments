@@ -33,7 +33,18 @@ import {
 } from "./config.ts";
 import { migrate } from "./db/migrate.ts";
 import { createPool } from "./db/pool.ts";
-import { checkDepositKeys, depositKeysFrom } from "./deposits/keys.ts";
+import {
+    countedLanes,
+    createDepositWatch,
+    type DepositWatch,
+    depositInterval,
+    depositRpcQueue,
+    depositsBusy,
+    runDepositTick,
+} from "./deposits/job.ts";
+import { checkDepositKeys, type DepositKeys, depositKeysFrom } from "./deposits/keys.ts";
+import { TxCache } from "./deposits/scan.ts";
+import { sweepHooks } from "./deposits/settle.ts";
 import { createHttpApp, type HttpX402Parts } from "./http/app.ts";
 import { startServer } from "./http/server.ts";
 import { type AlarmSnapshot, checkAlarms } from "./jobs/alarms.ts";
@@ -56,6 +67,8 @@ import { advanceColdTransfers, runColdTransfer } from "./x402/cold.ts";
 import { fastPassNeeded, runFastPass } from "./x402/fastpass.ts";
 import { createAllowanceFunding, type AllowanceFunding } from "./x402/funding.ts";
 import { bugnetAddresses } from "./x402/ids.ts";
+import type { PaidDeps } from "./x402/paid.ts";
+import type { BugnetAddresses } from "./x402/types.ts";
 import { type IndexCopy, loadIndex, parseIndex } from "./x402/index-file.ts";
 import {
     certExpiryAlarm,
@@ -129,6 +142,19 @@ function readOrEmpty(path: string): string {
         return "";
     }
 }
+
+// What the deposit job needs beyond the shared jobs, present whenever a deposit seed is loaded
+interface DepositWiring {
+    keys: DepositKeys;
+    seed: Buffer;
+    watch: DepositWatch;
+    recipientTokenAccount: Address;
+    floatTokenAccount: Address;
+    addresses: BugnetAddresses;
+}
+
+// The deposit job's own transaction cache holds the 10,000 newest answers (spec 6.1)
+const DEPOSIT_TX_CACHE = 10_000;
 
 // What the x402 jobs and the signer listener share once the boot checks have passed
 interface X402Wiring {
@@ -360,10 +386,23 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             reload = () => log.info("reload ignored: allowance_wallet is empty");
         }
 
+        const deposits: DepositWiring | null =
+            depositKeys === null || secrets.depositSeed === null
+                ? null
+                : {
+                      keys: depositKeys,
+                      seed: secrets.depositSeed,
+                      watch: createDepositWatch(s.deposits.viewer_ttl, s.deposits.busy_every),
+                      recipientTokenAccount: await usdcAta(recipient),
+                      floatTokenAccount: await usdcAta(refundSigner.address),
+                      addresses,
+                  };
         const jobs = startJobs({
             s,
             pool,
             rpc,
+            rpc0,
+            deposits,
             router: http.router,
             feePayer,
             refundSigner,
@@ -408,6 +447,9 @@ interface JobDeps {
     s: Settings;
     pool: pg.Pool;
     rpc: SolanaRpc;
+    // Before the x402 counter wraps it: the deposit job counts its calls on its own
+    rpc0: SolanaRpc;
+    deposits: DepositWiring | null;
     router: RouterClient;
     feePayer: KeyPairSigner;
     refundSigner: KeyPairSigner;
@@ -437,7 +479,16 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
     const funding = x === null ? null : d.funding;
     const paid = funding === null ? null : { funding, x402: s.x402, log };
     const reconcile = tracked(() =>
-        reconcileSettling({ pool, rpc, rpcTimeoutMs, log, now, paid, x402: s.x402 }),
+        reconcileSettling({
+            pool,
+            rpc,
+            rpcTimeoutMs,
+            log,
+            now,
+            paid,
+            x402: s.x402,
+            deposits: s.deposits,
+        }),
     );
     const first = reconcile().catch((err: unknown) =>
         log.error("job failed", { job: "reconcile", err }),
@@ -560,12 +611,84 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
         );
     }
     if (x !== null) stops.push(...startX402Jobs(d, x, tracked, track, refundDeps));
+    // Whatever [deposits] enabled says: it gates only new deposits, and existing ones must finish
+    if (d.deposits !== null) stops.push(startDepositJob(d, d.deposits, paid, tracked, track));
     return {
         async stop() {
             stopped = true;
             for (const stop of stops) stop();
             await Promise.allSettled([...running]);
         },
+    };
+}
+
+/**
+ * The deposit job (spec 6.4, 6.5): one tick at a time under its database lock, paced busy or idle,
+ * woken by a new viewer that needs an account. Until the RPC router gives two lanes, today's one
+ * client serves both, and the job's queue keeps its own caps either way. Both lanes count into
+ * one hourly counter of their own, never x402_rpc_budget's.
+ */
+function startDepositJob(
+    d: JobDeps,
+    w: DepositWiring,
+    paid: PaidDeps | null,
+    tracked: (fn: () => Promise<unknown>) => () => Promise<unknown>,
+    track: <T>(run: Promise<T>) => Promise<T>,
+): () => void {
+    const { s, pool, log, now } = d;
+    const cfg = s.deposits;
+    const nowMs = () => now().getTime();
+    const lanes = countedLanes(
+        { rpc: d.rpc0, backgroundRpc: d.rpc0 },
+        { limitPerHour: cfg.rpc_calls_per_hour_alarm, log, now: nowMs },
+    );
+    const queue = depositRpcQueue(lanes, {
+        perSecond: cfg.rpc_calls_per_second,
+        perDay: cfg.rpc_calls_per_day,
+        now: nowMs,
+        log,
+    });
+    const base = {
+        pool,
+        rpc: queue.rpc("deposits.move"),
+        feePayer: d.feePayer,
+        keys: w.keys,
+        cfg,
+        recipientTokenAccount: w.recipientTokenAccount,
+        floatTokenAccount: w.floatTokenAccount,
+        hotTokenAccount: d.x402?.hotTokenAccount ?? null,
+        paid,
+        rpcTimeoutMs: s.solana.rpc_timeout,
+        log,
+        now,
+        cache: new TxCache(DEPOSIT_TX_CACHE),
+        router: d.router,
+        // The order token's fee payer is always Payments' own (spec 10.5)
+        challengeFeePayer: d.feePayer.address,
+        x402: { x402: s.x402, signer: d.x402?.gate ?? { open: () => false } },
+        watch: w.watch,
+        bugnetOwners: w.addresses.all,
+        seed: w.seed,
+        queue,
+    };
+    const deps = { ...base, ...sweepHooks(base) };
+    const run = tracked(() => singleRunner(pool, RUNNER_KEYS.deposits, () => runDepositTick(deps)));
+    w.watch.wake.run = () => {
+        run().catch((err: unknown) => log.error("job failed", { job: "deposits", err }));
+    };
+    const stop = paced(
+        "deposits",
+        run,
+        () =>
+            track(depositsBusy(pool, w.watch, now(), cfg, queue.dayUsed().fraction)).then(
+                (busy) => depositInterval(busy, cfg),
+                () => cfg.idle_every,
+            ),
+        log,
+    );
+    return () => {
+        w.watch.wake.run = null;
+        stop();
     };
 }
 
