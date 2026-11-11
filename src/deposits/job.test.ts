@@ -1926,7 +1926,7 @@ describe("flows on FakeChain", () => {
         expect(chain.lamports(first.address)).toBe(firstBefore);
     });
 
-    it("a closed deposit put in review never keeps the job busy", async () => {
+    it("a closed deposit put in review is read at the closed pace and never keeps the job busy", async () => {
         const dep = await paidAndClosed();
         // Late money opens the account again, and a leaked key takes part of it before the job
         // reads, so every later read stays below the ledger
@@ -1951,5 +1951,19 @@ describe("flows on FakeChain", () => {
         await ticks(1, cfg.closed_every);
         expect(await depositOf()).toMatchObject({ state: "closed", reviewReason: "unknown_debit" });
         expect(await depositsBusy(db.pool, watch, clock, cfg)).toBe(false);
+
+        // No read is held, so checked_at stays put and watchedDeposits returns it every tick
+        const mark = chain.calls().length;
+        const calls = (method: string) =>
+            chain
+                .calls()
+                .slice(mark)
+                .filter((x) => x.method === method && x.params[0] !== undefined)
+                .filter((x) => JSON.stringify(x.params[0]).includes(dep.tokenAccount)).length;
+        await ticks(30, cfg.busy_every);
+        expect(calls("getMultipleAccounts")).toBeLessThanOrEqual(1);
+        expect(calls("getSignaturesForAddress")).toBeLessThanOrEqual(2);
+        await ticks(1, cfg.closed_every);
+        expect(calls("getMultipleAccounts")).toBeGreaterThanOrEqual(1);
     });
 });
