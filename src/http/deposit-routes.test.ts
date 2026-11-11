@@ -413,6 +413,33 @@ describe("the balance route", () => {
     });
 });
 
+describe("a failing balance read", () => {
+    let app: TestApp;
+    beforeAll(async () => {
+        const background = createFakeRpc({
+            getAccountInfo: () => {
+                throw new Error("node down");
+            },
+        });
+        app = await testApp({ now: at(5 * MIN), deposits: {}, backgroundRpc: background });
+    });
+    afterAll(() => app.close());
+
+    it("answers 503 and logs one warn line a minute", async () => {
+        await order(app);
+        for (const fill of [50, 51]) {
+            const owner = getBase58Decoder().decode(new Uint8Array(32).fill(fill));
+            const r = await json(app, `/o/${ID}/balance?owner=${owner}`);
+            expect(r.status).toBe(503);
+            expect(await r.json()).toEqual({ error: "rpc_unavailable" });
+        }
+        const warned = app.log.lines.filter((l) => l.msg === "deposit balance read failed");
+        expect(warned).toEqual([
+            expect.objectContaining({ level: "warn", label: "public.balance" }),
+        ]);
+    });
+});
+
 describe("the process-wide balance cap", () => {
     let app: TestApp;
     let background: ReturnType<typeof createFakeRpc>;

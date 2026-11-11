@@ -29,7 +29,7 @@ import { findOrder } from "../orders/store.ts";
 import type { OrderRow, OrderState } from "../orders/types.ts";
 import type { IpLimiter, RateLimiter } from "../ratelimit.ts";
 import { readTokenAccount, usdcAta } from "../solana/accounts.ts";
-import { deadline, type SolanaRpc } from "../solana/rpc.ts";
+import { deadline, rpcErrorFields, type SolanaRpc } from "../solana/rpc.ts";
 import type { BlockhashCache } from "../solana/blockhash.ts";
 import { decodeCursor } from "../stats/cursor.ts";
 import { statsPayments } from "../stats/payments.ts";
@@ -100,6 +100,8 @@ const REPORT_MAX_BYTES = 2_048;
 const REPORT_STAGES = new Set(["connect", "balance", "challenge", "sign", "submit", "status"]);
 const BALANCE_CACHE_MS = 15_000;
 const BALANCE_CACHE_SIZE = 1_000;
+// A failing read answers 503 every time, but logs once a minute
+const BALANCE_WARN_EVERY_MS = 60_000;
 const STATS_PAYMENTS = "/api/stats/payments";
 
 function unreachable(state: never): never {
@@ -300,6 +302,7 @@ async function sendStatsPayments(
 export function createPublicHandler(d: PublicDeps): Handler {
     // Each owner's balance for 15 s, so repeated checks of one wallet cost one read
     const balances = new Map<string, { at: number; micros: number }>();
+    const balanceWarned = { at: Number.NEGATIVE_INFINITY };
     return async (req, res) => {
         const path = requestPath(req.url);
         if (req.method === "GET" && path === "/healthz") {
@@ -398,7 +401,9 @@ export function createPublicHandler(d: PublicDeps): Handler {
             return;
         }
         if (sub === "report") return sendReport(res, d, order, ip, body);
-        if (sub === "balance") return sendBalance(req, res, d, order, ip, balances);
+        if (sub === "balance") {
+            return sendBalance(req, res, d, order, ip, balances, balanceWarned);
+        }
         if (sub === "qr.svg") return sendQr(res, d, order);
         if (isStatus) return sendStatus(req, res, d, order, ip);
         const state = publicState(order, d.now());
@@ -484,6 +489,7 @@ async function sendBalance(
     order: OrderRow,
     ip: IpKey,
     cache: Map<string, { at: number; micros: number }>,
+    warned: { at: number },
 ): Promise<void> {
     const limit = d.balancePerIp.take(ip);
     if (!limit.ok) {
@@ -528,7 +534,16 @@ async function sendBalance(
             ...deadline(d.rpcTimeoutMs),
         });
         micros = Number(read.info?.amount ?? 0n);
-    } catch {
+    } catch (err) {
+        // The page skips the check on a 503 (spec 13.1), so only this line shows a read that
+        // never works
+        if (now.getTime() - warned.at >= BALANCE_WARN_EVERY_MS) {
+            warned.at = now.getTime();
+            d.log.warn("deposit balance read failed", {
+                label: "public.balance",
+                ...rpcErrorFields(err),
+            });
+        }
         sendJson(res, 503, { error: "rpc_unavailable" });
         return;
     }
