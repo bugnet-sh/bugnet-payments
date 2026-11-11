@@ -10,6 +10,7 @@ import { createHttpApp } from "../http/app.ts";
 import { startServer } from "../http/server.ts";
 import { memoryLog } from "../log.ts";
 import { orderPublicKeyBase64 } from "../orders/token.ts";
+import type { SolanaRpc } from "../solana/rpc.ts";
 import type { OrderRequest, OrderRow } from "../orders/types.ts";
 import { testDb } from "./db.ts";
 import { bugnetAddresses } from "../x402/ids.ts";
@@ -35,6 +36,8 @@ export interface TestAppOptions {
     allowanceClaim?: boolean;
     signerOpen?: boolean;
     rpc?: Partial<FakeRpcScript>;
+    // Replaces the scripted fake, for a test that pays through a router over a fake chain
+    solanaRpc?: SolanaRpc;
 }
 
 export interface TestApp {
@@ -136,7 +139,7 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
             settings,
             secrets,
             pool: db.pool,
-            rpc,
+            rpc: over.solanaRpc ?? rpc,
             feePayer,
             x402: {
                 signer: { open: () => over.signerOpen ?? true },
