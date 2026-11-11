@@ -478,10 +478,11 @@ export async function renderCheckout(v: CheckoutView): Promise<string> {
     const expires = v.expiresAt.toISOString();
     let tail: string;
     if (v.state === "unpaid") {
-        const offered = v.depositsOffered && v.deposit !== null;
-        tail = offered
-            ? `${depositSection(v, v.deposit!)}\n${await paySections(v, amount, true)}`
-            : `<p id="deposit-message" class="note" role="status">Paying by address is off right now. Pay with a browser wallet below, or reload this page later.</p>
+        const dep = v.depositsOffered ? v.deposit : null;
+        tail =
+            dep !== null
+                ? `${depositSection(v, dep)}\n${await paySections(v, amount, true)}`
+                : `<p id="deposit-message" class="note" role="status">Paying by address is off right now. Pay with a browser wallet below, or reload this page later.</p>
 ${await paySections(v, amount, false)}`;
     } else {
         tail = `<p id="deposit-message" role="status" aria-live="polite">${closedLine(v)}</p>${

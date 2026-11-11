@@ -439,7 +439,8 @@ describe("address-first page", () => {
         expect(section(html, "deposit")).toContain(
             "Scan with a Solana wallet app to send 0.05 USDC",
         );
-        expect(section(html, "phone")).toContain("<svg");
+        const phantom = walletLinks(offered.pageUrl, offered.origin).phantom;
+        expect(section(html, "phone")).toContain(await qrSvg(phantom));
         expect(section(html, "phone")).toContain(
             "Scan with your phone to open this page in Phantom",
         );
@@ -495,8 +496,9 @@ describe("address-first page", () => {
     it("wallet section is secondary", async () => {
         const html = await renderCheckout(offered);
         expect(html).toContain("Or pay with a browser wallet");
-        expect(html).toContain('class="button outline" type="button" disabled');
-        expect(html).toContain('id="pay-button"');
+        expect(section(html, "wallet")).toContain(
+            '<button id="pay-button" class="button outline" type="button" disabled>',
+        );
     });
 
     it("no deposit offered", async () => {
@@ -514,7 +516,7 @@ describe("address-first page", () => {
             "The payment is confirming on Solana. This page updates when it lands.",
         );
         expect(await renderCheckout({ ...view, state: "refunded" })).toContain(
-            "This order&#39;s payment was returned to the wallet that paid.".replace("&#39;", "'"),
+            "This order's payment was returned to the wallet that paid.",
         );
         for (const state of ["unpaid", "paid", "expired"] as const) {
             expect(await renderCheckout({ ...offered, state })).toContain(
