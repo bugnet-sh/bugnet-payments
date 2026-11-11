@@ -220,14 +220,29 @@ toml_set() {
     ' "$TOML"
 }
 
+# Spec 4.3: seed_version changes only through --rotate-deposit-seed. --deposits remove takes the
+# whole section out, so the version waits in this file until a step adds the section back; read
+# as the default 1, the current seed would sign under an older version's number.
+kept_seed_version() {
+    local f="$ETC/payments.seed_version" v
+    [ -f "$f" ] || return 0
+    v=$(cat "$f")
+    case $v in
+    "" | *[!0-9]* | 0*) die "$f does not hold a whole number of at least 1" ;;
+    *) echo "$v" ;;
+    esac
+}
+
 # Sets one unquoted value (a boolean or a number) inside [deposits]. Unlike toml_set it adds the
 # key, and the section, when they are missing, since --deposits and the rotation own these keys.
 # A section it adds states enabled = false, as the install step's does, because a missing enabled
-# reads as true. The file is read twice; each pass starts outside every section.
+# reads as true, and the seed_version --deposits remove kept. The file is read twice; each pass
+# starts outside every section.
 deposits_set() {
-    local key=$1 value=$2
+    local key=$1 value=$2 kept
+    kept=$(kept_seed_version)
     # shellcheck disable=SC2016
-    toml_rewrite -v key="$key" -v val="$value" '
+    toml_rewrite -v key="$key" -v val="$value" -v kept="$kept" '
         FNR == 1 { cur = "" }
         NR == FNR {
             if ($0 ~ /^\[/) cur = $0
@@ -243,9 +258,11 @@ deposits_set() {
             if (!sec) {
                 print ""; print "[deposits]"; print key " = " val
                 if (key != "enabled") print "enabled = false"
+                if (kept != "" && key != "seed_version") print "seed_version = " kept
             }
         }
     ' "$TOML" "$TOML"
+    rm -f "$ETC/payments.seed_version"
 }
 
 deposits_get() {
@@ -264,6 +281,7 @@ deposits_get() {
 seed_version() {
     local v
     v=$(deposits_get seed_version)
+    [ -n "$v" ] || v=$(kept_seed_version)
     case $v in
     "") echo 1 ;;
     *[!0-9]* | 0*) die "[deposits] seed_version in $TOML is not a whole number of at least 1" ;;
@@ -272,7 +290,7 @@ seed_version() {
 }
 
 ensure_toml() {
-    local recipient=$1 event_key=$2 router_url=$3 allowance
+    local recipient=$1 event_key=$2 router_url=$3 allowance kept
     allowance=$(allowance_address)
     if [ ! -f "$TOML" ]; then
         cat >"$TOML" <<EOF
@@ -307,7 +325,10 @@ EOF
     toml_set x402 allowance_wallet "$allowance"
     # Only when the section is missing, so a later install keeps what --deposits set
     if ! grep -q '^\[deposits\]' "$TOML"; then
+        kept=$(kept_seed_version)
         printf '\n[deposits]\nenabled = false\n' >>"$TOML"
+        [ -z "$kept" ] || printf 'seed_version = %s\n' "$kept" >>"$TOML"
+        rm -f "$ETC/payments.seed_version"
         say "added [deposits] enabled = false to $TOML"
     fi
     chown root:root "$TOML"
@@ -649,7 +670,7 @@ deposits_gate_ok() {
 # waits for a roll forward and goes back with deposits return-late. It restarts nothing, since
 # this release would read the missing section as deposits on.
 deposits_remove() {
-    local list n moving m
+    local list n moving m version
     if ! grep -q '^\[deposits\]' "$TOML"; then
         say "$TOML has no [deposits]"
         return 0
@@ -662,9 +683,12 @@ deposits_remove() {
     if [ "$n" != 0 ] || [ "$m" != 0 ]; then
         die "deposits open, settling or draining: $n; with a move in flight: $m; [deposits] was not removed"
     fi
+    version=$(seed_version)
+    printf '%s\n' "$version" >"$ETC/payments.seed_version.new"
+    mv -f "$ETC/payments.seed_version.new" "$ETC/payments.seed_version"
     # shellcheck disable=SC2016
     toml_rewrite '/^\[/ { skip = ($0 ~ /^\[deposits(\]|\.)/) } !skip { print }' "$TOML"
-    say "removed [deposits] from $TOML; now install the older release and run its --start"
+    say "removed [deposits] from $TOML, keeping seed_version $version in $ETC/payments.seed_version; now install the older release and run its --start"
 }
 
 do_deposits() {

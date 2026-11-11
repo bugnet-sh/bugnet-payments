@@ -384,7 +384,10 @@ from this release's install step on:
    refuses while deposits are on, any deposit is `open`, `settling` or `draining`, or any deposit
    has a move in flight (`pcli deposits list --moving`), since the older release watches none of
    them. Otherwise it removes `[deposits]` from `payments.toml` by an atomic rename and restarts
-   nothing. When it refuses, wait for those deposits to finish and run it again.
+   nothing. When it refuses, wait for those deposits to finish and run it again. The section's
+   `seed_version` waits in `/etc/bugnet/payments.seed_version`, and the step that adds
+   `[deposits]` back (the install step or `--deposits`) writes it back, so the current seed keeps
+   its version.
 2. At once, the older release's own `deploy/vps-install.sh` with its tarball, then its `--start`
    (this release's install step would add `[deposits]` back). Until then this release must not
    restart: it reads the missing section as deposits on. Its `--start` refuses with

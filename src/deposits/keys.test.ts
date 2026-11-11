@@ -143,6 +143,44 @@ describe("checkDepositKeys", () => {
         await expect(checkDepositKeys(db.pool, null)).resolves.toBeUndefined();
     });
 
+    it("boot check refuses a seed loaded under another version's number, done deposits too", async () => {
+        await deposit(ORDER_A, {
+            address: ADDRESS_A,
+            tokenAccount: TOKEN_A,
+            keyVersion: 1,
+            state: "done",
+        });
+        await expect(checkDepositKeys(db.pool, keys7())).resolves.toBeUndefined();
+        // Seed 8 read as version 1, as after seed_version fell back to its default
+        const misnumbered = new DepositKeys(new Map([[1, SEED_8]]), 1);
+        const err = await checkDepositKeys(db.pool, misnumbered).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(BootCheckError);
+        expect((err as Error).message).toBe(
+            "BUGNET_DEPOSIT_SEED loaded as version 1 does not derive ord_aaaaaaaaaaaaaaaaaaaaaaaaaa, " +
+                "the newest deposit of that version; check [deposits] seed_version",
+        );
+        await expect(checkDepositKeys(db.pool, null)).resolves.toBeUndefined();
+    });
+
+    it("boot check refuses deposits of a version above seed_version", async () => {
+        await deposit(ORDER_B, {
+            address: "Fvkkb7d7zpJZcyUsygPojncsHASt2VtQB6hLRTHKp4aB",
+            tokenAccount: "other-token-account",
+            keyVersion: 2,
+            state: "done",
+        });
+        const err = await checkDepositKeys(db.pool, keys7()).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(BootCheckError);
+        expect((err as Error).message).toBe(
+            "1 deposits use seed version 2, above [deposits] seed_version 1; " +
+                "restore seed_version",
+        );
+        const two = new DepositKeys(new Map([[2, SEED_7]]), 2);
+        await expect(checkDepositKeys(db.pool, two)).resolves.toBeUndefined();
+        const wrong = new DepositKeys(new Map([[2, SEED_8]]), 2);
+        await expect(checkDepositKeys(db.pool, wrong)).rejects.toThrow(/newest deposit/);
+    });
+
     it("a version without its seed is refused while another version is loaded", async () => {
         await deposit(ORDER_A, { address: ADDRESS_A, tokenAccount: TOKEN_A, keyVersion: 1 });
         const onlyTwo = new DepositKeys(new Map([[2, SEED_8]]), 2);

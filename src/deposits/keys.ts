@@ -129,4 +129,44 @@ export async function checkDepositKeys(pool: Queryable, keys: DepositKeys | null
             );
         }
     }
+    await checkSeedVersion(pool, keys);
+}
+
+/**
+ * A seed loaded under the wrong number passes the checks above once every deposit of that number
+ * is done, and new deposits would then reuse the number for another seed, so a retired seed could
+ * no longer return their late money (spec 4.3). Done deposits count here: the newest deposit of
+ * each loaded version must derive, and no deposit may name a version above seed_version.
+ */
+async function checkSeedVersion(pool: Queryable, keys: DepositKeys): Promise<void> {
+    const above = await pool.query<{ key_version: number; n: number }>(
+        `select key_version, count(*)::int as n from deposits where key_version > $1
+         group by key_version order by key_version limit 1`,
+        [keys.current],
+    );
+    const high = above.rows[0];
+    if (high !== undefined) {
+        throw new BootCheckError(
+            `${high.n} deposits use seed version ${high.key_version}, above [deposits] ` +
+                `seed_version ${keys.current}; restore seed_version`,
+        );
+    }
+    for (const version of [keys.current, keys.current - 1]) {
+        if (!keys.has(version)) continue;
+        const { rows } = await pool.query<{ order_id: string; address: string; salt: Buffer }>(
+            `select order_id, address, salt from deposits where key_version = $1
+             order by created_at desc, order_id desc limit 1`,
+            [version],
+        );
+        const newest = rows[0];
+        if (newest === undefined) continue;
+        const signer = await keys.signer(newest.order_id, newest.salt, version);
+        if (signer.address !== newest.address) {
+            throw new BootCheckError(
+                `BUGNET_DEPOSIT_SEED loaded as version ${version} does not derive ` +
+                    `${newest.order_id}, the newest deposit of that version; check [deposits] ` +
+                    "seed_version",
+            );
+        }
+    }
 }

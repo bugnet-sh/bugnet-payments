@@ -502,6 +502,31 @@ describe("vps-install.sh deposits", () => {
         expect(server.calls()).toContain("systemctl restart bugnet-payments@v9");
     });
 
+    it("--deposits remove keeps seed_version for the step that adds [deposits] back", () => {
+        for (const add of ['ensure_toml "" "" ""', "main --deposits off"]) {
+            const server = fakeServer({ active: true });
+            const kept = join(server.root, "etc", "payments.seed_version");
+            writeFileSync(
+                server.toml,
+                '[solana]\nrecipient = "R"\n\n[deposits]\nenabled = false\nseed_version = 2\n',
+            );
+            expect(server.run("main --deposits remove").code).toBe(0);
+            expect(readFileSync(server.toml, "utf8")).not.toContain("seed_version");
+            expect(readFileSync(kept, "utf8")).toBe("2\n");
+            // A rotation run before the section is back still counts from version 2
+            expect(server.run("seed_version").out).toBe("2\n");
+
+            const r = server.run(add);
+            expect(r.code).toBe(0);
+            const toml = readFileSync(server.toml, "utf8");
+            expect(toml).toContain("[deposits]\n");
+            expect(toml).toContain("enabled = false\n");
+            expect(toml).toContain("seed_version = 2\n");
+            expect(existsSync(kept)).toBe(false);
+            expect(server.run("seed_version").out).toBe("2\n");
+        }
+    });
+
     it("deposits_set gives a section it adds enabled = false", () => {
         const server = fakeServer();
         writeFileSync(server.toml, "[solana]\n");
