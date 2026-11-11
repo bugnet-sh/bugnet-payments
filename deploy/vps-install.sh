@@ -9,6 +9,17 @@
 #                                         version
 #   vps-install.sh --rpc-urls             reads one BUGNET_SOLANA_RPC_URLS line on stdin into
 #                                         payments.env; deploy/push-rpc-urls.sh sends it
+#   vps-install.sh --deposits on|off      sets [deposits] enabled and restarts the running version;
+#                                         on needs the RPC router release and a passing rpc probe
+#   vps-install.sh --rotate-deposit-seed  makes a new deposit seed; the old one stays as
+#                                         BUGNET_DEPOSIT_SEED_PREVIOUS until it is retired
+#   vps-install.sh --retire-deposit-seed FILE
+#                                         once every deposit of the old seed is done: appends it
+#                                         to FILE, removes BUGNET_DEPOSIT_SEED_PREVIOUS
+#   vps-install.sh --retire-deposit-seed - [--remove-previous]
+#                                         prints the archive line; with --remove-previous, removes
+#                                         the seed once stdin holds that line.
+#                                         deploy/retire-deposit-seed.sh runs both on the Mac
 #
 # Every step can run again. It prints addresses and variable names, never a secret value.
 set -euo pipefail
@@ -19,6 +30,7 @@ TOML=$ETC/payments.toml
 ENV_FILE=${BUGNET_PAYMENTS_ENV:-$ETC/payments.env}
 ROUTER_ENV=$ETC/router.env
 RELEASE_FILE=$ETC/payments.release
+ROTATING=$ETC/payments.rotating
 OPT=/opt/bugnet/payments
 UNIT_DIR=/etc/systemd/system
 NODE_MAJOR=26
@@ -38,8 +50,9 @@ installed_version() {
     cat "$RELEASE_FILE"
 }
 
-# Runs the release's CLI with the secrets loaded, in a subshell so nothing leaks into this shell
-cli() {
+# Runs a command in the installed release with the secrets loaded, in a subshell so nothing leaks
+# into this shell
+in_release() {
     local v
     v=$(installed_version)
     (
@@ -47,8 +60,16 @@ cli() {
         # shellcheck disable=SC1090
         . "$ENV_FILE"
         set +a
-        cd "$OPT/$v" && node dist/cli.js "$@"
+        cd "$OPT/$v" && "$@"
     )
+}
+
+cli() { in_release node dist/cli.js "$@"; }
+
+# As README section 8's pcli: database commands log in by peer as the service user
+svc_cli() {
+    in_release setpriv --reuid="$SVC_USER" --regid="$SVC_USER" --init-groups \
+        node dist/cli.js -config "$TOML" "$@"
 }
 
 env_has() { grep -q "^$1=." "$ENV_FILE" 2>/dev/null; }
@@ -183,6 +204,50 @@ toml_set() {
     rm -f "$TOML.new"
 }
 
+# Sets one unquoted value (a boolean or a number) inside [deposits]. Unlike toml_set it adds the
+# key, and the section, when they are missing, since --deposits and the rotation own these keys.
+deposits_set() {
+    local key=$1 value=$2
+    awk -v key="$key" -v val="$value" '
+        NR == FNR {
+            if ($0 ~ /^\[/) cur = $0
+            else if (cur == "[deposits]" && $0 ~ "^" key "[[:space:]]*=") has = 1
+            if ($0 == "[deposits]") sec = 1
+            next
+        }
+        /^\[/ { cur = $0 }
+        cur == "[deposits]" && $0 ~ "^" key "[[:space:]]*=" { print key " = " val; next }
+        { print }
+        $0 == "[deposits]" && !has { print key " = " val }
+        END { if (!sec) { print ""; print "[deposits]"; print key " = " val } }
+    ' "$TOML" "$TOML" >"$TOML.new"
+    cat "$TOML.new" >"$TOML"
+    rm -f "$TOML.new"
+}
+
+deposits_get() {
+    awk -v key="$1" '
+        /^\[/ { cur = $0; next }
+        cur == "[deposits]" && $0 ~ "^" key "[[:space:]]*=" {
+            v = $0
+            sub("^" key "[[:space:]]*=[[:space:]]*", "", v)
+            sub("[[:space:]]*(#.*)?$", "", v)
+        }
+        END { print v }
+    ' "$TOML"
+}
+
+# Spec 4.3: the version of BUGNET_DEPOSIT_SEED, 1 until the first rotation
+seed_version() {
+    local v
+    v=$(deposits_get seed_version)
+    case $v in
+    "") echo 1 ;;
+    *[!0-9]* | 0*) die "[deposits] seed_version in $TOML is not a whole number of at least 1" ;;
+    *) echo "$v" ;;
+    esac
+}
+
 ensure_toml() {
     local recipient=$1 event_key=$2 router_url=$3 allowance
     allowance=$(allowance_address)
@@ -217,6 +282,11 @@ EOF
     [ -z "$event_key" ] || toml_set router event_public_key "$event_key"
     [ -z "$router_url" ] || toml_set router url "$router_url"
     toml_set x402 allowance_wallet "$allowance"
+    # Only when the section is missing, so a later install keeps what --deposits set
+    if ! grep -q '^\[deposits\]' "$TOML"; then
+        printf '\n[deposits]\nenabled = false\n' >>"$TOML"
+        say "added [deposits] enabled = false to $TOML"
+    fi
     chown root:root "$TOML"
     chmod 0644 "$TOML"
 }
@@ -387,7 +457,7 @@ do_start() {
     rpc_env_ok "$ENV_FILE" || ok=0
     for name in BUGNET_PAYMENTS_TOKEN BUGNET_PAYMENTS_ROUTER_TOKEN \
         BUGNET_ORDER_PRIVATE_KEY BUGNET_CLAIM_KEY BUGNET_FEE_PAYER_KEY BUGNET_REFUND_KEY \
-        BUGNET_ALLOWANCE_KEY BUGNET_X402_TLS_KEY; do
+        BUGNET_ALLOWANCE_KEY BUGNET_X402_TLS_KEY BUGNET_DEPOSIT_SEED; do
         env_has "$name" || { echo "$ENV_FILE has no $name" >&2; ok=0; }
     done
     for f in "$ETC/internal-ca.pem" "$ETC/payments/x402-server.pem" "$ETC/payments/x402-index.json"; do
@@ -416,8 +486,143 @@ do_start() {
     die "bugnet-payments@$v did not answer healthz within 60 s"
 }
 
+# The settings and the env file are read only at start. Only the installed version is restarted,
+# and only while it runs: an older one still running would refuse [deposits] keys it does not know.
+restart_running() {
+    local v
+    v=$(installed_version)
+    if systemctl is-active --quiet "bugnet-payments@$v"; then
+        do_start
+    else
+        say "bugnet-payments@$v is not running; the next --start loads the change"
+    fi
+}
+
+# Spec 19, D7: deposits go live only on the RPC router release, whose CLI lists rpc probe
+release_has_probe() {
+    local v usage
+    v=$(installed_version)
+    usage=$(cd "$OPT/$v" && node dist/cli.js 2>&1) || true
+    printf '%s\n' "$usage" | grep -q '^  rpc probe '
+}
+
+# Reads rpc probe's output on stdin and takes its exit code as $1. Deposit scans are pinned
+# listings, which go only to the endpoints on the listings line, and a "not found" needs two
+# domains (spec 19; router spec 14 step 3). Prints counts, never an endpoint.
+deposits_gate_ok() {
+    local rc=$1 line n=0 m=0 quorum=off listings=0 rest
+    local quorum_re='^quorum: ([0-9]+) of ([0-9]+) domains ready$'
+    while IFS= read -r line; do
+        if [[ $line =~ $quorum_re ]]; then
+            n=${BASH_REMATCH[1]}
+            m=${BASH_REMATCH[2]}
+            quorum="$n of $m domains ready"
+        elif [ "${line#listings: }" != "$line" ]; then
+            rest=${line#listings: }
+            listings=0
+            if [ "$rest" != none ]; then
+                listings=$(printf '%s\n' "$rest" | wc -w | tr -d ' ')
+            fi
+        fi
+    done
+    echo "rpc probe: exit $rc, quorum $quorum, $listings listing endpoint$([ "$listings" = 1 ] || echo s)"
+    if [ "$rc" = 0 ] && [ "$m" -ge 2 ] && [ "$n" -ge "$m" ] && [ "$listings" -ge 2 ]; then
+        return 0
+    fi
+    echo "deposits need the probe to exit 0, a quorum of at least 2 domains and at least 2 listing endpoints" >&2
+    return 1
+}
+
+do_deposits() {
+    local want=$1 out rc=0
+    case $want in
+    on | off) ;;
+    *) die "--deposits takes on or off" ;;
+    esac
+    if [ "$want" = on ]; then
+        if ! release_has_probe; then
+            echo "deposits need the RPC router release; install it first" >&2
+            exit 1
+        fi
+        env_has BUGNET_DEPOSIT_SEED || die "$ENV_FILE has no BUGNET_DEPOSIT_SEED; run the install step first"
+        # The probe's env file is loaded by the shell, which would split a bad list line
+        rpc_env_ok "$ENV_FILE" || die "deposits were not changed"
+        out=$(svc_cli rpc probe </dev/null) || rc=$?
+        printf '%s\n' "$out" | deposits_gate_ok "$rc" || die "deposits were not changed"
+        deposits_set enabled true
+    else
+        deposits_set enabled false
+    fi
+    say "[deposits] enabled = $([ "$want" = on ] && echo true || echo false) in $TOML"
+    restart_running
+}
+
+# Spec 4.3: the marker holds the target version from the first step to the last, so a run that
+# stopped halfway is finished by the next one and the seed is never rotated twice
+do_rotate_seed() {
+    local version target
+    version=$(seed_version)
+    if [ -f "$ROTATING" ]; then
+        target=$(cat "$ROTATING")
+        case $target in
+        "" | *[!0-9]*) die "$ROTATING holds no version; remove it only after checking $TOML and $ENV_FILE" ;;
+        esac
+        say "finishing the rotation to seed version $target"
+    else
+        if env_has BUGNET_DEPOSIT_SEED_PREVIOUS; then
+            die "BUGNET_DEPOSIT_SEED_PREVIOUS is set: an earlier rotation is still draining; run --retire-deposit-seed first"
+        fi
+        env_has BUGNET_DEPOSIT_SEED || die "$ENV_FILE has no BUGNET_DEPOSIT_SEED; run the install step first"
+        target=$((version + 1))
+        echo "$target" >"$ROTATING"
+    fi
+    if [ "$version" -lt "$target" ]; then
+        if env_has BUGNET_DEPOSIT_SEED_PREVIOUS; then
+            say "BUGNET_DEPOSIT_SEED was already moved to BUGNET_DEPOSIT_SEED_PREVIOUS"
+        else
+            cli keys rotate-deposit-seed --env "$ENV_FILE"
+        fi
+        deposits_set seed_version "$target"
+        say "[deposits] seed_version = $target in $TOML"
+    fi
+    restart_running
+    rm -f "$ROTATING"
+}
+
+# Spec 4.3, D8 A. With "-" the first run prints the archive line and removes nothing; the run with
+# --remove-previous takes the archive back on stdin and removes the seed only when it matches.
+do_retire_seed() {
+    local archive=$1 remove=$2 version old list n
+    if [ "$archive" = - ]; then
+        # stdout carries only the archive line, which deploy/retire-deposit-seed.sh captures
+        exec 3>&1 1>&2
+    fi
+    [ ! -f "$ROTATING" ] || die "a seed rotation stopped halfway; run --rotate-deposit-seed again first"
+    if ! env_has BUGNET_DEPOSIT_SEED_PREVIOUS; then
+        say "nothing to retire: $ENV_FILE has no BUGNET_DEPOSIT_SEED_PREVIOUS"
+        return 0
+    fi
+    version=$(seed_version)
+    [ "$version" -ge 2 ] || die "BUGNET_DEPOSIT_SEED_PREVIOUS is set while [deposits] seed_version is 1"
+    old=$((version - 1))
+    list=$(svc_cli deposits list --version "$old" </dev/null) || die "pcli deposits list failed; nothing was retired"
+    n=$(printf '%s' "$list" | grep -vc ' state=done ' || true)
+    [ "$n" = 0 ] || die "deposits of seed version $old not done yet: $n; retire once pcli deposits list --version $old shows only done ones"
+    if [ "$archive" != - ]; then
+        cli keys retire-deposit-seed --env "$ENV_FILE" --archive "$archive" --version "$old"
+    elif [ "$remove" = 1 ]; then
+        cli keys retire-deposit-seed --env "$ENV_FILE" --archive - --version "$old" --remove-previous
+    else
+        cli keys retire-deposit-seed --env "$ENV_FILE" --archive - --version "$old" </dev/null >&3
+        say "printed BUGNET_DEPOSIT_SEED_V$old for the archive; BUGNET_DEPOSIT_SEED_PREVIOUS stays until it is read back"
+        return 0
+    fi
+    restart_running
+}
+
 main() {
     local tgz="" recipient="" event_key="" router_url="" index="" mode=install mtls=""
+    local deposits="" archive="" remove=0
     [ "$(id -u)" = 0 ] || die "run as root"
     [ $# -gt 0 ] || die "usage: see the comment at the top of this file"
     while [ $# -gt 0 ]; do
@@ -430,16 +635,28 @@ main() {
         --pubkeys) mode=pubkeys; shift ;;
         --start) mode=start; shift ;;
         --rpc-urls) mode=rpc_urls; shift ;;
+        --deposits) mode=deposits; deposits=${2:?}; shift 2 ;;
+        --rotate-deposit-seed) mode=rotate_seed; shift ;;
+        --retire-deposit-seed) mode=retire_seed; archive=${2:?}; shift 2 ;;
+        --remove-previous) remove=1; shift ;;
         -*) die "unknown option $1" ;;
         *) tgz=$1; shift ;;
         esac
     done
+    if [ "$remove" = 1 ] && { [ "$mode" != retire_seed ] || [ "$archive" != - ]; }; then
+        die "--remove-previous goes with --retire-deposit-seed -"
+    fi
+    # The CLI runs inside the release folder, where a relative path would land
+    case $archive in "" | - | /*) ;; *) archive=$PWD/$archive ;; esac
     case $mode in
     install) [ -n "$tgz" ] || die "the install step needs the tarball"; do_install "$tgz" "$recipient" "$event_key" "$router_url" "$index" ;;
     mtls) do_mtls "$mtls" ;;
     pubkeys) do_pubkeys ;;
     start) do_start ;;
     rpc_urls) do_rpc_urls ;;
+    deposits) do_deposits "$deposits" ;;
+    rotate_seed) do_rotate_seed ;;
+    retire_seed) do_retire_seed "$archive" "$remove" ;;
     esac
 }
 
