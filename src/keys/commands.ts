@@ -13,7 +13,8 @@
  *
  * The commands that touch Solana read the same RPC list as the service, through the router. Only
  * with -config do they parse the TOML, and then only for [solana] rpc and rpc_timeout; without
- * one they use the router's defaults. pubkey, show --no-balances and generate never read a TOML.
+ * one they use the router's defaults. pubkey, show --no-balances, generate, rotate-deposit-seed
+ * and retire-deposit-seed never read a TOML and never call an RPC.
  */
 import {
     type Address,

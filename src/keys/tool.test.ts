@@ -508,7 +508,7 @@ describe("allowance and test seller plans", () => {
 describe("keys commands without settings", () => {
     const missingConfig = ["-config", join(tmpdir(), "bn-pay-no-such-file.toml")];
 
-    it("pubkey, show --no-balances and generate never parse TOML", async () => {
+    it("pubkey, show --no-balances, generate and the seed commands never parse TOML", async () => {
         const seed = Buffer.alloc(32, 7).toString("base64");
         const env = {
             BUGNET_ORDER_PRIVATE_KEY: seed,
@@ -529,6 +529,29 @@ describe("keys commands without settings", () => {
         expect(
             await cliMain([...missingConfig, "keys", "generate", "--env", p], {}, generate),
         ).toBe(0);
+
+        // With no RPC variable set, a command that built its router would fail
+        const depositSeed = Buffer.alloc(32, 8).toString("base64");
+        const seeds = tmpEnv(`BUGNET_DEPOSIT_SEED=${depositSeed}\n`, 0o600);
+        const rotate = captureIo();
+        expect(
+            await cliMain(
+                [...missingConfig, "keys", "rotate-deposit-seed", "--env", seeds],
+                {},
+                rotate,
+            ),
+        ).toBe(0);
+        const retire = captureIo();
+        const archive = join(dir, `archive-${counter++}`);
+        const retireArgs = ["--env", seeds, "--archive", archive, "--version", "1"];
+        expect(
+            await cliMain(
+                [...missingConfig, "keys", "retire-deposit-seed", ...retireArgs],
+                {},
+                retire,
+            ),
+        ).toBe(0);
+        expect(parseEnv(readFileSync(archive, "utf8")).BUGNET_DEPOSIT_SEED_V1).toBe(depositSeed);
     });
 
     it("names the variable when the test payer is missing and leaks no secret", async () => {
