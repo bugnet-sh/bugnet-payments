@@ -1093,8 +1093,12 @@ describe("cliMain refund groups", () => {
 
     it("a cold part resolved by hand completes the group when it is the last", async () => {
         const last = await sharedManual([{ state: "confirmed" }, { state: "manual" }]);
+        expect((await findOrder(db.pool, last.order.id))!.manualReason).not.toBeNull();
         expect(await cli(["manual", "resolve", String(last.ids[1])])).toBe(0);
-        expect((await findOrder(db.pool, last.order.id))!.state).toBe("refunded");
+        expect(await findOrder(db.pool, last.order.id)).toMatchObject({
+            state: "refunded",
+            manualReason: null,
+        });
 
         // With a part still in flight the order goes back to refunding for the executor to finish
         const flying = await sharedManual([{ state: "sent" }, { state: "manual" }]);

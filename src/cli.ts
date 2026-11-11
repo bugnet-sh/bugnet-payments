@@ -500,7 +500,14 @@ async function partLeftQueue(c: pg.PoolClient, r: RefundRow): Promise<void> {
     if (order === null || order.payInto === "allowance") return;
     if (order.state !== "manual" && order.state !== "refunding") return;
     if (await groupComplete(c, r.orderId, r.kind)) {
-        await setOrderState(c, r.orderId, order.state, "refunded");
+        // As applyEffects does, a manual order leaves its reason behind with the state
+        await setOrderState(
+            c,
+            r.orderId,
+            order.state,
+            "refunded",
+            order.state === "manual" ? { manualReason: null } : {},
+        );
         return;
     }
     const group = await refundGroup(c, r.orderId, r.kind);
