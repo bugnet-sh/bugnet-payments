@@ -74,15 +74,17 @@ function keysEnv(extra = ""): string {
     return `${lines.join("\n")}\nBUGNET_SOLANA_RPC_URLS=https://rpc1.example,https://rpc2.example\n${extra}`;
 }
 
-// A server with release v9 installed. systemctl, curl, journalctl, chown, setpriv and node are
-// fakes; node stands in for dist/cli.js, logs who ran it with which arguments, and answers from
-// files the test can change.
+// A server with release v9 installed. systemctl, curl, journalctl, chown, setpriv, id and node are
+// fakes; id makes main run as root, and node stands in for dist/cli.js, logs who ran it with which
+// arguments, and answers from files the test can change.
 function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) {
     const root = join(dir, "server");
     const etc = join(root, "etc");
     const opt = join(root, "opt");
     const bin = join(root, "bin");
     const log = join(root, "calls.log");
+    // A test may set up several servers in turn
+    rmSync(root, { recursive: true, force: true });
     mkdirSync(join(etc, "payments"), { recursive: true });
     mkdirSync(join(opt, "v9"), { recursive: true });
     mkdirSync(bin);
@@ -103,6 +105,7 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
         curl: "exit 0",
         journalctl: "exit 0",
         chown: "exit 0",
+        id: 'if [ "$1" = -u ]; then echo 0; else exec /usr/bin/id "$@"; fi',
         setpriv: [
             'for a in "$@"; do case $a in --reuid=*) export FAKE_AS=${a#--reuid=} ;; esac; done',
             'while [ "${1#--}" != "$1" ]; do shift; done',
@@ -139,7 +142,7 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
             readFileSync(log, "utf8")
                 .split("\n")
                 .filter((l) => l !== ""),
-        run(cmd: string, stdin = "") {
+        run(cmd: string, stdin = "", cwd = dir) {
             const r = spawnSync(
                 "bash",
                 [
@@ -152,9 +155,11 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
                 {
                     input: stdin,
                     encoding: "utf8",
+                    cwd,
                     env: {
                         ...process.env,
                         PATH: `${bin}:${process.env.PATH ?? ""}`,
+                        PWD: cwd,
                         VPS_INSTALL_LIB: "1",
                         BUGNET_PAYMENTS_ENV: env,
                     },
@@ -348,6 +353,43 @@ describe("vps-install.sh deposits", () => {
         expect(readFileSync(server.toml, "utf8")).toBe("[solana]\n\n[deposits]\nenabled = false\n");
     });
 
+    it("--deposits on refuses a bad list line or a missing seed before the probe", () => {
+        const bad = keysEnv().replace(
+            "BUGNET_SOLANA_RPC_URLS=https://rpc1.example,https://rpc2.example",
+            "BUGNET_SOLANA_RPC_URLS=https://rpc1.example, https://rpc2.example",
+        );
+        const noSeed = keysEnv().replace(/^BUGNET_DEPOSIT_SEED=.*\n/m, "");
+        for (const [env, message] of [
+            [bad, "BUGNET_SOLANA_RPC_URLS holds a space or a shell character"],
+            [noSeed, "has no BUGNET_DEPOSIT_SEED"],
+        ]) {
+            const server = fakeServer({ active: true, env });
+            const r = server.run("do_deposits on");
+            expect(r.code).toBe(1);
+            expect(r.err).toContain(message);
+            expect(readFileSync(server.toml, "utf8")).toContain("enabled = false\n");
+            expect(server.calls().some((c) => c.endsWith("rpc probe"))).toBe(false);
+            expect(server.calls()).not.toContain("systemctl restart bugnet-payments@v9");
+            expect(r.all).not.toContain("rpc1.example");
+        }
+    });
+
+    it("--start and --deposits refuse while a seed rotation stopped halfway", () => {
+        const server = fakeServer({ active: true });
+        writeFileSync(server.env, keysEnv(`BUGNET_DEPOSIT_SEED_PREVIOUS=${OLD_SEED}\n`));
+        writeFileSync(server.rotating, "2\n");
+        const before = readFileSync(server.toml, "utf8");
+        for (const cmd of ["main --start", "do_deposits off", "do_deposits on"]) {
+            const r = server.run(cmd);
+            expect(r.code).toBe(1);
+            expect(r.err).toContain(
+                "a seed rotation stopped halfway; run --rotate-deposit-seed again first",
+            );
+        }
+        expect(readFileSync(server.toml, "utf8")).toBe(before);
+        expect(server.calls().some((c) => c.startsWith("systemctl"))).toBe(false);
+    });
+
     it("the install step adds [deposits] enabled = false once", () => {
         const server = fakeServer();
         writeFileSync(server.toml, '[solana]\nrecipient = "R"\n\n[x402]\nallowance_wallet = ""\n');
@@ -379,6 +421,31 @@ describe("vps-install.sh deposits", () => {
         expect(readFileSync(server.toml, "utf8")).toBe("[solana]\n\n[deposits]\nenabled = false\n");
     });
 
+    it("deposits_set leaves a root-level key of the same name alone", () => {
+        const server = fakeServer();
+        writeFileSync(server.toml, "enabled = 1\n[solana]\n\n[deposits]\nenabled = false\n");
+        server.run("deposits_set enabled true");
+        expect(readFileSync(server.toml, "utf8")).toBe(
+            "enabled = 1\n[solana]\n\n[deposits]\nenabled = true\n",
+        );
+    });
+
+    it("deposits_set and toml_set replace the TOML by a rename, mode 0644", () => {
+        const server = fakeServer();
+        writeFileSync(server.toml, '[solana]\nrecipient = "A"\n\n[deposits]\nenabled = false\n');
+        let ino = statSync(server.toml).ino;
+        expect(server.run("deposits_set enabled true").code).toBe(0);
+        expect(statSync(server.toml).ino).not.toBe(ino);
+        expect(statSync(server.toml).mode & 0o777).toBe(0o644);
+        ino = statSync(server.toml).ino;
+        expect(server.run("toml_set solana recipient B").code).toBe(0);
+        expect(statSync(server.toml).ino).not.toBe(ino);
+        expect(statSync(server.toml).mode & 0o777).toBe(0o644);
+        expect(readFileSync(server.toml, "utf8")).toBe(
+            '[solana]\nrecipient = "B"\n\n[deposits]\nenabled = true\n',
+        );
+    });
+
     it("--rotate-deposit-seed rotates once and raises seed_version", () => {
         const server = fakeServer({ active: true });
         let r = server.run("do_rotate_seed");
@@ -408,6 +475,52 @@ describe("vps-install.sh deposits", () => {
         expect(server.calls().some((c) => c.includes("rotate-deposit-seed"))).toBe(false);
         expect(readFileSync(server.toml, "utf8")).toContain("seed_version = 2\n");
         expect(existsSync(server.rotating)).toBe(false);
+    });
+
+    it("a rotation that stopped right after its marker rotates exactly once", () => {
+        const server = fakeServer({ active: true });
+        writeFileSync(server.rotating, "2\n");
+        const r = server.run("do_rotate_seed");
+        expect(r.code).toBe(0);
+        expect(server.calls().filter((c) => c.includes("rotate-deposit-seed"))).toEqual([
+            `root keys rotate-deposit-seed --env ${server.env}`,
+        ]);
+        expect(readFileSync(server.toml, "utf8")).toBe(
+            "[solana]\n\n[deposits]\nseed_version = 2\nenabled = false\n",
+        );
+        expect(server.calls()).toContain("systemctl restart bugnet-payments@v9");
+        expect(existsSync(server.rotating)).toBe(false);
+    });
+
+    it("a rotation whose seed_version is already raised only restarts and removes the marker", () => {
+        const server = fakeServer({ active: true });
+        writeFileSync(server.env, keysEnv(`BUGNET_DEPOSIT_SEED_PREVIOUS=${OLD_SEED}\n`));
+        const toml = "[deposits]\nseed_version = 2\nenabled = true\n";
+        writeFileSync(server.toml, toml);
+        writeFileSync(server.rotating, "2\n");
+        const r = server.run("do_rotate_seed");
+        expect(r.code).toBe(0);
+        expect(server.calls().some((c) => c.includes("rotate-deposit-seed"))).toBe(false);
+        expect(readFileSync(server.toml, "utf8")).toBe(toml);
+        expect(server.calls()).toContain("systemctl restart bugnet-payments@v9");
+        expect(existsSync(server.rotating)).toBe(false);
+    });
+
+    it("a rotation marker that names neither the version nor the next one changes nothing", () => {
+        for (const marker of ["5\n", "x\n", ""]) {
+            const server = fakeServer({ active: true });
+            writeFileSync(server.env, keysEnv(`BUGNET_DEPOSIT_SEED_PREVIOUS=${OLD_SEED}\n`));
+            const toml = "[deposits]\nseed_version = 1\nenabled = true\n";
+            writeFileSync(server.toml, toml);
+            writeFileSync(server.rotating, marker);
+            const r = server.run("do_rotate_seed");
+            expect(r.code).toBe(1);
+            expect(r.err).toContain("does not name seed version 1 or 2; nothing was changed");
+            expect(r.err).not.toContain("remove");
+            expect(readFileSync(server.toml, "utf8")).toBe(toml);
+            expect(server.calls()).toEqual([]);
+            expect(existsSync(server.rotating)).toBe(true);
+        }
     });
 
     it("--retire-deposit-seed - prints only the archive line and removes nothing", () => {
@@ -482,13 +595,57 @@ describe("vps-install.sh deposits", () => {
         );
         expect(server.calls()).toContain("systemctl restart bugnet-payments@v9");
     });
+
+    it("--retire-deposit-seed makes a relative FILE absolute from the folder it runs in", () => {
+        const server = fakeServer();
+        writeFileSync(server.env, keysEnv(`BUGNET_DEPOSIT_SEED_PREVIOUS=${OLD_SEED}\n`));
+        writeFileSync(server.toml, "[deposits]\nseed_version = 2\n");
+        const r = server.run("main --retire-deposit-seed seeds/deposit-seeds.env");
+        expect(r.code).toBe(0);
+        expect(server.calls()).toContain(
+            `root keys retire-deposit-seed --env ${server.env} --archive ${dir}/seeds/deposit-seeds.env --version 1`,
+        );
+    });
+
+    it("--retire-deposit-seed refuses a flag where FILE goes, and --remove-previous without -", () => {
+        const cases: [string, string][] = [
+            [
+                "main --retire-deposit-seed --remove-previous",
+                "--retire-deposit-seed takes a file or -, not --remove-previous",
+            ],
+            [
+                "main --retire-deposit-seed seeds.env --remove-previous",
+                "--remove-previous goes with --retire-deposit-seed -",
+            ],
+            [
+                "main --start --remove-previous",
+                "--remove-previous goes with --retire-deposit-seed -",
+            ],
+        ];
+        for (const [cmd, message] of cases) {
+            const server = fakeServer({ active: true });
+            writeFileSync(server.env, keysEnv(`BUGNET_DEPOSIT_SEED_PREVIOUS=${OLD_SEED}\n`));
+            writeFileSync(server.toml, "[deposits]\nseed_version = 2\n");
+            const r = server.run(cmd);
+            expect(r.code).toBe(1);
+            expect(r.err).toBe(`vps-install: ${message}\n`);
+            expect(server.calls()).toEqual([]);
+            expect(readFileSync(server.env, "utf8")).toContain("BUGNET_DEPOSIT_SEED_PREVIOUS=");
+            expect(existsSync(join(dir, "--remove-previous"))).toBe(false);
+        }
+    });
 });
 
 describe("retire-deposit-seed.sh", () => {
     const LINE = `BUGNET_DEPOSIT_SEED_V1=${OLD_SEED}`;
 
-    // ssh is a fake: phase 1 prints the server's answer, phase 2 keeps what it was sent
-    function retire(answer: string, archive = join(dir, "vault", "deposit-seeds.env")) {
+    // ssh is a fake: phase 1 prints the server's answer, phase 2 keeps what it was sent and exits
+    // with phase2Exit
+    function retire(
+        answer: string,
+        archive = join(dir, "vault", "deposit-seeds.env"),
+        phase2Exit = 0,
+    ) {
         const bin = join(dir, "bin");
         const calls = join(dir, "ssh-calls");
         mkdirSync(bin, { recursive: true });
@@ -500,7 +657,7 @@ describe("retire-deposit-seed.sh", () => {
                 `echo "$*" >> "${calls}"`,
                 'for last in "$@"; do :; done',
                 "case $last in",
-                `*--remove-previous) cat > "${dir}/ssh-stdin" ;;`,
+                `*--remove-previous) cat > "${dir}/ssh-stdin"; exit ${phase2Exit} ;;`,
                 `*) cat "${dir}/answer" ;;`,
                 "esac",
                 "",
@@ -565,6 +722,18 @@ describe("retire-deposit-seed.sh", () => {
             expect(r.calls).toHaveLength(1);
             expect(existsSync(r.archive)).toBe(false);
         }
+    });
+
+    it("retire-deposit-seed.sh names no cause when phase 2 fails, and keeps the line", () => {
+        const r = retire(`${LINE}\n`, undefined, 1);
+        expect(r.code).toBe(1);
+        expect(r.sent).toBe(`${LINE}\n`);
+        expect(readFileSync(r.archive, "utf8")).toBe(`${LINE}\n`);
+        expect(r.all).toContain(
+            `retire-deposit-seed: phase 2 failed; check the server's message. BUGNET_DEPOSIT_SEED_V1 is in ${r.archive}\n`,
+        );
+        expect(r.all).not.toContain("the server kept");
+        expect(r.all).not.toContain(OLD_SEED);
     });
 
     it("retire-deposit-seed.sh stops when there is nothing to retire", () => {

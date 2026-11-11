@@ -79,7 +79,9 @@ chmod 600 "$archive"
 
 back=$(archived)
 [ "$back" = "$line" ] || die "$name did not read back from $archive; nothing removed"
+# The server may have removed the seed before a failed restart or a dropped connection, so the
+# failure names no cause; running this again is safe either way
 # shellcheck disable=SC2029
 printf '%s\n' "$back" | ssh "$@" "$remote --remove-previous" ||
-    die "the server kept BUGNET_DEPOSIT_SEED_PREVIOUS; $name stays in $archive"
+    die "phase 2 failed; check the server's message. $name is in $archive"
 echo "$name is in $archive and no longer on the server"

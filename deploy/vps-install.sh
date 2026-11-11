@@ -21,7 +21,8 @@
 #                                         the seed once stdin holds that line.
 #                                         deploy/retire-deposit-seed.sh runs both on the Mac
 #
-# Every step can run again. It prints addresses and variable names, never a secret value.
+# Every step can run again. It prints addresses and variable names, never a secret value, except
+# --retire-deposit-seed - without --remove-previous: its stdout is the seed's archive line.
 set -euo pipefail
 umask 077
 
@@ -192,23 +193,38 @@ ensure_router_token() {
 
 allowance_address() { cli keys show --no-balances | sed -n 's/^allowance=//p'; }
 
+# Runs awk with these arguments and puts its output in place of the TOML by a rename: a write cut
+# short, or a failed awk, leaves the old file whole, where a cut-short TOML would read as
+# seed_version 1 and lose its other sections
+toml_rewrite() {
+    local tmp
+    tmp=$(mktemp "$TOML.XXXXXX" 2>/dev/null) || die "cannot create a temporary file beside $TOML"
+    if ! awk "$@" >"$tmp" || ! chmod 0644 "$tmp" || ! mv -f "$tmp" "$TOML"; then
+        rm -f "$tmp"
+        die "cannot write $TOML; it was not changed"
+    fi
+}
+
 # Sets one key inside one [section], so the two url keys never touch each other
 toml_set() {
     local section=$1 key=$2 value=$3
-    awk -v sec="[$section]" -v key="$key" -v val="$value" '
+    # An awk program, which expands its own $0
+    # shellcheck disable=SC2016
+    toml_rewrite -v sec="[$section]" -v key="$key" -v val="$value" '
         /^\[/ { cur = $0 }
         cur == sec && $0 ~ "^" key " = " { print key " = \"" val "\""; next }
         { print }
-    ' "$TOML" >"$TOML.new"
-    cat "$TOML.new" >"$TOML"
-    rm -f "$TOML.new"
+    ' "$TOML"
 }
 
 # Sets one unquoted value (a boolean or a number) inside [deposits]. Unlike toml_set it adds the
 # key, and the section, when they are missing, since --deposits and the rotation own these keys.
+# The file is read twice; each pass starts outside every section.
 deposits_set() {
     local key=$1 value=$2
-    awk -v key="$key" -v val="$value" '
+    # shellcheck disable=SC2016
+    toml_rewrite -v key="$key" -v val="$value" '
+        FNR == 1 { cur = "" }
         NR == FNR {
             if ($0 ~ /^\[/) cur = $0
             else if (cur == "[deposits]" && $0 ~ "^" key "[[:space:]]*=") has = 1
@@ -220,9 +236,7 @@ deposits_set() {
         { print }
         $0 == "[deposits]" && !has { print key " = " val }
         END { if (!sec) { print ""; print "[deposits]"; print key " = " val } }
-    ' "$TOML" "$TOML" >"$TOML.new"
-    cat "$TOML.new" >"$TOML"
-    rm -f "$TOML.new"
+    ' "$TOML" "$TOML"
 }
 
 deposits_get() {
@@ -486,6 +500,14 @@ do_start() {
     die "bugnet-payments@$v did not answer healthz within 60 s"
 }
 
+# Between keys rotate-deposit-seed and the raised seed_version, a restart would load the new seed
+# under the old version: boot then refuses while that version has open deposits, and otherwise
+# new deposits get the old number on the new seed. Only --rotate-deposit-seed itself restarts
+# while the marker exists.
+no_rotation_halfway() {
+    [ ! -f "$ROTATING" ] || die "a seed rotation stopped halfway; run --rotate-deposit-seed again first"
+}
+
 # The settings and the env file are read only at start. Only the installed version is restarted,
 # and only while it runs: an older one still running would refuse [deposits] keys it does not know.
 restart_running() {
@@ -539,6 +561,7 @@ do_deposits() {
     on | off) ;;
     *) die "--deposits takes on or off" ;;
     esac
+    no_rotation_halfway
     if [ "$want" = on ]; then
         if ! release_has_probe; then
             echo "deposits need the RPC router release; install it first" >&2
@@ -564,9 +587,12 @@ do_rotate_seed() {
     version=$(seed_version)
     if [ -f "$ROTATING" ]; then
         target=$(cat "$ROTATING")
-        case $target in
-        "" | *[!0-9]*) die "$ROTATING holds no version; remove it only after checking $TOML and $ENV_FILE" ;;
-        esac
+        # Only this step writes the marker, always as version + 1; any other value means the
+        # TOML or the marker changed outside it, and raising seed_version to it would misnumber
+        # BUGNET_DEPOSIT_SEED_PREVIOUS
+        if [ "$target" != "$version" ] && [ "$target" != "$((version + 1))" ]; then
+            die "$ROTATING does not name seed version $version or $((version + 1)); nothing was changed"
+        fi
         say "finishing the rotation to seed version $target"
     else
         if env_has BUGNET_DEPOSIT_SEED_PREVIOUS; then
@@ -597,7 +623,7 @@ do_retire_seed() {
         # stdout carries only the archive line, which deploy/retire-deposit-seed.sh captures
         exec 3>&1 1>&2
     fi
-    [ ! -f "$ROTATING" ] || die "a seed rotation stopped halfway; run --rotate-deposit-seed again first"
+    no_rotation_halfway
     if ! env_has BUGNET_DEPOSIT_SEED_PREVIOUS; then
         say "nothing to retire: $ENV_FILE has no BUGNET_DEPOSIT_SEED_PREVIOUS"
         return 0
@@ -643,6 +669,8 @@ main() {
         *) tgz=$1; shift ;;
         esac
     done
+    # A forgotten "-" would take the next flag as FILE and leave the seed in a stray file
+    case $archive in -?*) die "--retire-deposit-seed takes a file or -, not $archive" ;; esac
     if [ "$remove" = 1 ] && { [ "$mode" != retire_seed ] || [ "$archive" != - ]; }; then
         die "--remove-previous goes with --retire-deposit-seed -"
     fi
@@ -652,7 +680,7 @@ main() {
     install) [ -n "$tgz" ] || die "the install step needs the tarball"; do_install "$tgz" "$recipient" "$event_key" "$router_url" "$index" ;;
     mtls) do_mtls "$mtls" ;;
     pubkeys) do_pubkeys ;;
-    start) do_start ;;
+    start) no_rotation_halfway; do_start ;;
     rpc_urls) do_rpc_urls ;;
     deposits) do_deposits "$deposits" ;;
     rotate_seed) do_rotate_seed ;;
