@@ -424,6 +424,9 @@ function timeLeft(expiresAt: Date, now: Date): string {
 function depositSection(v: CheckoutView, deposit: DepositView): string {
     const plain = decimalAmount(v.amountMicros);
     const id = escapeHtml(v.orderId);
+    // With the price covered the QR route answers 404, so the code waits hidden, unloaded
+    const qrHidden = deposit.remainingMicros > 0 ? "" : " hidden";
+    const qrLoading = deposit.remainingMicros > 0 ? "" : ' loading="lazy"';
     return `<section id="deposit">
 <h2>Send USDC to this address</h2>
 <dl class="facts">
@@ -431,8 +434,8 @@ function depositSection(v: CheckoutView, deposit: DepositView): string {
 <div><dt>Network</dt><dd>Solana</dd></div>
 <div><dt>Address</dt><dd><code>${escapeHtml(deposit.address)}</code> ${copyButton(deposit.address)}</dd></div>
 </dl>
-<figure class="qr">
-<img src="/o/${id}/qr.svg" alt="Solana Pay code for ${plain} USDC">
+<figure class="qr"${qrHidden}>
+<img src="/o/${id}/qr.svg"${qrLoading} alt="Solana Pay code for ${plain} USDC">
 <figcaption>Scan with a Solana wallet app to send ${plain} USDC</figcaption>
 </figure>
 <p class="note">Send only USDC on Solana.</p>

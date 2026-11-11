@@ -446,6 +446,18 @@ describe("address-first page", () => {
         );
     });
 
+    it("the deposit QR waits hidden while nothing more is owed", async () => {
+        const shown = section(await renderCheckout(offered), "deposit");
+        expect(shown).toContain('<figure class="qr">');
+        const held = {
+            ...offered,
+            deposit: { ...offered.deposit!, status: "held" as const, remainingMicros: 0 },
+        };
+        const hidden = section(await renderCheckout(held), "deposit");
+        expect(hidden).toContain('<figure class="qr" hidden>');
+        expect(hidden).toContain(`<img src="/o/${id}/qr.svg" loading="lazy"`);
+    });
+
     it("phone links stay", async () => {
         const phone = section(await renderCheckout(offered), "phone");
         expect(phone).toContain("Open in Phantom");

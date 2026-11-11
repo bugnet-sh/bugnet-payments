@@ -22,6 +22,7 @@ import {
     needsReload,
     parseStatus,
     pollDelay,
+    showDepositQr,
     showWalletOptions,
     statusKey,
     type StatusView,
@@ -308,15 +309,12 @@ function follow(p: Page, wallet: WalletSection | null): void {
                     ? [line.message, ...line.extra].join(" ")
                     : firstLine;
         }
-        // The QR asks for money only while the order takes it
+        // The QR asks for money only while the order lacks some
         const d = v.deposit;
-        if (
-            qr !== null &&
-            d !== null &&
-            v.state === "unpaid" &&
-            d.remainingMicros > 0 &&
-            d.remainingMicros !== remaining
-        ) {
+        const qrShown = showDepositQr(v);
+        const figure = qr?.closest("figure") ?? null;
+        if (figure !== null) figure.hidden = !qrShown;
+        if (qr !== null && d !== null && qrShown && d.remainingMicros !== remaining) {
             remaining = d.remainingMicros;
             qr.src = `/o/${p.ctx.orderId}/qr.svg?r=${remaining}`;
         }

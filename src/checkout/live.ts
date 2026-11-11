@@ -136,6 +136,11 @@ export function showWalletOptions(v: StatusView): boolean {
     return v.state === "unpaid";
 }
 
+// The deposit QR asks for money, so it shows only while the order still lacks some
+export function showDepositQr(v: StatusView): boolean {
+    return v.state === "unpaid" && v.deposit !== null && v.deposit.remainingMicros > 0;
+}
+
 // W35 while the order still takes a wallet payment and money already reached the address
 export function walletNote(v: StatusView, c: MessageContext): string | null {
     if (!showWalletOptions(v) || v.deposit === null) return null;

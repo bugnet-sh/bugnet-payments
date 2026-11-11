@@ -6,6 +6,7 @@ import {
     needsReload,
     parseStatus,
     pollDelay,
+    showDepositQr,
     showWalletOptions,
     statusKey,
     type StatusView,
@@ -102,6 +103,13 @@ describe("live status", () => {
         // W16 watches with no wait; a paid order ends the watch
         expect(watchWallet({ unpaidForMs: 0, unpaidSince: null }, "unpaid", t0)).toBe("unpaid");
         expect(watchWallet({ unpaidForMs: 0, unpaidSince: null }, "paid", t0)).toBeNull();
+    });
+
+    it("the deposit QR shows only while the order lacks money", () => {
+        expect(showDepositQr(view("unpaid", { remainingMicros: 20_000 }))).toBe(true);
+        expect(showDepositQr(view("unpaid", { status: "held", remainingMicros: 0 }))).toBe(false);
+        expect(showDepositQr(view("settling", { remainingMicros: 20_000 }))).toBe(false);
+        expect(showDepositQr(view("unpaid"))).toBe(false);
     });
 
     it("a page drawn for another state reloads once the order reads unpaid", () => {
