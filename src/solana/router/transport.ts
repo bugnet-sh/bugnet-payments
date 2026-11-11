@@ -10,6 +10,7 @@ import {
     SOLANA_ERROR__RPC__TRANSPORT_HTTP_ERROR,
 } from "@solana/kit";
 import { hasNull, mergeStatuses, statusesOf, type StatusesAnswer } from "./absence.ts";
+import { CursorBook } from "./affinity.ts";
 import { classifyAnswer, classifyThrown, type Outcome } from "./classify.ts";
 import { type Consistency, ConsistencyBook, type DisagreeReason } from "./consistency.ts";
 import { RpcRouterError } from "./errors.ts";
@@ -174,6 +175,17 @@ interface Run {
     thrown: { err: unknown } | null;
     // The last endpoint whose answer was refused for its slot
     stale: string | null;
+    // An endpoint was passed over because it could not prove the page's cursor
+    unproven: boolean;
+}
+
+// A listing's before cursor (spec 8.5)
+interface Cursor {
+    // The endpoint whose page ended with the cursor, which needs no check
+    readonly producer: string | null;
+    // Any other endpoint gets this call first, and runs the page only when proves accepts it
+    readonly check: unknown;
+    readonly proves: (answer: unknown) => boolean;
 }
 
 type Step =
@@ -296,12 +308,35 @@ function lacksTransaction(answer: unknown): boolean {
     );
 }
 
+// A cursor's predecessor with limit 1 must give back the cursor and nothing else
+function isOnly(answer: unknown, signature: string): boolean {
+    if (!isObject(answer) || !Array.isArray(answer.result) || answer.result.length !== 1) {
+        return false;
+    }
+    const [first] = answer.result;
+    return isObject(first) && first.signature === signature;
+}
+
+function hasStatus(answer: unknown): boolean {
+    const value = statusesOf(answer)?.result.value;
+    return value?.length === 1 && value[0] !== null;
+}
+
+function pageOf(answer: unknown): { signature: string }[] | null {
+    if (!isObject(answer) || !Array.isArray(answer.result)) return null;
+    const page: unknown[] = answer.result;
+    return page.every((e) => isObject(e) && typeof e.signature === "string")
+        ? (page as { signature: string }[])
+        : null;
+}
+
 class Router {
     readonly mode: "single" | "routed";
     private readonly endpoints: Endpoint[];
     private readonly byName: Map<string, Endpoint>;
     private readonly slots: SlotBook;
     private readonly book: ConsistencyBook;
+    private readonly cursors = new CursorBook();
     private readonly list: { domains: number; absenceQuorum: number; sendFanout: number };
     // Unconfirmed absences since the last rpc_absence_unconfirmed alarm
     private absenceAlarm: { at: number | null; count: number } = { at: null, count: 0 };
@@ -365,11 +400,13 @@ class Router {
             errorAnswer: null,
             thrown: null,
             stale: null,
+            unproven: false,
         };
+        const cursor = this.cursorOf(req, payload);
         for (;;) {
             if (signal?.aborted) throw signal.reason;
             if (run.attempts >= maxAttempts) break;
-            const next = this.pick(req, lane, run);
+            const next = this.pick(req, lane, run, undefined, cursor?.producer ?? null);
             if (next.kind === "wait") {
                 await this.wait(next.ms, signal);
                 run.waited += next.ms;
@@ -381,6 +418,14 @@ class Router {
                 break;
             }
             const { ep } = next;
+            // R6: a page with a cursor runs only where the cursor came from or was proven
+            if (cursor !== null && ep.name !== cursor.producer) {
+                run.tried.add(ep.name);
+                if (!(await this.proveCursor(ep, cursor, signal, lane, run))) {
+                    run.unproven = true;
+                    continue;
+                }
+            }
             const firsts = this.s.first_attempt_timeouts;
             const cutMs =
                 run.attempts === 0 && Object.hasOwn(firsts, req.method)
@@ -399,9 +444,14 @@ class Router {
                 if (step.ok && req.method === "getSignatureStatuses" && req.searchHistory) {
                     return this.confirmAbsence(ep, step.answer, req, payload, signal, lane, run);
                 }
+                if (step.ok && req.method === "getSignaturesForAddress") {
+                    this.rememberPage(ep, req, step.answer);
+                }
                 return step.answer;
             }
         }
+        // An unproven cursor's page could read as "history ended", so it is never run elsewhere
+        if (run.unproven) throw new RpcRouterError("cursor_unverified");
         return this.fail(run);
     }
 
@@ -660,6 +710,70 @@ class Router {
         return step.kind === "answer" && step.ok ? step.answer : firstAnswer;
     }
 
+    // Spec 8.5. The cursor is looked up under the request's own address only, so a predecessor
+    // never comes from another address's listing that ended with the same signature
+    private cursorOf(req: RouterRequest, payload: unknown): Cursor | null {
+        const { before } = req;
+        if (req.method !== "getSignaturesForAddress" || before === null) return null;
+        const address = req.params[0];
+        const entry =
+            typeof address === "string" ? this.cursors.entryOf(address, before) : undefined;
+        const id = isObject(payload) ? payload.id : null;
+        if (entry === undefined || entry.predecessor === null) {
+            // A cursor never seen, or one that ended a first page alone: the status index is all
+            // that can be checked, and the caller's own completeness proof carries the rest
+            return {
+                producer: entry?.endpoint ?? null,
+                check: {
+                    jsonrpc: "2.0",
+                    id,
+                    method: "getSignatureStatuses",
+                    params: [[before], { searchTransactionHistory: true }],
+                },
+                proves: hasStatus,
+            };
+        }
+        const options = isObject(req.params[1]) ? req.params[1] : {};
+        const pin = Object.fromEntries(
+            ["commitment", "minContextSlot"]
+                .filter((key) => Object.hasOwn(options, key))
+                .map((key) => [key, options[key]]),
+        );
+        return {
+            producer: entry.endpoint,
+            check: {
+                jsonrpc: "2.0",
+                id,
+                method: "getSignaturesForAddress",
+                params: [address, { ...pin, before: entry.predecessor, limit: 1 }],
+            },
+            proves: (answer) => isOnly(answer, before),
+        };
+    }
+
+    // One extra attempt outside max_attempts (spec 7.1); a failed or refused check proves nothing
+    private async proveCursor(
+        ep: Endpoint,
+        cursor: Cursor,
+        signal: AbortSignal | undefined,
+        lane: Lane,
+        run: Run,
+    ): Promise<boolean> {
+        const req = readRequest(cursor.check)!;
+        const timeoutMs = this.s.attempt_timeout;
+        const a = await this.attempt(ep, req, cursor.check, signal, lane, timeoutMs);
+        const step = this.settle(ep, req, a, run, null, timeoutMs, signal);
+        if (step.kind === "throw") throw step.err;
+        return step.kind === "answer" && step.ok && cursor.proves(step.answer);
+    }
+
+    private rememberPage(ep: Endpoint, req: RouterRequest, answer: unknown): void {
+        const address = req.params[0];
+        const page = pageOf(answer);
+        if (typeof address !== "string" || page === null) return;
+        this.cursors.remember(address, page, req.before, ep.name);
+    }
+
     // Spec 8.4: a null counts only once consistent endpoints on absence_quorum domains returned
     // it. A status found by any endpoint decides its entry, an inconsistent one's too
     private async confirmAbsence(
@@ -755,13 +869,15 @@ class Router {
         lane: Lane,
         run: Run,
         fits: (v: EndpointView) => boolean = () => true,
+        // Taken first while it is eligible, ahead of the list order
+        prefer: string | null = null,
     ): Choice {
         const now = this.deps.now();
         const views = this.views(req, lane);
         const untried = (list: EndpointView[]) =>
             list.filter((v) => !run.tried.has(v.name) && fits(v));
         const listed = untried(choose(req, views, { now, lane }));
-        const first = listed[0];
+        const first = listed.find((v) => v.name === prefer && v.breaker === "closed") ?? listed[0];
         if (first?.breaker === "closed") return { kind: "try", ep: this.endpoint(first.name) };
         // A healthy endpoint that is free within the wait is better than one whose breaker is
         // open or in probation

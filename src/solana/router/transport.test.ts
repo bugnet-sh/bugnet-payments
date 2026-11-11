@@ -1237,6 +1237,236 @@ describe("absence quorum", () => {
     });
 });
 
+describe("cursor affinity", () => {
+    const ADDRESS = "A";
+    const PINNED = { commitment: "confirmed", minContextSlot: 1_000n };
+    const LISTING = "getSignaturesForAddress";
+
+    function entry(signature: string): Record<string, unknown> {
+        return {
+            signature,
+            slot: 900n,
+            err: null,
+            memo: null,
+            blockTime: null,
+            confirmationStatus: "finalized",
+        };
+    }
+
+    function optionsOf(params: readonly unknown[]): { before?: string } {
+        return (params[1] ?? {}) as { before?: string };
+    }
+
+    // Listings by address and before cursor, a first page under ""; any other cursor gets []
+    function listings(
+        t: Setup,
+        byAddress: Record<string, Record<string, string[]>>,
+        over: Record<string, FakeHandler> = {},
+    ): FakeHandler {
+        return chain(t.clock, {
+            getSignaturesForAddress: (_method, params) => {
+                const pages = byAddress[params[0] as string] ?? {};
+                return rpcOk((pages[optionsOf(params).before ?? ""] ?? []).map(entry));
+            },
+            ...over,
+        });
+    }
+
+    function pages(
+        t: Setup,
+        byBefore: Record<string, string[]>,
+        over: Record<string, FakeHandler> = {},
+    ): FakeHandler {
+        return listings(t, { [ADDRESS]: byBefore }, over);
+    }
+
+    // The before cursor of each listing the fake received
+    function befores(fake: FakeEndpoint): (string | undefined)[] {
+        return fake.calls
+            .filter((c) => c.method === LISTING)
+            .map((c) => optionsOf(c.params).before);
+    }
+
+    function methods(fake: FakeEndpoint): string[] {
+        return fake.calls.map((c) => c.method);
+    }
+
+    function signaturesOf(answer: unknown): string[] {
+        return (resultOf(answer) as { signature: string }[]).map((e) => e.signature);
+    }
+
+    // Five network failures open the breaker, and no other endpoint sees those calls
+    async function open(t: Setup, fake: FakeEndpoint, name: string): Promise<void> {
+        fake.answer(() => netFail());
+        await via(t, name, async () => {
+            for (let i = 0; i < 5; i++) await call(t.router, "getSlot").catch(() => undefined);
+        });
+        expect(snap(t.router, name).state).toBe("open");
+    }
+
+    it("a page continues where its cursor came from", async () => {
+        const t = setup(2);
+        const listed = pages(t, { "": ["s1", "s2", "s3"], s3: ["s4", "s5"] });
+        t.a.answer((method, params, p) =>
+            t.clock.ms === 0 ? httpFail(429, { "retry-after": "10" }) : listed(method, params, p),
+        );
+        t.b.answer(listed);
+        const first = await call(t.router, LISTING, [ADDRESS, { limit: 3 }]);
+        expect(signaturesOf(first)).toEqual(["s1", "s2", "s3"]);
+        t.clock.ms = 11_000;
+        expect(snap(t.router, "rpc1").state).toBe("ok");
+        const second = await call(t.router, LISTING, [ADDRESS, { before: "s3", limit: 3 }]);
+        expect(signaturesOf(second)).toEqual(["s4", "s5"]);
+        expect(t.a.calls).toHaveLength(1);
+        expect(befores(t.b)).toEqual([undefined, "s3"]);
+    });
+
+    it("a cursor on a down endpoint is proven by its predecessor", async () => {
+        const t = setup(2);
+        t.a.answer(pages(t, { "": ["s1", "s2", "s3"] }));
+        t.b.answer(pages(t, { s2: ["s3"], s3: ["s4", "s5"] }));
+        await call(t.router, LISTING, [ADDRESS, { ...PINNED, limit: 3 }]);
+        await open(t, t.a, "rpc1");
+        const answer = await call(t.router, LISTING, [
+            ADDRESS,
+            { ...PINNED, before: "s3", limit: 3 },
+        ]);
+        expect(signaturesOf(answer)).toEqual(["s4", "s5"]);
+        expect(t.b.calls[0]!.params).toEqual([ADDRESS, { ...PINNED, before: "s2", limit: 1 }]);
+        expect(t.b.calls.map((c) => optionsOf(c.params).before)).toEqual(["s2", "s3"]);
+    });
+
+    it("the predecessor proof must return exactly the cursor", async () => {
+        for (const proof of [[], ["s4"]]) {
+            const t = setup(2);
+            t.a.answer(pages(t, { "": ["s1", "s2", "s3"] }));
+            t.b.answer(pages(t, { s2: proof, s3: ["s4", "s5"] }));
+            await call(t.router, LISTING, [ADDRESS, { limit: 3 }]);
+            await open(t, t.a, "rpc1");
+            const e = await rejection(
+                call(t.router, LISTING, [ADDRESS, { before: "s3", limit: 3 }]),
+            );
+            expect(reasonOf(e)).toBe("cursor_unverified");
+            expect(befores(t.b)).toEqual(["s2"]);
+        }
+    });
+
+    it("a cursor the other endpoint does not know fails closed", async () => {
+        const t = setup(3);
+        t.a.answer(pages(t, { "": ["s1", "s2", "s3"] }));
+        t.b.answer(pages(t, { s3: ["s4"] }));
+        t.c.answer(() => netFail());
+        await call(t.router, LISTING, [ADDRESS, { limit: 3 }]);
+        await open(t, t.a, "rpc1");
+        const e = await rejection(call(t.router, LISTING, [ADDRESS, { before: "s3", limit: 3 }]));
+        expect(reasonOf(e)).toBe("cursor_unverified");
+        expect(befores(t.b)).toEqual(["s2"]);
+        expect(befores(t.c)).toEqual(["s2"]);
+    });
+
+    it("one signature can end pages of two addresses", async () => {
+        const t = setup(2);
+        t.a.answer(listings(t, { HOT: { "": ["H1", "PH", "S"] } }));
+        t.b.answer(listings(t, { COLD: { "": ["PC", "S"] }, HOT: { PH: ["S"], S: ["H4"] } }));
+        await call(t.router, LISTING, ["HOT", { limit: 3 }]);
+        await via(t, "rpc2", () => call(t.router, LISTING, ["COLD", { limit: 2 }]));
+        await open(t, t.a, "rpc1");
+        const answer = await call(t.router, LISTING, ["HOT", { before: "S", limit: 3 }]);
+        expect(signaturesOf(answer)).toEqual(["H4"]);
+        expect(t.b.calls.map((c) => [c.params[0], optionsOf(c.params).before])).toEqual([
+            ["COLD", undefined],
+            ["HOT", "PH"],
+            ["HOT", "S"],
+        ]);
+    });
+
+    it("an unknown cursor falls back to the status check", async () => {
+        const page = [ADDRESS, { before: "zzz", limit: 3 }];
+        const check = [["zzz"], { searchTransactionHistory: true }];
+        const withStatus = (t: Setup, status: Status): FakeHandler =>
+            pages(
+                t,
+                { zzz: ["s9"] },
+                { getSignatureStatuses: () => statusesAnswer(slotAt(t.clock.ms), [status]) },
+            );
+
+        const known = setup(2);
+        known.a.answer(withStatus(known, S(900n, "finalized")));
+        expect(signaturesOf(await call(known.router, LISTING, page))).toEqual(["s9"]);
+        expect(methods(known.a)).toEqual(["getSignatureStatuses", LISTING]);
+        expect(known.a.calls[0]!.params).toEqual(check);
+        expect(known.b.calls).toHaveLength(0);
+
+        const next = setup(2);
+        next.a.answer(withStatus(next, null));
+        next.b.answer(withStatus(next, S(900n, "finalized")));
+        expect(signaturesOf(await call(next.router, LISTING, page))).toEqual(["s9"]);
+        expect(methods(next.a)).toEqual(["getSignatureStatuses"]);
+        expect(methods(next.b)).toEqual(["getSignatureStatuses", LISTING]);
+
+        const none = setup(2);
+        for (const fake of [none.a, none.b]) fake.answer(withStatus(none, null));
+        const e = await rejection(call(none.router, LISTING, page));
+        expect(reasonOf(e)).toBe("cursor_unverified");
+        expect(methods(none.a)).toEqual(["getSignatureStatuses"]);
+        expect(methods(none.b)).toEqual(["getSignatureStatuses"]);
+    });
+
+    it("a one-entry first page is checked by its status", async () => {
+        const t = setup(2);
+        t.a.answer(pages(t, { "": ["s1"] }));
+        t.b.answer(
+            pages(
+                t,
+                { s1: ["s0"] },
+                {
+                    getSignatureStatuses: () =>
+                        statusesAnswer(slotAt(t.clock.ms), [S(900n, "finalized")]),
+                },
+            ),
+        );
+        await call(t.router, LISTING, [ADDRESS, { limit: 1 }]);
+        await open(t, t.a, "rpc1");
+        const answer = await call(t.router, LISTING, [ADDRESS, { before: "s1", limit: 1 }]);
+        expect(signaturesOf(answer)).toEqual(["s0"]);
+        expect(methods(t.b)).toEqual(["getSignatureStatuses", LISTING]);
+        expect(t.b.calls[0]!.params).toEqual([["s1"], { searchTransactionHistory: true }]);
+    });
+
+    it("until needs no check", async () => {
+        const t = setup(2);
+        t.a.answer(pages(t, { "": ["s3", "s2"] }));
+        await call(t.router, LISTING, [ADDRESS, { until: "s1" }]);
+        expect(methods(t.a)).toEqual([LISTING]);
+        expect(t.b.calls).toHaveLength(0);
+    });
+
+    it("one endpoint pages without a cursor check", async () => {
+        const t = setup(1);
+        t.a.answer(pages(t, { zzz: ["s9"] }));
+        await call(t.router, LISTING, [ADDRESS, { before: "zzz", limit: 3 }]);
+        expect(methods(t.a)).toEqual([LISTING]);
+    });
+
+    it("an inconsistent endpoint never gets a listing", async () => {
+        const t = setup(3);
+        setCheckState(t.router, "rpc1", { consistent: "no" });
+        const listed = pages(t, { "": ["s1", "s2", "s3"], s2: ["s3"], s3: ["s4", "s5", "s6"] });
+        let served = 0;
+        t.a.answer(listed);
+        t.b.answer((method, params, p) =>
+            method === LISTING && ++served > 1 ? netFail() : listed(method, params, p),
+        );
+        t.c.answer(listed);
+        await call(t.router, LISTING, [ADDRESS, { limit: 3 }]);
+        const answer = await call(t.router, LISTING, [ADDRESS, { before: "s3", limit: 3 }]);
+        expect(signaturesOf(answer)).toEqual(["s4", "s5", "s6"]);
+        expect(befores(t.b)).toEqual([undefined, "s3"]);
+        expect(befores(t.c)).toEqual(["s2", "s3"]);
+        expect(t.a.calls).toHaveLength(0);
+    });
+});
+
 describe("secrets", () => {
     it("logs never carry a URL or host", async () => {
         const urls = [
