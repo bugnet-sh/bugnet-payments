@@ -593,16 +593,27 @@ describe("snapshot", () => {
             () => rpcFail(35, "upstream https://one.x.example/ said no"),
             () => httpFail(403),
         ];
+        // a.example is the host a failed fetch's cause names (netFail)
+        const parts = [
+            ...urls,
+            "one.x.example",
+            "two.b.example",
+            "x.example",
+            "b.example",
+            "a.example",
+            "KEYKEYKEY",
+            "upstream",
+        ];
+        // Each failure in turn, since lastError keeps only the latest
         for (const fail of failures) {
             t.a.answer(fail);
             await call(t.router, "getSlot", CONFIRMED).catch(() => undefined);
             t.clock.ms += 6_000;
+            await t.router.tick();
+            const text = JSON.stringify(t.router.snapshot());
+            for (const part of parts) expect(text).not.toContain(part);
+            expect(snap(t, "rpc1").lastError).not.toBeNull();
         }
-        await t.router.tick();
-        const text = JSON.stringify(t.router.snapshot());
-        const parts = [...urls, "one.x.example", "two.b.example", "x.example", "b.example"];
-        for (const part of [...parts, "KEYKEYKEY", "upstream"]) expect(text).not.toContain(part);
-        expect(snap(t, "rpc1").lastError).not.toBeNull();
     });
 
     it("the snapshot is written every 15 s", async () => {
