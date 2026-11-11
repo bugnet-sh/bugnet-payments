@@ -1490,7 +1490,37 @@ describe("cursor affinity", () => {
         expect(t.b.calls.at(-1)!.method).toBe("getLatestBlockhash");
     });
 
-    it("a page waits for its room after the check", async () => {
+    it("concurrent cursor pages stay within the background share", async () => {
+        for (const before of ["s3", "zzz"]) {
+            const t = setup(2);
+            await teach(t, t.b, "rpc2", 10);
+            const status = (): unknown =>
+                statusesAnswer(slotAt(t.clock.ms), [S(900n, "finalized")]);
+            t.a.answer(pages(t, { "": ["s1", "s2", "s3"] }));
+            t.b.answer(
+                pages(
+                    t,
+                    { s2: ["s3"], s3: ["s4", "s5"], zzz: ["s4", "s5"] },
+                    { getSignatureStatuses: status },
+                ),
+            );
+            await call(t.router, LISTING, [ADDRESS, { limit: 3 }]);
+            await open(t, t.a, "rpc1");
+            t.clock.ms = 11_000;
+            const page = [ADDRESS, { before, limit: 3 }];
+            const results = await Promise.allSettled(
+                [1, 2, 3].map(() => call(t.router.background, LISTING, page)),
+            );
+            expect(snap(t.router, "rpc2").laneRequests.background).toBeLessThanOrEqual(4);
+            for (const r of results) {
+                if (r.status === "fulfilled") expect(signaturesOf(r.value)).toEqual(["s4", "s5"]);
+                else expect(reasonOf(r.reason)).toBe("no_endpoint");
+            }
+            expect(results.some((r) => r.status === "fulfilled")).toBe(true);
+        }
+    });
+
+    it("concurrent cursor pages stay within the money limit", async () => {
         const t = setup(2);
         await teach(t, t.b, "rpc2", 10);
         t.a.answer(pages(t, { "": ["s1", "s2", "s3"] }));
@@ -1498,12 +1528,61 @@ describe("cursor affinity", () => {
         await call(t.router, LISTING, [ADDRESS, { limit: 3 }]);
         await open(t, t.a, "rpc1");
         t.clock.ms = 11_000;
-        for (let i = 0; i < 3; i++) await call(t.router.background, "getSlot");
+        const sent = t.b.calls.length;
+        const page = [ADDRESS, { before: "s3", limit: 3 }];
+        const results = await Promise.allSettled(
+            Array.from({ length: 7 }, () => call(t.router, LISTING, page)),
+        );
+        expect(t.clock.ms).toBe(11_000);
+        expect(t.b.calls.length - sent).toBeLessThanOrEqual(8);
+        for (const r of results) {
+            if (r.status === "fulfilled") expect(signaturesOf(r.value)).toEqual(["s4", "s5"]);
+        }
+        expect(results.some((r) => r.status === "fulfilled")).toBe(true);
+    });
+
+    it("a money page spills past an endpoint with room for its check alone", async () => {
+        const t = setup(3);
+        await teach(t, t.b, "rpc2", 10);
+        t.a.answer(pages(t, { "": ["s1", "s2", "s3"] }));
+        t.b.answer(pages(t, { s2: ["s3"], s3: ["s4", "s5"] }));
+        t.c.answer(pages(t, { s2: ["s3"], s3: ["s4", "s5"] }));
+        await call(t.router, LISTING, [ADDRESS, { limit: 3 }]);
+        await open(t, t.a, "rpc1");
+        t.clock.ms = 11_000;
+        await via(t, "rpc2", async () => {
+            for (let i = 0; i < 7; i++) await call(t.router, "getSlot");
+        });
+        const sent = t.b.calls.length;
+        const answer = await call(t.router, LISTING, [ADDRESS, { before: "s3", limit: 3 }]);
+        expect(signaturesOf(answer)).toEqual(["s4", "s5"]);
+        expect(t.b.calls).toHaveLength(sent);
+        expect(befores(t.c)).toEqual(["s2", "s3"]);
+    });
+
+    it("a page waits for room that another call took during its check", async () => {
+        const t = setup(2);
+        await teach(t, t.b, "rpc2", 10);
+        t.a.answer(pages(t, { "": ["s1", "s2", "s3"] }));
+        const listed = pages(t, { s2: ["s3"], s3: ["s4", "s5"] });
+        let other: Promise<unknown> | null = null;
+        t.b.answer((method, params, p) => {
+            // The last background slot goes to another call while the check runs
+            if (optionsOf(params).before === "s2") other ??= call(t.router.background, "getSlot");
+            return listed(method, params, p);
+        });
+        await call(t.router, LISTING, [ADDRESS, { limit: 3 }]);
+        await open(t, t.a, "rpc1");
+        t.clock.ms = 11_000;
+        for (let i = 0; i < 2; i++) await call(t.router.background, "getSlot");
         t.clock.ms = 20_500;
         const page = [ADDRESS, { before: "s3", limit: 3 }];
         expect(signaturesOf(await call(t.router.background, LISTING, page))).toEqual(["s4", "s5"]);
+        expect(other).not.toBeNull();
+        await other;
         expect(t.clock.ms).toBe(21_000);
         expect(befores(t.b).slice(-2)).toEqual(["s2", "s3"]);
+        expect(snap(t.router, "rpc2").laneRequests.background).toBe(5);
     });
 
     it("a status check keeps to its own method's cooldown", async () => {

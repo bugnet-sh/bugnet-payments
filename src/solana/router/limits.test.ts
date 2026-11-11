@@ -257,4 +257,40 @@ describe("LearnedLimits", () => {
         expect(limits.hasRoom("getEpochInfo", "money")).toBe(false);
         expect(limits.hasRoom("getEpochInfo", "background")).toBe(false);
     });
+
+    it("calls sent together need room for all of them", () => {
+        learnStar40();
+        const start = ms;
+        record(23, "getSlot", "background");
+        ms = start + 1_000;
+        record(16, "getSlot", "money");
+        const both = ["getSignatureStatuses", "getSignaturesForAddress"];
+        expect(limits.hasRoom("getSignaturesForAddress", "money")).toBe(true);
+        expect(limits.hasRoom(both, "money")).toBe(false);
+        expect(limits.msUntilRoom(both, "money")).toBe(9_000);
+        expect(limits.hasRoom("getSignaturesForAddress", "background")).toBe(true);
+        expect(limits.hasRoom(both, "background")).toBe(false);
+        expect(limits.msUntilRoom(both, "background")).toBe(9_000);
+        expect(limits.backgroundOut(both)).toBe(false);
+        ms = start + 10_000;
+        expect(limits.hasRoom(both, "money")).toBe(true);
+        expect(limits.hasRoom(both, "background")).toBe(true);
+    });
+
+    it("a method's own limit counts only its own calls", () => {
+        learnStar40();
+        record(3, "getSlot", "money");
+        expect(limits.hit429("getSlot", null).scope).toBe("getSlot");
+        ms += 20_000;
+        expect(limits.limits()).toEqual({ "*": 40, getSlot: 2 });
+        record(1, "getSlot", "money");
+        expect(limits.hasRoom(["getBalance", "getSlot"], "money")).toBe(true);
+        expect(limits.hasRoom(["getSlot", "getSlot"], "money")).toBe(false);
+        expect(limits.msUntilRoom(["getSlot", "getSlot"], "money")).toBe(10_000);
+        expect(limits.msUntilRoom(["getSlot", "getSlot", "getSlot"], "money")).toBe(Infinity);
+        expect(limits.backgroundOut("getSlot")).toBe(false);
+        expect(limits.backgroundOut(["getBalance", "getSlot"])).toBe(false);
+        expect(limits.backgroundOut(["getSlot", "getSlot"])).toBe(true);
+        expect(limits.msUntilRoom(["getSlot", "getSlot"], "background")).toBe(Infinity);
+    });
 });

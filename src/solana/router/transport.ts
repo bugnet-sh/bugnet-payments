@@ -187,6 +187,8 @@ interface Cursor {
     readonly check: unknown;
     readonly checkRequest: RouterRequest;
     readonly proves: (answer: unknown) => boolean;
+    // Endpoints whose check passed in this request, which take the page with no further check
+    readonly proven: Set<string>;
 }
 
 type Step =
@@ -426,14 +428,17 @@ class Router {
             }
             const { ep } = next;
             // R6: a page with a cursor runs only where the cursor came from or was proven
-            if (cursor !== null && ep.name !== cursor.producer) {
+            if (cursor !== null && !this.holdsCursor(ep, cursor)) {
                 run.tried.add(ep.name);
-                if (!(await this.proveCursor(ep, cursor, signal, lane, checks))) {
+                if (await this.proveCursor(ep, cursor, signal, lane, checks)) {
+                    cursor.proven.add(ep.name);
+                    run.tried.delete(ep.name);
+                } else {
                     run.unproven = true;
-                    continue;
                 }
-                // The page needs its own room after the check, here where the proof holds
-                await this.roomAfterCheck(ep, req, lane, run, signal);
+                // Other calls may have taken the room while the check ran, so the page is picked
+                // again: its room is then checked in the same run that records it (spec 6.3)
+                continue;
             }
             const firsts = this.s.first_attempt_timeouts;
             const cutMs =
@@ -742,6 +747,7 @@ class Router {
                 check,
                 checkRequest: readRequest(check)!,
                 proves: hasStatus,
+                proven: new Set(),
             };
         }
         const options = isObject(req.params[1]) ? req.params[1] : {};
@@ -761,6 +767,7 @@ class Router {
             check,
             checkRequest: readRequest(check)!,
             proves: (answer) => isOnly(answer, before),
+            proven: new Set(),
         };
     }
 
@@ -780,21 +787,8 @@ class Router {
         return step.kind === "answer" && step.ok && cursor.proves(step.answer);
     }
 
-    // Other requests may have filled the window while the check ran (spec 6.3)
-    private async roomAfterCheck(
-        ep: Endpoint,
-        req: RouterRequest,
-        lane: Lane,
-        run: Run,
-        signal: AbortSignal | undefined,
-    ): Promise<void> {
-        for (;;) {
-            const ms = this.busyFor(ep, [req.method], lane, this.deps.now());
-            if (ms === 0) return;
-            if (ms > MAX_WAIT_MS - run.waited) throw new RpcRouterError("no_endpoint");
-            await this.wait(ms, signal);
-            run.waited += ms;
-        }
+    private holdsCursor(ep: Endpoint, cursor: Cursor): boolean {
+        return ep.name === cursor.producer || cursor.proven.has(ep.name);
     }
 
     private rememberPage(ep: Endpoint, req: RouterRequest, answer: unknown): void {
@@ -906,9 +900,12 @@ class Router {
         const untried = (list: EndpointView[]) =>
             list.filter((v) => !run.tried.has(v.name) && fits(v));
         const listed = untried(choose(req, views, { now, lane }));
-        // The cursor's producer is taken first while it is eligible, ahead of the list order
-        const prefer = cursor?.producer ?? null;
-        const first = listed.find((v) => v.name === prefer && v.breaker === "closed") ?? listed[0];
+        // The cursor's producer is taken first while it is eligible, ahead of the list order. Next
+        // comes an endpoint that proved it, relaxed or not, since its page runs there (spec 8.5)
+        const first =
+            listed.find((v) => v.name === cursor?.producer && v.breaker === "closed") ??
+            listed.find((v) => cursor?.proven.has(v.name)) ??
+            listed[0];
         if (first?.breaker === "closed") return { kind: "try", ep: this.endpoint(first.name) };
         // A healthy endpoint that is free within the wait is better than one whose breaker is
         // open or in probation
@@ -927,19 +924,15 @@ class Router {
         return { kind: "stop", blocked: untried(choose(req, free, { now, lane })).length > 0 };
     }
 
-    // How long until these methods' cooldowns end and the window has room for each of them
+    // How long until these methods' cooldowns end and the window has room for all of them
     private busyFor(ep: Endpoint, methods: readonly string[], lane: Lane, now: number): number {
-        let ms = 0;
-        for (const m of methods) {
-            const cooling = Math.max(0, ep.limits.coolingUntil(m) - now);
-            ms = Math.max(ms, cooling, ep.limits.msUntilRoom(m, lane));
-        }
-        return ms;
+        const cooling = Math.max(0, ...methods.map((m) => ep.limits.coolingUntil(m) - now));
+        return Math.max(cooling, ep.limits.msUntilRoom(methods, lane));
     }
 
-    // A cursor check goes out before the page everywhere but on the cursor's producer
+    // A cursor check goes out before the page on an endpoint that does not hold the cursor
     private sends(ep: Endpoint, req: RouterRequest, cursor: Cursor | null): string[] {
-        return cursor === null || ep.name === cursor.producer
+        return cursor === null || this.holdsCursor(ep, cursor)
             ? [req.method]
             : [cursor.checkRequest.method, req.method];
     }
@@ -959,9 +952,9 @@ class Router {
                 inflight: ep.health.inflight(),
                 lagging: this.lagging(ep),
                 coolingUntil: Math.max(...sends.map((m) => ep.limits.coolingUntil(m))),
-                room: sends.every((m) => ep.limits.hasRoom(m, lane)),
+                room: ep.limits.hasRoom(sends, lane),
                 rateLimited: ep.limits.rateLimited(),
-                backgroundOut: sends.some((m) => ep.limits.backgroundOut(m)),
+                backgroundOut: ep.limits.backgroundOut(sends),
                 behindPin: ep.behindPin,
                 methodsOff: ep.health.methodsOff(),
             };

@@ -36,6 +36,14 @@ interface Limit {
     filled: boolean;
 }
 
+// A limit that calls sent together must stay under, and how many of them count under it
+interface Need {
+    count: Count;
+    limit: Limit;
+    scope: string;
+    calls: number;
+}
+
 export class LearnedLimits {
     // Requests of the last LIMIT_WINDOW_MS, oldest first from head
     private sent: Sent[] = [];
@@ -130,30 +138,33 @@ export class LearnedLimits {
         return this.endpointUntil > this.now() ? this.endpointUntil : 0;
     }
 
-    // The window only: a cooldown is coolingUntil's
-    hasRoom(method: string, lane: Lane): boolean {
+    // The window only: a cooldown is coolingUntil's. Calls sent together, such as a cursor check
+    // and its page, need room for all of them at once
+    hasRoom(methods: string | readonly string[], lane: Lane): boolean {
         this.settle();
-        return this.applying(method).every(([count, limit]) => {
-            if (count.all >= limit.value) return false;
-            return lane === "money" || count.background < this.backgroundCap(limit);
+        return this.needs(methods).every(({ count, limit, calls }) => {
+            if (count.all + calls > limit.value) return false;
+            return lane === "money" || count.background + calls <= this.backgroundCap(limit);
         });
     }
 
-    // Infinity when the background lane has no room under a limit at all
-    msUntilRoom(method: string, lane: Lane): number {
+    // Infinity when the calls never fit in one window, such as background calls under a limit
+    // whose share rounds down to 0
+    msUntilRoom(methods: string | readonly string[], lane: Lane): number {
         this.settle();
         let wait = 0;
-        for (const [count, limit, scope] of this.applying(method)) {
+        for (const { count, limit, scope, calls } of this.needs(methods)) {
             const ofScope = (e: Sent) => scope === ENDPOINT || e.method === scope;
-            if (count.all >= limit.value) {
-                wait = Math.max(wait, this.leaves(count.all - limit.value + 1, ofScope));
+            if (calls > limit.value) return Infinity;
+            if (count.all + calls > limit.value) {
+                wait = Math.max(wait, this.leaves(count.all + calls - limit.value, ofScope));
             }
             if (lane === "background") {
                 const cap = this.backgroundCap(limit);
-                if (cap === 0) return Infinity;
-                if (count.background >= cap) {
+                if (calls > cap) return Infinity;
+                if (count.background + calls > cap) {
                     const ofLane = (e: Sent) => e.background && ofScope(e);
-                    wait = Math.max(wait, this.leaves(count.background - cap + 1, ofLane));
+                    wait = Math.max(wait, this.leaves(count.background + calls - cap, ofLane));
                 }
             }
         }
@@ -165,9 +176,10 @@ export class LearnedLimits {
         return Object.fromEntries([...this.learned].map(([key, limit]) => [key, limit.value]));
     }
 
-    backgroundOut(method: string): boolean {
+    // A share too small for the calls ever to fit, which waiting cannot cure
+    backgroundOut(methods: string | readonly string[]): boolean {
         this.settle();
-        return this.applying(method).some(([, limit]) => this.backgroundCap(limit) === 0);
+        return this.needs(methods).some(({ limit, calls }) => this.backgroundCap(limit) < calls);
     }
 
     rateLimited(): boolean {
@@ -200,6 +212,18 @@ export class LearnedLimits {
         const own = method === ENDPOINT ? undefined : this.learned.get(method);
         if (own !== undefined) found.push([this.countOf(method, false), own, method]);
         return found;
+    }
+
+    private needs(methods: string | readonly string[]): Need[] {
+        const found = new Map<string, Need>();
+        for (const method of typeof methods === "string" ? [methods] : methods) {
+            for (const [count, limit, scope] of this.applying(method)) {
+                const need = found.get(scope);
+                if (need === undefined) found.set(scope, { count, limit, scope, calls: 1 });
+                else need.calls += 1;
+            }
+        }
+        return [...found.values()];
     }
 
     private learn(scope: string, value: number, at: number): void {
