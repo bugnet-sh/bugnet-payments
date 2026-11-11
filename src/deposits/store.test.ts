@@ -19,7 +19,9 @@ import {
     insertShares,
     insertTransfers,
     lockDeposit,
+    meteredLamports,
     moveCursor,
+    ownerReturns,
     putHold,
     setTransferOutcomes,
     sharesOf,
@@ -543,6 +545,37 @@ describe("depositLedger and depositView", () => {
         await tx((c) => insertTransfers(c, o.id, [transfer("A1", { orderId: o.id })]));
         expect(await depositView(db.pool, { ...o, state: "paid" }, NOW, cfg)).toMatchObject({
             status: "refunding",
+        });
+    });
+});
+
+describe("indexes", () => {
+    // Every order with a viewed page adds moves for good; these run on every tick and status poll
+    it("the move ledger and the hourly windows never scan every move", async () => {
+        const cfg = parseSettings(`[solana]\nrecipient = "${RECIPIENT}"`, "t.toml").deposits;
+        const queries: { text: string; values: unknown[] }[] = [];
+        const capture = {
+            query: async (text: string, values: unknown[] = []) => {
+                queries.push({ text, values });
+                return { rows: text.includes("count(*)") ? [{ n: 0 }] : [], rowCount: 0 };
+            },
+        } as unknown as pg.Pool;
+        const since = new Date(NOW.getTime() - 3_600_000);
+        await meteredLamports(capture, since, "Fee", cfg);
+        await ownerReturns(capture, since, "Fee");
+        await unpaidCreateLamports(capture, since, cfg);
+        const ledger = "select * from deposit_moves where order_id = $1 order by id";
+        queries.push({ text: ledger, values: [ORDER_A] });
+        await tx(async (c) => {
+            await c.query("set local enable_seqscan = off");
+            for (const q of queries) {
+                const { rows } = await c.query<{ "QUERY PLAN": string }>(
+                    `explain ${q.text}`,
+                    q.values,
+                );
+                const plan = rows.map((r) => r["QUERY PLAN"]).join("\n");
+                expect(plan, q.text).not.toContain("Seq Scan on deposit_moves");
+            }
         });
     });
 });

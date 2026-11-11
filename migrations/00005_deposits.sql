@@ -163,3 +163,9 @@ create table deposit_moves (
 -- one transaction in flight per deposit, so the planner never races its own moves
 create unique index deposit_moves_one_in_flight on deposit_moves (order_id)
     where state in ('pending', 'signed', 'sent');
+-- moves are kept for good: the ledger load and the hourly budgets read by index, not by a scan
+-- of every move ever made
+create index deposit_moves_order on deposit_moves (order_id, id);
+create index deposit_moves_failed on deposit_moves (failed_at) where state = 'failed';
+create index deposit_moves_confirmed on deposit_moves (confirmed_at) where state = 'confirmed';
+create index deposit_moves_returns on deposit_moves (created_at) where kind = 'return';
