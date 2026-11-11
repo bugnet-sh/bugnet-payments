@@ -41,4 +41,5 @@ the first serving while it is healthy and the rest as fallbacks, with no provide
 redeems and refunds it. It fails up front, naming each missing variable, unless `.env` holds the
 RPC URL, the fee-payer, refund and recipient keys, the order and claim keys, the payments token and
 a test payer (key or mnemonic). Run it as `set -a; . ./.env; set +a; pnpm test:live`, with the RPC
-list line free of spaces and quotes, as above.
+list line free of spaces and quotes, as above. `test/live/rpc-router.live.test.ts` checks every URL
+of the list without moving money; `pnpm test:live test/live/rpc-router.live.test.ts` runs it alone.

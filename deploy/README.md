@@ -239,7 +239,10 @@ and stays for a rollback to a release without the router.
 restarts a running service so it loads the new list. The probe must exit 0 with
 `quorum: 2 of 2 domains ready`. Before `[deposits] enabled = true` it must
 also name two endpoints on `listings:`. After the first day, post `pcli rpc status --outcomes`.
-The mainnet smoke test (`test/live/rpc-router.live.test.ts`) checks a list without moving money.
+The mainnet smoke test checks a list without moving money, and runs only with the founder's go:
+`set -a; . ./.env; set +a; pnpm test:live test/live/rpc-router.live.test.ts` on the Mac. It prints
+the probe's lines, each URL's 2021 history note and its `minContextSlot` with `until` answer, by
+position, passes by the probe's exit rule, and spends at most 10 + 30 calls per URL.
 
 ## 7. Wallets
 
