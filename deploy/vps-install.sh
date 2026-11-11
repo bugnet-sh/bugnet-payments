@@ -13,12 +13,10 @@
 #                                         on needs the RPC router release and a passing rpc probe
 #   vps-install.sh --rotate-deposit-seed  makes a new deposit seed; the old one stays as
 #                                         BUGNET_DEPOSIT_SEED_PREVIOUS until it is retired
-#   vps-install.sh --retire-deposit-seed FILE
-#                                         once every deposit of the old seed is done: appends it
-#                                         to FILE, removes BUGNET_DEPOSIT_SEED_PREVIOUS
 #   vps-install.sh --retire-deposit-seed - [--remove-previous]
-#                                         prints the archive line; with --remove-previous, removes
-#                                         the seed once stdin holds that line.
+#                                         once every deposit of the old seed is done: prints the
+#                                         archive line; with --remove-previous, removes the seed
+#                                         once stdin holds that line.
 #                                         deploy/retire-deposit-seed.sh runs both on the Mac
 #
 # Every step can run again. It prints addresses and variable names, never a secret value, except
@@ -625,14 +623,13 @@ do_rotate_seed() {
     rm -f "$ROTATING"
 }
 
-# Spec 4.3, D8 A. With "-" the first run prints the archive line and removes nothing; the run with
-# --remove-previous takes the archive back on stdin and removes the seed only when it matches.
+# Spec 4.3, D8 A. The first run prints the archive line and removes nothing; the run with
+# --remove-previous takes the archive back on stdin and removes the seed only when it matches. No
+# seed file is ever written on the server (founder, D8).
 do_retire_seed() {
-    local archive=$1 remove=$2 version old list n
-    if [ "$archive" = - ]; then
-        # stdout carries only the archive line, which deploy/retire-deposit-seed.sh captures
-        exec 3>&1 1>&2
-    fi
+    local remove=$1 version old list n
+    # stdout carries only the archive line, which deploy/retire-deposit-seed.sh captures
+    exec 3>&1 1>&2
     no_rotation_halfway
     if ! env_has BUGNET_DEPOSIT_SEED_PREVIOUS; then
         say "nothing to retire: $ENV_FILE has no BUGNET_DEPOSIT_SEED_PREVIOUS"
@@ -644,9 +641,7 @@ do_retire_seed() {
     list=$(svc_cli deposits list --version "$old" </dev/null) || die "pcli deposits list failed; nothing was retired"
     n=$(printf '%s' "$list" | grep -vc ' state=done ' || true)
     [ "$n" = 0 ] || die "deposits of seed version $old not done yet: $n; retire once pcli deposits list --version $old shows only done ones"
-    if [ "$archive" != - ]; then
-        cli keys retire-deposit-seed --env "$ENV_FILE" --archive "$archive" --version "$old"
-    elif [ "$remove" = 1 ]; then
+    if [ "$remove" = 1 ]; then
         cli keys retire-deposit-seed --env "$ENV_FILE" --archive - --version "$old" --remove-previous
     else
         cli keys retire-deposit-seed --env "$ENV_FILE" --archive - --version "$old" </dev/null >&3
@@ -658,7 +653,7 @@ do_retire_seed() {
 
 main() {
     local tgz="" recipient="" event_key="" router_url="" index="" mode=install mtls=""
-    local deposits="" archive="" remove=0
+    local deposits="" remove=0
     [ "$(id -u)" = 0 ] || die "run as root"
     [ $# -gt 0 ] || die "usage: see the comment at the top of this file"
     while [ $# -gt 0 ]; do
@@ -673,19 +668,19 @@ main() {
         --rpc-urls) mode=rpc_urls; shift ;;
         --deposits) mode=deposits; deposits=${2:?}; shift 2 ;;
         --rotate-deposit-seed) mode=rotate_seed; shift ;;
-        --retire-deposit-seed) mode=retire_seed; archive=${2:?}; shift 2 ;;
+        --retire-deposit-seed)
+            mode=retire_seed
+            [ "${2:-}" = - ] || die "--retire-deposit-seed takes -; deploy/retire-deposit-seed.sh runs it from the Mac"
+            shift 2
+            ;;
         --remove-previous) remove=1; shift ;;
         -*) die "unknown option $1" ;;
         *) tgz=$1; shift ;;
         esac
     done
-    # A forgotten "-" would take the next flag as FILE and leave the seed in a stray file
-    case $archive in -?*) die "--retire-deposit-seed takes a file or -, not $archive" ;; esac
-    if [ "$remove" = 1 ] && { [ "$mode" != retire_seed ] || [ "$archive" != - ]; }; then
+    if [ "$remove" = 1 ] && [ "$mode" != retire_seed ]; then
         die "--remove-previous goes with --retire-deposit-seed -"
     fi
-    # The CLI runs inside the release folder, where a relative path would land
-    case $archive in "" | - | /*) ;; *) archive=$PWD/$archive ;; esac
     case $mode in
     install) [ -n "$tgz" ] || die "the install step needs the tarball"; do_install "$tgz" "$recipient" "$event_key" "$router_url" "$index" ;;
     mtls) do_mtls "$mtls" ;;
@@ -694,7 +689,7 @@ main() {
     rpc_urls) do_rpc_urls ;;
     deposits) do_deposits "$deposits" ;;
     rotate_seed) do_rotate_seed ;;
-    retire_seed) do_retire_seed "$archive" "$remove" ;;
+    retire_seed) do_retire_seed "$remove" ;;
     esac
 }
 

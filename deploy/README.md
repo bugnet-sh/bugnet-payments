@@ -623,9 +623,7 @@ Every step can run again: a line already archived with the same value is not app
 one with another value stops the run. The seed moves only through pipes: never an argument, never
 printed, and no seed file is left on the server. Keep the archive offline with the database
 backups, and never delete a line from it: a user who saved a closed address and sends to it again
-can still get the money back. `vps-install.sh --retire-deposit-seed <file>` writes the line to a
-file on the server instead, which then has to be copied off and deleted; the Mac script is the
-way.
+can still get the money back.
 
 **Returning money with a retired seed.** `deposits return-late` and `deposits return-sol` take
 `--archive -` and read the archive on stdin, so it never touches the server's disk. On the Mac:

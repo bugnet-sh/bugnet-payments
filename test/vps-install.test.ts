@@ -560,7 +560,7 @@ describe("vps-install.sh deposits", () => {
             join(server.root, "list.out"),
             "ord_a state=done received=50000 returned=0 kept=0 review=0 held=0 reason=-\n",
         );
-        const r = server.run('do_retire_seed - ""');
+        const r = server.run("do_retire_seed 0");
         expect(r.code).toBe(0);
         expect(r.out).toBe(`BUGNET_DEPOSIT_SEED_V1=${OLD_SEED}\n`);
         expect(r.err).not.toContain(OLD_SEED);
@@ -580,14 +580,14 @@ describe("vps-install.sh deposits", () => {
             "ord_a state=done received=1 returned=0 kept=0 review=0 held=0 reason=-\n" +
                 "ord_b state=closed received=1 returned=0 kept=0 review=0 held=0 reason=-\n",
         );
-        let r = server.run('do_retire_seed - ""');
+        let r = server.run("do_retire_seed 0");
         expect(r.code).toBe(1);
         expect(r.out).toBe("");
         expect(r.err).toContain("deposits of seed version 1 not done yet: 1");
         expect(server.calls().some((c) => c.includes("keys retire"))).toBe(false);
 
         writeFileSync(server.rotating, "3\n");
-        r = server.run('do_retire_seed - ""');
+        r = server.run("do_retire_seed 0");
         expect(r.code).toBe(1);
         expect(r.err).toContain("a seed rotation stopped halfway");
         expect(server.calls().some((c) => c.includes("keys retire"))).toBe(false);
@@ -597,7 +597,7 @@ describe("vps-install.sh deposits", () => {
         const server = fakeServer({ active: true });
         writeFileSync(server.env, keysEnv(`BUGNET_DEPOSIT_SEED_PREVIOUS=${OLD_SEED}\n`));
         writeFileSync(server.toml, "[deposits]\nseed_version = 2\n");
-        const r = server.run("do_retire_seed - 1", `BUGNET_DEPOSIT_SEED_V1=${OLD_SEED}\n`);
+        const r = server.run("do_retire_seed 1", `BUGNET_DEPOSIT_SEED_V1=${OLD_SEED}\n`);
         expect(r.code).toBe(0);
         expect(r.out).toBe("");
         expect(r.all).not.toContain(OLD_SEED);
@@ -611,40 +611,19 @@ describe("vps-install.sh deposits", () => {
         expect(server.calls()).toContain("systemctl restart bugnet-payments@v9");
     });
 
-    it("--retire-deposit-seed FILE retires into that file, then restarts", () => {
-        const server = fakeServer({ active: true });
-        writeFileSync(server.env, keysEnv(`BUGNET_DEPOSIT_SEED_PREVIOUS=${OLD_SEED}\n`));
-        writeFileSync(server.toml, "[deposits]\nseed_version = 3\n");
-        const archive = join(dir, "deposit-seeds.env");
-        const r = server.run(`do_retire_seed "${archive}" 0`);
-        expect(r.code).toBe(0);
-        expect(r.all).not.toContain(OLD_SEED);
-        expect(server.calls()).toContain(
-            `root keys retire-deposit-seed --env ${server.env} --archive ${archive} --version 2`,
-        );
-        expect(server.calls()).toContain("systemctl restart bugnet-payments@v9");
-    });
-
-    it("--retire-deposit-seed makes a relative FILE absolute from the folder it runs in", () => {
-        const server = fakeServer();
-        writeFileSync(server.env, keysEnv(`BUGNET_DEPOSIT_SEED_PREVIOUS=${OLD_SEED}\n`));
-        writeFileSync(server.toml, "[deposits]\nseed_version = 2\n");
-        const r = server.run("main --retire-deposit-seed seeds/deposit-seeds.env");
-        expect(r.code).toBe(0);
-        expect(server.calls()).toContain(
-            `root keys retire-deposit-seed --env ${server.env} --archive ${dir}/seeds/deposit-seeds.env --version 1`,
-        );
-    });
-
-    it("--retire-deposit-seed refuses a flag where FILE goes, and --remove-previous without -", () => {
+    it("--retire-deposit-seed takes only -, so no seed file is written on the server", () => {
         const cases: [string, string][] = [
             [
-                "main --retire-deposit-seed --remove-previous",
-                "--retire-deposit-seed takes a file or -, not --remove-previous",
+                "main --retire-deposit-seed seeds.env",
+                "--retire-deposit-seed takes -; deploy/retire-deposit-seed.sh runs it from the Mac",
             ],
             [
-                "main --retire-deposit-seed seeds.env --remove-previous",
-                "--remove-previous goes with --retire-deposit-seed -",
+                "main --retire-deposit-seed --remove-previous",
+                "--retire-deposit-seed takes -; deploy/retire-deposit-seed.sh runs it from the Mac",
+            ],
+            [
+                "main --retire-deposit-seed",
+                "--retire-deposit-seed takes -; deploy/retire-deposit-seed.sh runs it from the Mac",
             ],
             [
                 "main --start --remove-previous",
@@ -660,7 +639,7 @@ describe("vps-install.sh deposits", () => {
             expect(r.err).toBe(`vps-install: ${message}\n`);
             expect(server.calls()).toEqual([]);
             expect(readFileSync(server.env, "utf8")).toContain("BUGNET_DEPOSIT_SEED_PREVIOUS=");
-            expect(existsSync(join(dir, "--remove-previous"))).toBe(false);
+            expect(readdirSync(dir).toSorted()).toEqual(["payments.env", "server"]);
         }
     });
 });
