@@ -608,7 +608,9 @@ do_rotate_seed() {
         fi
         env_has BUGNET_DEPOSIT_SEED || die "$ENV_FILE has no BUGNET_DEPOSIT_SEED; run the install step first"
         target=$((version + 1))
-        echo "$target" >"$ROTATING"
+        # By a rename, so a cut-short write never leaves an empty marker that would block --start
+        printf '%s\n' "$target" >"$ROTATING.new"
+        mv -f "$ROTATING.new" "$ROTATING"
     fi
     if [ "$version" -lt "$target" ]; then
         if env_has BUGNET_DEPOSIT_SEED_PREVIOUS; then

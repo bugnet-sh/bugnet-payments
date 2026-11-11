@@ -494,6 +494,18 @@ describe("vps-install.sh deposits", () => {
         expect(server.calls().filter((c) => c.includes("rotate-deposit-seed"))).toHaveLength(1);
     });
 
+    it("the rotation marker is written by a rename, so a failed write leaves none", () => {
+        const server = fakeServer({ active: true });
+        const bin = join(server.root, "bin");
+        writeFileSync(join(bin, "mv"), "#!/usr/bin/env bash\nexit 1\n");
+        chmodSync(join(bin, "mv"), 0o755);
+        const r = server.run("do_rotate_seed");
+        expect(r.code).not.toBe(0);
+        expect(existsSync(server.rotating)).toBe(false);
+        expect(server.calls().some((c) => c.includes("rotate-deposit-seed"))).toBe(false);
+        expect(readFileSync(server.env, "utf8")).not.toContain("BUGNET_DEPOSIT_SEED_PREVIOUS=");
+    });
+
     it("a rotation that stopped halfway is finished and never rotates twice", () => {
         const server = fakeServer();
         // The env file already moved the seed, then the run stopped before the TOML changed
