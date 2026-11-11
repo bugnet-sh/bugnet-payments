@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import type { Settings } from "../config.ts";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { encodePaymentResponseHeader } from "@x402/core/http";
 import type pg from "pg";
@@ -45,6 +46,8 @@ export interface PublicDeps {
     trustedProxies: readonly string[];
     maxBodyBytes: number;
     checkoutJsPath: string;
+    // What the page shows about returns and how long it keeps checking past the deadline
+    deposits: Pick<Settings["deposits"], "refund_min_micros" | "settle_grace">;
     log: Log;
     now: () => Date;
 }
@@ -144,6 +147,14 @@ async function sendCheckout(
         state,
         pageUrl: payUrlFor(d.challenge.publicUrl, order.id),
         origin: new URL(d.challenge.publicUrl).origin,
+        expiresAt: order.expiresAt,
+        now: d.now(),
+        kind: order.kind,
+        // Task 16 passes the order's deposit once the route reads it
+        deposit: null,
+        depositsOffered: false,
+        refundMinMicros: d.deposits.refund_min_micros,
+        settleGraceMs: d.deposits.settle_grace,
     });
     sendHtml(res, closedAnswer(order, state)?.status ?? 200, html);
 }

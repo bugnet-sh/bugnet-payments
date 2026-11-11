@@ -1,6 +1,9 @@
 import QRCode from "qrcode";
+import type { DepositView } from "../deposits/types.ts";
 import type { PublicState } from "../http/public.ts";
+import type { OrderKind } from "../orders/types.ts";
 import { STATE_LABELS } from "./flow.ts";
+import { USDC_ICON } from "./usdc.ts";
 
 export const CHECKOUT_CSP =
     "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
@@ -14,6 +17,13 @@ export interface CheckoutView {
     state: PublicState;
     pageUrl: string;
     origin: string;
+    expiresAt: Date;
+    now: Date;
+    kind: OrderKind;
+    deposit: DepositView | null;
+    depositsOffered: boolean;
+    refundMinMicros: number;
+    settleGraceMs: number;
 }
 
 const ESCAPES: Record<string, string> = {
@@ -35,6 +45,15 @@ export function amountLabel(micros: number): string {
         .replace(/0+$/, "")
         .padEnd(2, "0");
     return `$${whole}.${fraction}`;
+}
+
+// The amount as a wallet or an exchange takes it: "0.05", "0.000001", "1"
+export function decimalAmount(micros: number): string {
+    const whole = Math.trunc(micros / 1_000_000);
+    const fraction = String(micros % 1_000_000)
+        .padStart(6, "0")
+        .replace(/0+$/, "");
+    return fraction === "" ? String(whole) : `${whole}.${fraction}`;
 }
 
 export function walletLinks(
@@ -110,6 +129,8 @@ const STYLE = `
     --wallet-row: 48px;
     --wallet-icon: 24px;
     --qr: 192px;
+    --usdc: #2775ca;
+    --usdc-icon: 20px;
     /* Phones scan the code only on a light square */
     --qr-paper: #ffffff;
 }
@@ -148,6 +169,11 @@ html {
 }
 body {
     margin: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+    min-height: 100dvh;
+    gap: var(--space-7);
     background: var(--bg);
     font-size: var(--ui-size);
     line-height: var(--ui-line);
@@ -182,8 +208,9 @@ button { font: inherit; color: inherit; border-radius: 0; }
     max-width: var(--column);
     margin-inline: auto;
 }
+/* Auto margins center the card, and fall to zero when it is taller than the screen */
 .box {
-    margin-top: var(--space-7);
+    margin-block: auto;
     padding: var(--box-pad);
     border: var(--hairline) solid var(--line);
     background: var(--bg);
@@ -309,7 +336,6 @@ h2 {
 }
 .button.outline:hover { background: var(--surface-hover); }
 #message { min-height: var(--ui-line); margin: var(--space-3) 0 0; }
-#message::first-letter { text-transform: uppercase; }
 .mobile-links {
     display: none;
     flex-direction: column;
@@ -318,13 +344,16 @@ h2 {
 }
 .qr { margin: 0; }
 .qr svg { display: block; width: var(--qr); height: var(--qr); background: var(--qr-paper); }
+.qr img { display: block; width: var(--qr); height: var(--qr); background: var(--qr-paper); }
+.usdc { width: var(--usdc-icon); height: var(--usdc-icon); flex-shrink: 0; vertical-align: middle; }
+.note { margin: var(--space-3) 0 0; color: var(--text-muted); }
+#deposit-message, #wallet-note { min-height: var(--ui-line); margin: var(--space-3) 0 0; }
 .qr figcaption { margin-top: var(--space-3); color: var(--text-muted); }
 
 .foot {
     display: flex;
     gap: var(--space-5);
-    margin-top: var(--space-5);
-    margin-bottom: var(--space-7);
+    margin: 0 auto var(--space-7);
     /* The box's border plus its padding, so the links start on the content's left edge */
     padding: 0 calc(var(--box-pad) + var(--hairline));
     color: var(--text-muted);
@@ -384,17 +413,51 @@ ${FOOTER}
 
 const MESSAGE = '<p id="message" role="status" aria-live="polite"></p>';
 const SCRIPT = '<script type="module" src="/checkout.js"></script>';
+const NOSCRIPT =
+    "<noscript><p>This page needs JavaScript to show live status. You can still send to the address above.</p></noscript>";
+const COPY_LABELS = "<span>Copy</span><span>Copied</span>";
 
-async function paySection(v: CheckoutView, amount: string): Promise<string> {
+function copyButton(value: string): string {
+    return `<button class="copy" type="button" data-copy="${escapeHtml(value)}">${COPY_LABELS}</button>`;
+}
+
+// mm:ss until the deadline, which the script keeps counting down
+function timeLeft(expiresAt: Date, now: Date): string {
+    const s = Math.max(0, Math.floor((expiresAt.getTime() - now.getTime()) / 1000));
+    return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function depositSection(v: CheckoutView, deposit: DepositView): string {
+    const plain = decimalAmount(v.amountMicros);
+    const id = escapeHtml(v.orderId);
+    return `<section id="deposit">
+<h2>Send USDC to this address</h2>
+<dl class="facts">
+<div><dt>Amount</dt><dd>${USDC_ICON} <span>${plain} USDC</span> ${copyButton(plain)}</dd></div>
+<div><dt>Network</dt><dd>Solana</dd></div>
+<div><dt>Address</dt><dd><code>${escapeHtml(deposit.address)}</code> ${copyButton(deposit.address)}</dd></div>
+</dl>
+<figure class="qr">
+<img src="/o/${id}/qr.svg" alt="Solana Pay code for ${plain} USDC">
+<figcaption>Scan with a Solana wallet app to send ${plain} USDC</figcaption>
+</figure>
+<p class="note">Send only USDC on Solana.</p>
+<p class="note">From an exchange, send exactly ${plain} USDC. Anything returned goes back to the sending address, which an exchange may not credit to you.</p>
+<p id="deposit-message" role="status" aria-live="polite"></p>
+</section>`;
+}
+
+async function paySections(v: CheckoutView, amount: string, withDeposit: boolean): Promise<string> {
     const links = walletLinks(v.pageUrl, v.origin);
-    return `<section>
-<h2>Pay with a browser wallet</h2>
+    return `<section id="wallet">
+<h2>${withDeposit ? "Or pay with a browser wallet" : "Pay with a browser wallet"}</h2>
 <ul id="wallets"><li>Looking for wallets</li></ul>
-<button id="pay-button" class="button" type="button" disabled>Pay ${amount}</button>
+<button id="pay-button" class="button outline" type="button" disabled>Pay ${amount}</button>
+<p id="wallet-note" role="status" hidden></p>
 ${MESSAGE}
 </section>
-<section>
-<h2>Pay with a phone wallet</h2>
+<section id="phone">
+<h2>Or pay in a phone wallet</h2>
 <div class="mobile-links">
 <a class="button outline" href="${escapeHtml(links.phantom)}">Open in Phantom</a>
 <a class="button outline" href="${escapeHtml(links.solflare)}">Open in Solflare</a>
@@ -406,28 +469,49 @@ ${await qrSvg(links.phantom)}
 </section>`;
 }
 
+// The page-level line for an order that no longer takes money (spec 15.6, P2 and P3)
+function closedLine(v: CheckoutView): string {
+    if (v.deposit !== null) return "";
+    if (v.state === "settling")
+        return "The payment is confirming on Solana. This page updates when it lands.";
+    if (v.state === "refunded") return "This order's payment was returned to the wallet that paid.";
+    return "";
+}
+
 export async function renderCheckout(v: CheckoutView): Promise<string> {
     const amount = amountLabel(v.amountMicros);
     const id = escapeHtml(v.orderId);
-    let tail = "";
-    if (v.state === "unpaid") tail = await paySection(v, amount);
-    else if (v.state === "settling") tail = MESSAGE;
+    const expires = v.expiresAt.toISOString();
+    let tail: string;
+    if (v.state === "unpaid") {
+        const offered = v.depositsOffered && v.deposit !== null;
+        tail = offered
+            ? `${depositSection(v, v.deposit!)}\n${await paySections(v, amount, true)}`
+            : `<p id="deposit-message" class="note" role="status">Paying by address is off right now. Pay with a browser wallet below, or reload this page later.</p>
+${await paySections(v, amount, false)}`;
+    } else {
+        tail = `<p id="deposit-message" role="status" aria-live="polite">${closedLine(v)}</p>${
+            v.state === "settling" ? `\n${MESSAGE}` : ""
+        }`;
+    }
     return page(
         `Pay ${amount} to Bugnet`,
-        `<main id="checkout" class="box" data-order-id="${id}" data-state="${v.state}" data-amount="${amount}">
+        `<main id="checkout" class="box" data-order-id="${id}" data-state="${v.state}" data-amount="${amount}" data-amount-micros="${v.amountMicros}" data-expires-at="${expires}" data-now="${v.now.toISOString()}" data-kind="${v.kind}" data-refund-min-micros="${v.refundMinMicros}" data-settle-grace-ms="${v.settleGraceMs}">
 <h1 class="description">${escapeHtml(v.description)}</h1>
 <p class="amount">
 <span class="amount-value">${amount}</span>
-<span class="amount-unit">USDC on Solana</span>
+<span class="amount-unit">${USDC_ICON} USDC on Solana</span>
 </p>
 <dl class="facts">
 <div><dt>Order</dt><dd><code>${id}</code>
-<button class="copy" type="button" data-copy="${id}"><span>Copy</span><span>Copied</span></button>
+${copyButton(v.orderId)}
 </dd></div>
 <div><dt>Status</dt>
 <dd id="state" class="state" data-state="${v.state}">${STATE_LABELS[v.state]}</dd></div>
+<div><dt>Time left</dt><dd><time id="time-left" datetime="${expires}">${timeLeft(v.expiresAt, v.now)}</time> <span id="until"></span></dd></div>
 </dl>
 ${tail}
+${NOSCRIPT}
 </main>
 ${SCRIPT}`,
     );
@@ -437,7 +521,8 @@ export function renderNotFound(): string {
     return page(
         "Order not found",
         `<main class="box">
-<h1 class="description">Order not found</h1>
+<h1 class="description">Order not found.</h1>
+<p class="note">Check the link, or ask your agent for a new payment link.</p>
 </main>`,
     );
 }

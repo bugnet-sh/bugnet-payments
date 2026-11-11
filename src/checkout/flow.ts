@@ -46,7 +46,7 @@ export interface PageStep {
 
 export const STATE_LABELS: Record<PublicState, string> = {
     unpaid: "Awaiting payment",
-    settling: "Settling",
+    settling: "Confirming",
     paid: "Paid",
     expired: "Expired",
     refunded: "Refunded",

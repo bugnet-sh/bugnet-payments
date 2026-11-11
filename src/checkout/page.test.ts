@@ -22,6 +22,7 @@ import {
     qrSvg,
     renderCheckout,
     renderNotFound,
+    decimalAmount,
     walletLinks,
 } from "./page.ts";
 
@@ -35,6 +36,13 @@ const view: CheckoutView = {
     state: "unpaid",
     pageUrl: `https://pay.bugnet.sh/o/${id}`,
     origin: "https://pay.bugnet.sh",
+    expiresAt: new Date("2030-01-01T00:15:00.000Z"),
+    now: new Date("2030-01-01T00:00:00.000Z"),
+    kind: "start",
+    deposit: null,
+    depositsOffered: false,
+    refundMinMicros: 1_000,
+    settleGraceMs: 60_000,
 };
 
 describe("checkout page", () => {
@@ -138,7 +146,9 @@ describe("checkout page", () => {
 
     it("follows a settling order with the client but offers no way to pay", async () => {
         const html = await renderCheckout({ ...view, state: "settling" });
-        expect(html).toContain('<dd id="state" class="state" data-state="settling">Settling</dd>');
+        expect(html).toContain(
+            '<dd id="state" class="state" data-state="settling">Confirming</dd>',
+        );
         expect(html).toContain('<p id="message" role="status" aria-live="polite"></p>');
         expect(html).toContain('<script type="module" src="/checkout.js"></script>');
         expect(html).not.toContain('id="pay-button"');
@@ -263,7 +273,7 @@ describe("checkout routes", () => {
         const r = await get(app, `/o/${settling.id}`, { accept: "text/html" });
         expect(r.status).toBe(200);
         const html = await r.text();
-        expect(html).toContain("Settling");
+        expect(html).toContain("Confirming");
         expect(html).toContain('<script type="module" src="/checkout.js"></script>');
         expect(html).not.toContain('id="pay-button"');
         expect(totalCalls(app.rpc)).toBe(0);
@@ -363,5 +373,168 @@ describe("checkout routes", () => {
         expect(status).toMatchObject({ orderId: order.id, state: "paid" });
         const via = await app.pool.query("select paid_via from orders where id = $1", [order.id]);
         expect(via.rows).toEqual([{ paid_via: "checkout" }]);
+    });
+});
+
+describe("address-first page", () => {
+    const ADDRESS = "BGx7SpE3VBc356Bhn9Y2GUvkecpfPjSkSM9iRxJ63Ley";
+    const deposit = {
+        address: ADDRESS,
+        ready: true,
+        status: "waiting",
+        receivedMicros: 0,
+        otherMicros: 0,
+        remainingMicros: 50_000,
+        extraMicros: 0,
+        returningMicros: 0,
+        returnedMicros: 0,
+        keptMicros: 0,
+        reviewMicros: 0,
+        reason: null,
+        reasonMicros: 0,
+        blockedUntil: null,
+        hold: null,
+        transfers: [],
+    } as unknown as NonNullable<CheckoutView["deposit"]>;
+    const offered: CheckoutView = { ...view, amountMicros: 50_000, deposit, depositsOffered: true };
+    const section = (html: string, name: string) => {
+        const at = html.indexOf(`<section id="${name}">`);
+        return html.slice(at, html.indexOf("</section>", at));
+    };
+
+    it("decimalAmount", () => {
+        expect(decimalAmount(50_000)).toBe("0.05");
+        expect(decimalAmount(1)).toBe("0.000001");
+        expect(decimalAmount(1_000_000)).toBe("1");
+        expect(decimalAmount(10_000)).toBe("0.01");
+    });
+
+    it("deposit section comes first", async () => {
+        const html = await renderCheckout(offered);
+        const d = html.indexOf('id="deposit"');
+        expect(d).toBeGreaterThan(0);
+        expect(d).toBeLessThan(html.indexOf('id="wallet"'));
+        expect(html.indexOf('id="wallet"')).toBeLessThan(html.indexOf('id="phone"'));
+    });
+
+    it("the address, amount and network are shown with copy buttons", async () => {
+        const html = await renderCheckout(offered);
+        expect(html).toContain(`data-copy="${ADDRESS}"`);
+        expect(html).toContain('data-copy="0.05"');
+        expect(html).toContain(">Solana<");
+        expect(html).toContain("Send only USDC on Solana.");
+    });
+
+    it("both QRs, each with its own caption", async () => {
+        const html = await renderCheckout(offered);
+        expect(html.match(/<figure class="qr">/g)).toHaveLength(2);
+        expect(section(html, "deposit")).toContain(`<img src="/o/${id}/qr.svg"`);
+        expect(section(html, "deposit")).toContain(
+            "Scan with a Solana wallet app to send 0.05 USDC",
+        );
+        expect(section(html, "phone")).toContain("<svg");
+        expect(section(html, "phone")).toContain(
+            "Scan with your phone to open this page in Phantom",
+        );
+    });
+
+    it("phone links stay", async () => {
+        const phone = section(await renderCheckout(offered), "phone");
+        expect(phone).toContain("Open in Phantom");
+        expect(phone).toContain("Open in Solflare");
+    });
+
+    it("the USDC icon sits in the payment details", async () => {
+        const dep = section(await renderCheckout(offered), "deposit");
+        expect(dep).toContain('class="usdc"');
+        expect(dep.toLowerCase()).toContain("#2775ca");
+    });
+
+    it("the deadline is shown", async () => {
+        const html = await renderCheckout(offered);
+        expect(html).toContain('<time id="time-left" datetime="2030-01-01T00:15:00.000Z"');
+        expect(html).toContain('data-expires-at="2030-01-01T00:15:00.000Z"');
+        expect(html).toContain('data-refund-min-micros="1000"');
+        expect(html).toContain('data-settle-grace-ms="60000"');
+        expect(html).toContain(">15:00</time>");
+    });
+
+    it("the card is centered", async () => {
+        const html = await renderCheckout(offered);
+        expect(html).toContain("min-height: 100dvh");
+        expect(html).toContain("margin-block: auto");
+        expect(html).not.toContain("::first-letter");
+    });
+
+    it("the deposit QR image is sized like the phone QR", async () => {
+        expect(await renderCheckout(offered)).toContain(
+            ".qr img { display: block; width: var(--qr); height: var(--qr);",
+        );
+    });
+
+    it("the wallet note is there and hidden", async () => {
+        const wallet = section(await renderCheckout(offered), "wallet");
+        const note = wallet.indexOf('<p id="wallet-note"');
+        expect(note).toBeGreaterThan(0);
+        expect(wallet.slice(note, wallet.indexOf(">", note))).toContain("hidden");
+        expect(note).toBeLessThan(wallet.indexOf('id="message"'));
+    });
+
+    it("wallet section is secondary", async () => {
+        const html = await renderCheckout(offered);
+        expect(html).toContain("Or pay with a browser wallet");
+        expect(html).toContain('class="button outline" type="button" disabled');
+        expect(html).toContain('id="pay-button"');
+    });
+
+    it("no deposit offered", async () => {
+        const html = await renderCheckout({ ...offered, depositsOffered: false });
+        expect(html).not.toContain('id="deposit"');
+        expect(html).toContain("Pay with a browser wallet");
+        expect(html).not.toContain("Or pay with a browser wallet");
+        expect(html).toContain(
+            "Paying by address is off right now. Pay with a browser wallet below, or reload this page later.",
+        );
+    });
+
+    it("page-level messages", async () => {
+        expect(await renderCheckout({ ...view, state: "settling" })).toContain(
+            "The payment is confirming on Solana. This page updates when it lands.",
+        );
+        expect(await renderCheckout({ ...view, state: "refunded" })).toContain(
+            "This order&#39;s payment was returned to the wallet that paid.".replace("&#39;", "'"),
+        );
+        for (const state of ["unpaid", "paid", "expired"] as const) {
+            expect(await renderCheckout({ ...offered, state })).toContain(
+                "<noscript><p>This page needs JavaScript to show live status. You can still send to the address above.</p></noscript>",
+            );
+        }
+    });
+
+    it("not found tells what to do", () => {
+        const html = renderNotFound();
+        expect(html).toContain("Order not found.");
+        expect(html).toContain("Check the link, or ask your agent for a new payment link.");
+    });
+
+    it("no middle dot, no raw error text", async () => {
+        const pages = [
+            renderNotFound(),
+            ...(await Promise.all(
+                (["unpaid", "settling", "paid", "expired", "refunded", "review"] as const).map(
+                    (state) => renderCheckout({ ...offered, state }),
+                ),
+            )),
+        ];
+        for (const html of pages) {
+            for (const bad of [
+                "\u00b7",
+                "Unexpected error",
+                "payment refused:",
+                "did not go through",
+            ]) {
+                expect(html).not.toContain(bad);
+            }
+        }
     });
 });

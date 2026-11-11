@@ -154,6 +154,7 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
         trustedProxies: s.http.trusted_proxies,
         maxBodyBytes: s.http.max_body_bytes,
         checkoutJsPath: o.checkoutJsPath ?? CHECKOUT_JS,
+        deposits: s.deposits,
         log,
         now,
     });
