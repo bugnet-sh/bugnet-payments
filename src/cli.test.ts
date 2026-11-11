@@ -1091,6 +1091,25 @@ describe("cliMain refund groups", () => {
         expect((await findOrder(db.pool, hot.order.id))!.state).toBe("manual");
     });
 
+    it("manual resolve <orderId> marks a hot order refunded once every part has landed", async () => {
+        // Each confirmed part already ran its ledger effects, so nothing is left to apply
+        const landed = await sharedManual(
+            [
+                { state: "confirmed", fromWallet: "allowance" },
+                { state: "confirmed", fromWallet: "allowance" },
+            ],
+            { payInto: "allowance", kind: "start", allowanceMicros: 20_000 },
+        );
+        const io = captureIo();
+        expect(await cli(["manual", "resolve", landed.order.id], io)).toBe(0);
+        expect(io.outText()).toBe(`${landed.order.id}: refunded`);
+        expect((await findOrder(db.pool, landed.order.id))!.state).toBe("refunded");
+        expect(await partStates(landed.order.id)).toEqual([
+            ["confirmed", null],
+            ["confirmed", null],
+        ]);
+    });
+
     it("a cold part resolved by hand completes the group when it is the last", async () => {
         const last = await sharedManual([{ state: "confirmed" }, { state: "manual" }]);
         expect((await findOrder(db.pool, last.order.id))!.manualReason).not.toBeNull();
