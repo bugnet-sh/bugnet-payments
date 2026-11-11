@@ -132,7 +132,7 @@ BUGNET_FEE_PAYER_KEY=
 BUGNET_REFUND_KEY=
 # Section 6: copied by deploy/push-rpc-urls.sh, never edited here
 BUGNET_SOLANA_RPC_URLS=
-# Section 6: read only while the list is unset; kept for a rollback
+# Section 6: read only while the list is unset; kept for a rollback (section 8)
 BUGNET_SOLANA_RPC_URL=
 BUGNET_ALLOWANCE_KEY=
 BUGNET_X402_TLS_KEY=
@@ -253,7 +253,8 @@ Copy it to the server with `deploy/push-rpc-urls.sh [ssh options] HOST`. It send
 through a pipe, to `vps-install.sh --rpc-urls`.
 Nobody edits `/etc/bugnet/payments.env` by hand. `rpc1` is the first URL in every log, alarm and
 `pcli` line. The single `BUGNET_SOLANA_RPC_URL` is read only while the list is unset or blank,
-and stays for a rollback to a release without the router.
+and stays for a rollback to a release without the router; from the deposits release on, such a
+rollback also needs `[deposits]` gone from `payments.toml` (section 8).
 
 - No spaces, quotes, comment or shell character on the line: `pcli` and the install script load
   the file with the shell, which would split the line and print part of it. A comma inside a URL
@@ -347,7 +348,19 @@ file after the secrets file, for `keys drain --allowance`, which also needs `BUG
 **Deposits.** `vps-install.sh` here is the installed release's `deploy/vps-install.sh`, run as
 root. No step comes before the install: the install step generates `BUGNET_DEPOSIT_SEED` and, once,
 adds `[deposits] enabled = false` to `payments.toml`, and `--start` checks the seed like the other
-keys. To turn deposits on:
+keys.
+
+Releases without deposits decode `payments.toml` strictly: with `[deposits]` in it, their boot
+check fails with a `reason` ending `unknown key deposits`, and the unit restarts every 2 s. So from
+this release's install step on:
+
+- run `--start` right after the install step. Until then the older version still runs, but a
+  crash or a reboot leaves it unable to start. `--start` stops it and starts this release;
+- a rollback to a release without deposits first needs `[deposits]` removed from
+  `payments.toml`. No script step removes it, and nobody edits the file by hand, so there is no
+  rollback below this release yet: fix forward.
+
+To turn deposits on:
 
 1. With the founder's go, the router's mainnet smoke test passes, its test
    `minContextSlot with until is accepted` included, on the endpoints that `pcli rpc probe` names
@@ -572,7 +585,8 @@ does not derive a stored address.
   as root (the seed moves to `BUGNET_DEPOSIT_SEED_PREVIOUS` and a new one is written, in one
   atomic `0600` write), raises `[deposits] seed_version` by 1, restarts the running version, and
   removes the marker last. A run that stopped halfway is finished by the next run and never
-  rotates twice.
+  rotates twice. While the marker exists, `--start`, `--deposits` and retirement refuse, since a
+  restart then would load the new seed under the old version.
 
 New deposits use the new version. Each deposit keeps signing with the seed of its own version.
 
@@ -612,7 +626,8 @@ spcli() {
             exec setpriv --reuid=bugnet-payments --regid=bugnet-payments --init-groups \
                 node dist/cli.js -config /etc/bugnet/payments.toml \"\$@\"' sh $(printf '%q ' "$@")"
 }
-spcli deposits return-late <orderId> --signature <sig> --archive - <~/.bugnet/deposit-seeds.env
+spcli deposits return-late <orderId> --signature <sig> --archive - \
+    <"${BUGNET_DEPOSIT_ARCHIVE:-$HOME/.bugnet/deposit-seeds.env}"
 ```
 
 **If the seed leaks.** The seed alone gives no key; someone holding both the env file and the
@@ -623,7 +638,9 @@ deposit accounts to themselves (about 0.00204 SOL each, at most `max_open`, abou
 could not touch the recipient (no key on the server), the fee payer, the refund float, the
 allowance wallet, money already swept, or review money already carried to the refund float.
 
-1. `vps-install.sh --deposits off`. Deposits that exist keep being watched and finish.
+1. `vps-install.sh --deposits off`. Deposits that exist keep being watched and finish. If it
+   prints `bugnet-payments@<version> is not running`, the change is not loaded yet: run
+   `vps-install.sh --start`.
 2. `vps-install.sh --rotate-deposit-seed`. If an earlier rotation is still draining it refuses:
    deposits stay off until `deploy/retire-deposit-seed.sh` can run (at most about 25 h), then
    rotate.
