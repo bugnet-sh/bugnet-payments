@@ -608,9 +608,10 @@ the account that sent it, and closes the token account to get the rent back. Des
 **The seed and key recovery.** A deposit's key is derived from `BUGNET_DEPOSIT_SEED` and that
 deposit's random 16-byte salt in `deposits.salt`. Order ids are public, so the salt keeps the seed
 alone from giving any key. The key itself is never stored. Recovery needs both the env file and
-the database: database backups are part of key recovery and are kept with the seed archive.
-Without either, money still in a deposit, and late money sent to a closed address, cannot be
-moved. Boot refuses while a deposit that is not `done` uses a seed version that is not loaded
+the database. No backup step exists yet: the current seed and `BUGNET_DEPOSIT_SEED_PREVIOUS` live
+only in `/etc/bugnet/payments.env`, the archive holds retired seeds only, and the database has no
+scripted backup. Without the database and those two seed lines, money still in a deposit, and
+late money sent to a closed address, cannot be moved. Boot refuses while a deposit that is not `done` uses a seed version that is not loaded
 (`BUGNET_DEPOSIT_SEED for version N is missing while M deposits use it`), and when a loaded seed
 does not derive a stored address.
 
@@ -624,7 +625,9 @@ does not derive a stored address.
   rotates twice. While the marker exists, `--start`, `--deposits` and retirement refuse, since a
   restart then would load the new seed under the old version.
 
-New deposits use the new version. Each deposit keeps signing with the seed of its own version.
+New deposits use the new version. Each deposit keeps signing with the seed of its own version. The
+per-IP rented counts hash the viewer's IP key under the current seed, so a rotation starts them
+again for the deposits open at that moment (at most 15 minutes of them).
 
 **Retirement, with the archive on the Mac.** Once `pcli deposits list --version <old>` prints only
 `state=done` lines (at most `watch_after_close`, 24 h, after the last one closed), on the Mac, in
@@ -655,7 +658,7 @@ can still get the money back.
 ```sh
 # Runs one pcli command on the server, fed this shell's stdin
 spcli() {
-    ssh -p PORT -i KEY_FILE USER@HOST "cd /opt/bugnet/payments/\$(cat /etc/bugnet/payments.release) &&
+    ssh -T -p PORT -i KEY_FILE USER@HOST "cd /opt/bugnet/payments/\$(cat /etc/bugnet/payments.release) &&
         sudo -n sh -c 'set -a; . /etc/bugnet/payments.env; set +a
             exec setpriv --reuid=bugnet-payments --regid=bugnet-payments --init-groups \
                 node dist/cli.js -config /etc/bugnet/payments.toml \"\$@\"' sh $(printf '%q ' "$@")"
@@ -706,13 +709,13 @@ allowance wallet, money already swept, or review money already carried to the re
   pending; refused while a move is in flight.
 - `deposits return-to <orderId> <signature> <tokenAccount> [--signed FILE]`: returns a transfer in
   review (below).
-- `deposits return-late <orderId> [--signature SIG]... [--archive FILE|-]`: for a `done` deposit.
+- `deposits return-late <orderId> [--signature SIG]... [--archive -]`: for a `done` deposit.
   Without `--signature` it lists the credits sent after the close, each with its source, owner and
   whether the owner signed; with it, it returns exactly those credits, each to its own
   signer-owned source, and closes the account only when it is empty afterwards. It prints
   `sending <signature>` before it sends; if the command is cut off, check that signature on chain
   before running it again.
-- `deposits return-sol <orderId> <to> [--archive FILE|-]`: SOL sent to a deposit address, on
+- `deposits return-sol <orderId> <to> [--archive -]`: SOL sent to a deposit address, on
   request.
 - `manual list`, `manual retry`, `manual resolve` and `manual refund` take split refund parts and
   `deposit` refund rows, one line or one id per part.

@@ -129,6 +129,8 @@ const USAGE = [
     "                                           list late credits, or return the named ones",
     "  deposits return-sol <orderId> <to> [--archive FILE|-]",
     "                                           send the deposit address's SOL to <to>",
+    "                                           --archive of both: - on the server, FILE",
+    "                                           only for a local database",
     KEYS_USAGE,
 ].join("\n");
 
