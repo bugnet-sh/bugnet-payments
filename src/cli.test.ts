@@ -2443,6 +2443,28 @@ describe("deposits commands", () => {
         expect(await depositLedger(db.pool, ORDER_A)).toEqual(before);
     });
 
+    it("return-to refuses money left in the account of a done deposit", async () => {
+        const ownA = await testSigner(73);
+        const first = await usdcAta(ownA.address);
+        await seedDeposit(ORDER_A, { order: { state: "expired" }, deposit: { state: "done" } });
+        await seedTransfer(ORDER_A, {
+            signature: SIG(64),
+            amountMicros: 7_000,
+            outcome: "review",
+            reason: "late_limit",
+            owner: ownA.address,
+            source: first,
+        });
+        const before = await depositLedger(db.pool, ORDER_A);
+        const io = captureIo();
+        const rpc = accountsRpc({ [first]: ownA.address });
+        expect(await cli(["deposits", "return-to", ORDER_A, SIG(64), first], io, { rpc })).toBe(1);
+        expect(io.errText()).toContain(
+            `deposit ${ORDER_A} is done, so no move returns money left in its account`,
+        );
+        expect(await depositLedger(db.pool, ORDER_A)).toEqual(before);
+    });
+
     it("return-to refuses held money whose carrying move is not confirmed", async () => {
         const ownA = await testSigner(73);
         const first = await usdcAta(ownA.address);

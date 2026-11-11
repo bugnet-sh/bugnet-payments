@@ -1564,7 +1564,8 @@ async function returnHeld(
     c: pg.PoolClient,
     o: { orderId: string; signature: string; account: string; owner: string; at: Date },
 ): Promise<{ refused: string } | { line: string; outcome: ReturnOutcome }> {
-    if ((await lockDeposit(c, o.orderId)) === null) return { refused: noDeposit(o.orderId) };
+    const deposit = await lockDeposit(c, o.orderId);
+    if (deposit === null) return { refused: noDeposit(o.orderId) };
     if (await moveInFlight(c, o.orderId)) return { refused: inFlight(o.orderId) };
     const { rows } = await c.query<{
         outcome: string;
@@ -1587,6 +1588,12 @@ async function returnHeld(
     if (t?.outcome !== "review") return { refused: `transfer ${o.signature} is not in review` };
     // A failed move carried nothing, so that money is still in the deposit too
     if (t.move_id === null || t.move_state === "failed") {
+        // The job never reads a done deposit, so no planner would carry out the return
+        if (deposit.state === "done") {
+            return {
+                refused: `deposit ${o.orderId} is done, so no move returns money left in its account`,
+            };
+        }
         await c.query(
             `update deposit_transfers set outcome = 'return', reason = 'operator',
                 source_token_account = $3, source_owner = $4, move_id = null

@@ -599,12 +599,13 @@ function closeAccount(c: Ctx): Plan | null {
     );
 }
 
-// Rule 14
+// Rule 14. Review money still in the account keeps a closed deposit watched until a close
+// carries it to the float: a done deposit is never read again, so nothing could move it (spec 5)
 function closedOrDone(c: Ctx): Plan | null {
     const { deposit, read } = c.i;
     if (deposit.state === "closed") {
         const over = deposit.watchUntil !== null && c.now >= deposit.watchUntil.getTime();
-        return over ? { kind: "done" } : null;
+        return over && leftovers(c).held === 0 ? { kind: "done" } : null;
     }
     return finished(c) && !read.exists ? { kind: "closed" } : null;
 }

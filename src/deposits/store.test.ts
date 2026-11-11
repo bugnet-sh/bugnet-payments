@@ -400,10 +400,21 @@ describe("deposit rows", () => {
             watchUntil: NOW,
         });
         await updateDeposit(db.pool, done.id, { state: "done" });
+        // Past its watch and read since, as one still waiting for a close: the closed pace again
+        const { order: waiting } = await fresh();
+        await updateDeposit(db.pool, waiting.id, {
+            state: "closed",
+            checkedAt: new Date(NOW.getTime() - 60_000),
+            watchUntil: new Date(NOW.getTime() - 90_000),
+        });
         const ids = (await watchedDeposits(db.pool, NOW, 120_000)).map((d) => d.orderId);
         expect(ids).toEqual(expect.arrayContaining([open.id, due.id, ended.id]));
         expect(ids).not.toContain(recent.id);
         expect(ids).not.toContain(done.id);
+        expect(ids).not.toContain(waiting.id);
+        const afterPace = new Date(NOW.getTime() + 60_000);
+        const later2 = (await watchedDeposits(db.pool, afterPace, 120_000)).map((d) => d.orderId);
+        expect(later2).toContain(waiting.id);
     });
 
     it("putHold upserts per owner and clearHolds removes every hold", async () => {

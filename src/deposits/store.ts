@@ -558,7 +558,8 @@ export async function updateDeposit(
 }
 
 // Closed deposits are read every closedEveryMs for late money, and once more when their watch
-// ends so the planner can mark them done
+// ends so the planner can mark them done. One that still holds review money then keeps the
+// closed pace until a close carries it.
 export async function watchedDeposits(
     db: Queryable,
     now: Date,
@@ -568,7 +569,7 @@ export async function watchedDeposits(
         `select * from deposits
          where state in ('open', 'settling', 'draining')
             or (state = 'closed' and (checked_at is null or checked_at <= $2
-                or watch_until is null or watch_until <= $1))
+                or watch_until is null or (watch_until <= $1 and checked_at < watch_until)))
          order by order_id`,
         [now, new Date(now.getTime() - closedEveryMs)],
     );

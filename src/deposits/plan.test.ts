@@ -1368,6 +1368,44 @@ describe("planDeposit: the account", () => {
         expect(p).toEqual({ kind: "done" });
     });
 
+    it("a closed deposit holding review money is not done until a close carries it", () => {
+        const late = B1({
+            amountMicros: 2_000,
+            blockTime: at("00:20:00"),
+            outcome: "review",
+            reason: "late_limit",
+        });
+        const backingOff = expired({
+            deposit: {
+                state: "closed",
+                rentPayer: "Stranger",
+                stableSince: ago(3_000),
+                watchUntil: ago(1_000),
+                closeAfter: new Date(NOW.getTime() + 60_000),
+            },
+            transfers: [late],
+            read: { micros: 2_000n },
+        });
+        expect(planDeposit(backingOff)).toEqual(WAIT);
+
+        // Once the backoff ends, the close carries it to the float, and the deposit then finishes
+        const due = { ...backingOff, deposit: { ...backingOff.deposit, closeAfter: null } };
+        const close = moved(planDeposit(due));
+        expect(close.move).toMatchObject({ kind: "close", heldMicros: 2_000, closeTo: "Stranger" });
+        const gone = landed(due, close, 9, 0n);
+        expect(planDeposit({ ...gone, read: { ...gone.read, exists: false } })).toEqual({
+            kind: "done",
+        });
+
+        // Kept dust never holds a deposit open
+        const dust = expired({
+            deposit: { state: "closed", rentPayer: "Stranger", watchUntil: ago(1_000) },
+            transfers: [{ ...late, amountMicros: 500, outcome: "keep", reason: "below_minimum" }],
+            read: { micros: 500n },
+        });
+        expect(planDeposit(dust)).toEqual({ kind: "done" });
+    });
+
     it("create only for a viewer under every cap", () => {
         const plan = (o: Over) =>
             planDeposit(
