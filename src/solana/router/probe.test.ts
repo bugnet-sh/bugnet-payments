@@ -1026,6 +1026,24 @@ describe("single mode", () => {
         expect(await reaches(t, "getSlot")).toEqual(["a"]);
     });
 
+    it("single mode only warns on a genesis 401 and opens no breaker", async () => {
+        const t = routed(1);
+        tweak(t, t.a, (m, _p, n) =>
+            m === "getGenesisHash" && n === 0 ? httpFail(401) : undefined,
+        );
+        await t.router.start({ timers: false });
+        expect(t.log.lines).toEqual([
+            {
+                level: "warn",
+                msg: "rpc genesis check failed",
+                endpoint: "rpc1",
+                outcome: "http_401",
+            },
+        ]);
+        await t.router.check();
+        expect(snap(t, "rpc1").state).toBe("ok");
+    });
+
     it("single mode never drops its endpoint", async () => {
         const t = routed(1);
         await t.router.start({ timers: false });

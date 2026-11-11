@@ -1044,7 +1044,10 @@ class Router {
                     ep.lastError = { at: this.deps.now(), ...error };
                     const o = classifyThrown(err, false, this.deps.now());
                     this.cool(ep, req.method, o);
-                    if (o.kind === "auth" || o.kind === "down") this.shutOut(ep, o, codeOf(error));
+                    // Single mode has no breaker: its failed genesis is one warn line (spec 3.4)
+                    if (this.mode === "routed" && (o.kind === "auth" || o.kind === "down")) {
+                        this.shutOut(ep, o, codeOf(error));
+                    }
                 }
                 throw err;
             } finally {
