@@ -66,7 +66,7 @@ describe("rpcErrorFields", () => {
     it("keeps the code and HTTP status of an RPC error, never its message", () => {
         const err = new SolanaError(SOLANA_ERROR__RPC__TRANSPORT_HTTP_ERROR, {
             headers: new Headers(),
-            message: "https://mainnet.helius-rpc.com/?api-key=secret",
+            message: "https://rpc1.example/?api-key=secret",
             statusCode: 429,
         });
         const fields = rpcErrorFields(err);
