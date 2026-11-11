@@ -4,6 +4,7 @@ import {
     existsSync,
     mkdirSync,
     mkdtempSync,
+    readdirSync,
     readFileSync,
     rmSync,
     writeFileSync,
@@ -114,6 +115,34 @@ describe("vps-install.sh RPC list", () => {
         expect(r.stderr).toContain("cannot create a temporary file");
         expect(readFileSync(file, "utf8")).toBe(before);
         expect(r.stdout + r.stderr).not.toContain("a.example");
+    });
+
+    it("write_rpc_list leaves no copy of the env file when killed before the rename", () => {
+        const before =
+            "BUGNET_FEE_PAYER_KEY=madeupfeepayer\nBUGNET_SOLANA_RPC_URLS=https://old.example\n";
+        const file = envFile(before);
+        const bin = join(dir, "bin");
+        mkdirSync(bin);
+        // A Ctrl-C or a dropped ssh session lands while the new file waits beside the old one
+        writeFileSync(join(bin, "mv"), '#!/usr/bin/env bash\nkill -TERM "$PPID"\nexit 1\n');
+        chmodSync(join(bin, "mv"), 0o755);
+        const r = spawnSync(
+            "bash",
+            ["-c", `. "${SCRIPT}"; write_rpc_list "$1" || echo failed`, "bash", file],
+            {
+                input: "BUGNET_SOLANA_RPC_URLS=https://a.example,https://b.example\n",
+                encoding: "utf8",
+                env: {
+                    ...process.env,
+                    PATH: `${bin}:${process.env.PATH ?? ""}`,
+                    VPS_INSTALL_LIB: "1",
+                    BUGNET_PAYMENTS_ENV: file,
+                },
+            },
+        );
+        expect(r.status).not.toBe(0);
+        expect(readdirSync(dir).toSorted()).toEqual(["bin", "payments.env"]);
+        expect(readFileSync(file, "utf8")).toBe(before);
     });
 
     it("--start restarts a running unit so it loads a changed list", () => {
