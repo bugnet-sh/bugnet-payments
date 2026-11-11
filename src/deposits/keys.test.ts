@@ -157,7 +157,9 @@ describe("checkDepositKeys", () => {
         expect(err).toBeInstanceOf(BootCheckError);
         expect((err as Error).message).toBe(
             "BUGNET_DEPOSIT_SEED loaded as version 1 does not derive ord_aaaaaaaaaaaaaaaaaaaaaaaaaa, " +
-                "the newest deposit of that version; check [deposits] seed_version",
+                "the newest deposit of that version; if /etc/bugnet/payments.rotating exists, " +
+                "run vps-install.sh --rotate-deposit-seed again, else see deploy/README.md " +
+                "section 12",
         );
         await expect(checkDepositKeys(db.pool, null)).resolves.toBeUndefined();
     });
@@ -173,7 +175,7 @@ describe("checkDepositKeys", () => {
         expect(err).toBeInstanceOf(BootCheckError);
         expect((err as Error).message).toBe(
             "1 deposits use seed version 2, above [deposits] seed_version 1; " +
-                "restore seed_version",
+                "no script sets it back, see deploy/README.md section 12",
         );
         const two = new DepositKeys(new Map([[2, SEED_7]]), 2);
         await expect(checkDepositKeys(db.pool, two)).resolves.toBeUndefined();

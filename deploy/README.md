@@ -611,9 +611,33 @@ alone from giving any key. The key itself is never stored. Recovery needs both t
 the database. No backup step exists yet: the current seed and `BUGNET_DEPOSIT_SEED_PREVIOUS` live
 only in `/etc/bugnet/payments.env`, the archive holds retired seeds only, and the database has no
 scripted backup. Without the database and those two seed lines, money still in a deposit, and
-late money sent to a closed address, cannot be moved. Boot refuses while a deposit that is not `done` uses a seed version that is not loaded
-(`BUGNET_DEPOSIT_SEED for version N is missing while M deposits use it`), and when a loaded seed
-does not derive a stored address.
+late money sent to a closed address, cannot be moved.
+
+**Boot checks on the seeds.** A failed one stops the whole service, not only deposits. The journal
+shows `"msg":"boot check failed"` with one of these `reason` texts, and `--start` ends with
+`did not answer healthz within 60 s`.
+
+- **A version is missing.** `BUGNET_DEPOSIT_SEED for version N is missing while M deposits use it`.
+  A deposit that is not `done` uses a seed version that is not loaded.
+- **A seed does not derive an address.**
+  `BUGNET_DEPOSIT_SEED does not derive the stored deposit address of <orderId>`. The seed loaded
+  for that deposit's version did not make it. Only deposits that are not `done` count.
+- **The seed version.** This one counts `done` deposits too. It has two texts:
+    - `M deposits use seed version N, above [deposits] seed_version K`. Deposits carry a version
+      above the one boot read from `payments.toml`.
+    - `BUGNET_DEPOSIT_SEED loaded as version N does not derive <orderId>`, the newest deposit of
+      that version. The seed loaded under number N is not the one that made version N's deposits.
+
+When one of them fires:
+
+1. If `/etc/bugnet/payments.rotating` exists, a rotation stopped halfway and a restart loaded the
+   new seed under the old number. Run `vps-install.sh --rotate-deposit-seed` again. It raises
+   `seed_version` to the version in the marker and restarts the running version. If it prints
+   `bugnet-payments@<version> is not running`, run `vps-install.sh --start`.
+2. Otherwise no script fixes it. The seed lines and `seed_version` are never edited by hand.
+   `pcli deposits list --version N` lists the deposits of version N, and `[deposits] seed_version`
+   in `/etc/bugnet/payments.toml` shows the number boot read. Payments stays down until the founder
+   picks a fix.
 
 **Rotation.** `vps-install.sh --rotate-deposit-seed`:
 

@@ -148,7 +148,8 @@ async function checkSeedVersion(pool: Queryable, keys: DepositKeys): Promise<voi
     if (high !== undefined) {
         throw new BootCheckError(
             `${high.n} deposits use seed version ${high.key_version}, above [deposits] ` +
-                `seed_version ${keys.current}; restore seed_version`,
+                `seed_version ${keys.current}; no script sets it back, see deploy/README.md ` +
+                "section 12",
         );
     }
     for (const version of [keys.current, keys.current - 1]) {
@@ -164,8 +165,9 @@ async function checkSeedVersion(pool: Queryable, keys: DepositKeys): Promise<voi
         if (signer.address !== newest.address) {
             throw new BootCheckError(
                 `BUGNET_DEPOSIT_SEED loaded as version ${version} does not derive ` +
-                    `${newest.order_id}, the newest deposit of that version; check [deposits] ` +
-                    "seed_version",
+                    `${newest.order_id}, the newest deposit of that version; if ` +
+                    "/etc/bugnet/payments.rotating exists, run vps-install.sh " +
+                    "--rotate-deposit-seed again, else see deploy/README.md section 12",
             );
         }
     }
