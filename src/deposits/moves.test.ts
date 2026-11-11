@@ -588,6 +588,29 @@ describe("the guard", () => {
         expect((await moveRow(move.id)).state).toBe("sent");
     });
 
+    it("the guard read is pinned to the newest landed move too", async () => {
+        const { sigs } = await funded([{ micros: 7_000n }]);
+        // On a real chain a move lands after the read the job holds; FakeChain lands it in that
+        // slot, so the rows say so directly
+        const landedAt = (await depositRow()).checkedSlot! + 3n;
+        chain.advance(10);
+        const create = await pending({ kind: "create" });
+        await db.pool.query(
+            `update deposit_moves set state = 'confirmed', confirmed_at = $2, landed_slot = $3,
+                tx_signature = 'landed-create', attempts = 1
+             where id = $1`,
+            [create.id, clock, landedAt.toString()],
+        );
+        await pending(returnTo(7_000), sigs);
+        const mark = chain.calls().length;
+        await run();
+        const guard = callsOf("getMultipleAccounts", mark);
+        expect(guard).toHaveLength(1);
+        expect((guard[0]!.params[1] as { minContextSlot: number }).minContextSlot).toBe(
+            Number(landedAt),
+        );
+    });
+
     it("a low pinned read is an invariant failure, not review", async () => {
         const { dep, sigs } = await funded([{ micros: 7_000n }]);
         chain.debit(TOKEN_A, 1_000n);

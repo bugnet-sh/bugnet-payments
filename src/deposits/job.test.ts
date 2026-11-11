@@ -791,6 +791,22 @@ describe("lanes", () => {
         expect((await ledgerOf()).transfers).toEqual([]);
     });
 
+    it("the balance batch is pinned to the expiry slot when it is the highest", async () => {
+        await deposit();
+        await ticks(1);
+        const pin = (await depositOf()).checkedSlot! + 5n;
+        chain.advance(10);
+        await updateDeposit(db.pool, ORDER_A, { expiryMinSlot: pin });
+        const mark = chain.calls().length;
+        later(cfg.idle_every);
+        await tick();
+        const read = chain
+            .calls()
+            .slice(mark)
+            .find((x) => x.method === "getMultipleAccounts")!;
+        expect((read.params[1] as { minContextSlot: number }).minContextSlot).toBe(Number(pin));
+    });
+
     it("a fault that is no RPC error is logged as an error with its message", async () => {
         await deposit();
         await ticks(1);
