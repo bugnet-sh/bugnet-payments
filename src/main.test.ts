@@ -705,6 +705,92 @@ describe("startService", () => {
     });
 });
 
+describe("deposits over HTTP", () => {
+    let chain: FakeChain;
+    beforeAll(async () => {
+        chain = await startFakeChain({ autoFinalize: true });
+        for (const w of [recipient, refundWallet]) {
+            chain.setTokenAccount({
+                address: await usdcAta(w.address),
+                owner: w.address,
+                amount: 0n,
+            });
+        }
+    });
+    afterAll(async () => {
+        await chain.close();
+    });
+
+    it("HTTP end to end on FakeChain", async () => {
+        chain.fundLamports((await testSigner(5)).address, 1_000_000_000n);
+        const payer = await testSigner(41);
+        const source = await usdcAta(payer.address);
+        chain.setTokenAccount({ address: source, owner: payer.address, amount: 1_000_000n });
+        const now = Date.now();
+        const { order } = await seedOrder(db.pool, {
+            amountMicros: 50_000,
+            createdAt: new Date(now),
+            expiresAt: new Date(now + 15 * MIN),
+        });
+        const s = await startService({
+            settings: testSettings({
+                deposits: { busy_every: "50ms", idle_every: "50ms", rpc_calls_per_second: 5 },
+            }),
+            secrets,
+            rpc: chain.rpc,
+            log: silentLog,
+        });
+        try {
+            const url = `http://127.0.0.1:${s.publicPort}/o/${order.id}`;
+            const page = await fetch(url, { headers: { accept: "text/html" } });
+            expect(page.status).toBe(200);
+            const dep = (await findDeposit(db.pool, order.id))!;
+            expect(await page.text()).toContain(dep.address);
+
+            // A page polls every 2 s; this test polls faster, within the status route's limit,
+            // and the chain moves on a slot between polls as a real one does
+            const seen: string[] = [];
+            const status = async () => {
+                await new Promise((r) => setTimeout(r, 300));
+                chain.advance(1);
+                const res = await fetch(`${url}/status`, {
+                    headers: { accept: "application/json", "bugnet-client": "checkout" },
+                });
+                expect(res.status).toBe(200);
+                const body = (await res.json()) as {
+                    state: string;
+                    deposit: { status: string; ready: boolean } | null;
+                };
+                const at = body.deposit?.status ?? "none";
+                if (seen.at(-1) !== at) seen.push(at);
+                return body;
+            };
+            // The poll notes a viewer, which wakes the job to create the account
+            await until(async () => (await status()).deposit?.ready === true, 30_000);
+            expect((await status()).deposit?.status).toBe("waiting");
+
+            await chain.transfer({
+                authority: payer,
+                feePayer: payer,
+                source,
+                destination: dep.tokenAccount,
+                micros: 50_000n,
+            });
+            await until(async () => {
+                const d = (await status()).deposit?.status;
+                return d === "confirming" || d === "paid";
+            }, 30_000);
+            await until(async () => (await status()).deposit?.status === "paid", 30_000);
+            expect((await status()).state).toBe("paid");
+            // Confirming lasts one or two ticks, which a poll may fall between
+            expect(seen.filter((x) => x !== "confirming")).toEqual(["waiting", "paid"]);
+            expect(chain.balance(await usdcAta(recipient.address))).toBe(50_000n);
+        } finally {
+            await s.stop();
+        }
+    }, 120_000);
+});
+
 describe("routeConsole", () => {
     it("routes console.error through the redacting logger", () => {
         const out: string[] = [];

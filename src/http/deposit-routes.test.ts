@@ -253,6 +253,20 @@ describe("deposit routes", () => {
         expect(lines().filter((l) => l.level === "error")).toEqual([]);
     });
 
+    it("one /64 is one key", async () => {
+        await order(app);
+        const a = "2001:db8:aa:bb::1";
+        const b = "2001:db8:aa:bb:ffff::2";
+        for (let i = 0; i < 60; i++) {
+            expect((await page(app, i % 2 === 0 ? a : b)).status).toBe(200);
+        }
+        const over = await page(app, b);
+        expect(over.status).toBe(429);
+        expect(over.headers.get("retry-after")).not.toBeNull();
+        // Another /64 of the same /48 has its own 60
+        expect((await page(app, "2001:db8:aa:cc::1")).status).toBe(200);
+    });
+
     it("balance answers the owner's USDC", async () => {
         await order(app);
         const payer = app.payer.address;
