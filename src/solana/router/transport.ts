@@ -880,11 +880,14 @@ class Router {
             if (c.genesis === "ok") ep.alerted.delete("unreachable");
             if (failed && routed && !ep.alerted.has("unreachable")) {
                 ep.alerted.add("unreachable");
-                this.deps.log.alarm("rpc_endpoint_down", {
-                    endpoint: ep.name,
-                    reason: "unreachable",
-                    ...failureCode(c.genesisError),
-                });
+                // An open breaker alarmed its opening already, a 401 to 410 of this call included
+                if (ep.health.breaker() !== "open") {
+                    this.deps.log.alarm("rpc_endpoint_down", {
+                        endpoint: ep.name,
+                        reason: "unreachable",
+                        ...failureCode(c.genesisError),
+                    });
+                }
             }
         }
         if (c.identity !== null) this.sawIdentity(ep, c.identity);

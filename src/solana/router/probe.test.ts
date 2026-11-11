@@ -905,6 +905,14 @@ describe("unreachable endpoints", () => {
         expect(await reaches(t, "getSlot")).toEqual(["b"]);
     });
 
+    it("a genesis 401 to 410 alarms once, with its own reason", async () => {
+        const t = routed(2);
+        tweak(t, t.a, (m) => (m === "getGenesisHash" ? httpFail(402) : undefined));
+        await t.router.start({ timers: false });
+        expect(snap(t, "rpc1").checks.genesis).toBe("error http_402");
+        expect(lines(t, "alarm")).toEqual([alarm("rpc1", "http_402", { status: 402 })]);
+    });
+
     it("no endpoint at all", async () => {
         const t = routed(2);
         for (const ep of [t.a, t.b]) ep.answer(() => netFail());
