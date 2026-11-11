@@ -345,8 +345,9 @@ export function errorStep(err: unknown, c: MessageContext & { wallet: string }):
     );
 }
 
+// Pay is offered again at once without a Retry-After, so the line names no wait then
 function waitText(s: number | undefined): string {
-    return s === undefined || s <= 0 ? "in a minute" : `in ${s} s`;
+    return s === undefined || s <= 0 ? "" : ` in ${s} s`;
 }
 
 const CLOSED_FUNDING: Record<string, (amount: string) => string> = {
@@ -418,7 +419,7 @@ export function pageStep(r: PayFlowResult, c: MessageContext & { wallet: string 
             case "payer_rate_limited":
             case "too_many_attempts":
                 return {
-                    message: `Too many tries from this wallet. Nothing was charged. Press Pay again ${waitText(s)}.`,
+                    message: `Too many tries from this wallet. Nothing was charged. Press Pay again${waitText(s)}.`,
                     payAfterMs: after,
                 };
             case "x402_disabled":
@@ -429,7 +430,7 @@ export function pageStep(r: PayFlowResult, c: MessageContext & { wallet: string 
                 };
             default:
                 return {
-                    message: `Bugnet cannot take the payment right now. Nothing was charged. Press Pay again ${waitText(s)}.`,
+                    message: `Bugnet cannot take the payment right now. Nothing was charged. Press Pay again${waitText(s)}.`,
                     payAfterMs: after,
                 };
         }

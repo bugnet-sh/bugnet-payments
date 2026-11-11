@@ -464,9 +464,18 @@ describe("refusal messages", () => {
         ).toBe(
             "Bugnet cannot take the payment right now. Nothing was charged. Press Pay again in 7 s.",
         );
-        expect(pageStep({ unavailable: "rpc_unavailable" }, W).message).toBe(
-            "Bugnet cannot take the payment right now. Nothing was charged. Press Pay again in a minute.",
-        );
+        // Without a Retry-After Pay is offered at once, so the line names no wait
+        for (const retryAfterSeconds of [undefined, 0]) {
+            expect(pageStep({ unavailable: "rpc_unavailable", retryAfterSeconds }, W)).toEqual({
+                message:
+                    "Bugnet cannot take the payment right now. Nothing was charged. Press Pay again.",
+                payAfterMs: 0,
+            });
+            expect(pageStep({ unavailable: "payer_rate_limited", retryAfterSeconds }, W)).toEqual({
+                message: "Too many tries from this wallet. Nothing was charged. Press Pay again.",
+                payAfterMs: 0,
+            });
+        }
         expect(pageStep({ refused: "order_unknown" }, W).message).toBe(
             "Bugnet has no order for this link. Ask your agent for a new payment link.",
         );

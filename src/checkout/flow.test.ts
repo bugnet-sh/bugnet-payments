@@ -495,7 +495,7 @@ describe("refusals through payWithWallet", () => {
     const W25 =
         "Bugnet could not accept the transaction Phantom signed. Nothing was charged. Press Pay to try again, or send to the address above.";
     const W24 = (wait: string) =>
-        `Bugnet cannot take the payment right now. Nothing was charged. Press Pay again ${wait}.`;
+        `Bugnet cannot take the payment right now. Nothing was charged. Press Pay again${wait}.`;
     const settlingFor = (n: number) =>
         Array.from({ length: n }, () => () => json(200, { orderId: id, state: "settling" }));
     const rows: [string, Script, string][] = [
@@ -582,12 +582,12 @@ describe("refusals through payWithWallet", () => {
         [
             "W24 with Retry-After",
             { submit: () => json(503, { refused: "router_unavailable", orderId: id }, RETRY) },
-            W24("in 7 s"),
+            W24(" in 7 s"),
         ],
         [
             "W24 without Retry-After",
             { submit: () => json(503, { refused: "settlement_unavailable", orderId: id }) },
-            W24("in a minute"),
+            W24(""),
         ],
         [
             "W25 payment_invalid",
