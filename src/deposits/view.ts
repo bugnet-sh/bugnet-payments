@@ -31,6 +31,16 @@ export interface DepositSummary {
     decided: boolean;
 }
 
+/**
+ * Spec 8.4: an unpaid order past its deadline has lapsed only with no deposit, or with one a
+ * pinned read decided holds nothing on time; until then the deposit job may still settle it.
+ * publicState and the internal order API both answer by this one rule.
+ */
+export function depositLapsed(expiresAt: Date, now: Date, dep: DepositSummary | null): boolean {
+    if (now.getTime() < expiresAt.getTime()) return false;
+    return dep === null || (dep.onTimeMicros === 0 && dep.decided);
+}
+
 export interface DepositLedger {
     deposit: DepositRow;
     transfers: readonly TransferRow[];

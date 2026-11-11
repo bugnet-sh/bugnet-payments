@@ -9,14 +9,14 @@
  * under the row lock so it never races the refund sweeper. Every answer comes from the stored
  * order, never from the request's terms.
  */
-import { depositLedger } from "../deposits/store.ts";
-import { depositSummary, type DepositSummary } from "../deposits/view.ts";
 import type { KeyObject } from "node:crypto";
 import type { SettleResponse } from "@x402/core/types";
 import type pg from "pg";
 import { z } from "zod";
 import type { Settings } from "../config.ts";
 import { withTx, type Queryable } from "../db/pool.ts";
+import { depositLedger } from "../deposits/store.ts";
+import { depositLapsed, depositSummary } from "../deposits/view.ts";
 import { isRecord } from "../is-record.ts";
 import type { Log } from "../log.ts";
 import { findOrderRefund } from "../refunds/request.ts";
@@ -352,14 +352,7 @@ function termsDiffer(r: OrderRequest, o: OrderRow): boolean {
     );
 }
 
-// True only where publicState answers expired: past the deadline with no deposit, or with one a
-// pinned read decided holds nothing on time; until then the deposit job may still settle it
-function lapsed(o: OrderRow, now: Date, dep: DepositSummary | null): boolean {
-    if (now.getTime() < o.expiresAt.getTime()) return false;
-    return dep === null || (dep.onTimeMicros === 0 && dep.decided);
-}
-
-// One query, and only for an unpaid order past its deadline
+// Reads the deposit only for an unpaid order past its deadline
 async function unpaidAnswer(
     d: OrderServiceDeps,
     o: OrderRow,
@@ -367,9 +360,12 @@ async function unpaidAnswer(
     const now = d.now();
     if (now.getTime() < o.expiresAt.getTime()) return "open";
     const ledger = await depositLedger(d.pool, o.id);
+    // An unpaid order never has a settled deposit: the settle committed after this request read
+    // the order, and the order is settling now
+    if (ledger !== null && ledger.deposit.settledAt !== null) return "settling";
     const dep =
         ledger === null ? null : depositSummary(o, ledger, d.settings.deposits.settle_grace);
-    return lapsed(o, now, dep) ? "expired" : "settling";
+    return depositLapsed(o.expiresAt, now, dep) ? "expired" : "settling";
 }
 
 async function closedAnswer(db: Queryable, o: OrderRow): Promise<Refused> {

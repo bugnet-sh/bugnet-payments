@@ -15,7 +15,12 @@ import type { DepositWatch } from "../deposits/job.ts";
 import type { DepositKeys } from "../deposits/keys.ts";
 import { depositLedger, ensureDeposit } from "../deposits/store.ts";
 import type { DepositView } from "../deposits/types.ts";
-import { depositSummary, depositView, type DepositSummary } from "../deposits/view.ts";
+import {
+    depositLapsed,
+    depositSummary,
+    depositView,
+    type DepositSummary,
+} from "../deposits/view.ts";
 import type { Log } from "../log.ts";
 import { isOrderId } from "../orders/ids.ts";
 import { type PayDeps, type PayOutcome, payOrder } from "../orders/pay.ts";
@@ -108,8 +113,7 @@ export function publicState(o: OrderRow, now: Date, dep?: DepositSummary): Publi
     switch (state) {
         case "unpaid":
             if (now.getTime() < o.expiresAt.getTime()) return "unpaid";
-            if (dep !== undefined && (dep.onTimeMicros > 0 || !dep.decided)) return "settling";
-            return "expired";
+            return depositLapsed(o.expiresAt, now, dep ?? null) ? "expired" : "settling";
         case "settling":
             return "settling";
         case "paid":

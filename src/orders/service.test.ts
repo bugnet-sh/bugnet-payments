@@ -1612,7 +1612,7 @@ describe("deposit-aware expiry", () => {
     const MIN = 60_000;
 
     // An unpaid order whose deposit exists, optionally holding an on-time transfer
-    async function withDeposit(o: { micros?: number; decided?: boolean } = {}) {
+    async function withDeposit(o: { micros?: number; decided?: boolean; settled?: boolean } = {}) {
         const key = KEY + randomBytes(4).toString("hex");
         const created = await post(app, "/v1/orders", create({ idempotencyKey: key }));
         const order = (await findOrder(app.pool, created.body.orderId))!;
@@ -1645,6 +1645,12 @@ describe("deposit-aware expiry", () => {
                 [order.id, after(20 * MIN)],
             );
         }
+        if (o.settled === true) {
+            await app.pool.query("update deposits set settled_at = $2 where order_id = $1", [
+                order.id,
+                after(9 * MIN),
+            ]);
+        }
         return { orderId: order.id, claim: created.body.claim as string, key };
     }
     // By claim (authorized), then by replaying the create (unauthorized)
@@ -1654,7 +1660,8 @@ describe("deposit-aware expiry", () => {
     ];
 
     it("lapsed is deposit-aware, with three branches", async () => {
-        const paidOnTime = await withDeposit({ micros: 30_000 });
+        // Decided, so only its on-time money keeps it settling
+        const paidOnTime = await withDeposit({ micros: 30_000, decided: true });
         const empty = await withDeposit();
         const decidedEmpty = await withDeposit({ decided: true });
         const noDeposit = await post(app, "/v1/orders", create({ idempotencyKey: KEY + "nodep" }));
@@ -1670,12 +1677,24 @@ describe("deposit-aware expiry", () => {
             claim: empty.claim,
         });
         expect(before.body.status).toBe("payment_required");
+        const replay = await post(app, "/v1/orders", create({ idempotencyKey: empty.key }));
+        expect(replay.body.status).toBe("payment_required");
 
         app.now.set(after(10 * MIN + 30_000));
         expect(await ask(paidOnTime)).toEqual(["settling", "settling"]);
         expect(await ask(empty)).toEqual(["settling", "settling"]);
         expect(await ask(decidedEmpty)).toEqual(["order_expired", "order_expired"]);
         expect(await ask(plain)).toEqual(["order_expired", "order_expired"]);
+    });
+
+    it("an unpaid row read before its deposit settled answers settling", async () => {
+        // The settle committed between this request's order read and its deposit read, and the
+        // transfers it paid are no longer open on-time money
+        const stale = await withDeposit({ decided: true, settled: true });
+        const decided = await withDeposit({ decided: true });
+        app.now.set(after(15 * MIN + 30_000));
+        expect(await ask(stale)).toEqual(["settling", "settling"]);
+        expect(await ask(decided)).toEqual(["order_expired", "order_expired"]);
     });
 });
 
@@ -1691,6 +1710,9 @@ describe("transfer payments", () => {
         try {
             flag.token_payer_claims = true;
             const seeded = await seedPaid({ payer: SENDER });
+            await app.pool.query("update orders set paid_via = 'transfer' where id = $1", [
+                seeded.order.id,
+            ]);
             await seedPayment(app.pool, seeded.order.id, {
                 payer: SENDER,
                 txSignature: sweep,
