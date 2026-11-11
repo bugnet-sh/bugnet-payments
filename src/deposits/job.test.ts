@@ -506,6 +506,8 @@ describe("account creation caps", () => {
             await deposit(id);
             await updateDeposit(db.pool, id, { rentPayer: feePayer.address, readyAt: T0 });
         }
+        // A settling deposit still holds its rent until the sweep lands
+        await updateDeposit(db.pool, b, { state: "settling" });
         await deposit(c, { account: false });
         expect(await rentHolding(db.pool, feePayer.address)).toBe(2);
         view(c, "198.51.100.3");
@@ -787,6 +789,41 @@ describe("lanes", () => {
         });
         expect((await orderOf()).state).toBe("unpaid");
         expect((await ledgerOf()).transfers).toEqual([]);
+    });
+
+    it("a fault that is no RPC error is logged as an error with its message", async () => {
+        await deposit();
+        await ticks(1);
+        const broken = (method: string): DepositRpcQueue => ({
+            rpc: (purpose) =>
+                new Proxy(queue.rpc(purpose), {
+                    get: (target, prop, recv) =>
+                        prop === method
+                            ? () => ({
+                                  send: () => Promise.reject(new TypeError(`${method} bug`)),
+                              })
+                            : Reflect.get(target, prop, recv),
+                }),
+            dayUsed: () => queue.dayUsed(),
+        });
+        later(cfg.idle_every);
+        await tick({ queue: broken("getMultipleAccounts") });
+        clock = at("00:16:05");
+        await tick({ queue: broken("getSlot") });
+        const errors = log.lines.filter((l) => l.level === "error");
+        expect(errors).toContainEqual(
+            expect.objectContaining({
+                msg: "deposit balance read failed, retrying next tick",
+                err: expect.objectContaining({ message: "getMultipleAccounts bug" }),
+            }),
+        );
+        expect(errors).toContainEqual(
+            expect.objectContaining({
+                msg: "deposit expiry pin failed, retrying next tick",
+                orderId: ORDER_A,
+                err: expect.objectContaining({ message: "getSlot bug" }),
+            }),
+        );
     });
 });
 

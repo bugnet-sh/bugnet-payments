@@ -336,9 +336,9 @@ function asSettle(plan: Plan): SettlePlan {
 
 const signal = () => AbortSignal.timeout(5_000);
 
-async function settle(id = ORDER_A, d: SettleDeps = settleDeps()) {
+async function settle(id = ORDER_A, d: SettleDeps = settleDeps(), timeout = signal) {
     const { plan, read } = await nextPlan(id);
-    return await settleDeposit(d, id, asSettle(plan), read.read.contextSlot, signal());
+    return await settleDeposit(d, id, asSettle(plan), read.read.contextSlot, timeout);
 }
 
 // What the job does with each step (Task 11), enough to carry a deposit to its close
@@ -347,7 +347,7 @@ async function apply(id: string, plan: Plan, read: ScanResult): Promise<void> {
         case "wait":
             return;
         case "settle":
-            await settleDeposit(settleDeps(), id, plan, read.read.contextSlot, signal());
+            await settleDeposit(settleDeps(), id, plan, read.read.contextSlot, signal);
             return;
         case "assign":
             await withTx(db.pool, async (c) => {
@@ -455,7 +455,7 @@ describe("settle", () => {
             ORDER_A,
             asSettle(plan),
             read.read.contextSlot,
-            signal(),
+            signal,
         );
         expect(outcome).toBe("settling");
         expect(await orderOf()).toMatchObject({ state: "settling", payer: owners.A.address });
@@ -580,7 +580,7 @@ describe("settle", () => {
                 ORDER_A,
                 asSettle(plan),
                 read.read.contextSlot,
-                signal(),
+                signal,
             ),
         ).toBe("settling");
         const sweep = await sweepOf();
@@ -610,7 +610,7 @@ describe("settle", () => {
                 ORDER_A,
                 asSettle(plan),
                 read.read.contextSlot,
-                signal(),
+                signal,
             ),
         ).toBe("wait");
         expect(callsOf("sendTransaction", mark)).toHaveLength(0);
@@ -648,6 +648,22 @@ describe("owners and the router", () => {
             [1, owners.B.address, sources.B, 20_000],
         ]);
         expect((await orderOf()).payer).toBe(owners.A.address);
+    });
+
+    it("each router call gets its own time limit", async () => {
+        await deposit();
+        await send("A", 30_000n);
+        await send("B", 20_000n);
+        let made = 0;
+        // One limit for every owner would leave the later ones the time the first ones spent
+        expect(
+            await settle(ORDER_A, settleDeps(), () => {
+                made++;
+                return signal();
+            }),
+        ).toBe("settling");
+        expect(payers()).toEqual([owners.A.address, owners.B.address, ""]);
+        expect(made).toBe(3);
     });
 
     it("dust owners are kept, never applied", async () => {
@@ -757,7 +773,7 @@ describe("owners and the router", () => {
                 ORDER_A,
                 asSettle(plan),
                 read.read.contextSlot,
-                signal(),
+                signal,
             ),
         ).toBe("settling");
         expect(await transferOf(b1)).toMatchObject({ outcome: "return", reason: "extra" });
@@ -854,7 +870,7 @@ describe("owners and the router", () => {
                 ORDER_A,
                 asSettle(plan),
                 read.read.contextSlot,
-                signal(),
+                signal,
             ),
         ).toBe("settling");
         expect(lanes).toEqual([

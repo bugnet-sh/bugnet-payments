@@ -647,7 +647,9 @@ async function readBalances(
         c.tick.read += reads.size;
         return { reads, failed: false };
     } catch (err) {
-        rpcWarn(c.d.log, "deposit balance read failed, retrying next tick", null, err);
+        const msg = "deposit balance read failed, retrying next tick";
+        if (isRpcError(err)) rpcWarn(c.d.log, msg, null, err);
+        else c.d.log.error(msg, { err });
         return { reads: new Map(), failed: true };
     }
 }
@@ -962,11 +964,7 @@ async function apply(
             return !(await storeMove(c, ledger, plan));
         case "settle": {
             const settleDeps: SettleDeps = { ...d, rpc: d.queue.rpc("deposits.move"), routerCalls };
-            const outcome = await settleDeposit(
-                settleDeps,
-                orderId,
-                plan,
-                read.contextSlot,
+            const outcome = await settleDeposit(settleDeps, orderId, plan, read.contextSlot, () =>
                 AbortSignal.timeout(d.rpcTimeoutMs),
             );
             if (outcome === "settling") c.tick.settled++;
@@ -1042,7 +1040,9 @@ async function pinExpirySlot(c: TickContext, order: OrderRow): Promise<boolean> 
         });
         return true;
     } catch (err) {
-        rpcWarn(c.d.log, "deposit expiry pin failed, retrying next tick", order.id, err);
+        const msg = "deposit expiry pin failed, retrying next tick";
+        if (isRpcError(err)) rpcWarn(c.d.log, msg, order.id, err);
+        else c.d.log.error(msg, { orderId: order.id, err });
         return false;
     }
 }

@@ -108,7 +108,8 @@ export async function settleDeposit(
     orderId: string,
     plan: SettlePlan,
     readSlot: bigint,
-    signal: AbortSignal,
+    // A fresh limit per router call, so a slow first owner never leaves the next one no time
+    signal: () => AbortSignal,
 ): Promise<SettleOutcome> {
     const order = await findOrder(d.pool, orderId);
     const ledger = await depositLedger(d.pool, orderId);
@@ -130,7 +131,7 @@ export async function settleDeposit(
         if (d.routerCalls.left <= 0) return null;
         d.routerCalls.left--;
         const r = { payer, feePayer: d.challengeFeePayer, ...target };
-        return await d.router.checkPayer(r, signal);
+        return await d.router.checkPayer(r, signal());
     };
     const checked = plan.multiSender
         ? await checkShared(d, order, plan, open, ask)
