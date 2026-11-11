@@ -42,6 +42,7 @@ function deposit(over: Partial<DepositRow> = {}): DepositRow {
         viewerBlock: null,
         reviewReason: null,
         holdReason: null,
+        movesFailingResetAt: null,
         recheckAt: null,
         expiryDueAt: null,
         hardStopAt: null,

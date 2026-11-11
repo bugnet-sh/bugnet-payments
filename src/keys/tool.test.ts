@@ -367,6 +367,89 @@ describe("deposit seed commands", () => {
         }
     });
 
+    it("retire-deposit-seed --archive - prints only the archive line and removes nothing", async () => {
+        const text = `BUGNET_DEPOSIT_SEED=${CURRENT}\nBUGNET_DEPOSIT_SEED_PREVIOUS=${A}\n`;
+        const p = tmpEnv(text, 0o600);
+        const args = [
+            "keys",
+            "retire-deposit-seed",
+            "--env",
+            p,
+            "--archive",
+            "-",
+            "--version",
+            "1",
+        ];
+        const io = captureIo();
+        expect(await cliMain(args, {}, io)).toBe(0);
+        expect(io.outText()).toBe(`BUGNET_DEPOSIT_SEED_V1=${A}`);
+        expect(io.errText()).toBe("");
+        expect(readFileSync(p, "utf8")).toBe(text);
+
+        const empty = tmpEnv(`BUGNET_DEPOSIT_SEED=${CURRENT}\n`, 0o600);
+        const nothing = captureIo();
+        expect(
+            await cliMain(
+                args.map((a) => (a === p ? empty : a)),
+                {},
+                nothing,
+            ),
+        ).toBe(0);
+        expect(nothing.outText()).toBe("");
+        expect(nothing.errText()).toBe("nothing to retire");
+    });
+
+    it("retire-deposit-seed --remove-previous drops the seed only once stdin holds it", async () => {
+        const text = `BUGNET_DEPOSIT_SEED=${CURRENT}\nBUGNET_DEPOSIT_SEED_PREVIOUS=${A}\n`;
+        const p = tmpEnv(text, 0o600);
+        const args = [
+            "keys",
+            "retire-deposit-seed",
+            "--env",
+            p,
+            "--archive",
+            "-",
+            "--version",
+            "1",
+            "--remove-previous",
+        ];
+        const piped = (stdin: string) => ({ ...captureIo(), stdin: async () => stdin });
+        const refused: ReturnType<typeof captureIo>[] = [];
+        for (const stdin of [
+            "",
+            `BUGNET_DEPOSIT_SEED_V1=${THIRD}\n`,
+            `BUGNET_DEPOSIT_SEED_V2=${A}\n`,
+        ]) {
+            const io = piped(stdin);
+            expect(await cliMain(args, {}, io)).toBe(1);
+            expect(io.errText()).toContain(
+                "BUGNET_DEPOSIT_SEED_V1 on stdin does not match BUGNET_DEPOSIT_SEED_PREVIOUS; " +
+                    "nothing removed",
+            );
+            expect(readFileSync(p, "utf8")).toBe(text);
+            refused.push(io);
+        }
+
+        const io = piped(`# deposit-seeds.env\nBUGNET_DEPOSIT_SEED_V1=${A}\n`);
+        expect(await cliMain(args, {}, io)).toBe(0);
+        expect(io.outText()).toBe("removed BUGNET_DEPOSIT_SEED_PREVIOUS");
+        expect(readFileSync(p, "utf8")).toBe(`BUGNET_DEPOSIT_SEED=${CURRENT}\n`);
+        expect(statSync(p).mode & 0o777).toBe(0o600);
+
+        const again = piped(`BUGNET_DEPOSIT_SEED_V1=${A}\n`);
+        expect(await cliMain(args, {}, again)).toBe(0);
+        expect(again.outText()).toBe("nothing to retire");
+        for (const value of [A, CURRENT, THIRD]) {
+            expect(printed(io, again, ...refused)).not.toContain(value);
+        }
+
+        const archive = join(dir, `archive-${counter++}`);
+        const withFile = captureIo();
+        const fileArgs = args.map((a) => (a === "-" ? archive : a));
+        expect(await cliMain(fileArgs, {}, withFile)).toBe(2);
+        expect(withFile.errText()).toContain("--remove-previous takes the archive on stdin");
+    });
+
     it("retire-deposit-seed appends to an archive of earlier versions", () => {
         const p = tmpEnv(
             `BUGNET_DEPOSIT_SEED=${CURRENT}\nBUGNET_DEPOSIT_SEED_PREVIOUS=${A}\n`,

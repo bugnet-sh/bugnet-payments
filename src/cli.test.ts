@@ -1,10 +1,20 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getBase58Decoder } from "@solana/kit";
+import {
+    address,
+    getBase58Decoder,
+    type KeyPairSigner,
+    signBytes,
+    signature as toSignature,
+} from "@solana/kit";
 import { stringify } from "smol-toml";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { type CliOptions, cliMain, formatRpcStatus } from "./cli.ts";
+import { loadSettings } from "./config.ts";
+import { type PlanInput, planDeposit } from "./deposits/plan.ts";
+import { depositLedger, findDeposit, findMove } from "./deposits/store.ts";
 import {
     type FakeEndpoint,
     type FakeHandler,
@@ -20,12 +30,16 @@ import { MAINNET_GENESIS, type RouterSnapshot } from "./solana/router/index.ts";
 import { endpointFingerprint, pgSnapshotStore, pgVerdictStore } from "./solana/rpc-store.ts";
 import type { EndpointSnapshot } from "./solana/router/transport.ts";
 import { silentLog } from "./log.ts";
+import { newOrderId } from "./orders/ids.ts";
 import { findOrder } from "./orders/store.ts";
 import type { OrderRow } from "./orders/types.ts";
 import { pauseRefunds, refundsPaused, resumeRefunds } from "./refunds/executor.ts";
 import { findOrderRefund, findRefundById, refundGroup } from "./refunds/request.ts";
+import { insertRefundGroup, refundTargets } from "./refunds/split.ts";
+import { generateExportableKeypair } from "./solana/keys.ts";
 import { testDb, type TestDb } from "./testing/db.ts";
-import { startFakeChain } from "./testing/fake-chain.ts";
+import { heldRefundId } from "./testing/deposits.ts";
+import { type FakeChain, startFakeChain } from "./testing/fake-chain.ts";
 import { createFakeRpc } from "./testing/fake-rpc.ts";
 import { testSigner } from "./testing/keys.ts";
 import { seedOrder, seedPayment, seedSharedPayment } from "./testing/orders.ts";
@@ -39,6 +53,7 @@ import {
     seedService,
     seedX402Payment,
     TEST_PAYTO,
+    usdcAccountAnswer,
 } from "./testing/x402.ts";
 import { isPayToBlocked, readControls, setControls } from "./x402/controls.ts";
 import { openIncidents, recordIncident } from "./x402/incidents.ts";
@@ -1891,5 +1906,886 @@ describe("rpc commands", () => {
         } finally {
             await chain.close();
         }
+    });
+});
+
+describe("deposits commands", () => {
+    const ORDER_A = "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ORDER_B = "ord_bbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const ADDRESS_A = "BGx7SpE3VBc356Bhn9Y2GUvkecpfPjSkSM9iRxJ63Ley";
+    const TOKEN_A = "D2mAKdUVEHvizHThmG57bTCiASiiYj5gQbMeMoyWtQo1";
+    const ADDRESS_B = "Fvkkb7d7zpJZcyUsygPojncsHASt2VtQB6hLRTHKp4aB";
+    const SEED_7 = Buffer.alloc(32, 7).toString("base64");
+    const CREATED = new Date("2030-01-01T00:00:00Z");
+    const EXPIRES = new Date("2030-01-01T00:15:00Z");
+    const LATER = new Date("2030-01-01T00:20:00Z");
+    const OTHER_MINT = "So11111111111111111111111111111111111111112";
+
+    let files = 0;
+
+    // The golden deposits (spec 4.2) sit at their derived addresses; any other only needs its own
+    async function seedDeposit(
+        orderId: string,
+        o: { order?: Partial<OrderRow>; deposit?: Record<string, unknown> } = {},
+    ): Promise<void> {
+        await seedOrder(db.pool, {
+            id: orderId,
+            amountMicros: 50_000,
+            createdAt: CREATED,
+            expiresAt: EXPIRES,
+            ...o.order,
+        });
+        const golden: Record<string, string> = { [ORDER_A]: ADDRESS_A, [ORDER_B]: ADDRESS_B };
+        const owner = golden[orderId];
+        await db.pool.query(
+            `insert into deposits (order_id, address, token_account, key_version, salt, created_at)
+             values ($1, $2, $3, 1, $4, $5)`,
+            [
+                orderId,
+                owner ?? `addr-${randomBytes(8).toString("hex")}`,
+                owner === undefined
+                    ? `ata-${randomBytes(8).toString("hex")}`
+                    : await usdcAta(address(owner)),
+                Buffer.alloc(16, 1),
+                CREATED,
+            ],
+        );
+        for (const [column, value] of Object.entries(o.deposit ?? {})) {
+            await db.pool.query(`update deposits set ${column} = $2 where order_id = $1`, [
+                orderId,
+                value,
+            ]);
+        }
+    }
+
+    async function seedTransfer(
+        orderId: string,
+        t: {
+            signature: string;
+            amountMicros: number;
+            outcome?: string;
+            reason?: string | null;
+            owner?: string | null;
+            source?: string | null;
+            moveId?: number | null;
+            slot?: bigint;
+        },
+    ): Promise<void> {
+        await db.pool.query(
+            `insert into deposit_transfers (order_id, signature, slot, seq, block_time, seen_at,
+                amount_micros, source_token_account, source_owner, outcome, reason, move_id)
+             values ($1, $2, $3, 0, $4, $4, $5, $6, $7, $8, $9, $10)`,
+            [
+                orderId,
+                t.signature,
+                (t.slot ?? 100n).toString(),
+                new Date("2030-01-01T00:05:00Z"),
+                t.amountMicros,
+                t.source ?? null,
+                t.owner ?? null,
+                t.outcome ?? "open",
+                t.reason ?? null,
+                t.moveId ?? null,
+            ],
+        );
+    }
+
+    async function seedMove(
+        orderId: string,
+        m: {
+            kind: "create" | "sweep" | "return" | "close";
+            state: string;
+            amountMicros?: number;
+            heldMicros?: number;
+            destination?: string | null;
+            attempts?: number;
+            manualReason?: string | null;
+            txSignature?: string | null;
+            createdAt?: Date;
+        },
+    ): Promise<number> {
+        const closes = m.kind === "close";
+        const res = await db.pool.query<{ id: string }>(
+            `insert into deposit_moves (order_id, kind, amount_micros, held_micros, destination,
+                closes, close_to, state, attempts, manual_reason, tx_signature, created_at)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) returning id`,
+            [
+                orderId,
+                m.kind,
+                m.amountMicros ?? 0,
+                m.heldMicros ?? 0,
+                m.destination ?? null,
+                closes,
+                closes ? "Fee" : null,
+                m.state,
+                m.attempts ?? 1,
+                m.manualReason ?? null,
+                m.txSignature ?? null,
+                m.createdAt ?? CREATED,
+            ],
+        );
+        return Number(res.rows[0]!.id);
+    }
+
+    // A review transfer whose money a confirmed closing move carried to the refund float
+    async function heldTransfer(
+        orderId: string,
+        t: { signature: string; reason: string; owner?: string; source?: string; slot?: bigint },
+        moveState = "confirmed",
+    ): Promise<void> {
+        await seedDeposit(orderId, { order: { state: "expired" }, deposit: { state: "closed" } });
+        const moveId = await seedMove(orderId, {
+            kind: "close",
+            state: moveState,
+            heldMicros: 7_000,
+            txSignature: moveState === "confirmed" ? null : SIG(90),
+        });
+        await seedTransfer(orderId, {
+            ...t,
+            amountMicros: 7_000,
+            outcome: "review",
+            moveId,
+        });
+    }
+
+    async function signedFile(signer: KeyPairSigner, message: string): Promise<string> {
+        const bytes = await signBytes(signer.keyPair.privateKey, new TextEncoder().encode(message));
+        const path = join(dir, `signed-${files++}.json`);
+        writeFileSync(
+            path,
+            JSON.stringify({ message, signature: getBase58Decoder().decode(bytes) }),
+        );
+        return path;
+    }
+
+    // Each account answers as an initialized token account of the given owner
+    const accountsRpc = (owners: Readonly<Record<string, string>>, over: { mint?: string } = {}) =>
+        createFakeRpc({
+            getAccountInfo: (a: string) =>
+                owners[a] === undefined ? { value: null } : usdcAccountAnswer(owners[a], over),
+        });
+
+    function logLine(
+        io: ReturnType<typeof captureIo>,
+        msg: string,
+    ): Record<string, unknown> | null {
+        for (const line of io.errText().split("\n")) {
+            if (!line.startsWith("{")) continue;
+            const parsed = JSON.parse(line) as Record<string, unknown>;
+            if (parsed.msg === msg) return parsed;
+        }
+        return null;
+    }
+
+    const sha256 = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
+
+    it("list prints one line per deposit", async () => {
+        for (const [i, id] of [ORDER_A, ORDER_B].entries()) {
+            await seedDeposit(id);
+            await seedTransfer(id, {
+                signature: SIG(60 + i),
+                amountMicros: 30_000,
+                owner: "OwnA",
+                source: "SrcA",
+            });
+        }
+        const io = captureIo();
+        expect(await cli(["deposits", "list"], io)).toBe(0);
+        const lines = io.outText().split("\n");
+        expect(lines).toHaveLength(2);
+        for (const [i, id] of [ORDER_A, ORDER_B].entries()) {
+            expect(lines[i]!.startsWith(`${id} `)).toBe(true);
+            expect(lines[i]).toContain(
+                "state=open received=30000 returned=0 kept=0 review=0 held=0",
+            );
+        }
+        for (const filter of [
+            ["--state", "settling"],
+            ["--version", "2"],
+        ]) {
+            const none = captureIo();
+            expect(await cli(["deposits", "list", ...filter], none)).toBe(0);
+            expect(none.outText()).toBe("");
+        }
+        expect(await cli(["deposits", "list", "--state", "lost"])).toBe(2);
+    });
+
+    it("--review only lists flagged deposits", async () => {
+        await seedDeposit(ORDER_A);
+        await seedTransfer(ORDER_A, {
+            signature: SIG(61),
+            amountMicros: 7_000,
+            outcome: "review",
+            reason: "unattributed",
+        });
+        await seedDeposit(ORDER_B);
+        await seedTransfer(ORDER_B, {
+            signature: SIG(62),
+            amountMicros: 30_000,
+            owner: "OwnA",
+            source: "SrcA",
+        });
+        const io = captureIo();
+        expect(await cli(["deposits", "list", "--review"], io)).toBe(0);
+        const lines = io.outText().split("\n");
+        expect(lines).toHaveLength(1);
+        expect(lines[0]).toContain(
+            `${ORDER_A} state=open received=7000 returned=0 kept=0 review=7000 held=0`,
+        );
+    });
+
+    it("show prints shares and refund parts", async () => {
+        const orderId = newOrderId();
+        await seedDeposit(orderId, { order: { state: "refunding" }, deposit: { state: "done" } });
+        await seedSharedPayment(db.pool, orderId);
+        const moveId = await seedMove(orderId, {
+            kind: "sweep",
+            state: "confirmed",
+            amountMicros: 50_000,
+            destination: "Recipient",
+            txSignature: SIG(63),
+        });
+        await seedTransfer(orderId, {
+            signature: SIG(64),
+            amountMicros: 30_000,
+            outcome: "paid",
+            owner: "OwnA",
+            source: "SrcA",
+            moveId,
+        });
+        const targets = (await refundTargets(db.pool, orderId, 50_000))!;
+        await withTx(db.pool, (c) =>
+            insertRefundGroup(
+                c,
+                {
+                    orderId,
+                    kind: "full",
+                    reason: "operator",
+                    fromWallet: "refund",
+                    budgetWaived: false,
+                    at: LATER,
+                },
+                targets,
+            ),
+        );
+        const io = captureIo();
+        expect(await cli(["deposits", "show", orderId], io)).toBe(0);
+        const lines = io.outText().split("\n");
+        const starts = (prefix: string) => lines.some((l) => l.startsWith(prefix));
+        expect(starts(`deposit ${orderId} state=done`)).toBe(true);
+        expect(starts(`transfer ${SIG(64)} 30000 paid`)).toBe(true);
+        expect(starts(`move ${moveId} sweep confirmed`)).toBe(true);
+        expect(starts("share 0 OwnA 30000")).toBe(true);
+        expect(starts("share 1 OwnB 20000")).toBe(true);
+        expect(starts("refund full part 0/2 OwnA 30000 pending")).toBe(true);
+        expect(starts("refund full part 1/2 OwnB 20000 pending")).toBe(true);
+
+        const unknown = captureIo();
+        expect(await cli(["deposits", "show", newOrderId()], unknown)).toBe(1);
+        expect(unknown.errText()).toContain("no deposit for");
+    });
+
+    it("retry clears review and requeues a manual sweep", async () => {
+        await seedDeposit(ORDER_A, {
+            order: { state: "settling" },
+            deposit: { state: "settling", review_reason: "move_expired_repeatedly" },
+        });
+        const failed = await seedMove(ORDER_A, {
+            kind: "sweep",
+            state: "failed",
+            amountMicros: 50_000,
+            destination: "Recipient",
+            txSignature: SIG(65),
+        });
+        const sweep = await seedMove(ORDER_A, {
+            kind: "sweep",
+            state: "manual",
+            amountMicros: 50_000,
+            destination: "Recipient",
+            attempts: 3,
+            manualReason: "move_expired_repeatedly",
+            txSignature: SIG(66),
+        });
+        const io = captureIo();
+        expect(await cli(["deposits", "retry", ORDER_A], io, { now: () => LATER })).toBe(0);
+        expect(io.outText()).toBe(`deposit ${ORDER_A} retried: 1 move requeued`);
+        expect(await findDeposit(db.pool, ORDER_A)).toMatchObject({
+            reviewReason: null,
+            movesFailingResetAt: LATER,
+        });
+        expect(await findMove(db.pool, sweep)).toMatchObject({
+            state: "pending",
+            attempts: 0,
+            manualReason: null,
+        });
+        expect((await findMove(db.pool, failed))!.state).toBe("failed");
+    });
+
+    it("return-to returns review money still in the deposit", async () => {
+        const chain = await startFakeChain();
+        try {
+            const [sender, vaultOwner] = await Promise.all([testSigner(71), testSigner(72)]);
+            const vault = await usdcAta(vaultOwner.address);
+            const back = await usdcAta(sender.address);
+            chain.setTokenAccount({ address: vault, owner: vaultOwner.address, amount: 100_000n });
+            chain.setTokenAccount({ address: back, owner: sender.address, amount: 0n });
+            chain.setTokenAccount({ address: TOKEN_A, owner: ADDRESS_A, amount: 0n });
+            // A vault moved by a program: its owner did not sign, so the transfer has no source
+            const sig = await chain.vaultTransfer({
+                vault,
+                to: TOKEN_A,
+                micros: 7_000n,
+                signer: sender,
+            });
+            await seedDeposit(ORDER_A, {
+                order: { state: "expired" },
+                deposit: { state: "draining", rent_payer: "Fee" },
+            });
+            await seedTransfer(ORDER_A, {
+                signature: sig,
+                amountMicros: 7_000,
+                outcome: "review",
+                reason: "unattributed",
+                slot: chain.slot(),
+            });
+            const file = await signedFile(sender, `bugnet return-to ${ORDER_A} ${sig} ${back}`);
+            const io = captureIo();
+            const args = ["deposits", "return-to", ORDER_A, sig, back, "--signed", file];
+            expect(await cli(args, io, { rpc: chain.rpc, now: () => LATER })).toBe(0);
+            expect(io.outText()).toBe(`transfer ${sig} returns to ${back}`);
+            const ledger = (await depositLedger(db.pool, ORDER_A))!;
+            expect(ledger.transfers).toMatchObject([
+                {
+                    outcome: "return",
+                    reason: "operator",
+                    sourceTokenAccount: back,
+                    sourceOwner: sender.address,
+                    moveId: null,
+                },
+            ]);
+            const input: PlanInput = {
+                order: (await findOrder(db.pool, ORDER_A))!,
+                deposit: ledger.deposit,
+                read: {
+                    exists: true,
+                    micros: 7_000n,
+                    contextSlot: chain.slot(),
+                    invariant: "held",
+                },
+                expectedMicros: 7_000n,
+                transfers: ledger.transfers,
+                moves: ledger.moves,
+                holds: ledger.holds,
+                bugnetOwners: new Set(),
+                viewer: { seen: false, ipRented: 0, blockRented: 0 },
+                rentHolding: 0,
+                unpaidCreateLeft: 0n,
+                feeBudgetLeft: 2_000_000n,
+                ownerReturns: new Map(),
+                feePayer: "Fee",
+                now: LATER,
+                cfg: loadSettings(config).deposits,
+            };
+            expect(planDeposit(input)).toMatchObject({
+                kind: "move",
+                move: {
+                    kind: "return",
+                    amountMicros: 7_000,
+                    destination: back,
+                    payer: sender.address,
+                },
+                transfers: [sig],
+            });
+        } finally {
+            await chain.close();
+        }
+    });
+
+    it("return-to returns held money from the float", async () => {
+        const ownA = await testSigner(73);
+        const first = await usdcAta(ownA.address);
+        const second = (await testSigner(74)).address;
+        const rpc = accountsRpc({ [first]: ownA.address, [second]: ownA.address });
+        await heldTransfer(ORDER_A, {
+            signature: SIG(64),
+            reason: "return_destination_invalid",
+            owner: ownA.address,
+            source: "SrcGone",
+        });
+        const run = async (account: string) => {
+            const io = captureIo();
+            const code = await cli(["deposits", "return-to", ORDER_A, SIG(64), account], io, {
+                rpc,
+                now: () => LATER,
+            });
+            return { code, io };
+        };
+        const inserted = await run(first);
+        expect(inserted.code).toBe(0);
+        const id = (await heldRefundId(db.pool, ORDER_A, SIG(64)))!;
+        expect(inserted.io.outText()).toBe(`refund ${id} pays ${first}`);
+        expect(await refundOf(id)).toMatchObject({
+            kind: "deposit",
+            amountMicros: 7_000,
+            destination: first,
+            payer: ownA.address,
+            state: "pending",
+        });
+
+        const again = await run(first);
+        expect(again.code).toBe(1);
+        expect(again.io.errText()).toContain(`refund ${id} is pending`);
+
+        await db.pool.query(
+            `update refunds set state = 'manual', manual_reason = 'refund_destination_invalid',
+                attempts = 3 where id = $1`,
+            [id],
+        );
+        const repointed = await run(second);
+        expect(repointed.code).toBe(0);
+        expect(repointed.io.outText()).toBe(`refund ${id} now pays ${second}`);
+        expect(await refundOf(id)).toMatchObject({
+            destination: second,
+            payer: ownA.address,
+            state: "pending",
+            attempts: 0,
+        });
+    });
+
+    it("return-to refuses while a move is in flight", async () => {
+        const ownA = await testSigner(73);
+        const first = await usdcAta(ownA.address);
+        await heldTransfer(
+            ORDER_A,
+            {
+                signature: SIG(64),
+                reason: "return_destination_invalid",
+                owner: ownA.address,
+                source: "SrcGone",
+            },
+            "sent",
+        );
+        const before = await depositLedger(db.pool, ORDER_A);
+        const io = captureIo();
+        const rpc = accountsRpc({ [first]: ownA.address });
+        expect(await cli(["deposits", "return-to", ORDER_A, SIG(64), first], io, { rpc })).toBe(1);
+        expect(io.errText()).toContain(
+            `deposit ${ORDER_A} has a move in flight; try again shortly`,
+        );
+        expect(await depositLedger(db.pool, ORDER_A)).toEqual(before);
+    });
+
+    it("return-to refuses an account with another mint", async () => {
+        const ownA = await testSigner(73);
+        const first = await usdcAta(ownA.address);
+        await heldTransfer(ORDER_A, {
+            signature: SIG(64),
+            reason: "return_destination_invalid",
+            owner: ownA.address,
+            source: "SrcGone",
+        });
+        for (const rpc of [
+            accountsRpc({ [first]: ownA.address }, { mint: OTHER_MINT }),
+            accountsRpc({}),
+        ]) {
+            const io = captureIo();
+            expect(await cli(["deposits", "return-to", ORDER_A, SIG(64), first], io, { rpc })).toBe(
+                1,
+            );
+            expect(io.errText()).toContain(`account ${first} is not a USDC token account`);
+        }
+        expect(await heldRefundId(db.pool, ORDER_A, SIG(64))).toBeNull();
+    });
+
+    it("return-to refuses another owner's account without a proof", async () => {
+        const [ownA, attacker] = await Promise.all([testSigner(73), testSigner(75)]);
+        const [own, theirs] = await Promise.all([usdcAta(ownA.address), usdcAta(attacker.address)]);
+        const rpc = accountsRpc({ [own]: ownA.address, [theirs]: attacker.address });
+        await heldTransfer(ORDER_A, {
+            signature: SIG(64),
+            reason: "return_failed",
+            owner: ownA.address,
+            source: own,
+        });
+        const refused = captureIo();
+        expect(
+            await cli(["deposits", "return-to", ORDER_A, SIG(64), theirs], refused, { rpc }),
+        ).toBe(1);
+        expect(refused.errText()).toContain("destination is not the sender's; pass --signed");
+        expect(logLine(refused, "deposit return-to")).toBeNull();
+        expect(await heldRefundId(db.pool, ORDER_A, SIG(64))).toBeNull();
+
+        const io = captureIo();
+        expect(await cli(["deposits", "return-to", ORDER_A, SIG(64), own], io, { rpc })).toBe(0);
+        expect(logLine(io, "deposit return-to")).toMatchObject({
+            orderId: ORDER_A,
+            signature: SIG(64),
+            destination: own,
+            proof: "owner",
+            proofSha256: null,
+        });
+        expect(await heldRefundId(db.pool, ORDER_A, SIG(64))).not.toBeNull();
+    });
+
+    it("return-to accepts a message the sender signed", async () => {
+        const [ownA, attacker, other] = await Promise.all([
+            testSigner(73),
+            testSigner(75),
+            testSigner(76),
+        ]);
+        const [own, theirs] = await Promise.all([usdcAta(ownA.address), usdcAta(attacker.address)]);
+        const rpc = accountsRpc({ [theirs]: attacker.address });
+        await heldTransfer(ORDER_A, {
+            signature: SIG(64),
+            reason: "return_failed",
+            owner: ownA.address,
+            source: own,
+        });
+        const message = `bugnet return-to ${ORDER_A} ${SIG(64)} ${theirs}`;
+        const args = (file: string) => [
+            "deposits",
+            "return-to",
+            ORDER_A,
+            SIG(64),
+            theirs,
+            "--signed",
+            file,
+        ];
+        for (const [signer, text] of [
+            [other, message],
+            [ownA, `bugnet return-to ${ORDER_A} ${SIG(64)} ${own}`],
+            [ownA, `bugnet return-to ${ORDER_B} ${SIG(64)} ${theirs}`],
+        ] as const) {
+            const io = captureIo();
+            expect(await cli(args(await signedFile(signer, text)), io, { rpc })).toBe(1);
+            expect(io.errText()).toContain("signature does not match");
+        }
+        expect(await heldRefundId(db.pool, ORDER_A, SIG(64))).toBeNull();
+
+        const file = await signedFile(ownA, message);
+        const io = captureIo();
+        expect(await cli(args(file), io, { rpc })).toBe(0);
+        const id = await heldRefundId(db.pool, ORDER_A, SIG(64));
+        expect(io.outText()).toBe(`refund ${id} pays ${theirs}`);
+        expect(await refundOf(id!)).toMatchObject({ destination: theirs, payer: attacker.address });
+        expect(logLine(io, "deposit return-to")).toMatchObject({
+            proof: "signed",
+            proofSha256: sha256(file),
+        });
+
+        // A transfer with no source: a signer of its transaction speaks for it
+        const chain = await startFakeChain();
+        try {
+            const [payerOfTx, vaultOwner] = await Promise.all([testSigner(77), testSigner(78)]);
+            const vault = await usdcAta(vaultOwner.address);
+            const back = await usdcAta(payerOfTx.address);
+            const depositAta = (await testSigner(79)).address;
+            chain.setTokenAccount({ address: vault, owner: vaultOwner.address, amount: 9_000n });
+            chain.setTokenAccount({ address: back, owner: payerOfTx.address, amount: 0n });
+            chain.setTokenAccount({ address: theirs, owner: attacker.address, amount: 0n });
+            chain.setTokenAccount({ address: depositAta, owner: ADDRESS_B, amount: 0n });
+            const sig = await chain.vaultTransfer({
+                vault,
+                to: depositAta,
+                micros: 7_000n,
+                signer: payerOfTx,
+            });
+            await heldTransfer(ORDER_B, {
+                signature: sig,
+                reason: "unattributed",
+                slot: chain.slot(),
+            });
+            const run = async (signer: KeyPairSigner, account: string) => {
+                const text = `bugnet return-to ${ORDER_B} ${sig} ${account}`;
+                const out = captureIo();
+                const code = await cli(
+                    [
+                        "deposits",
+                        "return-to",
+                        ORDER_B,
+                        sig,
+                        account,
+                        "--signed",
+                        await signedFile(signer, text),
+                    ],
+                    out,
+                    { rpc: chain.rpc },
+                );
+                return { code, out };
+            };
+            const stranger = await run(attacker, theirs);
+            expect(stranger.code).toBe(1);
+            expect(stranger.out.errText()).toContain("signature does not match");
+            const sender = await run(payerOfTx, back);
+            expect(sender.code).toBe(0);
+            const held = await heldRefundId(db.pool, ORDER_B, sig);
+            expect(sender.out.outText()).toBe(`refund ${held} pays ${back}`);
+        } finally {
+            await chain.close();
+        }
+    });
+
+    describe("on chain", () => {
+        let chain: FakeChain;
+        let payer: KeyPairSigner;
+        let stranger: KeyPairSigner;
+        let payerAta: string;
+        let strangerAta: string;
+        let feePayerKey: string;
+        let feePayer: string;
+
+        beforeEach(async () => {
+            chain = await startFakeChain();
+            [payer, stranger] = await Promise.all([testSigner(81), testSigner(82)]);
+            [payerAta, strangerAta] = await Promise.all([
+                usdcAta(payer.address),
+                usdcAta(stranger.address),
+            ]);
+            chain.setTokenAccount({ address: payerAta, owner: payer.address, amount: 100_000n });
+            chain.setTokenAccount({
+                address: strangerAta,
+                owner: stranger.address,
+                amount: 100_000n,
+            });
+            const fee = await generateExportableKeypair();
+            feePayerKey = fee.secretBase58;
+            feePayer = fee.signer.address;
+        });
+        afterEach(async () => {
+            await chain.close();
+        });
+
+        const chainEnv = (over: Record<string, string> = {}) => ({
+            BUGNET_SOLANA_RPC_URLS: chain.url,
+            BUGNET_FEE_PAYER_KEY: feePayerKey,
+            BUGNET_DEPOSIT_SEED: SEED_7,
+            ...over,
+        });
+        const run = async (
+            args: string[],
+            o: { env?: Record<string, string>; config?: string; stdin?: string } = {},
+        ) => {
+            const io = captureIo();
+            const stdin = o.stdin;
+            const withStdin = stdin === undefined ? io : { ...io, stdin: async () => stdin };
+            const code = await cliMain(
+                ["-config", o.config ?? config, "deposits", ...args],
+                o.env ?? chainEnv(),
+                withStdin,
+            );
+            return { code, io };
+        };
+
+        // A done deposit's account made again by the payer with 2,000, then 1 micro from a stranger
+        async function lateMoney(orderId: string, owner: string) {
+            await seedDeposit(orderId, { order: { state: "paid" }, deposit: { state: "done" } });
+            const token = await usdcAta(address(owner));
+            const paid = await chain.transfer({
+                authority: payer,
+                feePayer: payer,
+                source: payerAta,
+                destination: token,
+                micros: 2_000n,
+                createDestinationFor: owner,
+            });
+            const dust = await chain.transfer({
+                authority: stranger,
+                feePayer: stranger,
+                source: strangerAta,
+                destination: token,
+                micros: 1n,
+            });
+            return { token, paid, dust };
+        }
+
+        it("return-late lists the credits", async () => {
+            const { paid, dust } = await lateMoney(ORDER_A, ADDRESS_A);
+            const { code, io } = await run(["return-late", ORDER_A]);
+            expect(code).toBe(0);
+            expect(io.outText().split("\n")).toEqual([
+                `${paid} 2000 source=${payerAta} owner=${payer.address} signed=yes`,
+                `${dust} 1 source=${strangerAta} owner=${stranger.address} signed=yes`,
+            ]);
+            expect(chain.balance(TOKEN_A)).toBe(2_001n);
+            expect(chain.balance(payerAta)).toBe(98_000n);
+            expect(chain.balance(strangerAta)).toBe(99_999n);
+
+            // Only credits after the cursor are listed
+            await db.pool.query("update deposits set last_signature = $2 where order_id = $1", [
+                ORDER_A,
+                paid,
+            ]);
+            const later = await run(["return-late", ORDER_A]);
+            expect(later.io.outText().split("\n")).toEqual([
+                `${dust} 1 source=${strangerAta} owner=${stranger.address} signed=yes`,
+            ]);
+
+            // A credit the job recorded was decided by the job
+            await seedTransfer(ORDER_A, { signature: dust, amountMicros: 1, outcome: "keep" });
+            const recorded = await run(["return-late", ORDER_A]);
+            expect(recorded.io.outText()).toBe("no credits since the cursor");
+        });
+
+        it("return-late returns only the named credits, each to its own source", async () => {
+            const { paid, dust } = await lateMoney(ORDER_A, ADDRESS_A);
+            const one = await run(["return-late", ORDER_A, "--signature", paid]);
+            expect(one.code).toBe(0);
+            expect(chain.balance(payerAta)).toBe(100_000n);
+            expect(chain.balance(strangerAta)).toBe(99_999n);
+            expect(chain.balance(TOKEN_A)).toBe(1n);
+            expect(chain.accountExists(TOKEN_A)).toBe(true);
+            const sent = one.io.outText().split("\n")[0]!.replace("confirmed ", "");
+
+            // The returned credit is marked, and naming it again moves nothing
+            const listed = await run(["return-late", ORDER_A]);
+            expect(listed.io.outText().split("\n")).toEqual([
+                `${paid} 2000 source=${payerAta} owner=${payer.address} signed=yes returned=${sent}`,
+                `${dust} 1 source=${strangerAta} owner=${stranger.address} signed=yes`,
+            ]);
+            const twice = await run(["return-late", ORDER_A, "--signature", paid]);
+            expect(twice.code).toBe(1);
+            expect(twice.io.errText()).toContain(`credit ${paid} was returned in ${sent}`);
+            expect(chain.balance(TOKEN_A)).toBe(1n);
+
+            const b = await lateMoney(ORDER_B, ADDRESS_B);
+            const rent = chain.lamports(b.token);
+            const payerLamports = chain.lamports(payer.address);
+            const both = await run([
+                "return-late",
+                ORDER_B,
+                "--signature",
+                b.paid,
+                "--signature",
+                b.dust,
+            ]);
+            expect(both.code).toBe(0);
+            expect(chain.balance(payerAta)).toBe(100_000n);
+            expect(chain.balance(strangerAta)).toBe(99_999n);
+            expect(chain.accountExists(b.token)).toBe(false);
+            expect(chain.lamports(payer.address)).toBe(payerLamports + rent);
+
+            // A pool vault's credit: its owner never signed, so it has no source to go back to
+            const vaultOwner = await testSigner(83);
+            const vault = await usdcAta(vaultOwner.address);
+            chain.setTokenAccount({ address: vault, owner: vaultOwner.address, amount: 5_000n });
+            const pooled = await chain.vaultTransfer({
+                vault,
+                to: TOKEN_A,
+                micros: 3_000n,
+                signer: stranger,
+            });
+            const refused = await run(["return-late", ORDER_A, "--signature", pooled]);
+            expect(refused.code).toBe(1);
+            expect(refused.io.errText()).toContain(`credit ${pooled} has no signer-owned source`);
+            expect(chain.balance(TOKEN_A)).toBe(3_001n);
+        });
+
+        it("--archive signs an old version", async () => {
+            const v2 = join(dir, "seed-v2.toml");
+            const recipient = loadSettings(config).solana.recipient;
+            writeFileSync(
+                v2,
+                stringify({
+                    database: { url: db.url },
+                    solana: { recipient },
+                    deposits: { seed_version: 2 },
+                }),
+            );
+            const current = Buffer.alloc(32, 9).toString("base64");
+            const wrongSeed = Buffer.alloc(32, 8).toString("base64");
+            const env = chainEnv({ BUGNET_DEPOSIT_SEED: current });
+            const archive = join(dir, `archive-${files++}.env`);
+            writeFileSync(archive, `BUGNET_DEPOSIT_SEED_V1=${SEED_7}\n`);
+            const wrong = join(dir, `archive-${files++}.env`);
+            writeFileSync(wrong, `BUGNET_DEPOSIT_SEED_V1=${wrongSeed}\n`);
+            const { paid } = await lateMoney(ORDER_A, ADDRESS_A);
+            const args = ["return-late", ORDER_A, "--signature", paid];
+
+            const missing = await run(args, { env, config: v2 });
+            expect(missing.code).toBe(1);
+            expect(missing.io.errText()).toContain(
+                "seed for key version 1 is not loaded; pass --archive",
+            );
+            const bad = await run([...args, "--archive", wrong], { env, config: v2 });
+            expect(bad.code).toBe(1);
+            expect(bad.io.errText()).toContain(
+                `BUGNET_DEPOSIT_SEED_V1 does not derive the stored deposit address of ${ORDER_A}`,
+            );
+            expect(chain.balance(TOKEN_A)).toBe(2_001n);
+
+            const ok = await run([...args, "--archive", archive], { env, config: v2 });
+            expect(ok.code).toBe(0);
+            expect(chain.balance(payerAta)).toBe(100_000n);
+            for (const r of [missing, bad, ok]) {
+                for (const seed of [SEED_7, current, wrongSeed]) {
+                    expect(r.io.outText() + r.io.errText()).not.toContain(seed);
+                }
+            }
+        });
+
+        it("return-sol sends the lamports back", async () => {
+            await seedDeposit(ORDER_A, { order: { state: "paid" }, deposit: { state: "done" } });
+            chain.fundLamports(ADDRESS_A, 1_000_000n);
+            const to = (await testSigner(84)).address;
+            const { code, io } = await run(["return-sol", ORDER_A, to]);
+            expect(code).toBe(0);
+            const [line] = io.outText().split("\n");
+            expect(line).toMatch(/^confirmed \S+$/);
+            const sent = line!.replace("confirmed ", "");
+            expect(chain.lamports(to)).toBe(1_000_000n);
+            expect(chain.lamports(ADDRESS_A)).toBe(0n);
+            const tx = (await chain.rpc
+                .getTransaction(toSignature(sent), {
+                    encoding: "jsonParsed",
+                    commitment: "confirmed",
+                    maxSupportedTransactionVersion: 0,
+                })
+                .send()) as unknown as {
+                transaction: {
+                    message: {
+                        accountKeys: { pubkey: string; signer: boolean }[];
+                        instructions: { programId: string; parsed?: unknown }[];
+                    };
+                };
+            };
+            const { accountKeys, instructions } = tx.transaction.message;
+            expect(accountKeys.filter((k) => k.signer).map((k) => k.pubkey)).toEqual([
+                feePayer,
+                ADDRESS_A,
+            ]);
+            const system = instructions.filter(
+                (i) => i.programId === "11111111111111111111111111111111",
+            );
+            expect(system).toHaveLength(1);
+            expect(system[0]!.parsed).toMatchObject({
+                type: "transfer",
+                info: { source: ADDRESS_A, destination: to },
+            });
+        });
+
+        it("--archive - reads the archive from stdin", async () => {
+            const v2 = join(dir, "seed-v2-stdin.toml");
+            const recipient = loadSettings(config).solana.recipient;
+            writeFileSync(
+                v2,
+                stringify({
+                    database: { url: db.url },
+                    solana: { recipient },
+                    deposits: { seed_version: 2 },
+                }),
+            );
+            const env = chainEnv({ BUGNET_DEPOSIT_SEED: Buffer.alloc(32, 9).toString("base64") });
+            await seedDeposit(ORDER_A, { order: { state: "paid" }, deposit: { state: "done" } });
+            chain.fundLamports(ADDRESS_A, 1_000_000n);
+            const to = (await testSigner(84)).address;
+            const piped = await run(["return-sol", ORDER_A, to, "--archive", "-"], {
+                env,
+                config: v2,
+                stdin: `BUGNET_DEPOSIT_SEED_V1=${SEED_7}\n`,
+            });
+            expect(piped.code).toBe(0);
+            expect(chain.lamports(to)).toBe(1_000_000n);
+            expect(piped.io.outText() + piped.io.errText()).not.toContain(SEED_7);
+        });
     });
 });

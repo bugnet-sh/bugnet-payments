@@ -65,6 +65,9 @@ create table deposits (
             'move_expired_repeatedly')),
     -- a hold that stops every owner; holds of one owner are deposit_holds rows
     hold_reason text check (hold_reason in ('allowance_paused', 'router_unavailable')),
+    -- set by deposits retry: rule 7 counts only sweeps that failed after it, so a retried
+    -- deposit gets a fresh max_attempts without losing its failure history (17)
+    moves_failing_reset_at timestamptz,
     recheck_at timestamptz,
     expiry_due_at timestamptz,
     hard_stop_at timestamptz,

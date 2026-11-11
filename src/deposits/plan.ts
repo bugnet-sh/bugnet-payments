@@ -300,12 +300,16 @@ function notPayable(c: Ctx): Plan | null {
     return assign(rows);
 }
 
-// Rule 7. A failed move that carried CloseAccount only makes later moves close separately.
+// Rule 7. A failed move that carried CloseAccount only makes later moves close separately. Sweeps
+// that failed before an operator's retry no longer count.
 function failingMoves(c: Ctx): Plan | null {
-    const { moves, cfg } = c.i;
+    const { moves, cfg, deposit } = c.i;
     const failed = moves.filter((m) => m.state === "failed" && !m.closes);
     const sweepsConfirmed = moves.some((m) => m.kind === "sweep" && m.state === "confirmed");
-    const failedSweeps = failed.filter((m) => m.kind === "sweep").length;
+    const reset = deposit.movesFailingResetAt?.getTime() ?? null;
+    const failedSweeps = failed.filter(
+        (m) => m.kind === "sweep" && (reset === null || m.createdAt.getTime() > reset),
+    ).length;
     if (!sweepsConfirmed && failedSweeps >= cfg.max_attempts) {
         return { kind: "assign", rows: [], review: "moves_failing" };
     }

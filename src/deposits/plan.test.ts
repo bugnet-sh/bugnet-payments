@@ -45,6 +45,7 @@ function depositRow(over: Partial<DepositRow> = {}): DepositRow {
         viewerBlock: null,
         reviewReason: null,
         holdReason: null,
+        movesFailingResetAt: null,
         recheckAt: null,
         expiryDueAt: null,
         hardStopAt: null,
@@ -625,6 +626,33 @@ describe("planDeposit: failing moves", () => {
                     sweep(3, "failed", false),
                 ],
                 read: { micros: 50_000n },
+            }),
+        );
+        expect(p).toEqual({ kind: "assign", rows: [], review: "moves_failing" });
+    });
+
+    it("a retry counts only the sweeps that failed after it", () => {
+        const before = [1, 2, 3].map((id) => ({
+            ...sweep(id, "failed", false),
+            createdAt: ago(60_000),
+        }));
+        const retried = { movesFailingResetAt: ago(30_000) };
+        const again = planDeposit(
+            settling({
+                transfers: [paidA1],
+                moves: before,
+                read: { micros: 50_000n },
+                deposit: retried,
+            }),
+        );
+        expect(again).toMatchObject({ kind: "move", move: { kind: "sweep" } });
+        const after = [4, 5, 6].map((id) => sweep(id, "failed", false));
+        const p = planDeposit(
+            settling({
+                transfers: [paidA1],
+                moves: [...before, ...after],
+                read: { micros: 50_000n },
+                deposit: retried,
             }),
         );
         expect(p).toEqual({ kind: "assign", rows: [], review: "moves_failing" });

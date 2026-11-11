@@ -47,6 +47,7 @@ export interface DepositRow {
     viewerBlock: string | null;
     reviewReason: ReviewReason | null;
     holdReason: DepositHoldReason | null;
+    movesFailingResetAt: Date | null;
     recheckAt: Date | null;
     expiryDueAt: Date | null;
     hardStopAt: Date | null;

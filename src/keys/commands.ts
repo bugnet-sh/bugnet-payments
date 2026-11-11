@@ -6,7 +6,9 @@
  * Only `generate`, `rotate-deposit-seed`, `retire-deposit-seed`, `testseller` and
  * `drain --testseller` read an env file; every other command reads the process environment. The
  * two seed commands run as root on the server's env file and print variable names only, never a
- * value. Only `drain --allowance` parses the TOML settings, to check the key
+ * value, except `retire-deposit-seed --archive -`, whose stdout is the archive line a Mac-side
+ * script carries off the server (D8 A). Only `drain --allowance` parses the TOML settings, to
+ * check the key
  * against the configured allowance wallet and the hot ledger: `fund --create-recipient-ata` takes
  * the recipient address itself, so it never reads a config that names another wallet. The test
  * payer pays every fee and every ATA rent, so no other wallet needs SOL for these commands.
@@ -44,6 +46,8 @@ import {
     generateSecrets,
     parseEnvText,
     type PlannedTx,
+    previousSeedLine,
+    removeArchivedSeed,
     retireDepositSeed,
     rotateDepositSeed,
     testSellerDrainPlan,
@@ -56,6 +60,7 @@ import { existsSync, readFileSync } from "node:fs";
 interface Io {
     out: (s: string) => void;
     err: (s: string) => void;
+    stdin?: () => Promise<string>;
 }
 
 interface Flags {
@@ -76,7 +81,10 @@ const POLL_BACKOFF_MS = 250;
 const COMMANDS: Record<string, { values: string[]; switches: string[] }> = {
     generate: { values: ["--env"], switches: [] },
     "rotate-deposit-seed": { values: ["--env"], switches: [] },
-    "retire-deposit-seed": { values: ["--env", "--archive", "--version"], switches: [] },
+    "retire-deposit-seed": {
+        values: ["--env", "--archive", "--version"],
+        switches: ["--remove-previous"],
+    },
     fund: {
         values: ["--fee-payer-lamports", "--refund-usdc-micros", "--create-recipient-ata"],
         switches: ["--create-refund-ata", "--create-allowance-ata"],
@@ -93,6 +101,9 @@ export const KEYS_USAGE = [
     "  keys retire-deposit-seed --env FILE --archive FILE --version N",
     "                                           archive the previous deposit seed as version N,",
     "                                           then remove it from the env file",
+    "  keys retire-deposit-seed --env FILE --archive - --version N [--remove-previous]",
+    "                                           print the archive line; --remove-previous removes",
+    "                                           the seed once stdin holds that line",
     "  keys fund [--fee-payer-lamports N] [--refund-usdc-micros M]",
     "            [--create-recipient-ata RECIPIENT_ADDRESS] [--create-refund-ata]",
     "            [--create-allowance-ata]",
@@ -168,10 +179,20 @@ export async function runKeys(
     const source =
         readsEnvFile && existsSync(envFile) ? parseEnvText(readFileSync(envFile, "utf8")) : env;
     const archive = flags.values.get("--archive");
-    const archived =
-        archive !== undefined && existsSync(archive)
-            ? Object.values(parseEnvText(readFileSync(archive, "utf8")))
-            : [];
+    // Phase 2 of D8 A reads the archive back on stdin; phase 1 writes it to stdout
+    let piped: Record<string, string> | null = null;
+    if (archive === "-" && flags.switches.has("--remove-previous")) {
+        if (io.stdin === undefined) {
+            io.err("--archive - needs the archive on stdin");
+            return 2;
+        }
+        piped = parseEnvText(await io.stdin());
+    }
+    const file =
+        archive !== undefined && archive !== "-" && existsSync(archive)
+            ? parseEnvText(readFileSync(archive, "utf8"))
+            : {};
+    const archived = Object.values(piped ?? file);
     const sellerFile =
         (action === "testseller" || flags.switches.has("--testseller")) && flags.values.has("--env")
             ? sellerEnvFile(envFile, existsSync(envFile))
@@ -193,7 +214,7 @@ export async function runKeys(
             case "rotate-deposit-seed":
                 return rotateSeed(flags, io);
             case "retire-deposit-seed":
-                return retireSeed(flags, io);
+                return retireSeed(flags, io, piped);
             case "pubkey":
                 return pubkey(env, io);
             case "show":
@@ -300,7 +321,7 @@ function rotateSeed(flags: Flags, io: Io): number {
     return 0;
 }
 
-function retireSeed(flags: Flags, io: Io): number {
+function retireSeed(flags: Flags, io: Io, piped: Readonly<Record<string, string>> | null): number {
     const envPath = flags.values.get("--env");
     const archivePath = flags.values.get("--archive");
     if (envPath === undefined || archivePath === undefined) {
@@ -310,6 +331,11 @@ function retireSeed(flags: Flags, io: Io): number {
     const version = flags.values.get("--version") ?? "";
     if (!/^[1-9][0-9]{0,8}$/.test(version)) {
         io.err("--version needs a whole number of at least 1");
+        return 2;
+    }
+    if (archivePath === "-") return retireThroughStdio(envPath, Number(version), piped, io);
+    if (flags.switches.has("--remove-previous")) {
+        io.err("--remove-previous takes the archive on stdin: --archive -");
         return 2;
     }
     const name = `BUGNET_DEPOSIT_SEED_V${version}`;
@@ -325,6 +351,33 @@ function retireSeed(flags: Flags, io: Io): number {
     io.out(archived ? `archived ${name}` : `${name} was already archived`);
     io.out("removed BUGNET_DEPOSIT_SEED_PREVIOUS");
     return 0;
+}
+
+// D8 A: status lines go to stderr, so stdout carries only the archive line
+function retireThroughStdio(
+    envPath: string,
+    version: number,
+    piped: Readonly<Record<string, string>> | null,
+    io: Io,
+): number {
+    if (piped === null) {
+        const line = previousSeedLine(envPath, version);
+        if (line === null) io.err("nothing to retire");
+        else io.out(line);
+        return 0;
+    }
+    const name = `BUGNET_DEPOSIT_SEED_V${version}`;
+    switch (removeArchivedSeed(envPath, version, piped)) {
+        case "nothing":
+            io.out("nothing to retire");
+            return 0;
+        case "mismatch":
+            io.err(`${name} on stdin does not match BUGNET_DEPOSIT_SEED_PREVIOUS; nothing removed`);
+            return 1;
+        case "removed":
+            io.out("removed BUGNET_DEPOSIT_SEED_PREVIOUS");
+            return 0;
+    }
 }
 
 async function testSeller(
@@ -635,7 +688,7 @@ async function sendAndConfirm(
 
 // Waits by block height, not wall clock: a transaction can land any time before its blockhash
 // expires, so only an expired blockhash with no status proves it never will.
-async function waitForLanding(
+export async function waitForLanding(
     rpc: SolanaRpc,
     txSignature: string,
     lastValidBlockHeight: bigint,

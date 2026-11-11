@@ -175,6 +175,30 @@ export function retireDepositSeed(o: { envPath: string; archivePath: string; ver
     return { archived: kept === "", removed: true };
 }
 
+// D8 A, phase 1: the line a Mac-side script appends to the offline archive. The env file keeps
+// the seed until phase 2 sees that line read back, so a seed is never lost in transit.
+export function previousSeedLine(envPath: string, version: number): string | null {
+    const previous = readEnvFile(envPath).env[DEPOSIT_SEED_PREVIOUS] ?? "";
+    return previous === "" ? null : `${DEPOSIT_SEED}_V${version}=${previous}`;
+}
+
+// D8 A, phase 2: the seed leaves the env file only when the archive holds this same value
+export function removeArchivedSeed(
+    envPath: string,
+    version: number,
+    archive: Readonly<Record<string, string>>,
+): "removed" | "nothing" | "mismatch" {
+    const { lines, env } = readEnvFile(envPath);
+    const previous = env[DEPOSIT_SEED_PREVIOUS] ?? "";
+    if (previous === "") return "nothing";
+    if (archive[`${DEPOSIT_SEED}_V${version}`] !== previous) return "mismatch";
+    writeEnvFile(
+        envPath,
+        lines.filter((l) => LINE.exec(l)?.[1] !== DEPOSIT_SEED_PREVIOUS),
+    );
+    return "removed";
+}
+
 export async function fundingPlan(o: {
     testPayer: KeyPairSigner;
     feePayer: Address;

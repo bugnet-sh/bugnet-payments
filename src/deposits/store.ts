@@ -44,6 +44,7 @@ interface DepositDbRow extends pg.QueryResultRow {
     viewer_block: string | null;
     review_reason: DepositRow["reviewReason"];
     hold_reason: DepositRow["holdReason"];
+    moves_failing_reset_at: Date | null;
     recheck_at: Date | null;
     expiry_due_at: Date | null;
     hard_stop_at: Date | null;
@@ -148,6 +149,7 @@ function toDeposit(r: DepositDbRow): DepositRow {
         viewerBlock: r.viewer_block,
         reviewReason: r.review_reason,
         holdReason: r.hold_reason,
+        movesFailingResetAt: r.moves_failing_reset_at,
         recheckAt: r.recheck_at,
         expiryDueAt: r.expiry_due_at,
         hardStopAt: r.hard_stop_at,
@@ -486,6 +488,7 @@ const DEPOSIT_COLUMNS: Record<keyof DepositUpdate, string> = {
     viewerBlock: "viewer_block",
     reviewReason: "review_reason",
     holdReason: "hold_reason",
+    movesFailingResetAt: "moves_failing_reset_at",
     recheckAt: "recheck_at",
     expiryDueAt: "expiry_due_at",
     hardStopAt: "hard_stop_at",
