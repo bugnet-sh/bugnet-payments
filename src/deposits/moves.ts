@@ -3,12 +3,12 @@
  * ledger before any move that takes money out, and a re-sign only after the deposit's own proof.
  *
  * A pending move is checked, guarded, signed and stored as `signed` in one database transaction,
- * then sent; nothing is broadcast before COMMIT. A move in flight is checked once
- * `move_check_after` has passed since its send: confirmed when it landed, failed when it failed
- * on chain, resent unchanged while it is missing and its blockhash is valid, and signed again
- * once the blockhash expired only when a pinned balance read and a history scan both show that
- * none of its signatures landed. Every call runs on `rpc`, the money lane. An RPC error leaves
- * the row for the next tick.
+ * then sent; nothing is broadcast before COMMIT. A move a scan listed as landed is confirmed at
+ * once. Any other move in flight is checked once `move_check_after` has passed since its send:
+ * confirmed when it landed, failed when it failed on chain, resent unchanged while it is missing
+ * and its blockhash is valid, and signed again once the blockhash expired only when a pinned
+ * balance read and a history scan both show that none of its signatures landed. Every call runs
+ * on `rpc`, the money lane. An RPC error leaves the row for the next tick.
  */
 import {
     address,
@@ -250,7 +250,10 @@ export async function buildMoveTransaction(
 export async function guardRead(
     d: Pick<MoveDeps, "pool" | "rpc" | "rpcTimeoutMs" | "log">,
     deposit: DepositRow,
-    move: MoveRow,
+    move: Pick<
+        MoveRow,
+        "id" | "orderId" | "state" | "closes" | "amountMicros" | "keepMicros" | "heldMicros"
+    >,
     ledger: Ledger,
 ): Promise<{ verdict: GuardVerdict; slot: bigint; micros: bigint }> {
     const pin = maxOf([
@@ -511,7 +514,7 @@ async function signMove(
     );
     if (stored === null) return "wait";
     const pin = guardSlot > signed.contextSlot ? guardSlot : signed.contextSlot;
-    await send(d, stored, signed.wire, FRESH_SEND, pin);
+    await sendMove(d, stored, signed.wire, FRESH_SEND, pin);
     return "signed";
 }
 
@@ -532,8 +535,8 @@ function refusedAtPreflight(err: unknown): boolean {
  * resent; its landing proof, not this mark, decides whether a fee counts (spec 11.2). A
  * BlockhashNotFound or any other send error leaves the row for the next check.
  */
-async function send(
-    d: MoveDeps,
+export async function sendMove(
+    d: Pick<MoveDeps, "pool" | "rpc" | "rpcTimeoutMs" | "log" | "now">,
     move: Pick<MoveRow, "id" | "orderId" | "txSignature">,
     wire: string,
     config: typeof FRESH_SEND | typeof RESEND,
@@ -576,6 +579,15 @@ async function send(
 }
 
 async function checkInFlight(d: MoveDeps, move: MoveRow, tick: MoveTick): Promise<void> {
+    // A scan listed one of its signatures as landed (spec 10.3), which no status read can undo
+    if (move.landedSlot !== null) {
+        const signature = await landedSignature(d, move);
+        if (signature !== null) {
+            const landed = { signature, slot: move.landedSlot };
+            if (await confirmMove(d, move, landed)) tick.confirmed++;
+            return;
+        }
+    }
     const now = d.now().getTime();
     const since = move.sentAt ?? move.signedAt;
     if (since === null || now - since.getTime() < d.cfg.move_check_after) return;
@@ -607,7 +619,7 @@ async function checkInFlight(d: MoveDeps, move: MoveRow, tick: MoveTick): Promis
         case "not_found":
             if (move.preflightRefusedAt !== null) return;
             if (now - since.getTime() < d.cfg.resend_after) return;
-            if (await send(d, move, wireTx, RESEND)) tick.resent++;
+            if (await sendMove(d, move, wireTx, RESEND)) tick.resent++;
             return;
         case "blockhash_expired":
             await expired(d, move, read.slot, tick);

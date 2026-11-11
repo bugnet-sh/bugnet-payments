@@ -86,6 +86,9 @@ interface PaymentDbRow extends pg.QueryResultRow {
     created_at: Date;
     confirmed_at: Date | null;
     landed_slot: string | number | bigint | null;
+    payer_counted: boolean;
+    multi_sender: boolean;
+    split_min_micros: string | number | null;
 }
 
 function toOrder(r: OrderDbRow): OrderRow {
@@ -135,6 +138,9 @@ function toPayment(r: PaymentDbRow): PaymentRow {
         createdAt: r.created_at,
         confirmedAt: r.confirmed_at,
         landedSlot: r.landed_slot === null ? null : BigInt(r.landed_slot),
+        payerCounted: r.payer_counted,
+        multiSender: r.multi_sender,
+        splitMinMicros: r.split_min_micros === null ? null : Number(r.split_min_micros),
     };
 }
 
@@ -234,8 +240,9 @@ export async function setOrderState(
 export async function insertPayment(c: Queryable, p: NewPayment): Promise<void> {
     await c.query(
         `insert into payments (order_id, tx_signature, message_hash, payer, source_token_account,
-            amount_micros, blockhash, last_valid_block_height, status, created_at, key_sha256)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, 'settling', $9, $10)`,
+            amount_micros, blockhash, last_valid_block_height, status, created_at, key_sha256,
+            payer_counted, multi_sender, split_min_micros)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, 'settling', $9, $10, $11, $12, $13)`,
         [
             p.orderId,
             p.txSignature,
@@ -247,8 +254,31 @@ export async function insertPayment(c: Queryable, p: NewPayment): Promise<void> 
             p.lastValidBlockHeight.toString(),
             p.createdAt,
             p.keySha256 ?? null,
+            p.payerCounted ?? true,
+            p.multiSender ?? false,
+            p.splitMinMicros ?? null,
         ],
     );
+}
+
+// A deposit sweep signed again: the row names the attempt that can still land (spec 10.4)
+export async function replacePaymentTx(
+    c: pg.PoolClient,
+    orderId: string,
+    s: {
+        txSignature: string;
+        messageHash: string;
+        blockhash: string;
+        lastValidBlockHeight: bigint;
+    },
+): Promise<void> {
+    const res = await c.query(
+        `update payments set tx_signature = $2, message_hash = $3, blockhash = $4,
+            last_valid_block_height = $5
+         where order_id = $1`,
+        [orderId, s.txSignature, s.messageHash, s.blockhash, s.lastValidBlockHeight.toString()],
+    );
+    if (res.rowCount !== 1) throw new Error(`no payment for order ${orderId}`);
 }
 
 export async function paymentKeyHash(db: Queryable, orderId: string): Promise<Buffer | null> {

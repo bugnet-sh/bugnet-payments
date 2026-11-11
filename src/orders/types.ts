@@ -88,11 +88,23 @@ export interface PaymentRow {
     createdAt: Date;
     confirmedAt: Date | null;
     landedSlot: bigint | null;
+    // false only for a payment shared by several sending owners: its token names no payer
+    payerCounted: boolean;
+    multiSender: boolean;
+    // the smallest part of a split refund, set only on a multi-sender payment (spec 10.9)
+    splitMinMicros: number | null;
 }
 
-// createdAt comes from the injected clock, never from Postgres now(), so one clock decides every time rule.
-export type NewPayment = Omit<PaymentRow, "status" | "confirmedAt" | "landedSlot"> & {
+// createdAt comes from the injected clock, never from Postgres now(), so one clock decides every
+// time rule. A payment by one sender leaves the three sender fields at their defaults.
+export type NewPayment = Omit<
+    PaymentRow,
+    "status" | "confirmedAt" | "landedSlot" | "payerCounted" | "multiSender" | "splitMinMicros"
+> & {
     keySha256?: Buffer | null;
+    payerCounted?: boolean;
+    multiSender?: boolean;
+    splitMinMicros?: number | null;
 };
 
 // How the paying request reached us, from its Bugnet-Client header

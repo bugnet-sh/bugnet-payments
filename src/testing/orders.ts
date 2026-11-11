@@ -127,13 +127,16 @@ export async function seedPayment(
         createdAt: new Date(),
         confirmedAt: null,
         landedSlot: null,
+        payerCounted: true,
+        multiSender: false,
+        splitMinMicros: null,
         ...over,
     };
     await pool.query(
         `insert into payments (order_id, tx_signature, message_hash, payer, source_token_account,
             amount_micros, blockhash, last_valid_block_height, status, created_at, confirmed_at,
-            landed_slot)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+            landed_slot, payer_counted, multi_sender, split_min_micros)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
         [
             p.orderId,
             p.txSignature,
@@ -147,6 +150,9 @@ export async function seedPayment(
             p.createdAt,
             p.confirmedAt,
             p.landedSlot === null ? null : p.landedSlot.toString(),
+            p.payerCounted,
+            p.multiSender,
+            p.splitMinMicros,
         ],
     );
     return (await findPaymentByOrder(pool, orderId))!;

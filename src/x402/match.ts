@@ -14,7 +14,7 @@ import type { Settings } from "../config.ts";
 import { withTx, type Queryable } from "../db/pool.ts";
 import { isRecord } from "../is-record.ts";
 import type { Log } from "../log.ts";
-import { lockPayment, setPaymentLandedSlot } from "../orders/store.ts";
+import { lockOrder, lockPayment, setPaymentLandedSlot } from "../orders/store.ts";
 import type { X402ResolvedInput } from "../router/client.ts";
 import { confirmHotRefund } from "../refunds/hot.ts";
 import { TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
@@ -248,6 +248,8 @@ interface Matched {
     id: string | null;
     incidents: IncidentFact[];
     alarms?: Record<string, unknown>[];
+    // deposit_review alarms, fired after commit like the inflow alarms
+    reviews?: Record<string, unknown>[];
 }
 
 const sha256 = (s: string): Buffer =>
@@ -406,12 +408,36 @@ async function matchOrder(c: pg.PoolClient, tx: ChainTx): Promise<Matched | null
         [tx.signatures],
     );
     const orderId = found.rows[0]?.order_id;
-    if (orderId === undefined) return null;
+    if (orderId === undefined) return await matchEarlierSweep(c, tx);
     if (!tx.failed) {
         await lockPayment(c, orderId);
         await setPaymentLandedSlot(c, orderId, tx.slot);
     }
     return { kind: "order", id: orderId, incidents: [] };
+}
+
+// The re-sign proof (spec 11.2) should make this impossible: a deposit sweep's earlier attempt
+// landed, so the deposit may have paid twice and an operator must look (spec 10.7)
+async function matchEarlierSweep(c: pg.PoolClient, tx: ChainTx): Promise<Matched | null> {
+    const found = await c.query<{ order_id: string }>(
+        `select order_id from deposit_moves
+         where kind = 'sweep' and previous_signatures && $1::text[]
+         order by id limit 1`,
+        [tx.signatures],
+    );
+    const orderId = found.rows[0]?.order_id;
+    if (orderId === undefined) return null;
+    const matched: Matched = { kind: "order", id: orderId, incidents: [] };
+    if (tx.failed) return matched;
+    await lockPayment(c, orderId);
+    await lockOrder(c, orderId);
+    await c.query("update deposits set review_reason = 'double_sweep' where order_id = $1", [
+        orderId,
+    ]);
+    return {
+        ...matched,
+        reviews: [{ orderId, signature: tx.signature, reason: "double_sweep" }],
+    };
 }
 
 async function matchLateOrder(c: pg.PoolClient, tx: ChainTx): Promise<Matched | null> {
@@ -574,6 +600,9 @@ export async function storeAndMatch(
     for (const incident of m.incidents) await recordIncident(c, incident, d.log, d.now());
     for (const fields of m.alarms ?? []) {
         afterCommit.push(() => d.log.alarm("inflow_mismatch", fields));
+    }
+    for (const fields of m.reviews ?? []) {
+        afterCommit.push(() => d.log.alarm("deposit_review", fields));
     }
     return m.kind;
 }

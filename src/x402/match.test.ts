@@ -16,6 +16,7 @@ import { stringify } from "smol-toml";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { parseSettings, type Settings } from "../config.ts";
 import { withTx } from "../db/pool.ts";
+import { DepositKeys } from "../deposits/keys.ts";
 import { memoryLog } from "../log.ts";
 import { findPaymentByOrder } from "../orders/store.ts";
 import { findRefundById } from "../refunds/request.ts";
@@ -614,6 +615,45 @@ describe("storeAndMatch: orders", () => {
         const order = await hotOrderWithFailedPayment(s);
         expect(await match(await readTx(s))).toBe("order");
         expect(alarms("inflow_mismatch")).toEqual([expect.objectContaining({ orderId: order.id })]);
+    });
+
+    it("a previous sweep signature is matched and alarmed", async () => {
+        const live = chain.credit(hot, 1_013_000n);
+        const earlier = chain.credit(hot, 1_013_000n);
+        const order = await hotOrderPaidWith(db.pool, live);
+        const keys = new DepositKeys(new Map([[1, Buffer.alloc(32, 7)]]), 1);
+        const a = await keys.address(order.id, Buffer.alloc(16, 1));
+        await db.pool.query(
+            `insert into deposits (order_id, address, token_account, key_version, salt, state,
+                created_at, settled_at)
+             values ($1, $2, $3, 1, $4, 'closed', $5, $5)`,
+            [order.id, a.address, a.tokenAccount, Buffer.alloc(16, 1), NOW],
+        );
+        await db.pool.query(
+            `insert into deposit_moves (order_id, kind, amount_micros, destination, memo, state,
+                tx_signature, previous_signatures, attempts, created_at)
+             values ($1, 'sweep', 1013000, $2, $1, 'confirmed', $3, $4, 2, $5)`,
+            [order.id, hot, live, [earlier], NOW],
+        );
+
+        expect(await match(await readTx(earlier))).toBe("order");
+        expect(await chainRow(earlier)).toMatchObject({ matched: "order", matched_id: order.id });
+        expect(alarms("deposit_review")).toEqual([
+            expect.objectContaining({
+                orderId: order.id,
+                signature: earlier,
+                reason: "double_sweep",
+            }),
+        ]);
+        const deposit = await db.pool.query<{ review_reason: string }>(
+            "select review_reason from deposits where order_id = $1",
+            [order.id],
+        );
+        expect(deposit.rows).toEqual([{ review_reason: "double_sweep" }]);
+        expect(alarms("inflow_mismatch")).toEqual([]);
+
+        expect(await match(await readTx(live))).toBe("order");
+        expect(alarms("deposit_review")).toHaveLength(1);
     });
 });
 
