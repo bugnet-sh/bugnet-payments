@@ -757,20 +757,21 @@ function startDepositJob(
         queue,
     };
     const deps = { ...base, ...sweepHooks(base) };
-    let running = false;
+    // A count, not a flag: a run the lock skips ends while the tick it overlapped goes on
+    let running = 0;
     // A wake while a tick runs would find the lock taken and be skipped, so the paced loop runs
     // again as soon as that tick ends instead of after busy_every
     let wokenMeanwhile = false;
     const run = tracked(async () => {
-        running = true;
+        running++;
         try {
             return await singleRunner(pool, RUNNER_KEYS.deposits, () => runDepositTick(deps));
         } finally {
-            running = false;
+            running--;
         }
     });
     w.watch.wake.run = () => {
-        if (running) {
+        if (running > 0) {
             wokenMeanwhile = true;
             return;
         }
