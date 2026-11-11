@@ -245,10 +245,9 @@ describe("money decisions over the router", () => {
             .send();
         const report = await reconcile(r);
         expect(report.reverted).toBe(0);
-        const state = (await findOrder(db.pool, id))?.state;
-        // paid when c answered found; a null from c is no vote, so then the order waits
-        expect(["paid", "settling"]).toContain(state);
-        if (state === "settling") expect(absenceAlarms(r)).toHaveLength(1);
+        // c's null is no vote, so the order waits
+        expect((await findOrder(db.pool, id))?.state).toBe("settling");
+        expect(absenceAlarms(r)).toHaveLength(1);
     });
 
     describe("refunds", () => {
@@ -296,9 +295,12 @@ describe("money decisions over the router", () => {
 
         for (const mode of [false, "short"] as const) {
             it(`a history-less endpoint never re-signs a landed refund (history ${String(mode)})`, async () => {
-                const a = await chain.addEndpoint({ history: mode });
+                const a = await chain.addEndpoint();
                 const b = await chain.addEndpoint();
                 const r = await routed([a, b]);
+                // a keeps the history role it earned at boot, so its null is the first answer
+                // and only the quorum asks b
+                a.setHistory(mode);
                 const orderId = await pendingRefund();
                 expect((await runRefunds(deps(r), "refund")).sent).toBe(1);
                 advance(200);
@@ -322,6 +324,9 @@ describe("money decisions over the router", () => {
             const first = await runRefunds(d, "refund");
             expect(first.sent).toBe(0);
             expect(a.calls().some((c) => c.method === "sendTransaction")).toBe(true);
+            expect(b.calls().some((c) => c.method === "sendTransaction")).toBe(true);
+            const rpc2 = r.router.snapshot().endpoints.find((e) => e.name === "rpc2");
+            expect(rpc2?.outcomes.sendTransaction).toEqual({ "code_-32002": 1 });
             expect(JSON.stringify((d.log as ReturnType<typeof memoryLog>).lines)).toContain(
                 "send_unconfirmed",
             );
@@ -392,9 +397,11 @@ describe("money decisions over the router", () => {
         });
 
         it("resignProof never answers absent while one endpoint knows the transaction", async () => {
-            const a = await chain.addEndpoint({ history: "short" });
+            const a = await chain.addEndpoint();
             const b = await chain.addEndpoint();
             const r = await routed([a, b]);
+            // a keeps its history role, so its null answers first
+            a.setHistory("short");
             const sig = await pay();
             const expirySeenSlot = chain.slot();
             advance(400);
@@ -412,9 +419,11 @@ describe("money decisions over the router", () => {
         });
 
         it("checkLanded never releases while one endpoint knows the transaction", async () => {
-            const a = await chain.addEndpoint({ history: "short" });
+            const a = await chain.addEndpoint();
             const b = await chain.addEndpoint();
             const r = await routed([a, b]);
+            // a keeps its history role, so its null answers first
+            a.setHistory("short");
             const sig = await pay();
             const landedSlot = chain.slot();
             const row = await signedRow(db.pool, {
@@ -476,7 +485,50 @@ describe("money decisions over the router", () => {
             a.setLag(400, { refuse: true });
             chain.credit(hot, 5_000n);
             advance(1);
-            expect(await runMirror(d)).toMatchObject({ verified: true });
+            // A read from the lagging endpoint alone would verify too, but without the credit
+            expect(await runMirror(d)).toMatchObject({ verified: true, stored: 1 });
+        });
+
+        const pinnedReads = (ep: FakeChainEndpoint) =>
+            ep
+                .calls()
+                .filter(
+                    (c) =>
+                        c.method === "getAccountInfo" &&
+                        JSON.stringify(c.params).includes("minContextSlot"),
+                );
+
+        it("the mirror fails over when rpc1 lags and refuses its pin", async () => {
+            const a = await chain.addEndpoint();
+            const b = await chain.addEndpoint();
+            const r = await routed([a, b]);
+            const d = await mirrorDeps(r);
+            // Under max_slot_lag, so only the pin keeps a's read out; b answers the epoch read
+            a.setLag(30, { refuse: true });
+            a.failNext(500);
+            chain.credit(hot, 5_000n);
+            advance(1);
+            const before = pinnedReads(a).length;
+            expect(await runMirror(d)).toMatchObject({ verified: true, stored: 1 });
+            expect(pinnedReads(a).length - before).toBe(1);
+        });
+
+        it("an endpoint that ignores minContextSlot never serves a read below its pin", async () => {
+            const a = await chain.addEndpoint({ ignoreMinContextSlot: true });
+            const b = await chain.addEndpoint();
+            const r = await routed([a, b]);
+            expect(r.router.snapshot().endpoints[0]!.checks.pinnedAccounts).toBe("ignored");
+            const d = await mirrorDeps(r);
+            // a answers its own view, 30 slots below the pin that b's epoch read gives
+            a.setLag(30, { refuse: false });
+            a.failNext(500);
+            chain.credit(hot, 5_000n);
+            advance(1);
+            const before = pinnedReads(a).length;
+            const run = await runMirror(d);
+            expect(run).toMatchObject({ verified: true, stored: 1 });
+            expect(pinnedReads(a).length - before).toBe(1);
+            expect(run.c).toBeGreaterThanOrEqual(run.c0);
         });
 
         it("the mirror fails over when rpc1 dies", async () => {
@@ -565,6 +617,20 @@ describe("money decisions over the router", () => {
             expect(await createRpc(a.url).getBlockHeight().send()).toBe(chain.height() - 120n);
             const record = await settleUnknownBlockhash(r);
             expect(record.lastValidBlockHeight).toBeGreaterThanOrEqual(chain.height() + 250n);
+        });
+
+        it("a payment settles through a lagging rpc1 that has not seen its blockhash", async () => {
+            const a = await chain.addEndpoint();
+            const b = await chain.addEndpoint();
+            const r = await routed([a, b]);
+            // Under max_slot_lag, so rpc1 serves, but its simulation misses the fresh blockhash
+            a.setLag(30, { refuse: false });
+            const simulations = (ep: FakeChainEndpoint) =>
+                ep.calls().filter((c) => c.method === "simulateTransaction").length;
+            const before = [simulations(a), simulations(b)];
+            const record = await settleUnknownBlockhash(r);
+            expect([simulations(a), simulations(b)]).toEqual([before[0]! + 1, before[1]! + 1]);
+            expect(chain.submitted().map((t) => t.signature)).toContain(record.signature);
         });
 
         it("a lagging endpoint from boot keeps the stored height above the real one", async () => {

@@ -482,6 +482,33 @@ describe("boot checks", () => {
         expect((await rejection(read)).reason).toBe("absence_unconfirmed");
         expect([asked(t.b), asked(t.c)]).toEqual([before[0], before[1]! + 1]);
     });
+
+    // rpc1 and rpc2 report one node; rpc3 is on its own
+    async function sharing(): Promise<Setup> {
+        const t = routed(3);
+        for (const ep of [t.a, t.b]) {
+            tweak(t, ep, (m) =>
+                m === "getIdentity" ? rpcOk({ identity: "node-shared" }) : undefined,
+            );
+        }
+        await t.router.start({ timers: false });
+        return t;
+    }
+
+    it("a null transaction is asked again of another node, not of the one it shares", async () => {
+        const t = await sharing();
+        tweak(t, t.a, (m) => (m === "getTransaction" ? rpcOk(null) : undefined));
+        expect(await reaches(t, "getTransaction", TRANSACTION)).toEqual(["a", "c"]);
+    });
+
+    it("a send copy never goes to an endpoint that shares the node", async () => {
+        const t = await sharing();
+        const sends = (ep: FakeEndpoint) =>
+            ep.calls.filter((c) => c.method === "sendTransaction").length;
+        await call(t, "sendTransaction", ["AQID", { encoding: "base64" }]);
+        await new Promise((r) => setImmediate(r));
+        expect([t.a, t.b, t.c].map(sends)).toEqual([1, 0, 1]);
+    });
 });
 
 describe("pinned checks", () => {
@@ -664,6 +691,54 @@ describe("history checks", () => {
         expect(snap(t, "rpc1").consistent).toBe("yes");
     });
 
+    it("a run that finds nothing never clears a no", async () => {
+        const t = routed(2);
+        tweak(t, t.a, (m, _p, n) =>
+            m === "getSignatureStatuses" && n === 1 ? notFound(t) : undefined,
+        );
+        await t.router.start({ timers: false });
+        expect(snap(t, "rpc1").consistent).toBe("no");
+        // Every repeat answers and agrees, but the statuses find nothing
+        tweak(t, t.a, (m) => (m === "getSignatureStatuses" ? notFound(t) : undefined));
+        await tickAt(t, HOUR);
+        expect(snap(t, "rpc1")).toMatchObject({
+            consistent: "no",
+            checks: { history: "missing" },
+        });
+        tweak(t, t.a, () => undefined);
+        await tickAt(t, 2 * HOUR);
+        expect(snap(t, "rpc1").consistent).toBe("yes");
+    });
+
+    it("an hourly run waits out a cooldown", async () => {
+        const t = routed(2);
+        await t.router.start({ timers: false });
+        const first = historyCalls(t.a);
+        tweak(t, t.a, (m, _p, n) =>
+            m === "getSlot" && n === 0 ? httpFail(429, { "retry-after": "60" }) : undefined,
+        );
+        t.clock.ms = HOUR - 1_000;
+        expect(await reaches(t, "getSlot")).toEqual(["a", "b"]);
+        await tickAt(t, HOUR);
+        expect(historyCalls(t.a)).toBe(first);
+        await tickAt(t, HOUR + 60_000);
+        expect(historyCalls(t.a)).toBe(2 * first);
+    });
+
+    it("a CLI rerun waits out a cooldown within the cap", async () => {
+        const t = routed(2);
+        let rerunAt: number | null = null;
+        tweak(t, t.b, (m, _p, n) => {
+            if (m !== "getSignatureStatuses") return undefined;
+            if (n === 0) return httpFail(429, { "retry-after": "5" });
+            rerunAt ??= t.clock.ms;
+            return undefined;
+        });
+        const report = await t.router.start({ timers: false });
+        expect(report.endpoints[1]!.history).toBe("ok");
+        expect(rerunAt).toBe(5_000);
+    });
+
     it("an errored hourly run keeps consistent: yes", async () => {
         for (const fail of [() => httpFail(429), () => stall()]) {
             const t = routed(2);
@@ -830,6 +905,14 @@ describe("unreachable endpoints", () => {
         expect(await reaches(t, "getSlot")).toEqual(["b"]);
     });
 
+    it("a genesis 401 to 410 alarms once, with its own reason", async () => {
+        const t = routed(2);
+        tweak(t, t.a, (m) => (m === "getGenesisHash" ? httpFail(402) : undefined));
+        await t.router.start({ timers: false });
+        expect(snap(t, "rpc1").checks.genesis).toBe("error http_402");
+        expect(lines(t, "alarm")).toEqual([alarm("rpc1", "http_402", { status: 402 })]);
+    });
+
     it("no endpoint at all", async () => {
         const t = routed(2);
         for (const ep of [t.a, t.b]) ep.answer(() => netFail());
@@ -845,6 +928,44 @@ describe("unreachable endpoints", () => {
         tweak(t, t.a, () => undefined);
         await tickAt(t, 60_000);
         expect(await reaches(t, "getSlot")).toEqual(["a"]);
+    });
+});
+
+describe("the tick timer", () => {
+    it("the service's start ticks every 5 s until stop, and a CLI start never ticks", async () => {
+        vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+        onTestFinished(() => void vi.useRealTimers());
+        for (const timers of [true, false]) {
+            // A snapshot is written on the tick alone, once snapshot_every has passed
+            const written: unknown[] = [];
+            const t = routed(2, {}, { snapshots: { write: async (s) => void written.push(s) } });
+            await t.router.start({ timers });
+            const ticks = async (n: number) => {
+                for (let i = 0; i < n; i++) {
+                    t.clock.ms += 60_000;
+                    await vi.advanceTimersByTimeAsync(5_000);
+                    for (let j = 0; j < 5; j++) await new Promise((r) => setImmediate(r));
+                }
+            };
+            await ticks(3);
+            expect(written).toHaveLength(timers ? 3 : 0);
+            await t.router.stop();
+            await ticks(2);
+            expect(written).toHaveLength(timers ? 3 : 0);
+        }
+    });
+});
+
+describe("start line", () => {
+    it("a routed start names its positions", async () => {
+        const t = routed(2);
+        await t.router.start({ timers: false });
+        expect(lines(t, "info", "rpc router started")).toEqual([
+            { level: "info", msg: "rpc router started", endpoints: ["rpc1", "rpc2"] },
+        ]);
+        const single = routed(1);
+        await single.router.start({ timers: false });
+        expect(lines(single, "info")).toEqual([]);
     });
 });
 
@@ -903,6 +1024,36 @@ describe("single mode", () => {
             },
         ]);
         expect(await reaches(t, "getSlot")).toEqual(["a"]);
+    });
+
+    it("single mode only warns on a genesis 401 and opens no breaker", async () => {
+        const t = routed(1);
+        tweak(t, t.a, (m, _p, n) =>
+            m === "getGenesisHash" && n === 0 ? httpFail(401) : undefined,
+        );
+        await t.router.start({ timers: false });
+        expect(t.log.lines).toEqual([
+            {
+                level: "warn",
+                msg: "rpc genesis check failed",
+                endpoint: "rpc1",
+                outcome: "http_401",
+            },
+        ]);
+        await t.router.check();
+        expect(snap(t, "rpc1").state).toBe("ok");
+    });
+
+    it("single mode never enters probation on a long Retry-After", async () => {
+        const t = routed(1);
+        tweak(t, t.a, (m, _p, n) =>
+            m === "getGenesisHash" && n === 0 ? httpFail(429, { "retry-after": "600" }) : undefined,
+        );
+        await t.router.start({ timers: false });
+        // The 600 s wait is capped at 60 s; past it nothing but probes could end a probation
+        t.clock.ms += 61_000;
+        await t.router.check();
+        expect(snap(t, "rpc1").state).toBe("ok");
     });
 
     it("single mode never drops its endpoint", async () => {

@@ -1240,8 +1240,9 @@ export function formatRpcProbe(
     return lines;
 }
 
-// A missing history or consistent: no alone still serves reads, sends and found answers
-function probeFails(
+// A missing history or consistent: no alone still serves reads, sends and found answers. The
+// mainnet smoke test passes by the same rule (spec 12.3)
+export function probeFails(
     r: CheckReport,
     consistent: Readonly<Record<string, string>>,
     quorum: { ready: number; needed: number } | null,

@@ -25,7 +25,7 @@ import { RpcRouterError } from "./errors.ts";
 import { EndpointHealth, type Lane } from "./health.ts";
 import { LearnedLimits } from "./limits.ts";
 import { UNKNOWN_METHOD } from "./methods.ts";
-import { contextSlotOf, isObject, readRequest, type RouterRequest, rpcErrorOf } from "./payload.ts";
+import { isObject, readRequest, type RouterRequest, rpcErrorOf } from "./payload.ts";
 import {
     CHECK_PARTS,
     CHECK_TOTAL_MS,
@@ -185,9 +185,14 @@ interface Endpoint {
     passed: Record<keyof CheckState, boolean>;
     // The warns and alarms of a check's current failure, so each is raised once
     readonly alerted: Set<"unreachable" | "history" | "pinned">;
+    // The rpc_endpoint_down reasons raised since the breaker last closed, so each is raised once
+    // an outage
+    readonly downReasons: Set<string>;
     // At most one check run and one probe at a time
     checking: Promise<EndpointCheck> | null;
     probing: boolean;
+    // When tick() last sent an idle probe: one that got no slot must not repeat on every tick
+    idleProbeAt: number | null;
     // The checks that ended in an error run again at `at`, and each failure doubles the wait
     retry: { parts: ReadonlySet<CheckPart>; at: number; step: number } | null;
     // The next run of the history and pinned checks
@@ -298,6 +303,14 @@ const ROLE_REQUESTS: Readonly<Record<Role, RouterRequest>> = {
     })!,
 };
 const SYSTEM_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
+// A result that is not what the method returns, like a 200 that is not JSON
+const UNFIT: Outcome = {
+    kind: "failover",
+    strike: true,
+    history: false,
+    retryAfterMs: null,
+    ambiguous: true,
+};
 
 const ROUTERS = new WeakMap<RpcTransport, Router>();
 
@@ -388,6 +401,13 @@ function isOnly(answer: unknown, signature: string): boolean {
     }
     const [first] = answer.result;
     return isObject(first) && first.signature === signature;
+}
+
+// R8: a caller reads a missing entry as null, so statuses that are not one per signature asked
+// could turn a landed transaction into a missing one
+function unfitStatuses(req: RouterRequest, answer: unknown): boolean {
+    if (req.method !== "getSignatureStatuses" || req.signatures.length === 0) return false;
+    return statusesOf(answer)?.result.value.length !== req.signatures.length;
 }
 
 function hasStatus(answer: unknown): boolean {
@@ -503,8 +523,10 @@ class Router {
                     pinnedSignatures: false,
                 },
                 alerted: new Set(),
+                downReasons: new Set(),
                 checking: null,
                 probing: false,
+                idleProbeAt: null,
                 retry: null,
                 hourlyAt: null,
                 behindPin: null,
@@ -644,6 +666,10 @@ class Router {
         else report = o.timers ? await this.boot() : await this.checkAll(true);
         const wrong = report.endpoints.find((c) => c.genesis === "wrong");
         if (wrong !== undefined) throw new RpcRouterError("wrong_network", wrong.name);
+        if (this.mode === "routed") {
+            const endpoints = this.endpoints.map((ep) => ep.name);
+            this.deps.log.info("rpc router started", { endpoints });
+        }
         if (o.timers) this.startTimer();
         return report;
     }
@@ -674,7 +700,8 @@ class Router {
             if (ep.probing || ep.limits.coolingUntil(EPOCH_REQUEST.method) !== 0) continue;
             if (ep.health.probeDue()) {
                 work.push(this.recover(ep));
-            } else if (this.marksStale(ep, now)) {
+            } else if (this.idleProbeDue(ep, now)) {
+                ep.idleProbeAt = now;
                 work.push(this.probeEpoch(ep, this.s.attempt_timeout));
             }
         }
@@ -745,6 +772,15 @@ class Router {
                 const first = await this.runChecks(ep, all, probe, signal);
                 const again = erroredParts(first);
                 if (!rerun || again.size === 0 || signal.aborted) return first;
+                // A rerun into a Retry-After would meet another 429; one past the cap never runs
+                const cooling = ep.limits.endpointCoolingUntil() - this.deps.now();
+                if (cooling > 0) {
+                    try {
+                        await this.wait(cooling, signal);
+                    } catch {
+                        return first;
+                    }
+                }
                 return merged(first, await this.runChecks(ep, this.runParts(again), probe, signal));
             });
             return { endpoints: await Promise.all(checks) };
@@ -807,9 +843,10 @@ class Router {
         return set;
     }
 
-    // The hourly run brings the errored checks along; before it, only they run (spec 9)
+    // The hourly run brings the errored checks along; before it, only they run (spec 9). Like a
+    // probe, a run waits out a Retry-After, which its calls would only meet with 429s (6.3)
     private dueParts(ep: Endpoint, now: number): Set<CheckPart> | null {
-        if (ep.checking !== null) return null;
+        if (ep.checking !== null || ep.limits.endpointCoolingUntil() !== 0) return null;
         const hourly = ep.hourlyAt !== null && now >= ep.hourlyAt;
         const retry = ep.retry !== null && now >= ep.retry.at;
         if (!hourly && !retry) return null;
@@ -847,11 +884,14 @@ class Router {
             if (c.genesis === "ok") ep.alerted.delete("unreachable");
             if (failed && routed && !ep.alerted.has("unreachable")) {
                 ep.alerted.add("unreachable");
-                this.deps.log.alarm("rpc_endpoint_down", {
-                    endpoint: ep.name,
-                    reason: "unreachable",
-                    ...failureCode(c.genesisError),
-                });
+                // An open breaker alarmed its opening already, a 401 to 410 of this call included
+                if (ep.health.breaker() !== "open") {
+                    this.deps.log.alarm("rpc_endpoint_down", {
+                        endpoint: ep.name,
+                        reason: "unreachable",
+                        ...failureCode(c.genesisError),
+                    });
+                }
             }
         }
         if (c.identity !== null) this.sawIdentity(ep, c.identity);
@@ -871,9 +911,11 @@ class Router {
                 ep.passed.history = false;
             }
         }
-        // A run whose repeats did not all answer decides nothing (spec 8.10)
-        if (c.repeatsAgree !== null) {
-            const before = this.book.state(ep.name);
+        // A run whose repeats did not all answer decides nothing, and a "no" clears only after a
+        // run that found the probe every time (spec 8.10)
+        const before = this.book.state(ep.name);
+        const foundNothing = c.repeatsAgree === true && c.history !== "ok";
+        if (c.repeatsAgree !== null && !(before === "no" && foundNothing)) {
             this.book.checkRun(ep.name, c.repeatsAgree, startedAt);
             if (routed) this.marked(ep.name, before, "check_disagreed");
         }
@@ -920,9 +962,11 @@ class Router {
         }
     }
 
-    // Spec 6.5: an endpoint without a confirmed slot and height in probe_every
-    private marksStale(ep: Endpoint, now: number): boolean {
+    // Spec 6.5: an endpoint without a confirmed slot and height in probe_every, at most once in
+    // probe_every whatever the probe got (spec 13.3)
+    private idleProbeDue(ep: Endpoint, now: number): boolean {
         if (!ep.passed.genesis || ep.health.breaker() !== "closed") return false;
+        if (ep.idleProbeAt !== null && now - ep.idleProbeAt < this.s.probe_every) return false;
         return (["slot", "height"] as const).some((kind) => {
             const mark = this.slots.mark(ep.name, "confirmed", kind);
             return mark === null || now - mark.lastSeen >= this.s.probe_every;
@@ -949,6 +993,7 @@ class Router {
         const before = ep.health.breaker();
         ep.health.probeResult(good, sentAt);
         if (before !== "closed" && ep.health.breaker() === "closed") {
+            ep.downReasons.clear();
             this.deps.log.info("rpc endpoint back", { endpoint: ep.name });
         }
     }
@@ -973,11 +1018,15 @@ class Router {
         }
     }
 
-    // A check or probe call is counted and observed like traffic, but it never strikes, never
-    // fails over and logs nothing: its result is the check's
+    // A check or probe call is counted and observed like traffic, and a 429 or a 401 to 410
+    // acts as in traffic, so a quiet endpoint that only gets probes still leaves and alarms
+    // (spec 6.3, 6.4). It never strikes, never fails over and logs nothing: its result is the
+    // check's
     private checkTransport(ep: Endpoint): RpcTransport {
         return (async ({ payload, signal }: Config) => {
             const req = readRequest(payload) ?? opaqueRequest(payload);
+            // Counted but never held for background room: an hourly history check held on a busy
+            // rpc1 would delay catching a provider that cut its retention (spec 6.3)
             ep.limits.record(req.method, "background");
             ep.counters.count("background");
             ep.health.begin();
@@ -985,8 +1034,10 @@ class Router {
             try {
                 const answer = await ep.transport({ payload, signal });
                 ep.health.sample(this.deps.now() - started);
-                // Any answer, not only a result, says the endpoint is not rate limiting
-                ep.limits.succeeded(req.method);
+                const o = classifyAnswer(req.method, answer);
+                // Any other answer, not only a result, says the endpoint is not rate limiting
+                if (o.kind === "cooldown") this.cool(ep, req.method, o);
+                else ep.limits.succeeded(req.method);
                 this.observe(ep, req, answer);
                 const error = rpcErrorOf(answer);
                 ep.counters.outcome(req.method, error === null ? "ok" : codeLabel(error.code));
@@ -995,9 +1046,15 @@ class Router {
                 if (signal?.aborted) {
                     ep.counters.outcome(req.method, "timeout");
                 } else {
+                    const error = thrownError(err);
                     ep.counters.outcome(req.method, thrownLabel(err));
-                    ep.lastError = { at: this.deps.now(), ...thrownError(err) };
-                    this.cool(ep, req.method, classifyThrown(err, false, this.deps.now()));
+                    ep.lastError = { at: this.deps.now(), ...error };
+                    const o = classifyThrown(err, false, this.deps.now());
+                    this.cool(ep, req.method, o);
+                    // Single mode has no breaker: its failed genesis is one warn line (spec 3.4)
+                    if (this.mode === "routed" && (o.kind === "auth" || o.kind === "down")) {
+                        this.shutOut(ep, o, codeOf(error));
+                    }
                 }
                 throw err;
             } finally {
@@ -1072,11 +1129,13 @@ class Router {
         ep.health.sample(this.deps.now() - started);
         const error = rpcErrorOf(answer);
         ep.counters.outcome(method, error === null ? "ok" : codeLabel(error.code));
-        if (req !== null && req.spec.slot === "context" && req.minContextSlot !== null) {
-            const slot = contextSlotOf(answer);
-            if (slot !== null && slot < req.minContextSlot) {
-                throw new RpcRouterError("stale", ep.name);
-            }
+        const pin = req?.minContextSlot ?? null;
+        // A -32016 is the node's own answer, returned unchanged
+        if (req !== null && pin !== null && error === null) {
+            const below = observationsOf(req, answer).some(
+                (o) => o.slot !== undefined && o.slot < pin,
+            );
+            if (below) throw new RpcRouterError("stale", ep.name);
         }
         return answer;
     }
@@ -1157,7 +1216,9 @@ class Router {
         const floors = this.floorsOf(req);
         this.observe(ep, req, answer);
         this.remember(ep, req, answer);
-        const o = classifyAnswer(req.method, answer);
+        const classified = classifyAnswer(req.method, answer);
+        const unfit = classified.kind === "ok" && unfitStatuses(req, answer);
+        const o = unfit ? UNFIT : classified;
         const error = rpcErrorOf(answer);
         if (o.kind === "ok") {
             ep.health.succeed(a.elapsed);
@@ -1188,7 +1249,10 @@ class Router {
                 err: "SolanaError",
                 ...code,
             });
-        } else if (isObject(answer) && "result" in answer) {
+        } else if (unfit || !isObject(answer) || !("result" in answer)) {
+            this.react(ep, req, o, a.elapsed, {}, run);
+            this.failed(run, ep, req.method, "invalid", { err: "invalid_answer" });
+        } else {
             // R2: a context method's result without its slot could skip every slot check
             run.stale = ep.name;
             this.react(ep, req, o, a.elapsed, {}, run);
@@ -1196,9 +1260,6 @@ class Router {
                 err: "RpcRouterError",
                 reason: "stale",
             });
-        } else {
-            this.react(ep, req, o, a.elapsed, {}, run);
-            this.failed(run, ep, req.method, "invalid", { err: "invalid_answer" });
         }
         return { kind: "next" };
     }
@@ -1221,12 +1282,8 @@ class Router {
                 this.cool(ep, req.method, o);
                 return;
             case "auth":
-                ep.health.authFailed();
-                this.down(ep, "auth", code);
-                return;
             case "down":
-                ep.health.endpointDown();
-                this.down(ep, `http_${o.status}`, code);
+                this.shutOut(ep, o, code);
                 return;
             case "bad_request":
                 run.badRequests.push({ ep, ms: elapsed });
@@ -1255,15 +1312,17 @@ class Router {
 
     // A 429, or a 5xx with Retry-After (spec 6.3, 7.2)
     private cool(ep: Endpoint, method: string, o: Outcome): void {
+        // Single mode sends no probes, so a probation there would never end (spec 3.4)
+        const probation = this.mode === "routed";
         if (o.kind === "cooldown") {
             const { scope, capped } = ep.limits.hit429(method, o.retryAfterMs);
             // An endpoint-wide cooldown cut by the cap ends in probation, so probes decide
-            if (capped && scope === ENDPOINT_SCOPE) {
+            if (probation && capped && scope === ENDPOINT_SCOPE) {
                 ep.health.probationAt(ep.limits.endpointCoolingUntil());
             }
         } else if (o.kind === "failover" && o.retryAfterMs !== null) {
             const { capped } = ep.limits.coolEndpoint(o.retryAfterMs);
-            if (capped) ep.health.probationAt(ep.limits.endpointCoolingUntil());
+            if (probation && capped) ep.health.probationAt(ep.limits.endpointCoolingUntil());
         }
     }
 
@@ -1322,8 +1381,9 @@ class Router {
         this.deps.log.warn(run.failure, { endpoint: ep.name, method: req.method, outcome });
     }
 
-    // The getTransaction null path of spec 8.3: one more ask on another domain, a consistent
-    // endpoint while one is eligible, and its answer is returned whatever it holds
+    // The getTransaction null path of spec 8.3: one more ask on another domain, never one that
+    // shares the node (4.3), a consistent endpoint while one is eligible, and its answer is
+    // returned whatever it holds
     private async askAgain(
         first: Endpoint,
         firstAnswer: unknown,
@@ -1335,7 +1395,7 @@ class Router {
     ): Promise<unknown> {
         const now = this.deps.now();
         const others = choose(req, this.views(req, lane), { now, lane }).filter(
-            (v) => !run.tried.has(v.name) && this.endpoint(v.name).domain !== first.domain,
+            (v) => !run.tried.has(v.name) && !this.sameSource(first, this.endpoint(v.name)),
         );
         const view = others.find((v) => v.consistent) ?? others[0];
         if (view === undefined) return firstAnswer;
@@ -1612,7 +1672,8 @@ class Router {
         };
     }
 
-    // "pin" below the request's minContextSlot (R2), "floor" below the freshness floor (R3)
+    // "pin" below the request's minContextSlot (R2), "floor" below the freshness floor (R3). The
+    // pin holds for getSlot and getEpochInfo answers too, which are a slot themselves (spec 15)
     private refusalOf(
         req: RouterRequest,
         answer: unknown,
@@ -1620,7 +1681,7 @@ class Router {
     ): "pin" | "floor" | null {
         for (const o of observationsOf(req, answer)) {
             if (o.slot !== undefined) {
-                const pin = req.spec.slot === "context" ? req.minContextSlot : null;
+                const pin = req.minContextSlot;
                 if (pin !== null && o.slot < pin) return "pin";
                 if (floors.slot !== null && o.slot < floors.slot) return "floor";
             }
@@ -1658,7 +1719,22 @@ class Router {
         if (before === "closed" && ep.health.breaker() === "open") this.down(ep, "errors", code);
     }
 
+    // A 401 to 410 is about the URL: open for 10 min (spec 6.4). Its reason alarms once an
+    // outage, so a reopening in probation repeats no alarm (10.2), but a key revoked on an
+    // endpoint already out for errors still names the operator's next step
+    private shutOut(
+        ep: Endpoint,
+        o: Extract<Outcome, { kind: "auth" | "down" }>,
+        code: ErrorCode,
+    ): void {
+        if (o.kind === "auth") ep.health.authFailed();
+        else ep.health.endpointDown();
+        const reason = o.kind === "auth" ? "auth" : `http_${o.status}`;
+        if (!ep.downReasons.has(reason)) this.down(ep, reason, code);
+    }
+
     private down(ep: Endpoint, reason: string, code: ErrorCode): void {
+        ep.downReasons.add(reason);
         this.deps.log.alarm("rpc_endpoint_down", { endpoint: ep.name, reason, ...code });
     }
 

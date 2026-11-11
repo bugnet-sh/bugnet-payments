@@ -461,6 +461,20 @@ describe("priority and failover", () => {
         expect(snap(t.router, "rpc1").state).toBe("open");
     });
 
+    it("a 401 alarms once per opening", async () => {
+        const t = setup(2);
+        t.a.answer(() => httpFail(401));
+        t.b.answer(() => netFail("ECONNREFUSED"));
+        // b opens through strikes, and the relaxation then sends one request at a time to a
+        for (let i = 0; i < 10; i++) {
+            await call(t.router, "getSlot").catch(() => undefined);
+            t.clock.ms += 1_000;
+        }
+        expect(t.a.calls.length).toBeGreaterThan(2);
+        const reasons = alarms(t).map((l) => `${String(l.endpoint)} ${String(l.reason)}`);
+        expect(reasons).toEqual(["rpc1 auth", "rpc2 errors"]);
+    });
+
     it("a 403 opens the endpoint and alarms", async () => {
         const t = setup(2);
         t.a.answer(() => httpFail(403));
@@ -759,6 +773,55 @@ describe("slots and floors", () => {
         expect(snap(t.router, "rpc1").confirmedSlot).toBe("90");
     });
 
+    it("an answer below the request's own pin is refused like -32016", async () => {
+        const pinned = ["addr", { commitment: "confirmed", minContextSlot: 100n }];
+        const t = setup(2);
+        // Above the floor, which only a's own answer sets, so the pin alone refuses it
+        t.a.answer(() => rpcOk({ context: { slot: 90n }, value: 1n }));
+        const answer = rpcOk({ context: { slot: 120n }, value: 5n });
+        t.b.answer(() => answer);
+        expect(await call(t.router, "getAccountInfo", pinned)).toBe(answer);
+        // Tried last for that pin, as after a -32016
+        await call(t.router, "getAccountInfo", pinned);
+        expect(t.a.calls).toHaveLength(1);
+        expect(t.b.calls).toHaveLength(2);
+
+        const alone = setup(2);
+        alone.a.answer(() => rpcOk({ context: { slot: 90n }, value: 1n }));
+        alone.b.answer(() => netFail());
+        const e = await rejection(call(alone.router, "getAccountInfo", pinned));
+        expect(reasonOf(e)).toBe("stale");
+    });
+
+    it("a slot answer below the request's pin is refused too", async () => {
+        const pin = [{ commitment: "confirmed", minContextSlot: 100n }];
+        const t = setup(2);
+        t.a.answer(
+            chain(t.clock, {
+                getSlot: () => rpcOk(90n),
+                getEpochInfo: () => rpcOk(epochAt(0n, 90n)),
+            }),
+        );
+        t.b.answer(
+            chain(t.clock, {
+                getSlot: () => rpcOk(120n),
+                getEpochInfo: () => rpcOk(epochAt(20n, 120n)),
+            }),
+        );
+        expect(resultOf(await call(t.router, "getSlot", pin))).toBe(120n);
+        expect(resultOf(await call(t.router, "getEpochInfo", pin))).toEqual(epochAt(20n, 120n));
+
+        const single = setup(1);
+        single.a.answer(() => rpcOk(99n));
+        expect(reasonOf(await rejection(call(single.router, "getSlot", pin)))).toBe("stale");
+        // A -32016 is returned unchanged, as a node's own answer
+        const behind = rpcFail(-32016, "Minimum context slot has not been reached", {
+            contextSlot: 99n,
+        });
+        single.a.answer(() => behind);
+        expect(await call(single.router, "getSlot", pin)).toBe(behind);
+    });
+
     it("a pinned read reaches an endpoint probed 50 s ago", async () => {
         const t = setup(2);
         const epoch = await via(t, "rpc2", () =>
@@ -822,16 +885,28 @@ describe("slots and floors", () => {
     it("a dead endpoint never makes the live one lag", async () => {
         const t = setup(2);
         const confirmed = [{ commitment: "confirmed" }];
-        t.a.answer(() => rpcOk(1_000n));
-        expect(resultOf(await call(t.router, "getSlot", confirmed))).toBe(1_000n);
-        t.a.answer(() => netFail());
-        t.b.answer(() => rpcOk(1_000n + BigInt(Math.floor(t.clock.ms / 420))));
-        for (let ms = 5_000; ms <= 30 * 60_000; ms += 5_000) {
+        t.a.answer(() => rpcOk(5_000n));
+        expect(resultOf(await call(t.router, "getBlockHeight", confirmed))).toBe(5_000n);
+        // Silent from now on with its breaker closed, so only the 10 s reference window takes it
+        // out of b's lag, and only the 60 s projection cap keeps its mark under b's floor
+        setCheckState(t.router, "rpc1", { genesis: "error" });
+        // Slower than the 500 ms a block projection, as heights are when slots are skipped
+        const height = (ms: number) => 5_000n + BigInt(Math.floor(ms / 600));
+        t.b.answer(() => rpcOk(height(t.clock.ms)));
+        for (let ms = 15_000; ms <= 30 * 60_000; ms += 5_000) {
             t.clock.ms = ms;
-            const answer = await call(t.router, "getSlot", confirmed);
-            expect(resultOf(answer)).toBe(1_000n + BigInt(Math.floor(ms / 420)));
-            expect(snap(t.router, "rpc2").lag).toBe(0);
+            const answer = await call(t.router, "getBlockHeight", confirmed);
+            expect(resultOf(answer)).toBe(height(ms));
+            // b's own mark projects 2 blocks past it in 5 s; rpc1's mark would add about 95
+            expect(snap(t.router, "rpc2").lag).toBeLessThanOrEqual(2);
         }
+    });
+
+    it("a -32005 with numSlotsBehind is a lag sample", async () => {
+        const t = setup(2);
+        t.a.answer(() => rpcFail(-32005, "Node is behind by 99 slots", { numSlotsBehind: 99n }));
+        expect(resultOf(await call(t.router, "getSlot"))).toBe(1_000n);
+        expect(snap(t.router, "rpc1")).toMatchObject({ lag: 99, state: "lagging" });
     });
 
     it("the floor is per commitment", async () => {
@@ -1051,6 +1126,29 @@ describe("absence quorum", () => {
         t.b.answer(statuses(t, [S(7n, "confirmed")]));
         const answer = await call(t.router, "getSignatureStatuses", searching);
         expect((valueOf(answer) as Status[])[0]?.confirmationStatus).toBe("confirmed");
+    });
+
+    it("statuses that are not one per signature are never returned", async () => {
+        for (const params of [searching, [[SIG]]]) {
+            for (const value of [[], {}, [null, null]]) {
+                const t = setup(2);
+                t.a.answer(
+                    chain(t.clock, {
+                        getSignatureStatuses: () =>
+                            rpcOk({ context: { slot: slotAt(t.clock.ms) }, value }),
+                    }),
+                );
+                t.b.answer(statuses(t, [S(7n, "finalized")]));
+                const answer = await call(t.router, "getSignatureStatuses", params);
+                expect((valueOf(answer) as Status[])[0]?.confirmationStatus).toBe("finalized");
+                expect(snap(t.router, "rpc1").errorRate).toBe(1);
+            }
+        }
+        const t = setup(2);
+        for (const ep of [t.a, t.b]) ep.answer(statuses(t, []));
+        expect(reasonOf(await rejection(call(t.router, "getSignatureStatuses", searching)))).toBe(
+            "no_endpoint",
+        );
     });
 
     it("same-domain endpoints do not make a quorum", async () => {
@@ -1716,6 +1814,30 @@ describe("recovery", () => {
         expect(snap(t.router, "rpc1").state).toBe("open");
         expect(await served(t)).toBe("b");
         expect(back(t)).toEqual([]);
+    });
+
+    it("a 401 that reopens an endpoint out for errors alarms auth once an outage", async () => {
+        const t = setup(2, PROBED);
+        const reasons = () => alarms(t).map((l) => String(l.reason));
+        const tickAt = async (ms: number) => {
+            t.clock.ms = ms;
+            await t.router.tick();
+        };
+        await outAtZero(t);
+        t.a.answer(() => httpFail(401));
+        // Each probe reopens it for 10 min
+        for (const ms of [30_000, 630_000]) await tickAt(ms);
+        expect(probes(t)).toBe(2);
+        expect(reasons()).toEqual(["errors", "auth"]);
+
+        t.a.answer(chain(t.clock));
+        for (const ms of [1_230_000, 1_240_000, 1_250_000]) await tickAt(ms);
+        expect(back(t)).toHaveLength(1);
+        t.a.answer(() => netFail());
+        for (let i = 0; i < 5; i++) await call(t.router, "getSlot");
+        t.a.answer(() => httpFail(401));
+        await tickAt(1_250_000 + 30_000);
+        expect(reasons()).toEqual(["errors", "auth", "errors", "auth"]);
     });
 
     it("a lagging endpoint returns only at half the lag bound", async () => {

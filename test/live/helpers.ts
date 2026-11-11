@@ -18,7 +18,14 @@ import type { PaymentRequired } from "@x402/core/types";
 import { ExactSvmScheme, SOLANA_MAINNET_CAIP2 } from "@x402/svm";
 import { parse, stringify } from "smol-toml";
 import { expect } from "vitest";
-import { parseSettings, readSecrets, type Secrets, type Settings } from "../../src/config.ts";
+import {
+    ConfigError,
+    parseSettings,
+    readSecrets,
+    rpcUrlsOf,
+    type Secrets,
+    type Settings,
+} from "../../src/config.ts";
 import {
     ReserveAndSignRequestSchema,
     type ReserveAndSignResponse,
@@ -28,6 +35,7 @@ import {
 import type { RunningService } from "../../src/main.ts";
 import { orderKey, orderPublicKeyBase64 } from "../../src/orders/token.ts";
 import { usdcAta } from "../../src/solana/accounts.ts";
+import { checkRpcList, type RpcSettings } from "../../src/solana/router/index.ts";
 import type { SolanaRpc } from "../../src/solana/rpc.ts";
 import { startFakeRouter, type FakeRouter } from "../../src/testing/fake-router.ts";
 import { makeTestPki } from "../../src/testing/pki.ts";
@@ -83,6 +91,27 @@ export const COLD_OFF_MICROS = 1_000_000_000_000;
 
 export async function liveSettings(dbUrl: string, eventSeed: Buffer): Promise<Settings> {
     return parseSettings(stringify(await liveTables(dbUrl, eventSeed)), "live");
+}
+
+// The router settings, recipient and rpc_timeout of config/dev.toml, and the local list in its
+// order, checked by the service's rules; an error names positions only
+export function liveRpcSettings(env: NodeJS.ProcessEnv): {
+    settings: RpcSettings;
+    urls: string[];
+    recipient: string;
+    rpcTimeoutMs: number;
+} {
+    const dev = parse(readFileSync(resolve(REPO, "config/dev.toml"), "utf8")) as Tables;
+    const { solana } = parseSettings(stringify({ solana: dev.solana ?? {} }), "live-rpc");
+    const urls = rpcUrlsOf(env);
+    const problems = checkRpcList(solana.rpc, solana.rpc_timeout, urls);
+    if (problems.length > 0) throw new ConfigError(problems.join("\n"));
+    return {
+        settings: solana.rpc,
+        urls,
+        recipient: solana.recipient,
+        rpcTimeoutMs: solana.rpc_timeout,
+    };
 }
 
 // until polls every 20 ms, far above what the RPC plan allows

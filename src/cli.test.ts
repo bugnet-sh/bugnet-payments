@@ -1601,6 +1601,25 @@ describe("rpc commands", () => {
         expect(r.code).toBe(0);
     });
 
+    // Four URLs, so the quorum is met and only rpc3's error can fail the probe
+    it("rpc probe fails on a history check that errored", async () => {
+        const c = checkNode("c", { getTransaction: () => httpFail(503) });
+        const r = await probe(FOUR, [checkNode("a"), checkNode("b"), c, checkNode("d")]);
+        expect(r.out.find((l) => l.startsWith("rpc3"))).toMatch(/ {2}history: error {2}/);
+        expect(r.out).toContain("quorum: 3 of 2 domains ready");
+        expect(r.code).toBe(1);
+    });
+
+    it("rpc probe fails on a pinned check that errored at a consistent endpoint", async () => {
+        const c = checkNode("c", { getAccountInfo: () => httpFail(503) });
+        const r = await probe(FOUR, [checkNode("a"), checkNode("b"), c, checkNode("d")]);
+        expect(r.out.find((l) => l.startsWith("rpc3"))).toMatch(
+            /^rpc3 {2}genesis: ok {2}pinned-accounts: error {2}pinned-signatures: ok {2}history: ok {2}consistent: yes /,
+        );
+        expect(r.out).toContain("quorum: 4 of 2 domains ready");
+        expect(r.code).toBe(1);
+    });
+
     it("rpc probe names a genesis error", async () => {
         const broken = checkNode("a", { getGenesisHash: () => httpFail(400) });
         const r = await probe(TWO, [broken, checkNode("b")]);
@@ -1725,19 +1744,9 @@ describe("rpc commands", () => {
         it("the CLI proof uses the quorum", async () => {
             const sig = SIG(32);
             const id = await waitingRow(sig);
-            // a has no history at all; b knows the refund landed
-            const a = checkNode(
-                "a",
-                {
-                    getSignatureStatuses: (_m, params) =>
-                        statusesAnswer(
-                            AT,
-                            (params[0] as string[]).map(() => null),
-                        ),
-                    getTransaction: () => rpcOk(null),
-                },
-                AT,
-            );
+            // a passes its history check and answers null for sig alone, so its null is the first
+            // answer and only the quorum asks b, which knows the refund landed
+            const a = proofNode("a", sig);
             const knows = proofNode("b", sig, { getSignatureStatuses: statusesFor(sig, true) });
             const r = await retry(id, TWO, [a, knows]);
             expect(r.code).toBe(1);

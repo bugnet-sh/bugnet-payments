@@ -27,6 +27,10 @@ LimitCORE=0
 TimeoutStopSec=60
 Restart=on-failure
 RestartSec=2
+# A failing boot check restarts at once and then slower, up to every 5 min: each start calls every
+# RPC URL, so a loop every 2 s would spend the providers' daily caps (systemd 254 and later)
+RestartSteps=6
+RestartMaxDelaySec=5min
 
 [Install]
 WantedBy=multi-user.target

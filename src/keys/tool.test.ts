@@ -695,6 +695,34 @@ describe("keys commands without settings", () => {
             }
         });
 
+        it("a send that may have been delivered is checked by its landing", async () => {
+            const a = await chain.addEndpoint();
+            const b = await chain.addEndpoint();
+            // rpc1 lands the transfer and never answers; rpc2's preflight then finds it processed
+            a.stall("after", { methods: ["sendTransaction"] });
+            b.alreadyProcessed(true);
+            const funded = await generateExportableKeypair();
+            chain.fundLamports(funded.signer.address, 1_000_000n);
+            const env = {
+                ...(await drainEnv({ BUGNET_SOLANA_RPC_URLS: `${a.url},${b.url}` })),
+                BUGNET_FEE_PAYER_KEY: funded.secretBase58,
+            };
+            const file = join(dir, "keys-send.toml");
+            writeFileSync(
+                file,
+                stringify({
+                    solana: { recipient: recipient.address, rpc: { attempt_timeout: "2s" } },
+                }),
+            );
+            const before = chain.submitted().length;
+            const io = captureIo();
+            expect(await cliMain(["-config", file, "keys", "drain"], env, io)).toBe(0);
+            const landed = chain.submitted().slice(before);
+            expect(landed).toHaveLength(1);
+            expect(io.outText()).toBe(`confirmed ${landed[0]!.signature}`);
+            expect(b.calls().some((c) => c.method === "sendTransaction")).toBe(true);
+        });
+
         it("keys commands take the router settings from -config", async () => {
             // rpc1 takes each request and never answers, so each of its attempts runs to the
             // attempt timeout

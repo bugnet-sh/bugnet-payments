@@ -307,6 +307,44 @@ describe("alarms", () => {
         ]);
     });
 
+    it("a quiet fallback whose probes answer JSON-RPC 429 alarms too", async () => {
+        const t = setup();
+        t.b.answer(() => rpcFail(429, "Too many requests"));
+        // The service's tick, every 5 s
+        for (let ms = 0; ms <= 300_000; ms += 5_000) await tickAt(t, ms);
+        await tickAt(t, 301_000);
+        expect(alarms(t, "rpc_endpoint_down", { reason: "rate_limited" })).toEqual([
+            alarm("rpc_endpoint_down", { endpoint: "rpc2", reason: "rate_limited" }),
+        ]);
+        expect(snap(t, "rpc2").limits["*"]).toBe(1);
+    });
+
+    for (const [status, reason] of [
+        [401, "auth"],
+        [402, "http_402"],
+        [403, "http_403"],
+    ] as const) {
+        it(`a quiet fallback whose probes get ${status} opens and alarms once`, async () => {
+            const t = setup();
+            t.b.answer(() => httpFail(status));
+            for (let ms = 0; ms <= 600_000; ms += 5_000) await tickAt(t, ms);
+            expect(alarms(t, "rpc_endpoint_down", { endpoint: "rpc2" })).toEqual([
+                alarm("rpc_endpoint_down", { endpoint: "rpc2", reason, status }),
+            ]);
+            expect(snap(t, "rpc2").state).toBe("open");
+        });
+    }
+
+    it("an endpoint whose probes fail is probed once per probe_every", async () => {
+        for (const fail of [() => netFail("ECONNREFUSED"), () => httpFail(503)]) {
+            const t = setup();
+            t.b.answer(fail);
+            for (let ms = 0; ms <= 600_000; ms += 5_000) await tickAt(t, ms);
+            // At 0, 60 s, ... 600 s, as for an endpoint that answers (spec 13.3)
+            expect(t.b.calls).toHaveLength(11);
+        }
+    });
+
     it("the lag alarm waits 2 minutes", async () => {
         const t = setup();
         const behind = node(t.clock, "a", {
@@ -555,16 +593,27 @@ describe("snapshot", () => {
             () => rpcFail(35, "upstream https://one.x.example/ said no"),
             () => httpFail(403),
         ];
+        // a.example is the host a failed fetch's cause names (netFail)
+        const parts = [
+            ...urls,
+            "one.x.example",
+            "two.b.example",
+            "x.example",
+            "b.example",
+            "a.example",
+            "KEYKEYKEY",
+            "upstream",
+        ];
+        // Each failure in turn, since lastError keeps only the latest
         for (const fail of failures) {
             t.a.answer(fail);
             await call(t.router, "getSlot", CONFIRMED).catch(() => undefined);
             t.clock.ms += 6_000;
+            await t.router.tick();
+            const text = JSON.stringify(t.router.snapshot());
+            for (const part of parts) expect(text).not.toContain(part);
+            expect(snap(t, "rpc1").lastError).not.toBeNull();
         }
-        await t.router.tick();
-        const text = JSON.stringify(t.router.snapshot());
-        const parts = [...urls, "one.x.example", "two.b.example", "x.example", "b.example"];
-        for (const part of [...parts, "KEYKEYKEY", "upstream"]) expect(text).not.toContain(part);
-        expect(snap(t, "rpc1").lastError).not.toBeNull();
     });
 
     it("the snapshot is written every 15 s", async () => {

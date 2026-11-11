@@ -238,6 +238,21 @@ describe("readLanding", () => {
         expect((await readLanding(rpc, sig, 1_000n, 10_000)).landing).toBe(want);
     });
 
+    it.each([
+        ["no entry", []],
+        ["one entry for two signatures", [null]],
+        ["no list", {}],
+    ])("throws on statuses with %s, past expiry too", async (_n, value) => {
+        const rpc = createFakeRpc({
+            getEpochInfo: () => epochAt(1_001n),
+            getSignatureStatuses: () => ({ value }),
+        });
+        const earlierOnes = Array.isArray(value) && value.length === 1 ? [earlier] : [];
+        await expect(readLanding(rpc, sig, 1_000n, 10_000, earlierOnes)).rejects.toThrow(
+            "getSignatureStatuses",
+        );
+    });
+
     it("reads the finalized height and slot in one call, before the signature status", async () => {
         const reads: unknown[][] = [];
         const rpc = createFakeRpc({
@@ -495,6 +510,22 @@ describe("readLanding over the router", () => {
         const e = await readLanding(rpc, SIG, 1_000n, 10_000).catch((err: unknown) => err);
         expect(e).toBeInstanceOf(RpcRouterError);
         expect((e as RpcRouterError).reason).toBe("absence_unconfirmed");
+    });
+
+    it("readLanding never reads a short statuses answer as not found", async () => {
+        for (const value of [[], {}]) {
+            const { rpc, eps } = routed(2);
+            eps[0]!.answer(
+                node(epochAt(2_000n, 5_000n), rpcOk({ context: { slot: 5_000n }, value })),
+            );
+            const found = statuses([signatureStatus(4_990n, "finalized")], 5_001n);
+            eps[1]!.answer(node(epochAt(2_000n, 5_000n), found));
+            expect(await readLanding(rpc, SIG, 1_000n, 10_000)).toEqual({
+                landing: "landed",
+                signature: SIG,
+                slot: 4_990n,
+            });
+        }
     });
 
     it("readLanding sees landed through a history-less endpoint", async () => {

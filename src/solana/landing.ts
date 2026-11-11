@@ -80,6 +80,10 @@ export async function readLanding(
         unproven = err as RpcRouterError;
     }
     const { context, value } = answer;
+    // A missing entry would read as null, which can expire a landed transaction
+    if (!Array.isArray(value) || value.length !== signatures.length) {
+        throw new Error("getSignatureStatuses gave no status list of one entry per signature");
+    }
     const statuses: Status[] = signatures.map((_, i) => value[i] ?? null);
     const landed = statuses.findIndex((s) => settled(s) && s.err === null);
     if (landed !== -1)

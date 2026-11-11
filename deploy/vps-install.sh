@@ -427,10 +427,16 @@ write_rpc_list() {
         echo "cannot create a temporary file beside $file" >&2
         return 1
     fi
+    # A Ctrl-C or a dropped ssh session before the rename would leave a root-only copy of the keys
+    # beside the file. Traps are global and outlive $tmp, so the path is written into the trap.
+    # shellcheck disable=SC2064
+    trap "rm -f -- $(printf '%q' "$tmp")" EXIT
+    trap 'exit 1' INT TERM HUP
     # grep exits 1 when it keeps no line, which is fine, and 2 when it cannot read the file
     grep -v '^BUGNET_SOLANA_RPC_URLS=' "$file" >"$tmp" || rc=$?
     if [ "$rc" -gt 1 ] || ! printf '%s\n' "$input" >>"$tmp" || ! chmod 0600 "$tmp"; then
         rm -f "$tmp"
+        trap - EXIT INT TERM HUP
         echo "cannot write the new $file" >&2
         return 1
     fi
@@ -438,14 +444,18 @@ write_rpc_list() {
     lines=$(wc -l <"$tmp" | tr -d ' ')
     if [ "$lines" != "$((kept + 1))" ] || ! mv -f "$tmp" "$file"; then
         rm -f "$tmp"
+        trap - EXIT INT TERM HUP
         echo "cannot write the new $file" >&2
         return 1
     fi
+    trap - EXIT INT TERM HUP
     n=$(printf '%s' "${input#BUGNET_SOLANA_RPC_URLS=}" | tr ',' '\n' | grep -c . || true)
     echo "BUGNET_SOLANA_RPC_URLS set in $file: $n URL$([ "$n" = 1 ] || echo s)"
 }
 
 do_rpc_urls() {
+    # A line pasted at a terminal echoes on the screen; it comes only through the copy step's pipe
+    [ ! -t 0 ] || die "pipe the list line with deploy/push-rpc-urls.sh from the Mac"
     [ -f "$ENV_FILE" ] || die "$ENV_FILE does not exist; run the install step first"
     write_rpc_list "$ENV_FILE" || die "the RPC list was not changed"
     chown root:root "$ENV_FILE"

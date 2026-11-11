@@ -119,10 +119,13 @@ describe("SlotBook lag", () => {
     });
 
     it("a silent endpoint never makes others lag", () => {
-        slotAt(0, "a", 1000);
-        for (let t = 0; t <= 30 * 60_000; t += 5_000) {
-            slotAt(t, "b", 1000 + Math.floor(t / 420));
-            expect(book.lag("b")).toBe(0);
+        heightAt(0, "a", 5000);
+        // Heights slower than the 500 ms a block projection, as when slots are skipped, from
+        // after a's 10 s as a reference: only that window keeps a's projection out of b's lag
+        for (let t = 15_000; t <= 30 * 60_000; t += 5_000) {
+            heightAt(t, "b", 5000 + Math.floor(t / 600));
+            // b's own mark projects 2 blocks past it in 5 s; a's mark would add about 95
+            expect(book.lag("b")).toBeLessThanOrEqual(2);
         }
     });
 

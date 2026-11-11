@@ -104,9 +104,15 @@ export function httpFail(statusCode: number, headers: Record<string, string> = {
     });
 }
 
-// ECONNRESET may have delivered the request; ECONNREFUSED, ENOTFOUND and EAI_AGAIN never did
+// ECONNRESET may have delivered the request; ECONNREFUSED, ENOTFOUND and EAI_AGAIN never did.
+// Like undici's, the cause names the host, which no log line or snapshot may carry
 export function netFail(code = "ECONNRESET"): never {
-    throw new TypeError("fetch failed", { cause: Object.assign(new Error(code), { code }) });
+    const cause = Object.assign(new Error(`getaddrinfo ${code} a.example`), {
+        code,
+        hostname: "a.example",
+        syscall: "getaddrinfo",
+    });
+    throw new TypeError("fetch failed", { cause });
 }
 
 export function stall(): Promise<never> {

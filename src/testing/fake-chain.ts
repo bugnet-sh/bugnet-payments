@@ -137,8 +137,8 @@ export interface FakeChainEndpoint {
     ignoreMinContextSlot(on: boolean): void;
     rateLimit(times: number, retryAfterSeconds?: number): void;
     failNext(status?: number): void;
-    // "after": handles the request, never answers
-    stall(mode: "off" | "before" | "after"): void;
+    // "after": handles the request, never answers; with methods, only those calls stall
+    stall(mode: "off" | "before" | "after", o?: { methods?: readonly string[] }): void;
     // A known signature sent with preflight answers -32002 AlreadyProcessed
     alreadyProcessed(on: boolean): void;
     // The next sendTransaction answers its signature and lands nothing
@@ -744,13 +744,24 @@ export async function startFakeChain(
         return sig;
     }
 
+    // A lagging endpoint has not seen a blockhash newer than its own slot, so its simulation and
+    // its send's preflight miss it, as a lagging Agave node does
+    function unseenBlockhash(known: bigint): boolean {
+        if (current === null) return false;
+        return known + HEIGHT_OFFSET > (current.frozen?.slot ?? slot) - BigInt(current.lag);
+    }
+
     // A dry run of apply() on the current state: nothing lands. simulateTransaction answers
     // with it, and a send under preflight is refused with its error
     function dryRun(message: ReturnType<typeof readMessage>): Record<string, unknown> {
         const result = { logs: [], accounts: null, unitsConsumed: 0, returnData: null };
         const { compiled, keys, instructions } = message;
         const known = heights.get(compiled.lifetimeToken);
-        if (known === undefined || heightOf(slot) > known + BLOCKHASH_LIFE) {
+        if (
+            known === undefined ||
+            heightOf(slot) > known + BLOCKHASH_LIFE ||
+            unseenBlockhash(known)
+        ) {
             return { err: "BlockhashNotFound", ...result };
         }
         const { err } = apply(keys, compiled.header.numSignerAccounts, instructions);
@@ -758,6 +769,7 @@ export async function startFakeChain(
     }
 
     function sendTransaction(wire: string, config: Record<string, unknown>): string {
+        const preflight = config.skipPreflight !== true;
         let tx: Transaction;
         let message: ReturnType<typeof readMessage>;
         try {
@@ -768,7 +780,11 @@ export async function startFakeChain(
         }
         const { compiled } = message;
         const known = heights.get(compiled.lifetimeToken);
-        if (known === undefined || heightOf(slot) > known + BLOCKHASH_LIFE) {
+        if (
+            known === undefined ||
+            heightOf(slot) > known + BLOCKHASH_LIFE ||
+            (preflight && unseenBlockhash(known))
+        ) {
             throw new RpcError(-32002, "Transaction simulation failed: Blockhash not found", {
                 err: "BlockhashNotFound",
                 logs: [],
@@ -786,7 +802,7 @@ export async function startFakeChain(
         }
         const first = Object.values(tx.signatures)[0];
         const sig = getBase58Decoder().decode(first ?? new Uint8Array(64));
-        if (preflightOn && config.skipPreflight !== true && !bySignature.has(sig)) {
+        if (preflightOn && preflight && !bySignature.has(sig)) {
             const simulated = dryRun(message);
             if (simulated.err !== null) {
                 const [index] = (simulated.err as { InstructionError: [number, unknown] })
@@ -1427,10 +1443,20 @@ export async function startFakeChain(
         let retryAfter: number | null = null;
         let failStatus: number | null = null;
         let stallMode: "off" | "before" | "after" = "off";
+        let stalled: ReadonlySet<string> | null = null;
+        const stalls = (body: string): boolean => {
+            if (stalled === null) return true;
+            try {
+                const parsed: unknown = JSON.parse(body);
+                return isRecord(parsed) && stalled.has(String(parsed.method));
+            } catch {
+                return false;
+            }
+        };
         const ep = createServer((req, res) => {
             void readBody(req)
                 .then(async (body) => {
-                    if (stallMode === "before") return;
+                    if (stallMode === "before" && stalls(body)) return;
                     if (limited > 0) {
                         limited -= 1;
                         res.writeHead(
@@ -1448,7 +1474,7 @@ export async function startFakeChain(
                         return;
                     }
                     const payload = await respond(body, view, log);
-                    if (stallMode === "after") return;
+                    if (stallMode === "after" && stalls(body)) return;
                     send(res, payload);
                 })
                 // A client that aborts during the body read leaves nothing to answer
@@ -1483,8 +1509,9 @@ export async function startFakeChain(
             failNext(status = 500) {
                 failStatus = status;
             },
-            stall(mode) {
+            stall(mode, opts = {}) {
                 stallMode = mode;
+                stalled = opts.methods === undefined ? null : new Set(opts.methods);
             },
             alreadyProcessed(on) {
                 view.alreadyProcessed = on;
