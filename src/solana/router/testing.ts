@@ -8,7 +8,8 @@ import {
     SOLANA_ERROR__RPC__TRANSPORT_HTTP_ERROR,
     SolanaError,
 } from "@solana/kit";
-import { type RpcSettings, rpcSettingsSchema } from "./settings.ts";
+import { endpointName, type RpcSettings, rpcSettingsSchema } from "./settings.ts";
+import type { RouterDeps, RouterLog } from "./transport.ts";
 
 export type FakeHandler = (method: string, params: readonly unknown[], payload: unknown) => unknown;
 
@@ -111,5 +112,61 @@ export function testRpcSettings(over: Partial<RpcSettings> = {}): RpcSettings {
         first_attempt_timeouts: {},
         max_attempts: 3,
         ...over,
+    };
+}
+
+export interface TestLog extends RouterLog {
+    readonly lines: Record<string, unknown>[];
+}
+
+export type TestDeps = RouterDeps & {
+    urls: string[];
+    clock: { ms: number };
+    log: TestLog;
+};
+
+// The fakes in list order, a clock that only the test and sleep move, and jitter of exactly 1
+export function testDeps(
+    eps: readonly FakeEndpoint[],
+    over: Partial<RouterDeps> & { urls?: string[] } = {},
+): TestDeps {
+    const { urls = testUrls(eps.length), log: outer, ...rest } = over;
+    const clock = { ms: 0 };
+    const lines: Record<string, unknown>[] = [];
+    const line = (level: string, msg: string, f: Record<string, unknown> = {}): void => {
+        lines.push({ level, msg, ...f });
+    };
+    const log: TestLog = {
+        lines,
+        info(msg, f) {
+            line("info", msg, f);
+            outer?.info(msg, f);
+        },
+        warn(msg, f) {
+            line("warn", msg, f);
+            outer?.warn(msg, f);
+        },
+        alarm(name, f) {
+            line("alarm", name, { alarm: name, ...f });
+            outer?.alarm(name, f);
+        },
+    };
+    const byName = new Map(eps.map((ep, i) => [endpointName(i), ep]));
+    return {
+        urls,
+        clock,
+        log,
+        now: () => clock.ms,
+        random: () => 0.5,
+        transportFor: (name) => {
+            const ep = byName.get(name);
+            if (ep === undefined) throw new Error(`No fake endpoint at ${name}`);
+            return ep.transport;
+        },
+        sleep: async (ms, signal) => {
+            if (signal?.aborted) throw signal.reason;
+            clock.ms += ms;
+        },
+        ...rest,
     };
 }
