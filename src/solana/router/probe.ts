@@ -38,7 +38,8 @@ export interface HistoryProbe {
     // The recipient's USDC account, which every cold payment credits
     address: string;
     oldest: string;
-    // Confirmed a minute or more after oldest, for the address index; null until there is one
+    // Sent a minute or more after oldest was confirmed, so later on chain, for the address index;
+    // null until there is one
     later: string | null;
 }
 

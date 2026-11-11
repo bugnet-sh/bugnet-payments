@@ -227,12 +227,12 @@ describe("historyProbe", () => {
     const SECOND = new Date("2030-01-01T00:00:30Z");
     const THIRD = new Date("2030-01-01T00:02:00Z");
 
-    async function cold(signature: string, confirmedAt: Date): Promise<void> {
+    async function cold(signature: string, confirmedAt: Date, createdAt = confirmedAt) {
         const { order } = await seedOrder(db.pool, { state: "paid" });
         await seedPayment(db.pool, order.id, {
             txSignature: signature,
             status: "confirmed",
-            createdAt: confirmedAt,
+            createdAt,
             confirmedAt,
         });
     }
@@ -273,6 +273,23 @@ describe("historyProbe", () => {
             address: ATA,
             oldest: "sig-first",
             later: "sig-third",
+        });
+    });
+
+    it("a payment the reconciler confirmed late is not later", async () => {
+        // A landed first but was confirmed last, so a page before A could never hold B
+        await cold("sig-a", new Date("2030-01-01T00:03:00Z"), FIRST);
+        await cold("sig-b", SECOND);
+        expect(await historyProbe(db.pool, ATA)).toEqual({
+            address: ATA,
+            oldest: "sig-b",
+            later: null,
+        });
+        await cold("sig-c", THIRD);
+        expect(await historyProbe(db.pool, ATA)).toEqual({
+            address: ATA,
+            oldest: "sig-b",
+            later: "sig-c",
         });
     });
 

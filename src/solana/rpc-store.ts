@@ -88,14 +88,17 @@ export async function readSnapshot(
     return row === undefined ? null : { snapshot: row.snapshot, writtenAt: row.written_at };
 }
 
-// Only cold payments credit recipientAta; allowance payments go to the hot account
+// Only cold payments credit recipientAta; allowance payments go to the hot account. The address
+// check needs later after oldest on chain, and confirmed_at can trail the landing by minutes when
+// the reconciler confirms, so later is picked by created_at, which precedes its broadcast: oldest
+// landed by its confirmed_at, and later after its created_at
 export async function historyProbe(
     db: Queryable,
     recipientAta: string,
 ): Promise<HistoryProbe | null> {
     const res = await db.query<{ oldest: string; later: string | null }>(
         `with cold as (
-             select p.order_id, p.tx_signature, p.confirmed_at from payments p
+             select p.order_id, p.tx_signature, p.created_at, p.confirmed_at from payments p
              join orders o on o.id = p.order_id
              where p.status = 'confirmed' and o.pay_into = 'cold' and p.confirmed_at is not null
          ), first as (
@@ -103,8 +106,8 @@ export async function historyProbe(
          )
          select f.tx_signature as oldest,
              (select c.tx_signature from cold c
-              where c.confirmed_at >= f.confirmed_at + interval '1 minute'
-              order by c.confirmed_at, c.order_id limit 1) as later
+              where c.created_at >= f.confirmed_at + interval '1 minute'
+              order by c.created_at, c.order_id limit 1) as later
          from first f`,
     );
     const row = res.rows[0];
