@@ -1921,19 +1921,30 @@ describe("router wiring", () => {
             rpcTransportFor: () => live,
             onRouter: (r) => (router = r),
         });
-        const money = () =>
-            router!.snapshot().endpoints.reduce((n, e) => n + e.laneRequests.money, 0);
+        const lanes = () => {
+            const sum = { money: 0, background: 0 };
+            for (const e of router!.snapshot().endpoints) {
+                sum.money += e.laneRequests.money;
+                sum.background += e.laneRequests.background;
+            }
+            return sum;
+        };
         const reads = () => chain.calls().filter((c) => c.method === "getMultipleAccounts").length;
         try {
-            const before = money();
-            await until(async () => reads() >= 2, 5_000);
+            // Taken together, so the reads waited for all come after the lane counts
+            const before = lanes();
+            const booted = reads();
+            await until(async () => reads() >= booted + 2, 5_000);
+            const read = lanes();
+            expect(read.money).toBe(before.money);
+            expect(read.background).toBeGreaterThanOrEqual(before.background + 2);
             const owner = (await testSigner(31)).address;
             const res = await fetch(
                 `http://127.0.0.1:${s.publicPort}/o/${order.id}/balance?owner=${owner}`,
             );
             expect(res.status).toBe(200);
             expect(chain.calls().some((c) => c.method === "getAccountInfo")).toBe(true);
-            expect(money()).toBe(before);
+            expect(lanes().money).toBe(before.money);
         } finally {
             await s.stop();
         }
