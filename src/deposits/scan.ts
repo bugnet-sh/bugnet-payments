@@ -452,8 +452,11 @@ export interface ScanResult {
     read: AccountRead;
 }
 
+// fetched counts the answers to fetches inside an interval not yet explained: a padded interval
+// records nothing until it reaches the money, yet the scan is moving (spec 6.1, 6.6)
 export type ScanStep =
-    { calls: number; done: false } | { calls: number; done: true; result: ScanResult };
+    | { calls: number; fetched: number; done: false }
+    | { calls: number; fetched: number; done: true; result: ScanResult };
 
 interface Entry {
     signature: string;
@@ -524,6 +527,7 @@ interface Step {
     transfers: TransferRow[];
     moves: MoveRow[];
     now: Date;
+    fetched: number;
 }
 
 // pages and fetches end a run at a bound and keep the listing for the next one
@@ -586,7 +590,7 @@ async function prove(s: Step): Promise<number> {
     return 1;
 }
 
-function fetchNext(s: Step, e: Entry): Next | "bound" {
+function fetchNext(s: Step, e: Entry, unexplained = false): Next | "bound" {
     if (s.run.fetches >= s.d.cfg.scan_max_transactions) return "bound";
     return {
         kind: "call",
@@ -599,6 +603,7 @@ function fetchNext(s: Step, e: Entry): Next | "bound" {
                 s.d.rpcTimeoutMs,
             );
             if (calls > 0) s.run.fetches++;
+            if (calls > 0 && tx !== null && unexplained) s.fetched++;
             s.run.answers.set(e.signature, tx);
             if (tx?.noMeta !== true) s.m.noMeta.delete(e.signature);
             else {
@@ -731,7 +736,7 @@ async function explain(
         const noMeta: { entry: Entry; tx: CachedTx }[] = [];
         for (const e of candidates) {
             const tx = answerOf(s, e.signature);
-            if (tx === undefined) return fetchNext(s, e);
+            if (tx === undefined) return fetchNext(s, e, true);
             if (tx === null) return "waiting";
             if (tx.noMeta) {
                 noMeta.push({ entry: e, tx });
@@ -962,12 +967,16 @@ export async function scanStep(
         transfers: [...ledger.transfers],
         moves: [...ledger.moves],
         now: d.now(),
+        fetched: 0,
     };
     let calls = 0;
     for (;;) {
         const next = await advance(s);
-        if (next.kind === "end") return { calls, done: true, result: await finish(s, next) };
-        if (calls > 0) return { calls, done: false };
+        if (next.kind === "end") {
+            const result = await finish(s, next);
+            return { calls, fetched: s.fetched, done: true, result };
+        }
+        if (calls > 0) return { calls, fetched: s.fetched, done: false };
         calls += await next.call();
     }
 }

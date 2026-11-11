@@ -1195,6 +1195,32 @@ describe("the hard stop and a scan that is catching up", () => {
         expect((await transferOf(a1)).outcome).toBe("paid");
     }, 300_000);
 
+    it("the hard stop waits while a scan fetches padding before the payment", async () => {
+        cfg = { ...cfg, expire_hard_after: MIN };
+        queue = fakeQueue({ perSecond: 1 });
+        const dep = await deposit();
+        await ticks(2);
+        // Newest first, the scan reaches the payment only after every padding entry
+        const a1 = await send("A", 50_000n);
+        for (let i = 0; i < 300; i++) {
+            await chain.noOp({ touching: dep.tokenAccount, signer: owners.H });
+        }
+        chain.advance(1);
+
+        clock = at("00:16:00");
+        let sweeps = 0;
+        while ((await orderOf()).state === "unpaid") {
+            busyView();
+            await tick();
+            if (++sweeps % 15 === 0) expect((await sweep(sweepDeps(clock))).expired).toBe(0);
+            expect(clock.getTime()).toBeLessThan(at("00:46:00").getTime());
+            later(cfg.busy_every);
+        }
+        expect((await orderOf()).state).toBe("settling");
+        expect((await findPaymentByOrder(db.pool, ORDER_A))!.createdAt).toEqual(PAID_AT);
+        expect((await transferOf(a1)).outcome).toBe("paid");
+    }, 300_000);
+
     it("a push never loses the race with the sweeper", async () => {
         await deposit();
         await ticks(2);

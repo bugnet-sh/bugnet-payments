@@ -638,7 +638,8 @@ async function readBalances(
     }
 }
 
-// Scans recorded a transfer or a held read moved the anchor (spec 6.6)
+// Scans recorded a transfer or a held read moved the anchor (spec 6.6); runScans also counts a
+// fetch answered inside an unexplained interval, which is how a padded scan moves
 function noteProgress(m: DepositMemory, ledger: Ledger, nowMs: number): void {
     const now = { transfers: ledger.transfers.length, checkedSlot: ledger.deposit.checkedSlot };
     const before = m.seen;
@@ -707,6 +708,7 @@ async function runScans(
             stepped.add(orderId);
             try {
                 const step = await scanStep(scanDeps, item.deposit, m.trail);
+                if (step.fetched > 0) m.progressAtMs = c.nowMs;
                 if (!step.done) {
                     next.push(item);
                     continue;
