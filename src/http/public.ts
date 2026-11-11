@@ -19,6 +19,7 @@ import {
     depositLapsed,
     depositSummary,
     depositView,
+    depositViewOf,
     type DepositSummary,
 } from "../deposits/view.ts";
 import type { Log } from "../log.ts";
@@ -185,14 +186,14 @@ async function sendCheckout(
         return;
     }
     const now = d.now();
-    let deposit: DepositView | null = null;
-    if (d.deposits !== null) {
-        // The page makes the order's address; the job creates its account once a viewer polls
-        if (d.deposits.enabled)
-            await ensureDeposit(d.pool, d.deposits.keys, order, now, d.deposits.salt);
-        deposit = await depositView(d.pool, order, now, d.depositSettings);
+    // The page makes the order's address; the job creates its account once a viewer polls
+    if (d.deposits?.enabled === true) {
+        await ensureDeposit(d.pool, d.deposits.keys, order, now, d.deposits.salt);
     }
-    const state = publicState(order, now);
+    // The state the status route answers, so a page without its script tells the same
+    const dep = await orderDeposit(d, order, now);
+    const deposit: DepositView | null = d.deposits === null ? null : dep.view;
+    const state = publicState(order, now, dep.summary);
     const html = await renderCheckout({
         orderId: order.id,
         description: order.description,
@@ -320,7 +321,16 @@ export function createPublicHandler(d: PublicDeps): Handler {
         let body = "";
         try {
             if (sub === "report") {
-                body = (await readBody(req, REPORT_MAX_BYTES)).toString("utf8");
+                const read = await readBody(req, REPORT_MAX_BYTES).catch((err: unknown) => {
+                    // Any other failure is the client going away before its body ended
+                    if (err instanceof BodyTooLarge) throw err;
+                    return null;
+                });
+                if (read === null) {
+                    d.log.info("client hung up mid-body", { path });
+                    return;
+                }
+                body = read.toString("utf8");
             } else if (!(await drainBody(req, d.maxBodyBytes))) {
                 d.log.info("client hung up mid-body", { path });
                 return;
@@ -421,15 +431,14 @@ export function createPublicHandler(d: PublicDeps): Handler {
     };
 }
 
+// One ledger read gives the view, the summary and the row, so they agree with each other
 async function orderDeposit(d: PublicDeps, order: OrderRow, now: Date) {
     const ledger = await depositLedger(d.pool, order.id);
+    if (ledger === null) return { view: null, summary: undefined, row: null };
     return {
-        view: ledger === null ? null : await depositView(d.pool, order, now, d.depositSettings),
-        summary:
-            ledger === null
-                ? undefined
-                : depositSummary(order, ledger, d.depositSettings.settle_grace),
-        row: ledger?.deposit ?? null,
+        view: depositViewOf(order, ledger, now, d.depositSettings),
+        summary: depositSummary(order, ledger, d.depositSettings.settle_grace),
+        row: ledger.deposit,
     };
 }
 
@@ -523,6 +532,8 @@ async function sendBalance(
         sendJson(res, 503, { error: "rpc_unavailable" });
         return;
     }
+    // Oldest first: a refreshed owner moves to the end, so a fresh answer is never evicted first
+    cache.delete(owner);
     if (cache.size >= BALANCE_CACHE_SIZE) cache.delete(cache.keys().next().value!);
     cache.set(owner, { at: now.getTime(), micros });
     sendJson(res, 200, answer(micros));
@@ -538,8 +549,10 @@ export function cleanReport(
     if (typeof b.stage !== "string" || !REPORT_STAGES.has(b.stage)) return null;
     if (typeof b.wallet !== "string" || typeof b.message !== "string") return null;
     if (b.code !== null && (typeof b.code !== "number" || !Number.isFinite(b.code))) return null;
-    // eslint-disable-next-line no-control-regex
-    const clean = (s: string, max: number) => s.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, max);
+    // C0 and C1 controls and the line and paragraph separators
+    const clean = (s: string, max: number) =>
+        // eslint-disable-next-line no-control-regex
+        s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, "").slice(0, max);
     return {
         stage: b.stage,
         wallet: clean(b.wallet, 40),

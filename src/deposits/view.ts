@@ -320,6 +320,21 @@ export function depositSummary(
     return { onTimeMicros, returnedOrReturningMicros: back, keptMicros: kept, decided };
 }
 
+// depositView's answer from a ledger already read
+export function depositViewOf(
+    order: StatusOrder,
+    ledger: DepositLedger,
+    now: Date,
+    cfg: ViewCfg,
+): DepositView | null {
+    // An order paid another way, or being paid, shows only its own state when no money came here
+    const otherwise =
+        ledger.deposit.settledAt === null &&
+        (PAID_STATES.has(order.state) || order.state === "settling");
+    if (otherwise && ledger.transfers.length === 0) return null;
+    return depositViewFrom(order, ledger, now, cfg);
+}
+
 export async function depositView(
     db: Queryable,
     order: OrderRow,
@@ -327,11 +342,5 @@ export async function depositView(
     cfg: Settings["deposits"],
 ): Promise<DepositView | null> {
     const ledger = await depositLedger(db, order.id);
-    if (ledger === null) return null;
-    // An order paid another way, or being paid, shows only its own state when no money came here
-    const otherwise =
-        ledger.deposit.settledAt === null &&
-        (PAID_STATES.has(order.state) || order.state === "settling");
-    if (otherwise && ledger.transfers.length === 0) return null;
-    return depositViewFrom(order, ledger, now, cfg);
+    return ledger === null ? null : depositViewOf(order, ledger, now, cfg);
 }

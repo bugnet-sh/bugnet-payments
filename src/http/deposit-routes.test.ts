@@ -1,9 +1,14 @@
+import { request } from "node:http";
+import { getBase58Decoder } from "@solana/kit";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { qrSvg } from "../checkout/page.ts";
+import type { ViewerFacts } from "../deposits/job.ts";
 import { DepositKeys } from "../deposits/keys.ts";
-import { ensureDeposit, insertTransfers } from "../deposits/store.ts";
+import { ensureDeposit, insertTransfers, updateDeposit } from "../deposits/store.ts";
 import { TEST_DEPOSIT_SALT, TEST_DEPOSIT_SEED } from "../testing/app.ts";
 import { seedOrder } from "../testing/orders.ts";
 import { createFakeRpc } from "../testing/fake-rpc.ts";
+import { testSigner } from "../testing/keys.ts";
 import { get, testApp, type TestApp, totalCalls } from "../testing/app.ts";
 import { solanaPayUrl } from "./public.ts";
 
@@ -90,22 +95,40 @@ describe("deposit routes", () => {
         const r = await json(app, `/o/${ID}/status`);
         expect(r.status).toBe(200);
         expect(r.headers.get("cache-control")).toBe("no-store");
-        const body = (await r.json()) as Record<string, unknown>;
-        expect(body).toMatchObject({
+        expect(await r.json()).toEqual({
             orderId: ID,
             state: "unpaid",
             expiresAt: "2030-01-01T00:15:00.000Z",
             now: "2030-01-01T00:05:00.000Z",
             amountMicros: 50_000,
             kind: "start",
-        });
-        expect(body.deposit).toMatchObject({
-            address: ADDRESS,
-            ready: false,
-            status: "partial",
-            receivedMicros: 30_000,
-            otherMicros: 0,
-            remainingMicros: 20_000,
+            deposit: {
+                address: ADDRESS,
+                ready: false,
+                status: "partial",
+                receivedMicros: 30_000,
+                otherMicros: 0,
+                remainingMicros: 20_000,
+                extraMicros: 0,
+                returningMicros: 0,
+                returnedMicros: 0,
+                keptMicros: 0,
+                reviewMicros: 0,
+                reason: null,
+                reasonMicros: 0,
+                blockedUntil: null,
+                hold: null,
+                transfers: [
+                    {
+                        signature: "A1",
+                        amountMicros: 30_000,
+                        at: "2030-01-01T00:04:00.000Z",
+                        outcome: "counted",
+                        reason: null,
+                        returnSignature: null,
+                    },
+                ],
+            },
         });
         expect(totalCalls(app.rpc)).toBe(before);
     });
@@ -117,13 +140,41 @@ describe("deposit routes", () => {
     });
 
     it("a checkout status poll notes the viewer with facts", async () => {
-        await order(app);
-        await page(app);
-        const now = app.now.get().getTime();
-        await json(app, `/o/${ID}/status`);
-        expect(app.watch!.viewerSeen(ID, now)).toBe(false);
-        await json(app, `/o/${ID}/status`, { "bugnet-client": "checkout" });
-        expect(app.watch!.viewerSeen(ID, now)).toBe(true);
+        const watch = app.watch!;
+        const noted: ViewerFacts[] = [];
+        const real = watch.noteViewer.bind(watch);
+        watch.noteViewer = (id, ip, nowMs, facts) => {
+            noted.push(facts);
+            return real(id, ip, nowMs, facts);
+        };
+        try {
+            const checkout = { "bugnet-client": "checkout" };
+            // No deposit: nothing is noted
+            await order(app);
+            await json(app, `/o/${ID}/status`, checkout);
+            expect(noted).toEqual([]);
+            expect(watch.viewerSeen(ID, app.now.get().getTime())).toBe(false);
+
+            await page(app);
+            const now = app.now.get().getTime();
+            await json(app, `/o/${ID}/status`);
+            expect(watch.viewerSeen(ID, now)).toBe(false);
+            await json(app, `/o/${ID}/status`, checkout);
+            expect(watch.viewerSeen(ID, now)).toBe(true);
+            expect(noted).toEqual([
+                { state: "open", expiresAtMs: at(15 * MIN).getTime(), needsCreate: true },
+            ]);
+
+            // A closed deposit is noted with its state, and the watch ignores it; a minute on,
+            // the open poll above is past viewer_ttl
+            await updateDeposit(app.pool, ID, { state: "closed" });
+            app.now.set(at(6 * MIN));
+            await json(app, `/o/${ID}/status`, checkout);
+            expect(noted.at(-1)).toMatchObject({ state: "closed" });
+            expect(watch.viewerSeen(ID, at(6 * MIN).getTime())).toBe(false);
+        } finally {
+            watch.noteViewer = real;
+        }
     });
 
     it("the QR never counts a stranger's money", async () => {
@@ -143,6 +194,8 @@ describe("deposit routes", () => {
         expect(qr.status).toBe(200);
         expect(qr.headers.get("content-type")).toBe("image/svg+xml");
         expect(qr.headers.get("content-security-policy")).toBe("default-src 'none'");
+        // The code asks for the 0.02 the payer still owes, never less for the stranger's money
+        expect(await qr.text()).toBe(await qrSvg(solanaPayUrl(ADDRESS, 20_000, "Sandbox time")));
     });
 
     it("qr.svg is the Solana Pay request for the remaining amount", async () => {
@@ -159,6 +212,45 @@ describe("deposit routes", () => {
         await page(app);
         const withDeposit = await (await json(app, `/o/${ID}`)).text();
         expect(withDeposit).toBe(without);
+        const pr = JSON.parse(withDeposit) as { accepts: { payTo: string }[] };
+        expect(pr.accepts[0]!.payTo).toBe((await testSigner(1)).address);
+    });
+
+    it("the HTML page states what the status route states", async () => {
+        await order(app);
+        await page(app);
+        await credit(app, "A1", 30_000, "OwnA", at(4 * MIN));
+        // Inside the grace with on-time money: settling, not a 410 Expired page
+        app.now.set(at(15 * MIN + 30_000));
+        const r = await page(app);
+        expect(r.status).toBe(200);
+        expect(await r.text()).toContain('data-state="settling"');
+        const status = (await (await json(app, `/o/${ID}/status`)).json()) as { state: string };
+        expect(status.state).toBe("settling");
+    });
+
+    it("a report whose client hangs up is an info line, not an error", async () => {
+        await order(app);
+        const before = app.log.lines.length;
+        const url = new URL(`${app.publicOrigin}/o/${ID}/report`);
+        await new Promise<void>((resolve) => {
+            const req = request(url, {
+                method: "POST",
+                headers: {
+                    "content-type": "application/json",
+                    "content-length": "500",
+                    "x-forwarded-for": freshIp(),
+                },
+            });
+            req.on("error", () => resolve());
+            req.write('{"stage":"sign"', () => setTimeout(() => req.destroy(), 50));
+            req.on("close", () => resolve());
+        });
+        const lines = () => app.log.lines.slice(before);
+        await expect
+            .poll(() => lines().some((l) => l.msg === "client hung up mid-body"))
+            .toBe(true);
+        expect(lines().filter((l) => l.level === "error")).toEqual([]);
     });
 
     it("balance answers the owner's USDC", async () => {
@@ -199,7 +291,7 @@ describe("deposit routes", () => {
                 stage: "sign",
                 wallet: "Phantom",
                 code: -32603,
-                message: "Unexpected error\u0000\n",
+                message: "Unexpected\u2028 error\u0000\n\u0085",
             }),
         });
         expect(r.status).toBe(204);
@@ -294,26 +386,42 @@ describe("the balance route", () => {
     it("the balance route reads on the background lane", async () => {
         await order(app);
         const before = totalCalls(app.rpc);
-        expect((await json(app, `/o/${ID}/balance?owner=${app.payer.address}`)).status).toBe(200);
+        const r = await json(app, `/o/${ID}/balance?owner=${app.payer.address}`);
+        expect(r.status).toBe(200);
+        // The owner has no USDC account
+        expect(await r.json()).toEqual({
+            owner: app.payer.address,
+            usdcMicros: 0,
+            needMicros: 50_000,
+        });
         expect(totalCalls(background)).toBe(1);
         expect(totalCalls(app.rpc)).toBe(before);
     });
+});
+
+describe("the process-wide balance cap", () => {
+    let app: TestApp;
+    let background: ReturnType<typeof createFakeRpc>;
+    beforeAll(async () => {
+        background = createFakeRpc({ getAccountInfo: () => ({ value: null }) });
+        app = await testApp({ now: at(5 * MIN), deposits: {}, backgroundRpc: background });
+    });
+    afterAll(() => app.close());
 
     it("the balance route is capped process-wide", async () => {
         await order(app);
-        const owners = Array.from({ length: 31 }, (_, i) => {
-            const bytes = new Uint8Array(32).fill(i + 40);
-            return bytes;
-        });
-        const { getBase58Decoder } = await import("@solana/kit");
-        const before = totalCalls(background);
+        const owners = Array.from({ length: 31 }, (_, i) =>
+            getBase58Decoder().decode(new Uint8Array(32).fill(i + 40)),
+        );
         const codes: number[] = [];
-        for (const o of owners) {
-            const owner = getBase58Decoder().decode(o);
-            codes.push((await json(app, `/o/${ID}/balance?owner=${owner}`)).status);
+        let last: Response | undefined;
+        for (const owner of owners) {
+            last = await json(app, `/o/${ID}/balance?owner=${owner}`);
+            codes.push(last.status);
         }
-        expect(codes.filter((c) => c === 200).length).toBeLessThanOrEqual(30);
-        expect(codes.at(-1)).toBe(503);
-        expect(totalCalls(background) - before).toBeLessThanOrEqual(30);
+        expect(codes.slice(0, 30)).toEqual(Array.from({ length: 30 }, () => 200));
+        expect(codes[30]).toBe(503);
+        expect(await last!.json()).toEqual({ error: "rpc_unavailable" });
+        expect(totalCalls(background)).toBe(30);
     });
 });
