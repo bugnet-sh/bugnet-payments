@@ -254,7 +254,8 @@ describe("sends", () => {
     it("a refusal after a stalled attempt is send_unconfirmed", async () => {
         const t = setup(3);
         t.a.answer(() => stall());
-        t.b.answer(() => refusal("AlreadyProcessed"));
+        // An instruction error alone is a clean refusal, so only the stall can make it unconfirmed
+        t.b.answer(() => refusal());
         const e = await rejection(send(t));
         expect(e).toBeInstanceOf(RpcRouterError);
         expect(reasonOf(e)).toBe("send_unconfirmed");
@@ -295,7 +296,9 @@ describe("sends", () => {
     it("every send endpoint failing after a stall is send_unconfirmed", async () => {
         const t = setup(3);
         t.a.answer(() => stall());
-        for (const ep of [t.b, t.c]) ep.answer(() => httpFail(429));
+        // Neither surely delivered, so only the stall can make the send unconfirmed
+        t.b.answer(() => httpFail(403));
+        t.c.answer(() => netFail("ECONNREFUSED"));
         expect(reasonOf(await rejection(send(t)))).toBe("send_unconfirmed");
     });
 
