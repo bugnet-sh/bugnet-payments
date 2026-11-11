@@ -39,3 +39,4 @@ export {
     type RouterTransport,
     setCheckState,
 } from "./transport.ts";
+export type { SnapshotStore, UsageRow, UsageStore } from "./usage.ts";

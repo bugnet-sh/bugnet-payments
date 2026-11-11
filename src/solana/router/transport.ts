@@ -22,7 +22,7 @@ import {
     type VerdictStore,
 } from "./consistency.ts";
 import { RpcRouterError } from "./errors.ts";
-import { EndpointHealth, type Lane, monthOf } from "./health.ts";
+import { EndpointHealth, type Lane } from "./health.ts";
 import { LearnedLimits } from "./limits.ts";
 import { UNKNOWN_METHOD } from "./methods.ts";
 import { contextSlotOf, isObject, readRequest, type RouterRequest, rpcErrorOf } from "./payload.ts";
@@ -48,14 +48,20 @@ import {
     type RpcSettings,
 } from "./settings.ts";
 import { observationsOf, SlotBook } from "./slots.ts";
+import {
+    AlarmBook,
+    type AlarmView,
+    type Counters,
+    type SnapshotStore,
+    UsageBook,
+    type UsageStore,
+} from "./usage.ts";
 
 // A wait for a cooldown or for room is at most this long in all, inside the caller's signal
 export const MAX_WAIT_MS = 1_000;
 
-const HOUR_MS = 3_600_000;
 const TICK_MS = 5_000;
 const ENDPOINT_SCOPE = "*";
-const ABSENCE_ALARM_EVERY_MS = 600_000;
 // Transaction history is not available from this node
 const NO_HISTORY = -32011;
 const ATTEMPT_FAILED = "rpc attempt failed";
@@ -84,6 +90,10 @@ export interface RouterDeps {
     verdicts?: VerdictStore;
     // With verdicts: an HMAC of the URL, never the URL
     fingerprint?: (url: string) => string;
+    // The month's requests per position, loaded at start and flushed on the tick and at stop
+    usage?: UsageStore;
+    // The health snapshot the CLI reads, written on the tick
+    snapshots?: SnapshotStore;
 }
 
 // Calling the router itself is the money lane
@@ -161,13 +171,6 @@ interface ErrorCode {
     status?: number;
 }
 
-interface Hour {
-    key: number;
-    money: number;
-    background: number;
-    outcomes: Map<string, Map<string, number>>;
-}
-
 interface Endpoint {
     readonly name: string;
     // Never logged, stored or shown
@@ -192,8 +195,7 @@ interface Endpoint {
     // The pin of its last -32016 or answer below a pin, tried last for pins at or above it
     behindPin: { slot: bigint; at: number } | null;
     lastError: EndpointSnapshot["lastError"];
-    month: { key: string; requests: number; background: number };
-    hour: Hour;
+    readonly counters: Counters;
 }
 
 type Attempt =
@@ -279,6 +281,22 @@ const SERVING_REQUEST = readRequest({
     method: "getSlot",
     params: [{ commitment: "confirmed" }],
 })!;
+// What the all-down alarm asks of each role (spec 10.2)
+const ROLE_REQUESTS: Readonly<Record<Role, RouterRequest>> = {
+    read: SERVING_REQUEST,
+    history: readRequest({
+        jsonrpc: "2.0",
+        id: 0,
+        method: "getTransaction",
+        params: ["", { commitment: "confirmed" }],
+    })!,
+    send: readRequest({
+        jsonrpc: "2.0",
+        id: 0,
+        method: "sendTransaction",
+        params: ["", { encoding: "base64" }],
+    })!,
+};
 const SYSTEM_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 const ROUTERS = new WeakMap<RpcTransport, Router>();
@@ -315,15 +333,6 @@ function opaqueRequest(payload: unknown): RouterRequest {
         until: null,
         accounts: 0,
         signatures: [],
-    };
-}
-
-function freshHour(now: number): Hour {
-    return {
-        key: Math.floor(now / HOUR_MS),
-        money: 0,
-        background: 0,
-        outcomes: new Map(),
     };
 }
 
@@ -453,8 +462,8 @@ class Router {
     private readonly cursors = new CursorBook();
     private readonly identities = new IdentityBook();
     private readonly list: { domains: number; absenceQuorum: number; sendFanout: number };
-    // Unconfirmed absences since the last rpc_absence_unconfirmed alarm
-    private absenceAlarm: { at: number | null; count: number } = { at: null, count: 0 };
+    private readonly usage: UsageBook;
+    private readonly alarms: AlarmBook;
     // Ends every check run and probe at stop
     private readonly stopper = new AbortController();
     private readonly runs = new Set<Promise<unknown>>();
@@ -470,8 +479,13 @@ class Router {
     ) {
         this.mode = urls.length === 1 ? "single" : "routed";
         this.list = resolveRpcList(s, urls);
-        const now = deps.now();
         const stored = deps.verdicts !== undefined ? deps.fingerprint : undefined;
+        this.usage = new UsageBook(
+            s,
+            urls.map((_, i) => endpointName(i)),
+            deps,
+        );
+        this.alarms = new AlarmBook(s, deps.log);
         this.endpoints = urls.map((url, i) => {
             const name = endpointName(i);
             return {
@@ -495,8 +509,7 @@ class Router {
                 hourlyAt: null,
                 behindPin: null,
                 lastError: null,
-                month: { key: monthOf(now), requests: 0, background: 0 },
-                hour: freshHour(now),
+                counters: this.usage.of(name),
             };
         });
         this.byName = new Map(this.endpoints.map((ep) => [ep.name, ep]));
@@ -604,7 +617,7 @@ class Router {
             domains: this.list.domains,
             absenceQuorum: this.list.absenceQuorum,
             sendFanout: this.list.sendFanout,
-            endpoints: this.endpoints.map((ep) => this.endpointSnapshot(ep, now)),
+            endpoints: this.endpoints.map((ep) => this.endpointSnapshot(ep)),
         };
     }
 
@@ -622,9 +635,10 @@ class Router {
         else if (state.consistent === "yes") this.book.checkRun(name, true, this.deps.now());
     }
 
-    // Spec 9: the stored verdicts first, then the checks; a wrong genesis refuses the start
+    // Spec 9: the stored verdicts and the month's counts first, then the checks; a wrong genesis
+    // refuses the start
     async start(o: { timers: boolean }): Promise<CheckReport> {
-        await this.readVerdicts();
+        await Promise.all([this.readVerdicts(), this.usage.load()]);
         let report: CheckReport;
         if (this.mode === "single") report = await this.startSingle();
         else report = o.timers ? await this.boot() : await this.checkAll(true);
@@ -640,11 +654,17 @@ class Router {
         return this.checkAll(false);
     }
 
-    // The probes of spec 6.2 and 6.5, and the reruns of spec 9; single mode has none
+    // The alarms, the usage flush and the snapshot (spec 10) read the state before this tick's
+    // calls; then the probes of spec 6.2 and 6.5 and the reruns of spec 9, which single mode has
+    // none of
     async tick(): Promise<void> {
-        if (this.mode === "single") return;
         const now = this.deps.now();
-        const work: Promise<unknown>[] = [];
+        if (this.mode === "routed") this.alarms.evaluate(now, this.alarmView(now));
+        const work: Promise<unknown>[] = [this.usage.tick(() => this.snapshot())];
+        if (this.mode === "single") {
+            await Promise.all(work);
+            return;
+        }
         const due: { ep: Endpoint; parts: Set<CheckPart> }[] = [];
         for (const ep of this.endpoints) {
             if (ep.checks.genesis === "wrong") continue;
@@ -672,6 +692,7 @@ class Router {
         this.timer = null;
         this.stopper.abort();
         await Promise.allSettled([...this.runs]);
+        await this.usage.stop();
         await this.saving;
     }
 
@@ -958,7 +979,7 @@ class Router {
         return (async ({ payload, signal }: Config) => {
             const req = readRequest(payload) ?? opaqueRequest(payload);
             ep.limits.record(req.method, "background");
-            this.count(ep, "background");
+            ep.counters.count("background");
             ep.health.begin();
             const started = this.deps.now();
             try {
@@ -968,13 +989,13 @@ class Router {
                 ep.limits.succeeded(req.method);
                 this.observe(ep, req, answer);
                 const error = rpcErrorOf(answer);
-                this.outcome(ep, req.method, error === null ? "ok" : codeLabel(error.code));
+                ep.counters.outcome(req.method, error === null ? "ok" : codeLabel(error.code));
                 return answer;
             } catch (err) {
                 if (signal?.aborted) {
-                    this.outcome(ep, req.method, "timeout");
+                    ep.counters.outcome(req.method, "timeout");
                 } else {
-                    this.outcome(ep, req.method, thrownLabel(err));
+                    ep.counters.outcome(req.method, thrownLabel(err));
                     ep.lastError = { at: this.deps.now(), ...thrownError(err) };
                     this.cool(ep, req.method, classifyThrown(err, false, this.deps.now()));
                 }
@@ -1034,23 +1055,23 @@ class Router {
         const ep = this.endpoints[0]!;
         const req = readRequest(config.payload);
         const method = (req ?? opaqueRequest(config.payload)).method;
-        this.count(ep, lane);
+        ep.counters.count(lane);
         const started = this.deps.now();
         let answer: unknown;
         try {
             answer = await ep.transport(config);
         } catch (err) {
             if (config.signal?.aborted) {
-                this.outcome(ep, method, "aborted");
+                ep.counters.outcome(method, "aborted");
             } else {
-                this.outcome(ep, method, thrownLabel(err));
+                ep.counters.outcome(method, thrownLabel(err));
                 ep.lastError = { at: this.deps.now(), ...thrownError(err) };
             }
             throw err;
         }
         ep.health.sample(this.deps.now() - started);
         const error = rpcErrorOf(answer);
-        this.outcome(ep, method, error === null ? "ok" : codeLabel(error.code));
+        ep.counters.outcome(method, error === null ? "ok" : codeLabel(error.code));
         if (req !== null && req.spec.slot === "context" && req.minContextSlot !== null) {
             const slot = contextSlotOf(answer);
             if (slot !== null && slot < req.minContextSlot) {
@@ -1069,7 +1090,7 @@ class Router {
         timeoutMs: number,
     ): Promise<Attempt> {
         ep.limits.record(req.method, lane);
-        this.count(ep, lane);
+        ep.counters.count(lane);
         ep.health.begin();
         const timer = AbortSignal.timeout(timeoutMs);
         const started = this.deps.now();
@@ -1107,7 +1128,7 @@ class Router {
         if (a.kind === "thrown") {
             if (a.callerAborted) {
                 ep.health.callerAborted(a.elapsed);
-                this.outcome(ep, req.method, "aborted");
+                ep.counters.outcome(req.method, "aborted");
                 return { kind: "throw", err: signal!.reason };
             }
             run.thrown = { err: a.err };
@@ -1124,7 +1145,7 @@ class Router {
             const o = classifyThrown(a.err, false, this.deps.now());
             const error = thrownError(a.err);
             if (o.kind === "return") {
-                this.outcome(ep, req.method, thrownLabel(a.err));
+                ep.counters.outcome(req.method, thrownLabel(a.err));
                 return { kind: "throw", err: a.err };
             }
             this.react(ep, req, o, a.elapsed, codeOf(error), run);
@@ -1146,7 +1167,7 @@ class Router {
             run.badRequests = [];
             const refused = this.refusalOf(req, answer, floors);
             if (refused === null) {
-                this.outcome(ep, req.method, "ok");
+                ep.counters.outcome(req.method, "ok");
                 return { kind: "answer", answer, ok: true };
             }
             // R2 treats an answer below the request's own pin as -32016
@@ -1156,7 +1177,7 @@ class Router {
             return { kind: "next" };
         }
         if (o.kind === "return" || o.kind === "refused" || o.kind === "processed") {
-            this.outcome(ep, req.method, error === null ? "ok" : codeLabel(error.code));
+            ep.counters.outcome(req.method, error === null ? "ok" : codeLabel(error.code));
             return { kind: "answer", answer, ok: false };
         }
         if (error !== null) {
@@ -1475,15 +1496,8 @@ class Router {
         return a.domain === b.domain || this.identities.shares(a.name, b.name);
     }
 
-    // At most one alarm per 10 min, counting the unconfirmed absences since the last one
     private unconfirmed(domainsAnswered: number, partial: StatusesAnswer): RpcRouterError {
-        const now = this.deps.now();
-        this.absenceAlarm.count += 1;
-        const { at, count } = this.absenceAlarm;
-        if (at === null || now - at >= ABSENCE_ALARM_EVERY_MS) {
-            this.deps.log.alarm("rpc_absence_unconfirmed", { count, domainsAnswered });
-            this.absenceAlarm = { at: now, count: 0 };
-        }
+        this.alarms.absenceUnconfirmed(this.deps.now(), domainsAnswered);
         return new RpcRouterError("absence_unconfirmed", undefined, partial);
     }
 
@@ -1709,34 +1723,29 @@ class Router {
         outcome: string,
         error: ErrorSnapshot,
     ): void {
-        this.outcome(ep, method, outcome);
+        ep.counters.outcome(method, outcome);
         ep.lastError = { at: this.deps.now(), ...error };
         this.deps.log.warn(run.failure, { endpoint: ep.name, method, outcome });
     }
 
-    // Every real HTTP request counts, per position and lane
-    private count(ep: Endpoint, lane: Lane): void {
-        const now = this.deps.now();
-        const month = monthOf(now);
-        if (ep.month.key !== month) ep.month = { key: month, requests: 0, background: 0 };
-        ep.month.requests += 1;
-        if (lane === "background") ep.month.background += 1;
-        this.hourOf(ep, now)[lane] += 1;
-    }
-
-    private outcome(ep: Endpoint, method: string, outcome: string): void {
-        const { outcomes } = this.hourOf(ep, this.deps.now());
-        let counts = outcomes.get(method);
-        if (counts === undefined) {
-            counts = new Map();
-            outcomes.set(method, counts);
-        }
-        counts.set(outcome, (counts.get(outcome) ?? 0) + 1);
-    }
-
-    private hourOf(ep: Endpoint, now: number): Hour {
-        if (ep.hour.key !== Math.floor(now / HOUR_MS)) ep.hour = freshHour(now);
-        return ep.hour;
+    // A role is down when no endpoint is eligible for it without relaxing a breaker (spec 6.1)
+    private alarmView(now: number): AlarmView {
+        const down = new Set(
+            ROLES.filter((role) => {
+                const req = ROLE_REQUESTS[role];
+                const listed = choose(req, this.views(req, "money"), { now, lane: "money" });
+                return !listed.some((v) => v.breaker === "closed");
+            }),
+        );
+        return {
+            down,
+            endpoints: this.endpoints.map((ep) => ({
+                name: ep.name,
+                state: this.stateOf(ep).state,
+                lag: this.slots.lag(ep.name),
+                rateLimited: ep.limits.rateLimited(),
+            })),
+        };
     }
 
     private serving(now: number): string | null {
@@ -1757,9 +1766,9 @@ class Router {
         return { state: "ok", untilMs: null };
     }
 
-    private endpointSnapshot(ep: Endpoint, now: number): EndpointSnapshot {
-        const month = ep.month.key === monthOf(now) ? ep.month : null;
-        const hour = this.hourOf(ep, now);
+    private endpointSnapshot(ep: Endpoint): EndpointSnapshot {
+        const month = ep.counters.monthCounts();
+        const hour = ep.counters.hourCounts();
         const mark = this.slots.mark(ep.name, "confirmed", "slot");
         return {
             name: ep.name,
@@ -1772,13 +1781,11 @@ class Router {
             lag: this.slots.lag(ep.name),
             consistent: this.book.state(ep.name),
             limits: ep.limits.limits(),
-            monthRequests: month?.requests ?? 0,
-            monthBackground: month?.background ?? 0,
+            monthRequests: month.requests,
+            monthBackground: month.background,
             hourRequests: hour.money + hour.background,
             laneRequests: { money: hour.money, background: hour.background },
-            outcomes: Object.fromEntries(
-                [...hour.outcomes].map(([method, counts]) => [method, Object.fromEntries(counts)]),
-            ),
+            outcomes: hour.outcomes,
             checks: { ...ep.checks },
             lastError: ep.lastError === null ? null : { ...ep.lastError },
         };
