@@ -553,6 +553,16 @@ describe("address-first page", () => {
         expect(note).toBeLessThan(wallet.indexOf('id="message"'));
     });
 
+    it("a disabled Pay button looks disabled, outline or not", async () => {
+        const html = await renderCheckout(offered);
+        // Equal specificity, so the later rule wins
+        expect(html.indexOf(".button:disabled {")).toBeGreaterThan(
+            html.indexOf(".button.outline {"),
+        );
+        expect(html).toContain(".button.outline:not(:disabled):hover {");
+        expect(html).not.toContain(".button.outline:hover");
+    });
+
     it("wallet section is secondary", async () => {
         const html = await renderCheckout(offered);
         expect(html).toContain("Or pay with a browser wallet");

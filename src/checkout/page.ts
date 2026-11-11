@@ -324,13 +324,14 @@ h2 {
     cursor: pointer;
 }
 #pay-button { margin-top: var(--space-5); }
-.button:disabled { background: var(--surface); color: var(--text-muted); cursor: default; }
 .button.outline {
     border: var(--hairline) solid var(--line);
     background: var(--bg);
     color: var(--text);
 }
-.button.outline:hover { background: var(--surface-hover); }
+.button.outline:not(:disabled):hover { background: var(--surface-hover); }
+/* After .button.outline, whose specificity it shares, so a disabled outline button looks it */
+.button:disabled { background: var(--surface); color: var(--text-muted); cursor: default; }
 #message { min-height: var(--ui-line); margin: var(--space-3) 0 0; }
 .mobile-links {
     display: none;
