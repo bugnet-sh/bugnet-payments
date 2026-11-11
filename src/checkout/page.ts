@@ -143,6 +143,8 @@ const STYLE = `
     src: url("/fonts/obel-mono-400.woff2") format("woff2");
 }
 * { box-sizing: border-box; }
+/* The script hides rows and blocks whose own rules set a display */
+[hidden] { display: none !important; }
 html {
     background: var(--bg);
     color: var(--text);
@@ -428,7 +430,10 @@ function depositSection(v: CheckoutView, deposit: DepositView): string {
     // With the price covered the QR route answers 404, so the code waits hidden, unloaded
     const qrHidden = deposit.remainingMicros > 0 ? "" : " hidden";
     const qrLoading = deposit.remainingMicros > 0 ? "" : ' loading="lazy"';
+    // Money sent while the deposit is in review cannot pay the order until an operator looks
+    const askHidden = deposit.status === "review" ? " hidden" : "";
     return `<section id="deposit">
+<div id="deposit-ask"${askHidden}>
 <h2>Send USDC to this address</h2>
 <dl class="facts">
 <div><dt>Amount</dt><dd>${USDC_ICON} <span id="deposit-amount">${ask.plain} USDC</span> ${copyButton(ask.plain, "deposit-amount-copy")}</dd></div>
@@ -441,6 +446,7 @@ function depositSection(v: CheckoutView, deposit: DepositView): string {
 </figure>
 <p class="note">Send only USDC on Solana.</p>
 <p id="exchange-note" class="note">${ask.exchange}</p>
+</div>
 <p id="deposit-message" role="status" aria-live="polite"></p>
 </section>`;
 }

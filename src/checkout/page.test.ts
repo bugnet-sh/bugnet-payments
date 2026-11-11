@@ -485,6 +485,25 @@ describe("address-first page", () => {
         expect(html).toContain(">Pay $0.05</button>");
     });
 
+    it("the ask sits in one block the client hides, apart from the deposit line", async () => {
+        const dep = section(await renderCheckout(offered), "deposit");
+        const ask = dep.slice(dep.indexOf('<div id="deposit-ask">'), dep.indexOf("</div>\n<p id"));
+        expect(ask).toContain("<h2>Send USDC to this address</h2>");
+        expect(ask).toContain('<dl class="facts">');
+        expect(ask).toContain('<figure class="qr">');
+        expect(ask).toContain("Send only USDC on Solana.");
+        expect(ask).toContain('id="exchange-note"');
+        expect(ask).not.toContain('id="deposit-message"');
+        expect(dep).toContain('</div>\n<p id="deposit-message"');
+        const review = {
+            ...offered,
+            deposit: { ...offered.deposit!, status: "review" as const, remainingMicros: 30_000 },
+        };
+        expect(section(await renderCheckout(review), "deposit")).toContain(
+            '<div id="deposit-ask" hidden>',
+        );
+    });
+
     it("phone links stay", async () => {
         const phone = section(await renderCheckout(offered), "phone");
         expect(phone).toContain("Open in Phantom");
@@ -509,6 +528,8 @@ describe("address-first page", () => {
     it("time left shows only while the order takes money", async () => {
         expect(await renderCheckout({ ...offered, state: "paid" })).not.toContain('id="time-left"');
         expect(await renderCheckout(offered)).toContain('id="time-left"');
+        // The client hides the Time left row, a .facts div that is otherwise display: flex
+        expect(await renderCheckout(offered)).toContain("[hidden] { display: none !important; }");
     });
 
     it("the card is centered", async () => {

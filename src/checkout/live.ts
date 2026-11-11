@@ -136,9 +136,16 @@ export function showWalletOptions(v: StatusView): boolean {
     return v.state === "unpaid";
 }
 
+// The address and its notes ask for money, so they show only while money sent there can still
+// pay the order: a closed order says only what happened (spec 15.1), and a deposit in review
+// signs nothing until an operator looks
+export function showDepositAsk(v: StatusView): boolean {
+    return v.state === "unpaid" && v.deposit?.status !== "review";
+}
+
 // The deposit QR asks for money, so it shows only while the order still lacks some
 export function showDepositQr(v: StatusView): boolean {
-    return v.state === "unpaid" && v.deposit !== null && v.deposit.remainingMicros > 0;
+    return showDepositAsk(v) && v.deposit !== null && v.deposit.remainingMicros > 0;
 }
 
 // W35 while the order still takes a wallet payment and money already reached the address

@@ -6,6 +6,7 @@ import {
     needsReload,
     parseStatus,
     pollDelay,
+    showDepositAsk,
     showDepositQr,
     showWalletOptions,
     statusKey,
@@ -110,6 +111,19 @@ describe("live status", () => {
         expect(showDepositQr(view("unpaid", { status: "held", remainingMicros: 0 }))).toBe(false);
         expect(showDepositQr(view("settling", { remainingMicros: 20_000 }))).toBe(false);
         expect(showDepositQr(view("unpaid"))).toBe(false);
+    });
+
+    it("the deposit ask shows only while money sent to the address can still pay", () => {
+        expect(showDepositAsk(view("unpaid", { remainingMicros: 20_000 }))).toBe(true);
+        expect(showDepositAsk(view("unpaid", { status: "held", remainingMicros: 0 }))).toBe(true);
+        for (const state of ["settling", "paid", "expired", "refunded", "review"] as const) {
+            expect(showDepositAsk(view(state, { status: "paid", remainingMicros: 0 }))).toBe(false);
+        }
+        // Review signs nothing until an operator looks, so money sent now cannot pay
+        const review = view("unpaid", { status: "review", remainingMicros: 30_000 });
+        expect(showDepositAsk(review)).toBe(false);
+        expect(showDepositQr(review)).toBe(false);
+        expect(showWalletOptions(review)).toBe(true);
     });
 
     it("a page drawn for another state reloads once the order reads unpaid", () => {

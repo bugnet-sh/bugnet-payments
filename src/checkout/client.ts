@@ -22,6 +22,7 @@ import {
     needsReload,
     parseStatus,
     pollDelay,
+    showDepositAsk,
     showDepositQr,
     showWalletOptions,
     statusKey,
@@ -326,6 +327,11 @@ function follow(p: Page, wallet: WalletSection | null): void {
             if (askEls.exchange !== null) askEls.exchange.textContent = ask.exchange;
             if (qr !== null) qr.alt = ask.alt;
         }
+        const askEl = p.root.querySelector<HTMLElement>("#deposit-ask");
+        if (askEl !== null) askEl.hidden = !showDepositAsk(v);
+        // A countdown on an order that no longer takes money says nothing true
+        const timeRow = timeEl?.closest("div") ?? null;
+        if (timeRow !== null) timeRow.hidden = !showWalletOptions(v);
         const qrShown = showDepositQr(v);
         const figure = qr?.closest("figure") ?? null;
         if (figure !== null) figure.hidden = !qrShown;
