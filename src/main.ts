@@ -527,6 +527,7 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
                         refundWallet: d.refundSigner.address,
                         alarms: s.alarms,
                         refunds: s.refunds,
+                        deposits: s.deposits,
                         rpcTimeoutMs,
                         log,
                         now,

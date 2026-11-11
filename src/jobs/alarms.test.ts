@@ -1,11 +1,14 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { address } from "@solana/kit";
-import type { Settings } from "../config.ts";
+import { stringify } from "smol-toml";
+import { parseSettings, type Settings } from "../config.ts";
+import { DepositKeys } from "../deposits/keys.ts";
+import { ensureDeposit } from "../deposits/store.ts";
 import { memoryLog } from "../log.ts";
 import { createFakeRpc, type FakeRpcScript, neverAnswers } from "../testing/fake-rpc.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
 import { seedOrder, seedPayment } from "../testing/orders.ts";
-import { checkAlarms, type AlarmSnapshot } from "./alarms.ts";
+import { checkAlarms, depositLamports, type AlarmSnapshot } from "./alarms.ts";
 
 const MIN = 60_000;
 const t0 = new Date("2026-11-06T12:00:00Z");
@@ -13,6 +16,10 @@ const at = (ms: number) => new Date(t0.getTime() + ms);
 const FEE_PAYER = address("11111111111111111111111111111112");
 const REFUND_WALLET = address("11111111111111111111111111111113");
 const RPC_TIMEOUT_MS = 10_000;
+const DEPOSITS = parseSettings(
+    stringify({ solana: { recipient: "Bhhc3XNdjtCNr3pj2aZwhCt8pHwsU8wRL7dqJNDZEExw" } }),
+    "alarms.test",
+).deposits;
 const STALL_MS = 100;
 
 const defaults: Settings["alarms"] = {
@@ -68,6 +75,7 @@ function run(
             refundWallet: REFUND_WALLET,
             alarms: opts.alarms ?? defaults,
             refunds,
+            deposits: DEPOSITS,
             rpcTimeoutMs: opts.rpcTimeoutMs ?? RPC_TIMEOUT_MS,
             log,
             now: () => t0,
@@ -247,3 +255,96 @@ describe("checkAlarms", () => {
 function dev() {
     return { ...defaults, fee_payer_min_lamports: 0 };
 }
+
+describe("deposit moves in the fee payer alarm", () => {
+    const keys = new DepositKeys(new Map([[1, Buffer.alloc(32, 7)]]), 1);
+    beforeEach(async () => {
+        await db.pool.query("truncate deposits cascade");
+    });
+    async function deposit(): Promise<string> {
+        const { order } = await seedOrder(db.pool, {
+            state: "unpaid",
+            createdAt: new Date(),
+            expiresAt: new Date(Date.now() + 3_600_000),
+        });
+        await ensureDeposit(db.pool, keys, order, new Date());
+        return order.id;
+    }
+    async function move(
+        orderId: string,
+        m: {
+            kind: "create" | "sweep" | "return" | "close";
+            state: "confirmed" | "failed";
+            at: Date;
+            closes?: boolean;
+            closeTo?: string;
+            refused?: boolean;
+        },
+    ) {
+        const amount = m.kind === "sweep" || m.kind === "return" ? 1_000 : 0;
+        await db.pool.query(
+            `insert into deposit_moves (order_id, kind, amount_micros, payer, closes, close_to,
+                state, created_at, confirmed_at, failed_at, preflight_refused_at)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+            [
+                orderId,
+                m.kind,
+                amount,
+                m.kind === "return" ? "Payer" : null,
+                m.closes ?? false,
+                m.closeTo ?? null,
+                m.state,
+                m.at,
+                m.state === "confirmed" ? m.at : null,
+                m.state === "failed" ? m.at : null,
+                m.refused === true ? m.at : null,
+            ],
+        );
+    }
+
+    it("depositLamports counts fees, rent out and rent back", async () => {
+        const id = await deposit();
+        await move(id, { kind: "create", state: "confirmed", at: at(-4 * MIN) });
+        await move(id, {
+            kind: "sweep",
+            state: "confirmed",
+            at: at(-3 * MIN),
+            closes: true,
+            closeTo: FEE_PAYER,
+        });
+        await move(id, { kind: "return", state: "failed", at: at(-2 * MIN) });
+        await move(id, { kind: "return", state: "failed", at: at(-MIN), refused: true });
+        expect(await depositLamports(db.pool, at(-5 * MIN), t0, FEE_PAYER, DEPOSITS)).toBe(26_200n);
+    });
+
+    it("rent to someone else is not counted back", async () => {
+        const id = await deposit();
+        await move(id, {
+            kind: "return",
+            state: "confirmed",
+            at: at(-MIN),
+            closes: true,
+            closeTo: "Other",
+        });
+        expect(await depositLamports(db.pool, at(-5 * MIN), t0, FEE_PAYER, DEPOSITS)).toBe(10_400n);
+    });
+
+    it("a viewed, unpaid deposit does not alarm", async () => {
+        const id = await deposit();
+        await move(id, { kind: "create", state: "confirmed", at: at(-4 * MIN) });
+        await move(id, {
+            kind: "close",
+            state: "confirmed",
+            at: at(-2 * MIN),
+            closes: true,
+            closeTo: FEE_PAYER,
+        });
+        // Below the 15,800 the balance fell, so only counting the deposit moves keeps it quiet
+        const { names } = run({
+            lamports: 1_000_000_000n - 15_800n,
+            prev: prevAt(1_000_000_000n),
+            alarms: { ...defaults, max_lamports_per_order: 10_000 },
+        });
+        expect(await names()).not.toContain("sol_spent_without_orders");
+    });
+});

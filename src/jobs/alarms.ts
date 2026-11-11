@@ -12,7 +12,12 @@ import type { Settings } from "../config.ts";
 import type { Log } from "../log.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { deadline, type SolanaRpc } from "../solana/rpc.ts";
+import { moveFeeLamports } from "../deposits/moves.ts";
 import { hotFeeLamports } from "../x402/audit.ts";
+
+// What a USDC token account holds in rent; the fee payer pays it at a create and gets it back at
+// a close to itself
+export const TOKEN_ACCOUNT_RENT_LAMPORTS = 2_039_280n;
 
 export interface AlarmSnapshot {
     at: Date;
@@ -27,6 +32,7 @@ export interface AlarmDeps {
     refundWallet: Address;
     alarms: Settings["alarms"];
     refunds: Settings["refunds"];
+    deposits: Settings["deposits"];
     rpcTimeoutMs: number;
     log: Log;
     now: () => Date;
@@ -51,7 +57,10 @@ export async function checkAlarms(
 
     const x402Ends = prev ? await hotEnds(d.pool, prev.at, now) : 0;
     const spent = prev
-        ? prev.feePayerLamports - lamports - hotFeeLamports(d.refunds) * BigInt(x402Ends)
+        ? prev.feePayerLamports -
+          lamports -
+          hotFeeLamports(d.refunds) * BigInt(x402Ends) -
+          (await depositLamports(d.pool, prev.at, now, d.feePayer, d.deposits))
         : 0n;
     const max = BigInt(d.alarms.max_lamports_per_order);
     if (spent > 0n) {
@@ -120,4 +129,35 @@ async function refundsCreatedLastHour(pool: pg.Pool, now: Date): Promise<number>
         [now],
     );
     return res.rows[0]?.n ?? 0;
+}
+
+// The fee payer's SOL that deposit moves used in [from, to): every landed or failed move's fee
+// (a refused preflight costs nothing), a create's rent out, and a close's rent back to itself
+export async function depositLamports(
+    pool: pg.Pool,
+    from: Date,
+    to: Date,
+    feePayer: string,
+    cfg: Settings["deposits"],
+): Promise<bigint> {
+    const { rows } = await pool.query<{
+        kind: "create" | "sweep" | "return" | "close";
+        state: string;
+        closes: boolean;
+        close_to: string | null;
+        preflight_refused_at: Date | null;
+    }>(
+        `select kind, state, closes, close_to, preflight_refused_at from deposit_moves
+         where (state = 'confirmed' and confirmed_at >= $1 and confirmed_at < $2)
+            or (state = 'failed' and failed_at >= $1 and failed_at < $2)`,
+        [from, to],
+    );
+    let sum = 0n;
+    for (const m of rows) {
+        sum += moveFeeLamports({ kind: m.kind, preflightRefusedAt: m.preflight_refused_at }, cfg);
+        if (m.state !== "confirmed") continue;
+        if (m.kind === "create") sum += TOKEN_ACCOUNT_RENT_LAMPORTS;
+        if (m.closes && m.close_to === feePayer) sum -= TOKEN_ACCOUNT_RENT_LAMPORTS;
+    }
+    return sum;
 }
