@@ -1,7 +1,7 @@
 import type { Address } from "@solana/kit";
 import { findAssociatedTokenPda } from "@solana-program/token";
 import { USDC_MINT, TOKEN_PROGRAM } from "./constants.ts";
-import type { SolanaRpc } from "./rpc.ts";
+import { deadline, type SolanaRpc } from "./rpc.ts";
 
 export async function usdcAta(owner: Address): Promise<Address> {
     const [ata] = await findAssociatedTokenPda({
@@ -90,4 +90,21 @@ export async function readTokenAccount(
         contextSlot: BigInt(context.slot),
     };
     return { info: parsed, contextSlot };
+}
+
+// Only a successful answer showing the account missing or wrong counts, an RPC throw propagates
+export async function ownedUsdcAccount(
+    rpc: SolanaRpc,
+    account: Address,
+    owner: string,
+    timeoutMs: number,
+): Promise<boolean> {
+    const info = await inspectTokenAccount(rpc, account, deadline(timeoutMs));
+    return (
+        info !== null &&
+        info.programOwner === TOKEN_PROGRAM &&
+        info.mint === USDC_MINT &&
+        info.state === "initialized" &&
+        info.owner === owner
+    );
 }

@@ -6,7 +6,9 @@ export type Landing = "landed" | "onchain_failed" | "processed" | "not_found" | 
 export type LandingRead =
     | { landing: "landed"; signature: string; slot: bigint }
     | { landing: "onchain_failed"; slot: bigint }
-    | { landing: "processed" | "not_found" | "blockhash_expired" };
+    // slot: the status answer's context slot, from a node that has seen the expiry
+    | { landing: "blockhash_expired"; slot: bigint }
+    | { landing: "processed" | "not_found" };
 
 type Status = {
     confirmationStatus: string | null;
@@ -53,5 +55,7 @@ export async function readLanding(
         return { landing: "processed" };
     }
     const expired = epoch.blockHeight > lastValidBlockHeight && context.slot >= epoch.absoluteSlot;
-    return { landing: expired ? "blockhash_expired" : "not_found" };
+    return expired
+        ? { landing: "blockhash_expired", slot: context.slot }
+        : { landing: "not_found" };
 }

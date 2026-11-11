@@ -31,9 +31,9 @@ import type { Settings } from "../config.ts";
 import { type Queryable, withTx } from "../db/pool.ts";
 import type { Log } from "../log.ts";
 import { findPaymentByOrder, lockOrder, setOrderState } from "../orders/store.ts";
-import { inspectTokenAccount, usdcAta } from "../solana/accounts.ts";
+import { ownedUsdcAccount, usdcAta } from "../solana/accounts.ts";
 import type { BlockhashHint } from "../solana/blockhash.ts";
-import { MEMO_PROGRAM, TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
+import { MEMO_PROGRAM } from "../solana/constants.ts";
 import { readLanding } from "../solana/landing.ts";
 import { deadline, type SolanaRpc } from "../solana/rpc.ts";
 import { signV0Transaction, usdcTransferChecked } from "../solana/transfer.ts";
@@ -482,17 +482,9 @@ function isInFlight(r: RefundRow): r is InFlight {
     return r.txSignature !== null && r.wireTx !== null && r.lastValidBlockHeight !== null;
 }
 
-// Only a successful answer showing the account missing or wrong counts, an RPC throw propagates
 async function destinationValid(d: RefundDeps, r: RefundRow): Promise<boolean> {
     if (!isAddress(r.destination)) return false;
-    const account = await inspectTokenAccount(d.rpc, r.destination, deadline(d.rpcTimeoutMs));
-    return (
-        account !== null &&
-        account.programOwner === TOKEN_PROGRAM &&
-        account.mint === USDC_MINT &&
-        account.state === "initialized" &&
-        account.owner === r.payer
-    );
+    return ownedUsdcAccount(d.rpc, r.destination, r.payer, d.rpcTimeoutMs);
 }
 
 async function floatBalance(d: RefundDeps): Promise<bigint> {

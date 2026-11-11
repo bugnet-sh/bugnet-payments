@@ -275,6 +275,19 @@ export async function ensureDeposit(
     return rows[0] ? toDeposit(rows[0]) : findDeposit(db, order.id);
 }
 
+export async function findMove(db: Queryable, id: number): Promise<MoveRow | null> {
+    const { rows } = await db.query<MoveDbRow>("select * from deposit_moves where id = $1", [id]);
+    return rows[0] ? toMove(rows[0]) : null;
+}
+
+export async function lockMove(c: pg.PoolClient, id: number): Promise<MoveRow | null> {
+    const { rows } = await c.query<MoveDbRow>(
+        "select * from deposit_moves where id = $1 for no key update",
+        [id],
+    );
+    return rows[0] ? toMove(rows[0]) : null;
+}
+
 export async function depositLedger(
     db: Queryable,
     orderId: string,
