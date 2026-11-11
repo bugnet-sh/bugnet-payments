@@ -316,6 +316,8 @@ interface DepositMemory {
     // What the hard stop's progress rule compares: recorded transfers and the held slot
     seen: { transfers: number; checkedSlot: bigint | null } | null;
     progressAtMs: number | null;
+    // review_reason at the last tick: such a deposit waits for an operator, never for a read
+    inReview: boolean;
 }
 
 interface JobMemory {
@@ -357,6 +359,7 @@ function depositMemory(job: JobMemory, deposit: DepositRow): DepositMemory {
             earlyAsked: 0,
             seen: null,
             progressAtMs: null,
+            inReview: deposit.reviewReason !== null,
         };
         job.deposits.set(deposit.orderId, m);
     }
@@ -369,15 +372,16 @@ function depositMemory(job: JobMemory, deposit: DepositRow): DepositMemory {
 }
 
 // Database conditions of spec 6.4's busy deposit: a move in flight, money the planner has not
-// finished with, a hold, or an unpaid order near or past its deadline
+// finished with, a hold, or an unpaid order near or past its deadline. A deposit in review signs
+// nothing until an operator clears it (rule 6), so only its move in flight keeps the job busy.
 async function busyByLedger(pool: pg.Pool, now: Date, cfg: Cfg): Promise<Set<string>> {
     const { rows } = await pool.query<{ order_id: string }>(
         `select d.order_id from deposits d join orders o on o.id = d.order_id
          where d.state in ('open', 'settling', 'draining')
-            and (d.hold_reason is not null
-                or exists (select 1 from deposit_holds h where h.order_id = d.order_id)
-                or exists (select 1 from deposit_moves m where m.order_id = d.order_id
+            and (exists (select 1 from deposit_moves m where m.order_id = d.order_id
                     and m.state in ('pending', 'signed', 'sent'))
+                or d.review_reason is null and (d.hold_reason is not null
+                or exists (select 1 from deposit_holds h where h.order_id = d.order_id)
                 or exists (select 1 from deposit_transfers t where t.order_id = d.order_id
                     and (t.outcome = 'open'
                         or ((t.outcome = 'return' or (t.outcome = 'paid' and t.reason = 'extra'))
@@ -385,7 +389,7 @@ async function busyByLedger(pool: pg.Pool, now: Date, cfg: Cfg): Promise<Set<str
                             and not exists (select 1 from deposit_moves c
                                 where c.id = t.move_id and c.state = 'confirmed'))))
                 or (d.state = 'open' and o.state = 'unpaid'
-                    and o.expires_at <= $1::timestamptz + make_interval(secs => $2)))`,
+                    and o.expires_at <= $1::timestamptz + make_interval(secs => $2))))`,
         [now, cfg.settle_grace / 1_000],
     );
     return new Set(rows.map((r) => r.order_id));
@@ -394,7 +398,9 @@ async function busyByLedger(pool: pg.Pool, now: Date, cfg: Cfg): Promise<Set<str
 // Unrecorded money or an unfinished scan, which only the job's memory knows
 function unsettled(m: DepositMemory | undefined): boolean {
     return (
-        m !== undefined && (m.scanDue || (m.lastRead !== null && m.lastRead.invariant !== "held"))
+        m !== undefined &&
+        !m.inReview &&
+        (m.scanDue || (m.lastRead !== null && m.lastRead.invariant !== "held"))
     );
 }
 
@@ -593,6 +599,14 @@ async function dueDeposits(c: TickContext, watched: readonly DepositRow[]): Prom
         // watchedDeposits returns a closed deposit only once closed_every has passed
         if (deposit.state === "closed") return true;
         const m = c.job.deposits.get(deposit.orderId);
+        if (m !== undefined) m.inReview = deposit.reviewReason !== null;
+        // Reading faster cannot change a plan that waits for an operator, and an unknown debit
+        // keeps every read below the ledger for good: it would spend the day's budget (spec 6.4)
+        if (deposit.reviewReason !== null) {
+            return (
+                m === undefined || m.readAtMs === null || c.nowMs - m.readAtMs >= c.cfg.closed_every
+            );
+        }
         const idleDue =
             m === undefined || m.readAtMs === null || c.nowMs - m.readAtMs >= c.cfg.idle_every;
         if (fraction >= FULL_DAY) return idleDue;

@@ -1038,6 +1038,42 @@ describe("the daily budget", () => {
     });
 });
 
+describe("a deposit in review", () => {
+    it("is read at the closed pace and never keeps the job busy", async () => {
+        const dep = await deposit();
+        await send("A", 30_000n);
+        await ticks(2, 3_000, () => view(ORDER_A, "203.0.113.7", { needsCreate: false }));
+        expect((await ledgerOf()).transfers).toHaveLength(1);
+        // A debit only a leaked key could sign, which no ledger row explains
+        chain.debit(dep.tokenAccount, 30_000n);
+        chain.advance(1);
+        later(cfg.idle_every);
+        await tick();
+        expect((await depositOf()).reviewReason).toBe("unknown_debit");
+        expect(alarms("deposit_unknown_debit")).toHaveLength(1);
+        // The page's viewer is gone, and the next tick sees the review
+        later(cfg.viewer_ttl);
+        await tick();
+
+        const mark = chain.calls().length;
+        const reads = () =>
+            chain
+                .calls()
+                .slice(mark)
+                .filter(
+                    (x) =>
+                        x.method === "getMultipleAccounts" &&
+                        (x.params[0] as string[]).includes(dep.tokenAccount),
+                ).length;
+        expect(await depositsBusy(db.pool, watch, clock, cfg)).toBe(false);
+        await ticks(30, cfg.busy_every);
+        expect(reads()).toBeLessThanOrEqual(1);
+        expect(await depositsBusy(db.pool, watch, clock, cfg)).toBe(false);
+        await ticks(1, cfg.closed_every);
+        expect(reads()).toBeGreaterThanOrEqual(1);
+    });
+});
+
 describe("early blocked check", () => {
     it("a blocked owner's money is returned when it arrives", async () => {
         await deposit();
