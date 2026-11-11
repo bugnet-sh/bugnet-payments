@@ -31,6 +31,7 @@ import type { Settings } from "../config.ts";
 import { type Queryable, withTx } from "../db/pool.ts";
 import type { Log } from "../log.ts";
 import { findPaymentByOrder, lockOrder, setOrderState } from "../orders/store.ts";
+import type { PaymentRow } from "../orders/types.ts";
 import { ownedUsdcAccount, usdcAta } from "../solana/accounts.ts";
 import type { BlockhashHint } from "../solana/blockhash.ts";
 import { MEMO_PROGRAM } from "../solana/constants.ts";
@@ -41,7 +42,8 @@ import { readControls } from "../x402/controls.ts";
 import { utcDay } from "../x402/reserve.ts";
 import { resignProof } from "../x402/resign.ts";
 import { confirmHotRefund } from "./hot.ts";
-import { type RefundDbRow, type RefundRow, type RefundWallet, toRefund } from "./request.ts";
+import type { RefundRow, RefundWallet } from "./request.ts";
+import { groupComplete, groupSum, lockRefund } from "./split.ts";
 
 export interface RefundDeps {
     pool: pg.Pool;
@@ -193,22 +195,27 @@ export async function runRefunds(d: RefundDeps, wallet: RefundWallet): Promise<R
         const current: { refund?: RefundRow } = {};
         const takenBefore = taken.length;
         try {
-            const step = await withTx(d.pool, async (c) => {
-                // A deadlock re-run starts this callback again over the same closure
-                taken.length = takenBefore;
-                current.refund = undefined;
-                const pick = await pickRefund(c, taken, now, tick.paused === null, wallet);
-                if (pick === null) return null;
-                taken.push(pick.id);
-                if (pick.kind !== "allowance") await lockOrder(c, pick.orderId);
-                const r = await lockRefund(c, pick.id);
-                if (r === null) return { kind: "wait" } satisfies Step;
-                current.refund = r;
-                if (!isDue(r, now, tick.paused === null)) return { kind: "wait" } satisfies Step;
-                return r.state === "pending"
-                    ? checkPending(d, c, r, now)
-                    : checkInFlight(d, c, r, now);
-            });
+            const step = await withTx(
+                d.pool,
+                async (c) => {
+                    // A deadlock re-run starts this callback again over the same closure
+                    taken.length = takenBefore;
+                    current.refund = undefined;
+                    const pick = await pickRefund(c, taken, now, tick.paused === null, wallet);
+                    if (pick === null) return null;
+                    taken.push(pick.id);
+                    const r = await lockRefund(c, pick.id);
+                    if (r === null) return { kind: "wait" } satisfies Step;
+                    current.refund = r;
+                    if (!isDue(r, now, tick.paused === null)) {
+                        return { kind: "wait" } satisfies Step;
+                    }
+                    return r.state === "pending"
+                        ? checkPending(d, c, r, now)
+                        : checkInFlight(d, c, r, now);
+                },
+                d.log,
+            );
             if (step === null) break;
             if (current.refund === undefined) continue;
             await finish(d, current.refund, step, now, tick);
@@ -227,8 +234,8 @@ export async function runRefunds(d: RefundDeps, wallet: RefundWallet): Promise<R
     return tick;
 }
 
-// The pick takes no lock; the runner locks the order and the row, then checks the same
-// predicate again, so a refund another runner just signed is left alone. The age keeps a
+// The pick takes no lock; the runner locks the order and the refund's group, then checks the
+// same predicate again, so a refund another runner just signed is left alone. The age keeps a
 // refund just signed away from a second runner.
 async function pickRefund(
     c: pg.PoolClient,
@@ -251,14 +258,6 @@ async function pickRefund(
     return row ? { id: Number(row.id), orderId: row.order_id, kind: row.kind } : null;
 }
 
-async function lockRefund(c: pg.PoolClient, id: number): Promise<RefundRow | null> {
-    const res = await c.query<RefundDbRow>(
-        "select * from refunds where id = $1 for no key update",
-        [id],
-    );
-    return res.rows[0] ? toRefund(res.rows[0]) : null;
-}
-
 function isDue(r: RefundRow, now: Date, withPending: boolean): boolean {
     if (r.state === "pending") return withPending;
     if (r.state !== "signed" && r.state !== "sent") return false;
@@ -279,7 +278,8 @@ async function checkHotPending(
     now: Date,
 ): Promise<Step> {
     if ((await readControls(c)).refundsHeld) return { kind: "held", paused: "refunds_held" };
-    if (!(await withinPayment(c, r))) return toManual(c, r, "refund_exceeds_payment");
+    const breach = await groupBreach(c, r);
+    if (breach !== null) return toManual(c, r, breach);
     if (!(await viaRpc(() => destinationValid(d, r)))) {
         return toManual(c, r, "refund_destination_invalid");
     }
@@ -290,22 +290,75 @@ async function checkHotPending(
     return sign(d, c, r, now, false);
 }
 
-// The caller holds the order lock of a full or partial refund
-async function withinPayment(c: pg.PoolClient, r: RefundRow): Promise<boolean> {
+// Spec 10.9: whatever an insert site wrote, a group pays out at most what it may, and each part
+// goes only to the owner whose share it is. The caller holds the group's locks, and the order
+// lock of every kind but allowance.
+async function groupBreach(c: pg.PoolClient, r: RefundRow): Promise<ManualReason | null> {
+    if (r.kind === "deposit") {
+        return r.amountMicros <= (await heldFor(c, r)) ? null : "refund_exceeds_payment";
+    }
+    const payment = await findPaymentByOrder(c, r.orderId);
+    if (payment === null) return "refund_exceeds_payment";
+    if ((await groupSum(c, r.orderId, [r.kind])) > (await groupCap(c, r, payment))) {
+        return "refund_exceeds_payment";
+    }
+    if (
+        r.kind !== "allowance" &&
+        (await groupSum(c, r.orderId, ["full", "partial"])) > payment.amountMicros
+    ) {
+        return "refund_exceeds_payment";
+    }
+    const owner = await ownerOfPart(c, payment, r.part);
+    if (owner === null || owner.destination !== r.destination || owner.payer !== r.payer) {
+        return "refund_destination_invalid";
+    }
+    return null;
+}
+
+async function groupCap(c: pg.PoolClient, r: RefundRow, payment: PaymentRow): Promise<number> {
     if (r.kind === "allowance") {
         const res = await c.query<{ allowance_micros: string }>(
             "select allowance_micros from x402_fundings where order_id = $1",
             [r.orderId],
         );
         const funded = res.rows[0];
-        return funded !== undefined && r.amountMicros <= Number(funded.allowance_micros);
+        return funded === undefined ? 0 : Number(funded.allowance_micros);
     }
-    if (r.kind === "full") {
-        const payment = await findPaymentByOrder(c, r.orderId);
-        return payment !== null && r.amountMicros <= payment.amountMicros;
+    if (r.kind === "partial" && r.fromWallet === "allowance") {
+        const order = await lockOrder(c, r.orderId);
+        return order === null ? 0 : order.amountMicros - order.allowanceMicros;
     }
-    const order = await lockOrder(c, r.orderId);
-    return order !== null && r.amountMicros <= order.amountMicros - order.allowanceMicros;
+    return payment.amountMicros;
+}
+
+async function ownerOfPart(
+    c: pg.PoolClient,
+    payment: PaymentRow,
+    part: number,
+): Promise<{ destination: string; payer: string } | null> {
+    if (!payment.multiSender) {
+        return part === 0
+            ? { destination: payment.sourceTokenAccount, payer: payment.payer }
+            : null;
+    }
+    const res = await c.query<{ source_token_account: string; owner: string }>(
+        "select source_token_account, owner from payment_shares where order_id = $1 and part = $2",
+        [payment.orderId, part],
+    );
+    const share = res.rows[0];
+    return share === undefined
+        ? null
+        : { destination: share.source_token_account, payer: share.owner };
+}
+
+// A deposit row returns held review money: the rest of the one transfer in review that names it
+async function heldFor(c: pg.PoolClient, r: RefundRow): Promise<number> {
+    const res = await c.query<{ held: string }>(
+        `select (amount_micros - applied_micros)::text as held from deposit_transfers
+         where order_id = $1 and signature = $2 and outcome = 'review' and refund_id = $3`,
+        [r.orderId, r.depositSignature, r.id],
+    );
+    return Number(res.rows[0]?.held ?? 0);
 }
 
 async function hotBalance(d: RefundDeps): Promise<bigint> {
@@ -336,10 +389,8 @@ async function checkColdPending(
 ): Promise<Step> {
     const paused = await lockControls(c);
     if (paused !== null) return { kind: "held", paused };
-    const payment = await findPaymentByOrder(c, r.orderId);
-    if (payment === null || r.amountMicros > payment.amountMicros) {
-        return toManual(c, r, "refund_exceeds_payment");
-    }
+    const breach = await groupBreach(c, r);
+    if (breach !== null) return toManual(c, r, breach);
     if (!(await viaRpc(() => destinationValid(d, r)))) {
         return toManual(c, r, "refund_destination_invalid");
     }
@@ -350,7 +401,7 @@ async function checkColdPending(
     if ((await signedToday(c, now)) + r.amountMicros > d.cfg.daily_cap_micros) {
         return { kind: "pause", reason: "daily_cap" };
     }
-    if ((await signedLastHour(c, now)) >= d.cfg.max_per_hour) {
+    if ((await signedLastHour(c, now, r)) >= d.cfg.max_per_hour) {
         return { kind: "pause", reason: "hourly_rate" };
     }
     const balanceMicros = await viaRpc(() => floatBalance(d));
@@ -514,13 +565,16 @@ async function signedToday(c: pg.PoolClient, now: Date): Promise<number> {
     return Number(res.rows[0]?.total ?? 0);
 }
 
-// A pending row may keep the signed_at of an attempt an operator retried, so it is not counted
-async function signedLastHour(c: pg.PoolClient, now: Date): Promise<number> {
+// A refund split among owners is one refund: its own group never counts against its later
+// parts. A pending row may keep the signed_at of an attempt an operator retried, so it is not
+// counted.
+async function signedLastHour(c: pg.PoolClient, now: Date, r: RefundRow): Promise<number> {
     const res = await c.query<{ n: number }>(
-        `select count(*)::int as n from refunds
+        `select count(distinct (order_id, kind))::int as n from refunds
          where state <> 'pending' and from_wallet = 'refund'
-           and signed_at > $1::timestamptz - interval '1 hour'`,
-        [now],
+           and signed_at > $1::timestamptz - interval '1 hour'
+           and not (order_id = $2 and kind = $3)`,
+        [now, r.orderId, r.kind],
     );
     return res.rows[0]?.n ?? 0;
 }
@@ -532,6 +586,10 @@ async function sign(
     now: Date,
     resigned: boolean,
 ): Promise<Step> {
+    if (resigned) {
+        const breach = await groupBreach(c, r);
+        if (breach !== null) return toManual(c, r, breach);
+    }
     const hot = r.fromWallet === "allowance";
     const { context, value } = await viaRpc(() =>
         d.rpc.getLatestBlockhash({ commitment: "confirmed" }).send(deadline(d.rpcTimeoutMs)),
@@ -586,7 +644,8 @@ async function sign(
     return { kind: "send", signed, resigned };
 }
 
-// tx_signature names the transfer that moved the money, the attempts that did not land are kept
+// tx_signature names the transfer that moved the money, the attempts that did not land are kept.
+// The order is refunded once every part of its group landed or was resolved by hand.
 async function confirm(c: pg.PoolClient, r: RefundRow, landed: string, now: Date): Promise<Step> {
     await c.query(
         `update refunds set state = 'confirmed', confirmed_at = $2, tx_signature = $3,
@@ -595,21 +654,22 @@ async function confirm(c: pg.PoolClient, r: RefundRow, landed: string, now: Date
          where id = $1`,
         [r.id, now, landed],
     );
-    if (r.kind !== "allowance") {
+    if (r.kind === "full" || r.kind === "partial") {
         const order = await lockOrder(c, r.orderId);
-        if (order?.state === "refunding") {
+        if (order?.state === "refunding" && (await groupComplete(c, r.orderId, r.kind))) {
             await setOrderState(c, r.orderId, "refunding", "refunded");
         }
     }
     return { kind: "confirmed", signature: landed };
 }
 
+// The first part to go manual parks the order; a deposit row never moves it
 async function toManual(c: pg.PoolClient, r: RefundRow, reason: ManualReason): Promise<Step> {
     await c.query("update refunds set state = 'manual', manual_reason = $2 where id = $1", [
         r.id,
         reason,
     ]);
-    if (r.kind !== "allowance") {
+    if (r.kind === "full" || r.kind === "partial") {
         const order = await lockOrder(c, r.orderId);
         if (order?.state === "refunding") {
             await setOrderState(c, r.orderId, "refunding", "manual", { manualReason: reason });

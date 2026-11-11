@@ -32,7 +32,9 @@ interface ItemRow extends pg.QueryResultRow {
     tx: string | null;
 }
 
-// Millisecond times and bytewise text order, so a cursor repeats the order exactly
+// Millisecond times and bytewise text order, so a cursor repeats the order exactly. Each part of a
+// split refund is its own item with its owner's wallet; a deposit row returns held review money
+// that was never a payment, so it is left out.
 const PAGE_SQL = `
     with items as (
         select date_trunc('milliseconds', p.confirmed_at) as at,
@@ -47,7 +49,8 @@ const PAGE_SQL = `
             (case kind when 'allowance' then 'allowance_return' else 'refund' end) collate "C",
             id::text collate "C", amount_micros, null, payer, tx_signature
           from refunds
-         where state = 'confirmed' and confirmed_at > $1 and confirmed_at <= $2
+         where state = 'confirmed' and kind <> 'deposit'
+           and confirmed_at > $1 and confirmed_at <= $2
     )
     select at, kind, id, amount_micros::text, method, wallet, tx from items
      where at > $1 and at <= $2

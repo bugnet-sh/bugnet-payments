@@ -194,6 +194,42 @@ describe("statsTotals", () => {
         expect(t.daily).toEqual([{ day: "2030-01-10", ...t.totals }]);
     });
 
+    it("stats show each part with its wallet", async () => {
+        const o = await paidOrder(at("2030-01-10T01:00:00"), {
+            amountMicros: 50_000,
+            allowanceMicros: 20_000,
+            payInto: "allowance",
+        });
+        for (const [part, amount] of [
+            [0, 30_000],
+            [1, 20_000],
+        ] as const) {
+            await db.pool.query(
+                `insert into refunds (order_id, kind, part, reason, amount_micros, destination,
+                    payer, state, tx_signature, confirmed_at, from_wallet)
+                 values ($1, 'full', $2, 'late', $3, 'dest', 'payer', 'confirmed', $4, $5,
+                    'allowance')`,
+                [o.id, part, amount, `sig-part-${part}`, at("2030-01-10T02:00:00")],
+            );
+        }
+        await db.pool.query(
+            `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
+                tx_signature, confirmed_at, deposit_signature)
+             values ($1, 'deposit', 'deposit_held', 7000, 'dest', 'payer', 'confirmed',
+                'sig-held', $2, 'held')`,
+            [o.id, at("2030-01-10T03:00:00")],
+        );
+        const t = await statsTotals(db.pool, settings, NOW);
+        expect(t.totals).toEqual({
+            earnedMicros: 30_000,
+            refundedMicros: 30_000,
+            allowanceReturnedMicros: 20_000,
+            x402SpentMicros: 0,
+        });
+        expect(t.refunds).toEqual({ count: 1, micros: 30_000 });
+        expect(t.daily).toEqual([{ day: "2030-01-10", ...t.totals }]);
+    });
+
     it("counts an allowance refund from the hot wallet as allowance returned only", async () => {
         const a = await paidOrder(at("2030-01-10T01:00:00"), { kind: "allowance" });
         await refund(a.id, "allowance", 300_000, at("2030-01-10T02:00:00"), { from: "allowance" });

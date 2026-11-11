@@ -19,7 +19,7 @@ import { depositLedger } from "../deposits/store.ts";
 import { depositLapsed, depositSummary } from "../deposits/view.ts";
 import { isRecord } from "../is-record.ts";
 import type { Log } from "../log.ts";
-import { findOrderRefund } from "../refunds/request.ts";
+import { groupComplete } from "../refunds/split.ts";
 import type { BlockhashCache } from "../solana/blockhash.ts";
 import { SOLANA_MAINNET } from "../solana/constants.ts";
 import { type ChallengeContext, challengeFor, payUrlFor } from "../x402/challenge.ts";
@@ -370,8 +370,7 @@ async function unpaidAnswer(
 
 async function closedAnswer(db: Queryable, o: OrderRow): Promise<Refused> {
     if (o.x402Refusal !== null && ["refunding", "refunded", "manual"].includes(o.state)) {
-        const row = await findOrderRefund(db, o.id);
-        const done = row?.state === "confirmed" || row?.manualReason === "resolved_by_hand";
+        const done = await groupComplete(db, o.id, "full");
         return { ...refused(o.x402Refusal, o.id), refundPending: !done };
     }
     return refused(o.state === "expired" ? "order_expired" : "order_closed", o.id);

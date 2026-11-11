@@ -7,12 +7,12 @@ import { memoryLog } from "../log.ts";
 import { findOrder } from "../orders/store.ts";
 import type { OrderRow } from "../orders/types.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
-import { seedPayment } from "../testing/orders.ts";
+import { seedOrder, seedPayment, seedSharedPayment } from "../testing/orders.ts";
 import { resetLedger, seedAccount, seedFunding } from "../testing/x402.ts";
 import { createAllowanceFunding } from "../x402/funding.ts";
-import { findAccount, readPool } from "../x402/ledger.ts";
+import { findAccount, lockAccount, readPool } from "../x402/ledger.ts";
 import { confirmHotRefund, resolveHotRefundByHand, writeHotPartial } from "./hot.ts";
-import { findOrderRefund, findRefundById, requestRefund } from "./request.ts";
+import { findOrderRefund, findRefundById, refundGroup, requestRefund } from "./request.ts";
 
 const X = parseSettings(
     stringify({ solana: { recipient: "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi" } }),
@@ -526,5 +526,173 @@ describe("resolveHotRefundByHand", () => {
         const s63 = getBase58Decoder().decode(new Uint8Array(63).fill(1));
         expect(await resolve(id, s63)).toBe(false);
         expect(await findRefundById(db.pool, id)).toEqual(before);
+    });
+});
+
+// A hot start order of 50,000 (allowance 20,000) paid by OwnA (30,000) and OwnB (20,000)
+async function hotShared(state: OrderRow["state"], o: { funding?: boolean } = {}) {
+    const { order } = await seedOrder(db.pool, {
+        kind: "start",
+        state,
+        packageId: "cpu-small",
+        amountMicros: 50_000,
+        allowanceMicros: 20_000,
+        feeMicros: 3_000,
+        payInto: "allowance",
+    });
+    await seedSharedPayment(db.pool, order.id);
+    if (o.funding ?? true) {
+        await seedAccount(db.pool, { id: order.id });
+        await setPool(20_000, 0);
+        await seedFunding(db.pool, {
+            accountId: order.id,
+            orderId: order.id,
+            allowanceMicros: 20_000,
+            payer: "OwnA",
+            sourceTokenAccount: "SrcA",
+        });
+    }
+    return (await findOrder(db.pool, order.id))!;
+}
+
+const parts = async (orderId: string, kind: "full" | "partial" | "allowance") =>
+    (await refundGroup(db.pool, orderId, kind)).map((r) => ({
+        part: r.part,
+        amountMicros: r.amountMicros,
+        destination: r.destination,
+        payer: r.payer,
+        state: r.state,
+        fromWallet: r.fromWallet,
+    }));
+
+describe("every insert site splits a shared payment", () => {
+    it("a router partial of a hot shared order is one partial row per owner", async () => {
+        const order = await hotShared("redeemed", { funding: false });
+        expect(
+            await requestRefund(db.pool, order.id, "router_refundable", { amountMicros: 20_000 }),
+        ).toBe("created");
+        expect(await parts(order.id, "partial")).toEqual([
+            {
+                part: 0,
+                amountMicros: 12_000,
+                destination: "SrcA",
+                payer: "OwnA",
+                state: "pending",
+                fromWallet: "allowance",
+            },
+            {
+                part: 1,
+                amountMicros: 8_000,
+                destination: "SrcB",
+                payer: "OwnB",
+                state: "pending",
+                fromWallet: "allowance",
+            },
+        ]);
+        expect((await findOrder(db.pool, order.id))!.hotRouterRefundMicros).toBe(20_000);
+    });
+
+    it("decideHotFullRefund with a voidable funding is one full row per owner", async () => {
+        const order = await hotShared("paid");
+        expect(await requestRefund(db.pool, order.id, "unredeemed", opts)).toBe("created");
+        expect(await parts(order.id, "full")).toEqual([
+            expect.objectContaining({ part: 0, amountMicros: 30_000, destination: "SrcA" }),
+            expect.objectContaining({ part: 1, amountMicros: 20_000, destination: "SrcB" }),
+        ]);
+        expect((await parts(order.id, "full")).every((p) => p.fromWallet === "allowance")).toBe(
+            true,
+        );
+        expect(await fundingOf(order.id)).toMatchObject({ voidedAt: AT });
+        expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
+    });
+});
+
+describe("refund groups on the hot path", () => {
+    it("a second refund of the same kind is refused for the whole group", async () => {
+        const order = await hotShared("redeemed", { funding: false });
+        expect(await writeHotPartial(db.pool, order.id, 20_000, AT)).toBe("created");
+        expect(await writeHotPartial(db.pool, order.id, 5_000, AT)).toBe("exists");
+        expect(await parts(order.id, "partial")).toHaveLength(2);
+        expect((await findOrder(db.pool, order.id))!.hotRouterRefundMicros).toBe(20_000);
+    });
+
+    it("hotPartial leaves deposit rows out of its sum", async () => {
+        const { order } = await seedOrder(db.pool, {
+            kind: "start",
+            state: "redeemed",
+            amountMicros: 20_000,
+            allowanceMicros: 5_000,
+            payInto: "allowance",
+        });
+        await seedPayment(db.pool, order.id, {
+            status: "confirmed",
+            payer: "payer-1",
+            sourceTokenAccount: "src-1",
+        });
+        await db.pool.query(
+            `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
+                from_wallet, deposit_signature, created_at)
+             values ($1, 'deposit', 'deposit_held', 7000, 'src-9', 'payer-9', 'pending', 'refund',
+                'held-1', $2)`,
+            [order.id, AT],
+        );
+        expect(await writeHotPartial(db.pool, order.id, 15_000, AT)).toBe("created");
+        expect(await parts(order.id, "partial")).toEqual([
+            expect.objectContaining({ part: 0, amountMicros: 15_000 }),
+        ]);
+    });
+
+    it("the allowance refunded event is sent once per group", async () => {
+        const account = await seedAccount(db.pool, { state: "closing", closingAt: AT });
+        const { order } = await seedOrder(db.pool, {
+            kind: "allowance",
+            state: "redeemed",
+            packageId: "x402-allowance",
+            handleSha256: account.handleSha256,
+            amountMicros: 50_000,
+            allowanceMicros: 50_000,
+            payInto: "allowance",
+        });
+        await seedSharedPayment(db.pool, order.id);
+        await seedFunding(db.pool, {
+            accountId: account.id,
+            orderId: order.id,
+            allowanceMicros: 50_000,
+            payer: "OwnA",
+            sourceTokenAccount: "SrcA",
+        });
+        await db.pool.query("update x402_accounts set spent_micros = 40000 where id = $1", [
+            account.id,
+        ]);
+        const out = await withTx(db.pool, async (c) =>
+            F.refund(c, (await lockAccount(c, account.id))!, AT),
+        );
+        expect(out).toMatchObject({ kind: "refund", amountMicros: 10_000 });
+        const [p0, p1] = await refundGroup(db.pool, order.id, "allowance");
+        for (const [r, s] of [
+            [p0!, sig(5)],
+            [p1!, sig(6)],
+        ] as const) {
+            await db.pool.query(
+                "update refunds set state = 'sent', tx_signature = $2 where id = $1",
+                [r.id, s],
+            );
+        }
+        await setPool(10_000, 0);
+        const confirm = (id: number, signature: string) =>
+            withTx(db.pool, (c) => confirmHotRefund(c, id, { slot: 9n, signature }, AT, X, log));
+        const refunded = async () =>
+            (await routerEvents(order.id)).filter((e) => e.phase === "refunded");
+
+        expect(await confirm(p0!.id, sig(5))).toBe(true);
+        expect(await refunded()).toEqual([]);
+        expect((await readPool(db.pool)).committedMicros).toBe(4_000);
+        expect(await confirm(p1!.id, sig(6))).toBe(true);
+        expect(await refunded()).toEqual([
+            expect.objectContaining({
+                payload: expect.objectContaining({ amountMicros: 10_000, tx: sig(6) }),
+            }),
+        ]);
+        expect((await readPool(db.pool)).committedMicros).toBe(0);
     });
 });

@@ -5,17 +5,19 @@ import { createPool, withTx, type Queryable } from "./db/pool.ts";
 import { isKeysCommand, KEYS_USAGE, runKeys } from "./keys/commands.ts";
 import { jsonLog, type Log } from "./log.ts";
 import { isOrderId } from "./orders/ids.ts";
-import { findOrder, lockOrder, setOrderState } from "./orders/store.ts";
+import { findOrder, findPaymentByOrder, lockOrder, setOrderState } from "./orders/store.ts";
 import type { OrderRow } from "./orders/types.ts";
 import { refundsPaused, resumeRefunds } from "./refunds/executor.ts";
 import { resolveHotRefundByHand, writeHotPartial } from "./refunds/hot.ts";
 import {
     findOrderRefund,
     findRefundById,
+    refundGroup,
     type RefundRow,
     requestRefund,
     returnManualToRedeemed,
 } from "./refunds/request.ts";
+import { groupComplete, lockRefund, lockRefundGroup } from "./refunds/split.ts";
 import { usdcAta } from "./solana/accounts.ts";
 import { isCanonicalAddress, isCanonicalSignature } from "./solana/base58.ts";
 import { cliRouter, startOrStop } from "./solana/cli-router.ts";
@@ -48,10 +50,10 @@ const NEEDS_AMOUNT = ["refund_amount_pending", "refund_amount_invalid"];
 
 const USAGE = [
     "usage: cli [-config FILE] <command>",
-    "  manual list                              orders, then hot-wallet rows as 'refund' lines",
-    "  manual retry <orderId>                   refund a manual order again",
-    "  manual retry <refundId>                  hot-wallet row back to pending once its last",
-    "                                           transaction is proven absent",
+    "  manual list                              orders, then one 'refund' line per manual part",
+    "  manual retry <orderId>                   refund a manual order again, every manual part",
+    "  manual retry <refundId>                  one part back to pending; a hot-wallet row once its",
+    "                                           last transaction is proven absent",
     "  manual refund <orderId> <amount_micros>  refund this much of a manual order's payment",
     "  manual dismiss <orderId>                 router holds the parked order, back to redeemed",
     "  manual resolve <orderId>                 refund done by hand, mark the order refunded",
@@ -323,12 +325,34 @@ function refuseRefund(io: CliIo, refundId: number, why: string): number {
     return 1;
 }
 
-// A hot-wallet row the refund-id commands manage; every other row has an order-level command
+// The rows the refund-id commands manage: hot-wallet rows, the parts of a cold refund split among
+// owners and every deposit row. Every other row has an order-level command.
 async function isListed(pool: pg.Pool, r: RefundRow): Promise<boolean> {
     if (r.state !== "manual" || r.manualReason === BY_HAND) return false;
-    if (r.kind === "allowance") return true;
-    if (r.kind !== "partial") return false;
-    return (await findOrder(pool, r.orderId))?.payInto === "allowance";
+    if (r.kind === "allowance" || r.kind === "deposit") return true;
+    if ((await findOrder(pool, r.orderId))?.payInto === "allowance") return r.kind === "partial";
+    return (await findPaymentByOrder(pool, r.orderId))?.multiSender === true;
+}
+
+// Neither paid nor resolved by hand
+const isOpen = (r: RefundRow): boolean => r.state !== "confirmed" && r.manualReason !== BY_HAND;
+
+// A part of a cold order's refund left the queue: a complete refund refunds the order, and once no
+// part waits for an operator the order goes back to refunding, so the executor's confirm of the
+// parts still in flight finishes it. Deposit rows and hot orders never move the order this way.
+async function partLeftQueue(c: pg.PoolClient, r: RefundRow): Promise<void> {
+    if (r.kind !== "full" && r.kind !== "partial") return;
+    const order = await lockOrder(c, r.orderId);
+    if (order === null || order.payInto === "allowance") return;
+    if (order.state !== "manual" && order.state !== "refunding") return;
+    if (await groupComplete(c, r.orderId, r.kind)) {
+        await setOrderState(c, r.orderId, order.state, "refunded");
+        return;
+    }
+    const group = await refundGroup(c, r.orderId, r.kind);
+    if (order.state === "manual" && !group.some((p) => p.state === "manual" && isOpen(p))) {
+        await setOrderState(c, r.orderId, "manual", "refunding", { manualReason: null });
+    }
 }
 
 // The first two refusals every refund-id command shares
@@ -368,16 +392,11 @@ async function listManual(ctx: CliContext, io: CliIo): Promise<number> {
         payer: string | null;
         destination: string | null;
     }>(
-        `select o.id, coalesce(o.manual_reason, r.manual_reason) as reason,
-            coalesce(r.amount_micros, p.amount_micros, o.amount_micros)::text as amount,
-            coalesce(r.payer, p.payer, o.payer) as payer,
-            coalesce(r.destination, p.source_token_account) as destination
+        `select o.id, o.manual_reason as reason,
+            coalesce(p.amount_micros, o.amount_micros)::text as amount,
+            coalesce(p.payer, o.payer) as payer, p.source_token_account as destination
          from orders o
          left join payments p on p.order_id = o.id
-         left join lateral (
-            select * from refunds where order_id = o.id and kind in ('full', 'partial')
-            order by id limit 1
-         ) r on true
          where o.state = 'manual'
          order by o.created_at, o.id`,
     );
@@ -386,19 +405,27 @@ async function listManual(ctx: CliContext, io: CliIo): Promise<number> {
         const cells = [row.id, row.reason, amount, row.payer, row.destination];
         io.out(cells.map((c) => c ?? "-").join("\t"));
     }
+    // One line per part, so a part in the queue shows its own owner's amount and destination
     const rows = await ctx.pool.query<{
         id: string;
         kind: string;
+        part: number;
+        parts: number;
         from_wallet: string;
+        state: string;
         manual_reason: string | null;
         amount: string;
         destination: string;
     }>(
-        `select r.id, r.kind, r.from_wallet, r.manual_reason, r.amount_micros::text as amount,
-            r.destination
+        `select r.id, r.kind, r.part, r.from_wallet, r.state, r.manual_reason,
+            r.amount_micros::text as amount, r.destination,
+            (select count(*) from refunds g where g.order_id = r.order_id and g.kind = r.kind)::int
+                as parts
          from refunds r join orders o on o.id = r.order_id
          where r.state = 'manual' and r.manual_reason is distinct from 'resolved_by_hand'
-            and (r.kind = 'allowance' or (r.kind = 'partial' and o.pay_into = 'allowance'))
+            and (r.kind in ('allowance', 'deposit')
+                or (r.kind = 'partial' and o.pay_into = 'allowance')
+                or o.state = 'manual')
          order by r.id`,
     );
     for (const r of rows.rows) {
@@ -406,7 +433,9 @@ async function listManual(ctx: CliContext, io: CliIo): Promise<number> {
             "refund",
             r.id,
             r.kind,
+            `part ${r.part}/${r.parts}`,
             r.from_wallet,
+            r.state,
             r.manual_reason,
             r.amount,
             r.destination,
@@ -435,8 +464,7 @@ async function retryRefund(ctx: CliContext, io: CliIo, id: number): Promise<numb
         proven = provenKey(r);
     }
     const done = await withTx(ctx.pool, async (c) => {
-        const now = await c.query(`select id from refunds where id = $1 for update`, [id]);
-        const cur = now.rowCount === 1 ? await findRefundById(c, id) : null;
+        const cur = await lockRefund(c, id);
         if (cur === null || (proven !== null && provenKey(cur) !== proven)) return false;
         const res = await c.query(
             `update refunds set state = 'pending', attempts = 0, budget_waived = true,
@@ -445,29 +473,32 @@ async function retryRefund(ctx: CliContext, io: CliIo, id: number): Promise<numb
                 and manual_reason is distinct from 'resolved_by_hand'`,
             [id],
         );
-        return res.rowCount === 1;
+        if (res.rowCount !== 1) return false;
+        await partLeftQueue(c, cur);
+        return true;
     });
     if (!done) return refuseRefund(io, id, "changed while retrying");
     io.out(`refund ${id}: pending`);
     return 0;
 }
 
+// Every part of the order's refund that waits in the queue goes back to pending; a part already
+// paid or still in flight is left as it is
 async function retryOrder(ctx: CliContext, io: CliIo, orderId: string): Promise<number> {
     const { pool } = ctx;
     const seen = await findOrder(pool, orderId);
-    const peek = seen === null ? null : await findOrderRefund(pool, orderId);
-    let proven: string | null = null;
-    if (
-        seen?.state === "manual" &&
-        seen.payInto === "allowance" &&
-        peek?.kind === "full" &&
-        peek.state === "manual" &&
-        peek.fromWallet === "allowance" &&
-        peek.manualReason !== BY_HAND
-    ) {
-        const proof = await proofOf(ctx, peek);
-        if (proof !== "absent") return refuse(io, orderId, unproven(proof));
-        proven = provenKey(peek);
+    const head = seen === null ? null : await findOrderRefund(pool, orderId);
+    const peek = head === null ? [] : await refundGroup(pool, orderId, head.kind);
+    // Each allowance-wallet part needs its own proof that no transaction of it can still land
+    const proven = new Map<number, string>();
+    if (seen?.state === "manual" && seen.payInto === "allowance") {
+        for (const p of peek) {
+            if (p.kind !== "full" || p.state !== "manual" || p.manualReason === BY_HAND) continue;
+            if (p.fromWallet !== "allowance") continue;
+            const proof = await proofOf(ctx, p);
+            if (proof !== "absent") return refuse(io, orderId, unproven(proof));
+            proven.set(p.id, provenKey(p));
+        }
     }
     const outcome = await withTx(
         pool,
@@ -477,9 +508,14 @@ async function retryOrder(ctx: CliContext, io: CliIo, orderId: string): Promise<
             const order = await lockOrder(c, orderId);
             const hot = order?.payInto === "allowance";
             const refund = order === null ? null : await findOrderRefund(c, orderId);
-            if (refund?.manualReason === BY_HAND) return { refused: "resolved by hand" };
+            const group = refund === null ? [] : await lockRefundGroup(c, orderId, refund.kind);
+            const open = group.filter(isOpen);
+            if (open.length === 0 && group.some((p) => p.manualReason === BY_HAND)) {
+                return { refused: "resolved by hand" };
+            }
             if (hot && refund?.kind === "partial") {
-                return { refused: `hot-wallet refund: use manual retry ${refund.id}` };
+                const ids = (open.length > 0 ? open : group).map((p) => `manual retry ${p.id}`);
+                return { refused: `hot-wallet refund: use ${ids.join(", ")}` };
             }
             const refused = notManual(order);
             if (refused !== null || order === null) return { refused: refused ?? "unknown order" };
@@ -492,15 +528,19 @@ async function retryOrder(ctx: CliContext, io: CliIo, orderId: string): Promise<
             }
             if (refund === null)
                 return { noRefund: { coldShare: hot && order.coldTransferId !== null } };
-            if (refund.state !== "manual") return { refused: `its refund is ${refund.state}` };
-            if (hot && refund.fromWallet === "allowance" && proven !== provenKey(refund)) {
-                return { refused: "changed while retrying" };
+            const manual = open.filter((p) => p.state === "manual");
+            if (manual.length === 0) {
+                return { refused: `its refund is ${(open[0] ?? refund).state}` };
             }
+            const unprovenPart = manual.some(
+                (p) => hot && p.fromWallet === "allowance" && proven.get(p.id) !== provenKey(p),
+            );
+            if (unprovenPart) return { refused: "changed while retrying" };
             await c.query(
                 `update refunds set state = 'pending', attempts = 0, manual_reason = null,
                     budget_waived = budget_waived or $2
-                 where id = $1`,
-                [refund.id, hot],
+                 where id = any($1::bigint[])`,
+                [manual.map((p) => p.id), hot],
             );
             await setOrderState(c, orderId, "manual", "refunding", { manualReason: null });
             return "reset";
@@ -595,20 +635,34 @@ async function resolveManual(
     const refused = await withTx(ctx.pool, async (c) => {
         const order = await lockOrder(c, arg);
         const refund = order === null ? null : await findOrderRefund(c, arg);
-        if (refund?.manualReason === BY_HAND) return "resolved by hand";
-        if (order?.payInto === "allowance" && refund !== null) {
-            return `hot-wallet refund: use manual resolve ${refund.id}`;
+        const group = refund === null ? [] : await lockRefundGroup(c, arg, refund.kind);
+        const open = group.filter(isOpen);
+        if (open.length === 0 && group.some((p) => p.manualReason === BY_HAND)) {
+            return "resolved by hand";
+        }
+        // A hot part resolved without its transfer would leave the pool's committed too high, so
+        // each one is proven with its own --tx
+        const hot = order?.payInto === "allowance";
+        if (open.some((p) => p.fromWallet === "allowance") || (hot && open.length > 0)) {
+            const each = open.map((p) =>
+                p.fromWallet === "allowance"
+                    ? `manual resolve ${p.id} --tx <signature>`
+                    : `manual resolve ${p.id}`,
+            );
+            return `hot-wallet refund: use ${each.join(", ")}`;
         }
         const notInQueue = notManual(order);
         if (notInQueue !== null) return notInQueue;
-        if (refund !== null && IN_FLIGHT.includes(refund.state)) {
-            return `its refund is ${refund.state} and the executor still owns it`;
+        const busy = open.find((p) => IN_FLIGHT.includes(p.state));
+        if (busy !== undefined) {
+            return `its refund is ${busy.state} and the executor still owns it`;
         }
-        // The row stays manual, and this reason keeps anything from reading it as paid
-        if (refund !== null) {
-            await c.query("update refunds set manual_reason = 'resolved_by_hand' where id = $1", [
-                refund.id,
-            ]);
+        // The rows stay manual, and this reason keeps anything from reading them as paid
+        if (open.length > 0) {
+            await c.query(
+                "update refunds set manual_reason = 'resolved_by_hand' where id = any($1::bigint[])",
+                [open.map((p) => p.id)],
+            );
         }
         await setOrderState(c, arg, "manual", "refunded");
         return null;
@@ -636,12 +690,20 @@ async function resolveRefund(
                 `an allowance-wallet row: use manual resolve ${id} --tx <signature>`,
             );
         }
-        const res = await pool.query(
-            `update refunds set manual_reason = 'resolved_by_hand'
-             where id = $1 and state = 'manual' and from_wallet = 'refund'`,
-            [id],
-        );
-        if (res.rowCount !== 1) return refuseRefund(io, id, "changed while resolving");
+        const done = await withTx(pool, async (c) => {
+            const cur = await lockRefund(c, id);
+            if (cur === null) return false;
+            const res = await c.query(
+                `update refunds set manual_reason = 'resolved_by_hand'
+                 where id = $1 and state = 'manual' and from_wallet = 'refund'
+                    and manual_reason is distinct from 'resolved_by_hand'`,
+                [id],
+            );
+            if (res.rowCount !== 1) return false;
+            await partLeftQueue(c, cur);
+            return true;
+        });
+        if (!done) return refuseRefund(io, id, "changed while resolving");
         io.out(`refund ${id}: resolved by hand`);
         return 0;
     }
@@ -662,11 +724,8 @@ async function resolveRefund(
         return refuseRefund(io, id, `its refund is ${r.state} and the executor still owns it`);
     }
     const done = await withTx(pool, async (c) => {
-        if (proven !== null) {
-            await c.query(`select id from refunds where id = $1 for update`, [id]);
-            const cur = await findRefundById(c, id);
-            if (cur === null || provenKey(cur) !== proven) return false;
-        }
+        const cur = await lockRefund(c, id);
+        if (cur === null || (proven !== null && provenKey(cur) !== proven)) return false;
         return resolveHotRefundByHand(c, id, tx, ctx.now(), ctx.settings.x402, ctx.log);
     });
     if (!done) return refuseRefund(io, id, "changed while resolving");

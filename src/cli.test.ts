@@ -23,12 +23,12 @@ import { silentLog } from "./log.ts";
 import { findOrder } from "./orders/store.ts";
 import type { OrderRow } from "./orders/types.ts";
 import { pauseRefunds, refundsPaused, resumeRefunds } from "./refunds/executor.ts";
-import { findOrderRefund, findRefundById } from "./refunds/request.ts";
+import { findOrderRefund, findRefundById, refundGroup } from "./refunds/request.ts";
 import { testDb, type TestDb } from "./testing/db.ts";
 import { startFakeChain } from "./testing/fake-chain.ts";
 import { createFakeRpc } from "./testing/fake-rpc.ts";
 import { testSigner } from "./testing/keys.ts";
-import { seedOrder, seedPayment } from "./testing/orders.ts";
+import { seedOrder, seedPayment, seedSharedPayment } from "./testing/orders.ts";
 import { withTx } from "./db/pool.ts";
 import { usdcAta } from "./solana/accounts.ts";
 import {
@@ -453,7 +453,9 @@ describe("cliMain hot-wallet queue", () => {
                 "refund",
                 listed,
                 "allowance",
+                "part 0/1",
                 "allowance",
+                "manual",
                 "refund_destination_invalid",
                 "300000",
                 "source-cli",
@@ -464,7 +466,9 @@ describe("cliMain hot-wallet queue", () => {
                 "refund",
                 partial,
                 "partial",
+                "part 0/1",
                 "refund",
+                "manual",
                 "refund_failed_onchain",
                 "13000",
                 "source-cli",
@@ -897,6 +901,230 @@ describe("cliMain hot-wallet queue", () => {
             expect(await cli(args, io)).toBe(2);
             expect(io.errText()).toContain("usage");
         }
+    });
+});
+
+describe("cliMain refund groups", () => {
+    type Part = {
+        state: string;
+        manualReason?: string | null;
+        fromWallet?: "refund" | "allowance";
+    };
+
+    // A manual order of 50,000 paid by OwnA (30,000, SrcA) and OwnB (20,000, SrcB), its full
+    // refund split in two parts with the given states
+    async function sharedManual(
+        parts: readonly Part[] | null,
+        over: Partial<OrderRow> = {},
+    ): Promise<{ order: OrderRow; ids: number[] }> {
+        const { order } = await seedOrder(db.pool, {
+            state: "manual",
+            manualReason: "refund_destination_invalid",
+            amountMicros: 50_000,
+            ...over,
+        });
+        await seedSharedPayment(db.pool, order.id);
+        const ids: number[] = [];
+        for (const [part, p] of (parts ?? []).entries()) {
+            const res = await db.pool.query(
+                `insert into refunds (order_id, kind, part, reason, amount_micros, destination,
+                    payer, state, from_wallet, manual_reason, attempts)
+                 values ($1, 'full', $2, 'unredeemed', $3, $4, $5, $6, $7, $8, 3) returning id`,
+                [
+                    order.id,
+                    part,
+                    part === 0 ? 30_000 : 20_000,
+                    part === 0 ? "SrcA" : "SrcB",
+                    part === 0 ? "OwnA" : "OwnB",
+                    p.state,
+                    p.fromWallet ?? "refund",
+                    p.manualReason ?? (p.state === "manual" ? "refund_destination_invalid" : null),
+                ],
+            );
+            ids.push(Number(res.rows[0].id));
+        }
+        return { order, ids };
+    }
+
+    async function depositRow(orderId: string, state = "manual"): Promise<number> {
+        const res = await db.pool.query(
+            `insert into refunds (order_id, kind, part, reason, amount_micros, destination, payer,
+                state, from_wallet, deposit_signature, manual_reason)
+             values ($1, 'deposit', 0, 'deposit_held', 7000, 'DstA', 'PayA', $2, 'refund',
+                'held-1', $3) returning id`,
+            [orderId, state, state === "manual" ? "refund_destination_invalid" : null],
+        );
+        return Number(res.rows[0].id);
+    }
+
+    const partStates = async (orderId: string) =>
+        (await refundGroup(db.pool, orderId, "full")).map((r) => [r.state, r.manualReason]);
+
+    it("manual list prints every part", async () => {
+        const { order, ids } = await sharedManual([{ state: "confirmed" }, { state: "manual" }]);
+        const { order: paid } = await seedOrder(db.pool, { state: "paid" });
+        const held = await depositRow(paid.id);
+        const io = captureIo();
+        expect(await cli(["manual", "list"], io)).toBe(0);
+        const lines = io.outText().split("\n");
+        expect(lines.find((l) => l.startsWith(order.id))!.split("\t")).toEqual([
+            order.id,
+            "refund_destination_invalid",
+            "50000",
+            "OwnA",
+            "SrcA",
+        ]);
+        expect(lines).toContain(
+            [
+                "refund",
+                ids[1],
+                "full",
+                "part 1/2",
+                "refund",
+                "manual",
+                "refund_destination_invalid",
+                "20000",
+                "SrcB",
+            ].join("\t"),
+        );
+        expect(lines.some((l) => l.startsWith(`refund\t${ids[0]}\t`))).toBe(false);
+        expect(lines).toContain(
+            [
+                "refund",
+                held,
+                "deposit",
+                "part 0/1",
+                "refund",
+                "manual",
+                "refund_destination_invalid",
+                "7000",
+                "DstA",
+            ].join("\t"),
+        );
+    });
+
+    it("one bad destination stops only its own part", async () => {
+        const { order, ids } = await sharedManual([{ state: "confirmed" }, { state: "manual" }]);
+        expect(await cli(["manual", "retry", order.id])).toBe(0);
+        expect(await partStates(order.id)).toEqual([
+            ["confirmed", null],
+            ["pending", null],
+        ]);
+        expect((await refundOf(ids[1]!)).attempts).toBe(0);
+        expect(await findOrder(db.pool, order.id)).toMatchObject({
+            state: "refunding",
+            manualReason: null,
+        });
+
+        await db.pool.query(
+            `update refunds set state = 'manual', manual_reason = 'refund_destination_invalid'
+             where id = $1`,
+            [ids[1]],
+        );
+        await db.pool.query(
+            `update orders set state = 'manual', manual_reason = 'refund_destination_invalid'
+             where id = $1`,
+            [order.id],
+        );
+        const io = captureIo();
+        expect(await cli(["manual", "retry", String(ids[1])], io)).toBe(0);
+        expect(io.outText()).toBe(`refund ${ids[1]}: pending`);
+        expect(await partStates(order.id)).toEqual([
+            ["confirmed", null],
+            ["pending", null],
+        ]);
+        expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
+    });
+
+    it("manual resolve <orderId> marks every open part of a cold group", async () => {
+        const both = await sharedManual([{ state: "manual" }, { state: "manual" }]);
+        expect(await cli(["manual", "resolve", both.order.id])).toBe(0);
+        expect(await partStates(both.order.id)).toEqual([
+            ["manual", "resolved_by_hand"],
+            ["manual", "resolved_by_hand"],
+        ]);
+        expect((await findOrder(db.pool, both.order.id))!.state).toBe("refunded");
+
+        const sent = await sharedManual([{ state: "manual" }, { state: "sent" }]);
+        const inFlight = captureIo();
+        expect(await cli(["manual", "resolve", sent.order.id], inFlight)).toBe(1);
+        expect(inFlight.errText()).toContain("sent and the executor still owns it");
+        expect(await partStates(sent.order.id)).toEqual([
+            ["manual", "refund_destination_invalid"],
+            ["sent", null],
+        ]);
+        expect((await findOrder(db.pool, sent.order.id))!.state).toBe("manual");
+
+        const hot = await sharedManual(
+            [
+                { state: "confirmed", fromWallet: "allowance" },
+                { state: "manual", fromWallet: "allowance" },
+            ],
+            { payInto: "allowance", kind: "start", allowanceMicros: 20_000 },
+        );
+        const refused = captureIo();
+        expect(await cli(["manual", "resolve", hot.order.id], refused)).toBe(1);
+        expect(refused.errText()).toContain(`manual resolve ${hot.ids[1]} --tx`);
+        expect(refused.errText()).not.toContain(`manual resolve ${hot.ids[0]}`);
+        expect(await partStates(hot.order.id)).toEqual([
+            ["confirmed", null],
+            ["manual", "refund_destination_invalid"],
+        ]);
+        expect((await findOrder(db.pool, hot.order.id))!.state).toBe("manual");
+    });
+
+    it("a cold part resolved by hand completes the group when it is the last", async () => {
+        const last = await sharedManual([{ state: "confirmed" }, { state: "manual" }]);
+        expect(await cli(["manual", "resolve", String(last.ids[1])])).toBe(0);
+        expect((await findOrder(db.pool, last.order.id))!.state).toBe("refunded");
+
+        // With a part still in flight the order goes back to refunding for the executor to finish
+        const flying = await sharedManual([{ state: "sent" }, { state: "manual" }]);
+        expect(await cli(["manual", "resolve", String(flying.ids[1])])).toBe(0);
+        expect(await findOrder(db.pool, flying.order.id)).toMatchObject({
+            state: "refunding",
+            manualReason: null,
+        });
+    });
+
+    it("manual refund splits", async () => {
+        const { order } = await sharedManual(null, { manualReason: "refund_amount_pending" });
+        const io = captureIo();
+        expect(await cli(["manual", "refund", order.id, "10000"], io)).toBe(0);
+        expect(io.outText()).toBe(`${order.id}: refunding 10000 micros`);
+        expect(
+            (await refundGroup(db.pool, order.id, "partial")).map((r) => [
+                r.part,
+                r.amountMicros,
+                r.destination,
+                r.state,
+            ]),
+        ).toEqual([
+            [0, 6_000, "SrcA", "pending"],
+            [1, 4_000, "SrcB", "pending"],
+        ]);
+        expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
+    });
+
+    it("a manual deposit row can be retried and resolved", async () => {
+        const { order } = await seedOrder(db.pool, { state: "paid" });
+        const id = await depositRow(order.id);
+        const retried = captureIo();
+        expect(await cli(["manual", "retry", String(id)], retried)).toBe(0);
+        expect(retried.outText()).toBe(`refund ${id}: pending`);
+        expect(await refundOf(id)).toMatchObject({ state: "pending", manualReason: null });
+        await db.pool.query(
+            "update refunds set state = 'manual', manual_reason = 'refund_failed_onchain' where id = $1",
+            [id],
+        );
+        const resolved = captureIo();
+        expect(await cli(["manual", "resolve", String(id)], resolved)).toBe(0);
+        expect(resolved.outText()).toBe(`refund ${id}: resolved by hand`);
+        expect(await refundOf(id)).toMatchObject({
+            state: "manual",
+            manualReason: "resolved_by_hand",
+        });
+        expect((await findOrder(db.pool, order.id))!.state).toBe("paid");
     });
 });
 

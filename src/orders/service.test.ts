@@ -12,7 +12,12 @@ import {
     until,
     withHints,
 } from "../testing/app.ts";
-import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts";
+import {
+    seedAllowanceOrder,
+    seedOrder,
+    seedPayment,
+    seedSharedPayment,
+} from "../testing/orders.ts";
 import { signedPayment } from "../testing/payment.ts";
 import { agentPin, seedAccount, seedFunding, seedService, TEST_PAYTO } from "../testing/x402.ts";
 import { setControls } from "../x402/controls.ts";
@@ -1510,6 +1515,39 @@ describe("x402 answers", () => {
             reason: "allowance_ceiling",
             refundPending: false,
         });
+    });
+    it("closedAnswer waits for the whole group", async () => {
+        const { order, claim } = await seedAllowanceOrder(app.pool, {
+            handleSha256: newHandle(),
+            state: "manual",
+            manualReason: "refund_destination_invalid",
+            x402Refusal: "allowance_ceiling",
+            payer: app.payer.address,
+            createdAt: app.now.get(),
+            expiresAt: after(300_000),
+            amountMicros: 50_000,
+            allowanceMicros: 47_000,
+            feeMicros: 3_000,
+        });
+        await seedSharedPayment(app.pool, order.id);
+        for (const [part, amount, state] of [
+            [0, 30_000, "confirmed"],
+            [1, 20_000, "manual"],
+        ] as const) {
+            await app.pool.query(
+                `insert into refunds (order_id, kind, part, reason, amount_micros, destination,
+                    payer, state, from_wallet)
+                 values ($1, 'full', $2, 'x402_ceiling', $3, $4, $5, $6, 'allowance')`,
+                [order.id, part, amount, `Src${"AB"[part]}`, `Own${"AB"[part]}`, state],
+            );
+        }
+        const ask = async () => (await post(app, "/v1/orders", { orderId: order.id, claim })).body;
+        expect(await ask()).toMatchObject({ reason: "allowance_ceiling", refundPending: true });
+        await app.pool.query(
+            "update refunds set state = 'confirmed' where order_id = $1 and part = 1",
+            [order.id],
+        );
+        expect(await ask()).toMatchObject({ reason: "allowance_ceiling", refundPending: false });
     });
     it("a settle refusal answers charged false", async () => {
         const { order, claim } = await seedAllowanceOrder(app.pool, {

@@ -6,6 +6,7 @@ import type { OrderRow } from "../orders/types.ts";
 import type { AllowanceFunding } from "../x402/funding.ts";
 import { lockAccount } from "../x402/ledger.ts";
 import { decideHotFullRefund, writeHotPartial } from "./hot.ts";
+import { insertRefundGroup, refundTargets } from "./split.ts";
 
 export type RefundKind = "full" | "partial" | "allowance" | "deposit";
 export type RefundWallet = "refund" | "allowance";
@@ -125,12 +126,26 @@ export async function findRefund(
     return res.rows[0] ? toRefund(res.rows[0]) : null;
 }
 
+// Part 0 of the order's full or partial refund; an order never has both
 export async function findOrderRefund(db: Queryable, orderId: string): Promise<RefundRow | null> {
     const res = await db.query<RefundDbRow>(
-        "select * from refunds where order_id = $1 and kind in ('full', 'partial') order by id limit 1",
+        `select * from refunds where order_id = $1 and kind in ('full', 'partial')
+         order by part, id limit 1`,
         [orderId],
     );
     return res.rows[0] ? toRefund(res.rows[0]) : null;
+}
+
+export async function refundGroup(
+    db: Queryable,
+    orderId: string,
+    kind: RefundKind,
+): Promise<RefundRow[]> {
+    const res = await db.query<RefundDbRow>(
+        "select * from refunds where order_id = $1 and kind = $2 order by part",
+        [orderId, kind],
+    );
+    return res.rows.map(toRefund);
 }
 
 export async function findRefundById(db: Queryable, id: number): Promise<RefundRow | null> {
@@ -229,23 +244,21 @@ export async function requestRefund(
         ) {
             return "invalid_amount";
         }
-        const inserted = await c.query(
-            `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
-                from_wallet, budget_waived, created_at)
-             values ($1, $2, $3, $4, $5, $6, 'pending', 'refund', $7, $8)
-             on conflict do nothing`,
-            [
+        const targets = await refundTargets(c, orderId, amountMicros ?? payment.amountMicros);
+        if (targets === null) return "not_refundable";
+        const inserted = await insertRefundGroup(
+            c,
+            {
                 orderId,
-                amountMicros === undefined ? "full" : "partial",
+                kind: amountMicros === undefined ? "full" : "partial",
                 reason,
-                amountMicros ?? payment.amountMicros,
-                payment.sourceTokenAccount,
-                payment.payer,
+                fromWallet: "refund",
                 budgetWaived,
                 at,
-            ],
+            },
+            targets,
         );
-        if (inserted.rowCount !== 1) return "exists";
+        if (inserted === "exists") return "exists";
         await setOrderState(
             c,
             orderId,

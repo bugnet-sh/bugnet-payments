@@ -9,13 +9,8 @@ import type { AllowanceFunding } from "../x402/funding.ts";
 import { movePool, voidConditionsHold } from "../x402/ledger.ts";
 import { enqueueAllowanceEvent, paidEventSent } from "../x402/outbox.ts";
 import type { AccountRow } from "../x402/types.ts";
-import {
-    findRefund,
-    findRefundById,
-    type RefundReason,
-    type RefundRequest,
-    type RefundRow,
-} from "./request.ts";
+import { findRefund, type RefundReason, type RefundRequest, type RefundRow } from "./request.ts";
+import { groupComplete, groupSum, insertRefundGroup, lockRefund, refundTargets } from "./split.ts";
 
 async function insertFullRow(
     c: pg.PoolClient,
@@ -26,22 +21,14 @@ async function insertFullRow(
 ): Promise<RefundRequest> {
     const payment = await findPaymentByOrder(c, order.id);
     if (payment === null) return "not_refundable";
-    const inserted = await c.query(
-        `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
-            from_wallet, budget_waived, created_at)
-         values ($1, 'full', $2, $3, $4, $5, 'pending', 'allowance', $6, $7)
-         on conflict do nothing`,
-        [
-            order.id,
-            reason,
-            payment.amountMicros,
-            payment.sourceTokenAccount,
-            payment.payer,
-            budgetWaived,
-            at,
-        ],
+    const targets = await refundTargets(c, order.id, payment.amountMicros);
+    if (targets === null) return "not_refundable";
+    const inserted = await insertRefundGroup(
+        c,
+        { orderId: order.id, kind: "full", reason, fromWallet: "allowance", budgetWaived, at },
+        targets,
     );
-    if (inserted.rowCount !== 1) return "exists";
+    if (inserted === "exists") return "exists";
     await setOrderState(
         c,
         order.id,
@@ -52,7 +39,8 @@ async function insertFullRow(
     return "created";
 }
 
-// The caller holds the order lock. Every refund kind of the order counts against the payment.
+// The caller holds the order lock. Every refund of the order's payment counts against it; a
+// deposit row returns held review money, not the payment, so it does not.
 async function hotPartial(
     c: pg.PoolClient,
     order: OrderRow,
@@ -67,36 +55,33 @@ async function hotPartial(
     const payment = await findPaymentByOrder(c, order.id);
     if (payment === null) return "not_refundable";
     if ((await findRefund(c, order.id, "full")) !== null) return "exists";
-    const rows = await c.query<{ total: string }>(
-        "select coalesce(sum(amount_micros), 0) as total from refunds where order_id = $1",
-        [order.id],
-    );
+    if ((await findRefund(c, order.id, "partial")) !== null) return "exists";
+    const total = await groupSum(c, order.id, ["full", "partial", "allowance"]);
     if (
         !Number.isSafeInteger(share) ||
         share < 0 ||
         share > order.amountMicros - order.allowanceMicros ||
-        Number(rows.rows[0]!.total) + share > payment.amountMicros
+        total + share > payment.amountMicros
     ) {
         return "invalid_amount";
     }
     if (share > 0) {
         const wallet = order.coldTransferId === null ? "allowance" : "refund";
-        const inserted = await c.query(
-            `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
-                from_wallet, budget_waived, created_at)
-             values ($1, 'partial', 'router_refundable', $2, $3, $4, 'pending', $5, $6, $7)
-             on conflict (order_id, kind, part) do nothing`,
-            [
-                order.id,
-                share,
-                payment.sourceTokenAccount,
-                payment.payer,
-                wallet,
-                opts.budgetWaived,
+        const targets = await refundTargets(c, order.id, share);
+        if (targets === null) return "not_refundable";
+        const inserted = await insertRefundGroup(
+            c,
+            {
+                orderId: order.id,
+                kind: "partial",
+                reason: "router_refundable",
+                fromWallet: wallet,
+                budgetWaived: opts.budgetWaived,
                 at,
-            ],
+            },
+            targets,
         );
-        if (inserted.rowCount !== 1) return "exists";
+        if (inserted === "exists") return "exists";
         if (wallet === "allowance") {
             await c.query(
                 `update orders set hot_router_refund_micros = hot_router_refund_micros + $2
@@ -178,15 +163,9 @@ export async function writeHotPartial(
     });
 }
 
-async function lockRefund(c: pg.PoolClient, refundId: number): Promise<RefundRow | null> {
-    const peek = await findRefundById(c, refundId);
-    if (peek === null) return null;
-    if (peek.kind !== "allowance") await lockOrder(c, peek.orderId);
-    const res = await c.query("select id from refunds where id = $1 for no key update", [refundId]);
-    return res.rows.length === 1 ? findRefundById(c, refundId) : null;
-}
-
-// What a paid hot refund does to the ledger, shared by the confirm and by-hand paths.
+// What a paid hot refund does to the ledger, shared by the confirm and by-hand paths. The caller
+// holds the group's locks, so of two parts confirmed at once only the second sees the group
+// complete, and the group's event and order change happen once.
 async function applyEffects(
     c: pg.PoolClient,
     row: RefundRow,
@@ -205,22 +184,23 @@ async function applyEffects(
     const f = funding.rows[0];
     if (row.kind === "allowance") {
         if (f === undefined) throw new Error(`allowance refund ${row.id} has no funding`);
+        await movePool(c, { committed: -row.amountMicros }, x402, log);
+        if (!(await groupComplete(c, row.orderId, "allowance"))) return;
         await enqueueAllowanceEvent(
             c,
             {
                 startOrderId: f.account_id,
                 orderId: row.orderId,
                 phase: "refunded",
-                amountMicros: row.amountMicros,
+                amountMicros: await groupSum(c, row.orderId, ["allowance"]),
                 keptMicros: 0,
                 tx,
             },
             at,
         );
-        await movePool(c, { committed: -row.amountMicros }, x402, log);
         return;
     }
-    if (row.kind !== "full") return;
+    if (row.kind !== "full" || !(await groupComplete(c, row.orderId, "full"))) return;
     const order = await lockOrder(c, row.orderId);
     if (order !== null && (order.state === "refunding" || order.state === "manual")) {
         await setOrderState(

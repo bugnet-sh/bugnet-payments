@@ -4,9 +4,9 @@ import { memoryLog } from "../log.ts";
 import { orderKey, orderPublicKeyBase64 } from "../orders/token.ts";
 import { findOrder } from "../orders/store.ts";
 import type { OrderRow } from "../orders/types.ts";
-import { findOrderRefund } from "../refunds/request.ts";
+import { findOrderRefund, refundGroup } from "../refunds/request.ts";
 import { type TestApp, testApp } from "../testing/app.ts";
-import { seedOrder, seedPayment } from "../testing/orders.ts";
+import { seedOrder, seedPayment, seedSharedPayment } from "../testing/orders.ts";
 import { seedAccount, seedFunding, seedX402Payment } from "../testing/x402.ts";
 import { findAccount } from "../x402/ledger.ts";
 import { eventPublicKey, handleEvent, verifyEventSignature } from "./handler.ts";
@@ -932,5 +932,41 @@ describe("x402 accounts", () => {
         expect((await findOrder(app.pool, extend.id))!.state).toBe("refunding");
         expect(await refundRows(order.id)).toBe(0);
         expect((await findOrder(app.pool, order.id))!.routerConfirmedAt).not.toBeNull();
+    });
+    describe("every insert site splits a shared payment", () => {
+        it("a router terminated entry on a hot shared start order", async () => {
+            const { order } = await seedOrder(app.pool, {
+                kind: "start",
+                state: "redeemed",
+                amountMicros: 50_000,
+                allowanceMicros: 20_000,
+                feeMicros: 3_000,
+                payInto: "allowance",
+            });
+            await seedSharedPayment(app.pool, order.id);
+            await send(
+                placement("placement.terminated", order.id, {
+                    refundable: true,
+                    refunds: [{ order_id: order.id, refund_micros: 20_000 }],
+                }),
+            );
+            expect(await refundGroup(app.pool, order.id, "partial")).toEqual([
+                expect.objectContaining({
+                    part: 0,
+                    amountMicros: 12_000,
+                    destination: "SrcA",
+                    payer: "OwnA",
+                    state: "pending",
+                }),
+                expect.objectContaining({
+                    part: 1,
+                    amountMicros: 8_000,
+                    destination: "SrcB",
+                    payer: "OwnB",
+                    state: "pending",
+                }),
+            ]);
+            expect((await findOrder(app.pool, order.id))!.hotRouterRefundMicros).toBe(20_000);
+        });
     });
 });

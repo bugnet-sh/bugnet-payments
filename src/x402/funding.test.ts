@@ -6,7 +6,7 @@ import { silentLog } from "../log.ts";
 import type { OrderRow, PaymentRow } from "../orders/types.ts";
 import { findOrder, lockOrder, lockPayment } from "../orders/store.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
-import { seedAllowanceOrder, seedPayment } from "../testing/orders.ts";
+import { seedAllowanceOrder, seedPayment, seedSharedPayment } from "../testing/orders.ts";
 import { testSigner } from "../testing/keys.ts";
 import { resetLedger, seedAccount, seedFunding, seedX402Payment } from "../testing/x402.ts";
 import type pg from "pg";
@@ -360,5 +360,35 @@ describe("refund", () => {
         });
         expect(await inAccountTx(a.id, (c, l) => F.refund(c, l, AT))).toEqual({ kind: "already" });
         expect(await allowanceRows(a.id)).toHaveLength(1);
+    });
+});
+
+describe("every insert site splits a shared payment", () => {
+    it("the unspent refund of a shared funding order is one allowance row per owner", async () => {
+        const a = await seedAccount(db.pool);
+        const { order } = await seedAllowanceOrder(db.pool, {
+            state: "redeemed",
+            handleSha256: a.handleSha256,
+            amountMicros: 50_000,
+            allowanceMicros: 50_000,
+            feeMicros: 0,
+        });
+        await seedSharedPayment(db.pool, order.id);
+        await seedFunding(db.pool, {
+            accountId: a.id,
+            orderId: order.id,
+            allowanceMicros: 50_000,
+            payer: "OwnA",
+            sourceTokenAccount: "SrcA",
+        });
+        await db.pool.query("update x402_accounts set spent_micros = 40000 where id = $1", [a.id]);
+        await setPool(10_000, 0);
+        const out = await inAccountTx(a.id, (c, locked) => F.refund(c, locked, AT));
+        expect(out).toMatchObject({ kind: "refund", amountMicros: 10_000 });
+        expect(out.kind === "refund" && out.refundIds).toHaveLength(2);
+        expect(await allowanceRows(a.id)).toEqual([
+            expect.objectContaining({ amountMicros: 6_000, destination: "SrcA", payer: "OwnA" }),
+            expect.objectContaining({ amountMicros: 4_000, destination: "SrcB", payer: "OwnB" }),
+        ]);
     });
 });
