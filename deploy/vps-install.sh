@@ -9,6 +9,8 @@
 #                                         version
 #   vps-install.sh --rpc-urls             reads one BUGNET_SOLANA_RPC_URLS line on stdin into
 #                                         payments.env; deploy/push-rpc-urls.sh sends it
+#   vps-install.sh --payments-token       reads one BUGNET_PAYMENTS_TOKEN line on stdin into
+#                                         payments.env; deploy/push-payments-token.sh sends it
 #   vps-install.sh --deposits on|off      sets [deposits] enabled and restarts the running version;
 #                                         on needs the RPC router release and a passing rpc probe
 #   vps-install.sh --deposits remove      before a rollback below the deposits release: removes
@@ -350,7 +352,7 @@ do_install() {
     ensure_index "$index"
     ensure_unit "$v"
     do_pubkeys
-    say "next: fund the wallets, copy BUGNET_SOLANA_RPC_URLS with deploy/push-rpc-urls.sh, run --mtls, then --start"
+    say "next: fund the wallets, run deploy/push-rpc-urls.sh and deploy/push-payments-token.sh, --mtls, then --start"
 }
 
 do_mtls() {
@@ -417,18 +419,12 @@ rpc_env_ok() {
     return 1
 }
 
-# Replaces the list line with the one on stdin; the single URL line stays for a rollback. The env
-# file holds the only copy of the server's keys, so the new file is built and checked beside it
-# and renamed over it: any failure leaves the old file whole. Every step is checked by hand,
-# because a caller's `|| die` turns set -e off inside this function.
-write_rpc_list() {
-    local file=$1 input tmp n kept lines rc=0
-    input=$(cat)
-    if [ -z "$input" ] || [[ $input == *$'\n'* ]]; then
-        echo "expected one BUGNET_SOLANA_RPC_URLS line on stdin" >&2
-        return 1
-    fi
-    printf '%s\n' "$input" | rpc_list_ok || return 1
+# Puts LINE in place of every NAME= line of FILE. The env file holds the only copy of the server's
+# keys, so the new file is built and checked beside it and renamed over it: any failure leaves the
+# old file whole. Every step is checked by hand, because a caller's `|| die` turns set -e off
+# inside this function.
+replace_env_line() {
+    local file=$1 name=$2 line=$3 tmp kept lines rc=0
     tmp=$(mktemp "$file.XXXXXX" 2>/dev/null) || tmp=""
     if [ -z "$tmp" ]; then
         echo "cannot create a temporary file beside $file" >&2
@@ -440,14 +436,14 @@ write_rpc_list() {
     trap "rm -f -- $(printf '%q' "$tmp")" EXIT
     trap 'exit 1' INT TERM HUP
     # grep exits 1 when it keeps no line, which is fine, and 2 when it cannot read the file
-    grep -v '^BUGNET_SOLANA_RPC_URLS=' "$file" >"$tmp" || rc=$?
-    if [ "$rc" -gt 1 ] || ! printf '%s\n' "$input" >>"$tmp" || ! chmod 0600 "$tmp"; then
+    grep -v "^$name=" "$file" >"$tmp" || rc=$?
+    if [ "$rc" -gt 1 ] || ! printf '%s\n' "$line" >>"$tmp" || ! chmod 0600 "$tmp"; then
         rm -f "$tmp"
         trap - EXIT INT TERM HUP
         echo "cannot write the new $file" >&2
         return 1
     fi
-    kept=$(grep -vc '^BUGNET_SOLANA_RPC_URLS=' "$file" || true)
+    kept=$(grep -vc "^$name=" "$file" || true)
     lines=$(wc -l <"$tmp" | tr -d ' ')
     if [ "$lines" != "$((kept + 1))" ] || ! mv -f "$tmp" "$file"; then
         rm -f "$tmp"
@@ -456,7 +452,24 @@ write_rpc_list() {
         return 1
     fi
     trap - EXIT INT TERM HUP
-    n=$(printf '%s' "${input#BUGNET_SOLANA_RPC_URLS=}" | tr ',' '\n' | grep -c . || true)
+}
+
+# Reads one line on stdin into $line, refusing none or more than one
+one_line() {
+    line=$(cat)
+    if [ -z "$line" ] || [[ $line == *$'\n'* ]]; then
+        echo "expected one $1 line on stdin" >&2
+        return 1
+    fi
+}
+
+# Replaces the list line with the one on stdin; the single URL line stays for a rollback
+write_rpc_list() {
+    local file=$1 line n
+    one_line BUGNET_SOLANA_RPC_URLS || return 1
+    printf '%s\n' "$line" | rpc_list_ok || return 1
+    replace_env_line "$file" BUGNET_SOLANA_RPC_URLS "$line" || return 1
+    n=$(printf '%s' "${line#BUGNET_SOLANA_RPC_URLS=}" | tr ',' '\n' | grep -c . || true)
     echo "BUGNET_SOLANA_RPC_URLS set in $file: $n URL$([ "$n" = 1 ] || echo s)"
 }
 
@@ -469,6 +482,57 @@ do_rpc_urls() {
     chmod 0600 "$ENV_FILE"
     if [ -f "$RELEASE_FILE" ] && systemctl is-active --quiet "bugnet-payments@$(installed_version)"; then
         say "run pcli rpc probe, then --start to restart with the new list"
+    fi
+}
+
+# One line on stdin: BUGNET_PAYMENTS_TOKEN= and the token the gateway sends. Boot wants at least 32
+# characters and no space; the shell that loads the env file wants nothing it would split or
+# expand. Messages name the variable only, never the value.
+payments_token_ok() {
+    local line="" value
+    IFS= read -r line || true
+    case $line in
+    BUGNET_PAYMENTS_TOKEN=*) ;;
+    *)
+        echo "expected a BUGNET_PAYMENTS_TOKEN line" >&2
+        return 1
+        ;;
+    esac
+    value=${line#BUGNET_PAYMENTS_TOKEN=}
+    case $value in
+    *[!A-Za-z0-9+/=_.-]*)
+        echo "BUGNET_PAYMENTS_TOKEN holds a character other than letters, digits and + / = _ . -" >&2
+        return 1
+        ;;
+    esac
+    if [ "${#value}" -lt 32 ]; then
+        echo "BUGNET_PAYMENTS_TOKEN is shorter than 32 characters" >&2
+        return 1
+    fi
+}
+
+write_payments_token() {
+    local file=$1 line
+    one_line BUGNET_PAYMENTS_TOKEN || return 1
+    printf '%s\n' "$line" | payments_token_ok || return 1
+    # Boot refuses the two tokens equal, so the service would not start
+    if [ "${line#BUGNET_PAYMENTS_TOKEN=}" = "$(env_value BUGNET_PAYMENTS_ROUTER_TOKEN "$file")" ]; then
+        echo "BUGNET_PAYMENTS_TOKEN must differ from BUGNET_PAYMENTS_ROUTER_TOKEN" >&2
+        return 1
+    fi
+    replace_env_line "$file" BUGNET_PAYMENTS_TOKEN "$line" || return 1
+    echo "BUGNET_PAYMENTS_TOKEN set in $file"
+}
+
+do_payments_token() {
+    # A line pasted at a terminal echoes on the screen; it comes only through the copy step's pipe
+    [ ! -t 0 ] || die "pipe the token line with deploy/push-payments-token.sh from the Mac"
+    [ -f "$ENV_FILE" ] || die "$ENV_FILE does not exist; run the install step first"
+    write_payments_token "$ENV_FILE" || die "BUGNET_PAYMENTS_TOKEN was not changed"
+    chown root:root "$ENV_FILE"
+    chmod 0600 "$ENV_FILE"
+    if [ -f "$RELEASE_FILE" ] && systemctl is-active --quiet "bugnet-payments@$(installed_version)"; then
+        say "run --start to load it"
     fi
 }
 
@@ -712,6 +776,7 @@ main() {
         --pubkeys) mode=pubkeys; shift ;;
         --start) mode=start; shift ;;
         --rpc-urls) mode=rpc_urls; shift ;;
+        --payments-token) mode=payments_token; shift ;;
         --deposits) mode=deposits; deposits=${2:?}; shift 2 ;;
         --rotate-deposit-seed) mode=rotate_seed; shift ;;
         --retire-deposit-seed)
@@ -733,6 +798,7 @@ main() {
     pubkeys) do_pubkeys ;;
     start) no_rotation_halfway; do_start ;;
     rpc_urls) do_rpc_urls ;;
+    payments_token) do_payments_token ;;
     deposits) do_deposits "$deposits" ;;
     rotate_seed) do_rotate_seed ;;
     retire_seed) do_retire_seed "$remove" ;;

@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 const SCRIPT = join(import.meta.dirname, "../deploy/vps-install.sh");
 const PUSH = join(import.meta.dirname, "../deploy/push-rpc-urls.sh");
 const RETIRE = join(import.meta.dirname, "../deploy/retire-deposit-seed.sh");
+const PUSH_TOKEN = join(import.meta.dirname, "../deploy/push-payments-token.sh");
 
 const KEYS = [
     "BUGNET_PAYMENTS_TOKEN",
@@ -747,6 +748,74 @@ describe("vps-install.sh deposits", () => {
     });
 });
 
+describe("vps-install.sh payments token", () => {
+    const TOKEN = "T".repeat(20) + "ok+/=_.-" + "k".repeat(16);
+
+    it("--payments-token writes the line by a rename and prints only that it was set", () => {
+        const server = fakeServer();
+        writeFileSync(server.env, keysEnv("BUGNET_PAYMENTS_ROUTER_TOKEN=router\n"));
+        const ino = statSync(server.env).ino;
+        const r = server.run("main --payments-token", `BUGNET_PAYMENTS_TOKEN=${TOKEN}\n`);
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        expect(r.out).toBe(`BUGNET_PAYMENTS_TOKEN set in ${server.env}\n`);
+        const text = readFileSync(server.env, "utf8");
+        expect(text.match(/^BUGNET_PAYMENTS_TOKEN=.*$/gm)).toEqual([
+            `BUGNET_PAYMENTS_TOKEN=${TOKEN}`,
+        ]);
+        expect(text.replace(`BUGNET_PAYMENTS_TOKEN=${TOKEN}\n`, "")).toBe(
+            keysEnv("BUGNET_PAYMENTS_ROUTER_TOKEN=router\n").replace(
+                "BUGNET_PAYMENTS_TOKEN=x\n",
+                "",
+            ),
+        );
+        expect(statSync(server.env).ino).not.toBe(ino);
+        expect(statSync(server.env).mode & 0o777).toBe(0o600);
+    });
+
+    it("--payments-token refuses another name, a bad value, two lines or the router's token", () => {
+        const cases: [string, string][] = [
+            [
+                "BUGNET_FEE_PAYER_KEY=" + "f".repeat(44) + "\n",
+                "expected a BUGNET_PAYMENTS_TOKEN line",
+            ],
+            [
+                "BUGNET_PAYMENTS_TOKEN=short\n",
+                "BUGNET_PAYMENTS_TOKEN is shorter than 32 characters",
+            ],
+            [
+                `BUGNET_PAYMENTS_TOKEN=${TOKEN};x\n`,
+                "BUGNET_PAYMENTS_TOKEN holds a character other than",
+            ],
+            [
+                `BUGNET_PAYMENTS_TOKEN=${TOKEN} \n`,
+                "BUGNET_PAYMENTS_TOKEN holds a character other than",
+            ],
+            [
+                `BUGNET_PAYMENTS_TOKEN=${TOKEN}\nBUGNET_PAYMENTS_TOKEN=${TOKEN}\n`,
+                "expected one BUGNET_PAYMENTS_TOKEN line on stdin",
+            ],
+            ["", "expected one BUGNET_PAYMENTS_TOKEN line on stdin"],
+            [
+                `BUGNET_PAYMENTS_TOKEN=${TOKEN}\n`,
+                "BUGNET_PAYMENTS_TOKEN must differ from BUGNET_PAYMENTS_ROUTER_TOKEN",
+            ],
+        ];
+        for (const [stdin, message] of cases) {
+            const server = fakeServer();
+            const before = keysEnv(`BUGNET_PAYMENTS_ROUTER_TOKEN=${TOKEN}\n`);
+            writeFileSync(server.env, before);
+            const r = server.run("main --payments-token", stdin);
+            expect(r.code).toBe(1);
+            expect(r.err).toContain(message);
+            expect(r.err).toContain("BUGNET_PAYMENTS_TOKEN was not changed");
+            expect(readFileSync(server.env, "utf8")).toBe(before);
+            expect(r.all).not.toContain(TOKEN);
+            expect(r.all).not.toContain("f".repeat(44));
+        }
+    });
+});
+
 describe("retire-deposit-seed.sh", () => {
     const LINE = `BUGNET_DEPOSIT_SEED_V1=${OLD_SEED}`;
 
@@ -866,6 +935,64 @@ describe("retire-deposit-seed.sh", () => {
     });
 });
 
+describe("push-payments-token.sh", () => {
+    const TOKEN = "p".repeat(40);
+
+    function push(envText: string) {
+        const bin = join(dir, "bin");
+        const got = join(dir, "ssh-stdin");
+        const args = join(dir, "ssh-args");
+        mkdirSync(bin, { recursive: true });
+        writeFileSync(
+            join(bin, "ssh"),
+            `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "${args}"\ncat > "${got}"\n`,
+        );
+        chmodSync(join(bin, "ssh"), 0o755);
+        const local = join(dir, "local.env");
+        writeFileSync(local, envText, { mode: 0o600 });
+        const r = spawnSync("bash", [PUSH_TOKEN, "-p", "2222", "server.example"], {
+            encoding: "utf8",
+            env: {
+                ...process.env,
+                PATH: `${bin}:${process.env.PATH ?? ""}`,
+                BUGNET_LOCAL_ENV: local,
+            },
+        });
+        const sent = existsSync(got) ? readFileSync(got, "utf8") : null;
+        const sshArgs = existsSync(args) ? readFileSync(args, "utf8").split("\n") : null;
+        return { code: r.status, all: r.stdout + r.stderr, sent, sshArgs };
+    }
+
+    it("push-payments-token.sh sends only the token line, through a pipe", () => {
+        const r = push(
+            `BUGNET_FEE_PAYER_KEY=madeupfeepayer\nBUGNET_PAYMENTS_TOKEN=${TOKEN}\nBUGNET_PAYMENTS_TOKEN_OLD=madeupold\nBUGNET_CLAIM_KEY=madeupclaim\n`,
+        );
+        expect(r.code).toBe(0);
+        expect(r.sent).toBe(`BUGNET_PAYMENTS_TOKEN=${TOKEN}\n`);
+        expect(r.sshArgs?.slice(0, 4)).toEqual(["-T", "-p", "2222", "server.example"]);
+        expect(r.sshArgs?.[4]).toMatch(/vps-install\.sh --payments-token$/);
+        for (const secret of [TOKEN, "madeupfeepayer", "madeupold", "madeupclaim"]) {
+            expect(r.all).not.toContain(secret);
+            expect(r.sshArgs?.join("\n")).not.toContain(secret);
+        }
+    });
+
+    it("push-payments-token.sh refuses no line, two lines or a bad value", () => {
+        for (const text of [
+            "BUGNET_FEE_PAYER_KEY=madeupfeepayer\n",
+            `BUGNET_PAYMENTS_TOKEN=${TOKEN}\nBUGNET_PAYMENTS_TOKEN=${TOKEN}\n`,
+            "BUGNET_PAYMENTS_TOKEN=short\n",
+            `BUGNET_PAYMENTS_TOKEN=${TOKEN} # gateway\n`,
+        ]) {
+            const r = push(text);
+            expect(r.code).not.toBe(0);
+            expect(r.sent).toBeNull();
+            expect(r.all).not.toContain(TOKEN);
+            expect(r.all).not.toContain("madeupfeepayer");
+        }
+    });
+});
+
 describe("push-rpc-urls.sh", () => {
     function push(envText: string) {
         const bin = join(dir, "bin");
@@ -918,7 +1045,7 @@ describe("push-rpc-urls.sh", () => {
     });
 
     it("the deploy scripts parse", () => {
-        for (const file of [SCRIPT, PUSH, RETIRE]) {
+        for (const file of [SCRIPT, PUSH, RETIRE, PUSH_TOKEN]) {
             expect(spawnSync("bash", ["-n", file]).status).toBe(0);
         }
     });

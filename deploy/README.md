@@ -118,13 +118,13 @@ systemd keeps a `# comment` written after a value as part of that value, so ever
 on its own line:
 
 ```sh
-# Shared with the gateway, which sends it as a bearer token, at least 32 characters
+# Shared with the gateway, which sends it as a bearer token: copied by deploy/push-payments-token.sh
 BUGNET_PAYMENTS_TOKEN=
 # Shared with the router (section 5), at least 32 characters
 BUGNET_PAYMENTS_ROUTER_TOKEN=
-# openssl rand -base64 32
+# Made by the install step; never pasted
 BUGNET_ORDER_PRIVATE_KEY=
-# openssl rand -base64 32
+# Made by the install step; never pasted
 BUGNET_CLAIM_KEY=
 # base58 of the fee payer's 64-byte secret key
 BUGNET_FEE_PAYER_KEY=
@@ -142,20 +142,27 @@ BUGNET_DEPOSIT_SEED=
 BUGNET_DEPOSIT_SEED_PREVIOUS=
 ```
 
-The install step (`vps-install.sh <tarball>`) runs the new release's `keys generate` on this file,
-which adds `BUGNET_DEPOSIT_SEED` (32 random bytes, base64) when it is missing, as it does for the
-wallet keys. Nobody pastes it. With each deposit's salt in the database, it derives every deposit
-address (section 12).
+Nobody edits this file by hand. The install step (`vps-install.sh <tarball>`) makes it and runs
+the new release's `keys generate` on it, which adds `BUGNET_ORDER_PRIVATE_KEY`,
+`BUGNET_CLAIM_KEY` and `BUGNET_DEPOSIT_SEED` (32 random bytes each, base64) when they are missing,
+as it does for the wallet keys, and never replaces one that is set. With each deposit's salt in the
+database, `BUGNET_DEPOSIT_SEED` derives every deposit address (section 12).
+
+`BUGNET_PAYMENTS_TOKEN` is the one value the gateway shares, so the install step's random one is
+replaced by the line in the local `bugnet-payments/.env`. On the Mac, in `bugnet-payments`:
 
 ```sh
-sudo install -o root -g root -m 0600 /dev/null /etc/bugnet/payments.env
-sudoedit /etc/bugnet/payments.env
+deploy/push-payments-token.sh [ssh options] HOST
 ```
 
-Boot refuses a `BUGNET_PAYMENTS_TOKEN` shorter than 32 characters, and a shorter
-`BUGNET_PAYMENTS_ROUTER_TOKEN` whenever it is set (it is required while `router.get_order` or
-`router.check_payer` is on, or `[x402] allowance_wallet` is set); `openssl rand -base64 32` makes
-one of 44.
+It sends only that line, through a pipe, to `vps-install.sh --payments-token`, which replaces the
+line by an atomic rename and prints only `BUGNET_PAYMENTS_TOKEN set in /etc/bugnet/payments.env`.
+Both ends refuse a value shorter than 32 characters or holding anything but letters, digits and
+`+ / = _ . -`, and the server refuses one equal to `BUGNET_PAYMENTS_ROUTER_TOKEN`.
+`openssl rand -base64 32` makes one of 44. A running version loads it at the next `--start`. Boot
+refuses a `BUGNET_PAYMENTS_ROUTER_TOKEN` shorter than 32 characters whenever it is set (it is
+required while `router.get_order` or `router.check_payer` is on, or `[x402] allowance_wallet` is
+set).
 
 ## 4. Postgres
 

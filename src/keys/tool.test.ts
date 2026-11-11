@@ -15,6 +15,7 @@ import {
 import { stringify } from "smol-toml";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { cliMain } from "../cli.ts";
+import { isBase64Of32 } from "../config.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { generateExportableKeypair } from "../solana/keys.ts";
 import { type FakeChain, startFakeChain } from "../testing/fake-chain.ts";
@@ -160,6 +161,26 @@ describe("keys generate", () => {
         }
         expect(io.outText()).toMatch(/fee_payer=[1-9A-HJ-NP-Za-km-z]{32,44}/);
         expect(io.outText()).not.toMatch(/test_payer=/);
+    });
+
+    // The install step runs keys generate on the server's env file, so this is its claim key rule
+    it("adds BUGNET_CLAIM_KEY only when the file has none, and never replaces one", async () => {
+        const set = Buffer.alloc(32, 9).toString("base64");
+        const kept = tmpEnv(`BUGNET_CLAIM_KEY=${set}\n`, 0o600);
+        expect(await cliMain(["keys", "generate", "--env", kept], {}, captureIo())).toBe(0);
+        expect(parseEnv(readFileSync(kept, "utf8")).BUGNET_CLAIM_KEY).toBe(set);
+
+        const made: string[] = [];
+        for (const text of ["BUGNET_CLAIM_KEY=\n", ""]) {
+            const p = tmpEnv(text, 0o600);
+            expect(await cliMain(["keys", "generate", "--env", p], {}, captureIo())).toBe(0);
+            const lines = readFileSync(p, "utf8").match(/^BUGNET_CLAIM_KEY=.*$/gm) ?? [];
+            expect(lines).toHaveLength(1);
+            const value = parseEnv(lines[0]!).BUGNET_CLAIM_KEY!;
+            expect(isBase64Of32(value)).toBe(true);
+            made.push(value);
+        }
+        expect(new Set([set, ...made]).size).toBe(3);
     });
 
     it("tightens a looser file mode and is a no-op when nothing is missing", async () => {
