@@ -95,11 +95,26 @@ function deps(rpc: FakeRpc) {
     };
 }
 
+// The deadline's own abort, not a fast failure of another cause, ends the read
+async function endsAtDeadline(run: Promise<unknown>): Promise<void> {
+    const started = Date.now();
+    await expect(run).rejects.toThrow(/abort|timeout/i);
+    const took = Date.now() - started;
+    expect(took).toBeGreaterThanOrEqual(900);
+    expect(took).toBeLessThan(1_500);
+}
+
 describe("boot deadlines", () => {
     it("boot reads have a deadline", async () => {
-        const started = Date.now();
-        await expect(bootChecks(deps(okAccounts({ getBalance: neverAnswers })))).rejects.toThrow();
-        expect(Date.now() - started).toBeLessThan(1_500);
+        await endsAtDeadline(bootChecks(deps(okAccounts({ getBalance: neverAnswers }))));
+        await endsAtDeadline(bootChecks(deps(okAccounts({ getAccountInfo: neverAnswers }))));
+        // The refund wallet's account is read last, with refunds on
+        const recipientAta = await usdcAta(recipient);
+        const refundStalls = okAccounts({
+            getAccountInfo: (ata: Address) =>
+                ata === recipientAta ? tokenAccount(recipient) : neverAnswers(),
+        });
+        await endsAtDeadline(bootChecks({ ...deps(refundStalls), refundsEnabled: true }));
     });
 });
 
@@ -294,6 +309,12 @@ describe("x402BootChecks", () => {
             [accountId, JSON.stringify({ order_id: accountId })],
         );
     }
+
+    it("the hot account read has a deadline", async () => {
+        await endsAtDeadline(
+            x402BootChecks(createFakeRpc({ getAccountInfo: neverAnswers }), x402Deps()),
+        );
+    });
 
     it("refuses a key whose address is not allowance_wallet", async () => {
         const other = await secretKey(12);

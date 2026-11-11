@@ -957,29 +957,36 @@ export async function startFakeChain(
         };
         const log: { method: string; params: unknown[] }[] = [];
         let limited = 0;
-        let retryAfter = 1;
+        // Without one, a 429 carries no Retry-After, as some endpoints answer
+        let retryAfter: number | null = null;
         let failStatus: number | null = null;
         let stallMode: "off" | "before" | "after" = "off";
         const ep = createServer((req, res) => {
-            void readBody(req).then((body) => {
-                if (stallMode === "before") return;
-                if (limited > 0) {
-                    limited -= 1;
-                    res.writeHead(429, { "retry-after": String(retryAfter) });
-                    res.end();
-                    return;
-                }
-                if (failStatus !== null) {
-                    const status = failStatus;
-                    failStatus = null;
-                    res.writeHead(status);
-                    res.end();
-                    return;
-                }
-                const payload = respond(body, view, log);
-                if (stallMode === "after") return;
-                send(res, payload);
-            });
+            void readBody(req)
+                .then((body) => {
+                    if (stallMode === "before") return;
+                    if (limited > 0) {
+                        limited -= 1;
+                        res.writeHead(
+                            429,
+                            retryAfter === null ? {} : { "retry-after": String(retryAfter) },
+                        );
+                        res.end();
+                        return;
+                    }
+                    if (failStatus !== null) {
+                        const status = failStatus;
+                        failStatus = null;
+                        res.writeHead(status);
+                        res.end();
+                        return;
+                    }
+                    const payload = respond(body, view, log);
+                    if (stallMode === "after") return;
+                    send(res, payload);
+                })
+                // A client that aborts during the body read leaves nothing to answer
+                .catch(() => res.destroy());
         });
         await new Promise<void>((resolve) => ep.listen(0, "127.0.0.1", resolve));
         const close = async () => {
@@ -1003,9 +1010,9 @@ export async function startFakeChain(
             ignoreMinContextSlot(on) {
                 view.ignoreMin = on;
             },
-            rateLimit(times, retryAfterSeconds = 1) {
+            rateLimit(times, retryAfterSeconds) {
                 limited = times;
-                retryAfter = retryAfterSeconds;
+                retryAfter = retryAfterSeconds ?? null;
             },
             failNext(status = 500) {
                 failStatus = status;

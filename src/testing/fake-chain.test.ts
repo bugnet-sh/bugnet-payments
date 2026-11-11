@@ -428,6 +428,14 @@ describe("fake chain endpoints", () => {
         expect(ctx.statusCode).toBe(429);
         expect(ctx.headers?.get("retry-after")).toBe("10");
         expect(await createRpc(ep.url).getSlot().send()).toBe(chain.slot());
+
+        ep.rateLimit(1);
+        const bare = await createRpc(ep.url)
+            .getSlot()
+            .send()
+            .catch((e: unknown) => e);
+        const headers = (bare as { context: { headers?: Headers } }).context.headers;
+        expect(headers?.get("retry-after") ?? null).toBeNull();
     });
 
     it("a frozen endpoint keeps its slot", async () => {

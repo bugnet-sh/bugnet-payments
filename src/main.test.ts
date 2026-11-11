@@ -1619,14 +1619,40 @@ describe("router wiring", () => {
                 ? rpcOk("EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG")
                 : netFail(),
         );
+        const log = memoryLog();
         const started = startService({
             settings,
-            log: silentLog,
-            secrets: listed(["https://a.example/"]),
+            log,
+            secrets: { ...listed(["https://a.example/"]), rpcSingleIgnored: true },
             rpcTransportFor: () => devnet.transport,
         });
         await expect(started).rejects.toBeInstanceOf(BootCheckError);
         await expect(started).rejects.toThrow("RPC endpoint rpc1 is not on Solana mainnet");
+        // The line that explains which URL counted shows even though the start failed
+        expect(
+            log.lines.filter(
+                (l) =>
+                    l.msg ===
+                    "rpc BUGNET_SOLANA_RPC_URL is ignored while BUGNET_SOLANA_RPC_URLS is set",
+            ),
+        ).toHaveLength(1);
+    });
+
+    it("startService warns when two URLs share one domain", async () => {
+        const log = memoryLog();
+        const live = createDefaultRpcTransport({ url: chain.url });
+        const s = await startService({
+            settings,
+            log,
+            secrets: listed(["https://a.x.example/", "https://b.x.example/"]),
+            rpcTransportFor: () => live,
+        });
+        try {
+            expect(startLine(log)?.rpc).toMatchObject({ domains: 1, absenceQuorum: 1 });
+            expect(log.lines.filter((l) => l.msg === "rpc absence quorum is 1")).toHaveLength(1);
+        } finally {
+            await s.stop();
+        }
     });
 
     it("stop flushes router usage", async () => {

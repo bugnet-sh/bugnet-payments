@@ -182,6 +182,10 @@ export async function startService(o: StartOptions): Promise<RunningService> {
         const refundSigner = await loadKeypair(secrets.refundKey, "BUGNET_REFUND_KEY");
         const x402On = s.x402.allowance_wallet !== "";
         const recipient = address(s.solana.recipient);
+        // Before the router starts, so a list that fails its checks still shows which line counts
+        if (secrets.rpcSingleIgnored) {
+            log.warn("rpc BUGNET_SOLANA_RPC_URL is ignored while BUGNET_SOLANA_RPC_URLS is set");
+        }
         let routed: RoutedRpc | null = null;
         let rpc0: SolanaRpc;
         let bg0: SolanaRpc;
@@ -196,7 +200,7 @@ export async function startService(o: StartOptions): Promise<RunningService> {
                 random: Math.random,
                 usage: pgUsageStore(pool),
                 snapshots: pgSnapshotStore(pool, now),
-                verdicts: pgVerdictStore(pool, now),
+                verdicts: pgVerdictStore(pool, now, s.solana.rpc.history_check_every),
                 fingerprint: endpointFingerprint(secrets.claimKey),
                 historyProbe: () => historyProbe(pool, recipientAta),
                 ...(o.rpcTransportFor === undefined ? {} : { transportFor: o.rpcTransportFor }),
@@ -432,9 +436,6 @@ export async function startService(o: StartOptions): Promise<RunningService> {
         });
         if (routed !== null && routed.router.mode === "routed") {
             if (routed.router.snapshot().absenceQuorum === 1) log.warn("rpc absence quorum is 1");
-        }
-        if (secrets.rpcSingleIgnored) {
-            log.warn("rpc BUGNET_SOLANA_RPC_URL is ignored while BUGNET_SOLANA_RPC_URLS is set");
         }
 
         return {
