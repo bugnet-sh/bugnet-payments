@@ -775,6 +775,26 @@ describe("vps-install.sh deposits", () => {
     });
 });
 
+describe("vps-install.sh retirement at a terminal", () => {
+    it("--retire-deposit-seed never prints or reads the seed at a terminal", () => {
+        // on_terminal stands in for [ -t fd ], since a test has no terminal to give the script
+        for (const [fd, cmd] of [
+            ["3", "main --retire-deposit-seed -"],
+            ["0", "main --retire-deposit-seed - --remove-previous"],
+        ] as const) {
+            const server = fakeServer({ active: true });
+            writeFileSync(server.env, keysEnv(`BUGNET_DEPOSIT_SEED_PREVIOUS=${OLD_SEED}\n`));
+            writeFileSync(server.toml, "[deposits]\nseed_version = 2\n");
+            const r = server.run(`on_terminal() { [ "$1" = ${fd} ]; }; ${cmd}`);
+            expect(r.code).toBe(1);
+            expect(r.err).toBe("vps-install: run deploy/retire-deposit-seed.sh from the Mac\n");
+            expect(r.all).not.toContain(OLD_SEED);
+            expect(server.calls()).toEqual([]);
+            expect(readFileSync(server.env, "utf8")).toContain("BUGNET_DEPOSIT_SEED_PREVIOUS=");
+        }
+    });
+});
+
 describe("vps-install.sh payments token", () => {
     const TOKEN = "T".repeat(20) + "ok+/=_.-" + "k".repeat(16);
 
@@ -895,8 +915,9 @@ describe("retire-deposit-seed.sh", () => {
         expect(readFileSync(r.archive, "utf8")).toBe(`${LINE}\n`);
         expect(statSync(r.archive).mode & 0o777).toBe(0o600);
         expect(r.calls).toHaveLength(2);
-        expect(r.calls[0]).toMatch(/^-p 2222 server\.example sudo -n .*--retire-deposit-seed -$/);
-        expect(r.calls[1]).toMatch(/--retire-deposit-seed - --remove-previous$/);
+        // No remote terminal, which would echo the seed line back to this screen
+        expect(r.calls[0]).toMatch(/^-T -p 2222 server\.example sudo -n .*--retire-deposit-seed -$/);
+        expect(r.calls[1]).toMatch(/^-T -p 2222 .*--retire-deposit-seed - --remove-previous$/);
         expect(r.sent).toBe(`${LINE}\n`);
         expect(r.calls.join("\n")).not.toContain(OLD_SEED);
         expect(r.all).not.toContain(OLD_SEED);

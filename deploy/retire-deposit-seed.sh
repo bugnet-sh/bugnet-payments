@@ -34,8 +34,9 @@ fi
 # shellcheck disable=SC2016
 remote='sudo -n /opt/bugnet/payments/$(cat /etc/bugnet/payments.release)/deploy/vps-install.sh --retire-deposit-seed -'
 
+# -T: a remote terminal would echo the line back to this screen; an option beats ~/.ssh/config
 # shellcheck disable=SC2029
-line=$(ssh "$@" "$remote" </dev/null) || die "the server refused; nothing was archived or removed"
+line=$(ssh -T "$@" "$remote" </dev/null) || die "the server refused; nothing was archived or removed"
 if [ -z "$line" ]; then
     echo "nothing to retire"
     exit 0
@@ -82,6 +83,6 @@ back=$(archived)
 # The server may have removed the seed before a failed restart or a dropped connection, so the
 # failure names no cause; running this again is safe either way
 # shellcheck disable=SC2029
-printf '%s\n' "$back" | ssh "$@" "$remote --remove-previous" ||
+printf '%s\n' "$back" | ssh -T "$@" "$remote --remove-previous" ||
     die "phase 2 failed; check the server's message. $name is in $archive"
 echo "$name is in $archive and no longer on the server"

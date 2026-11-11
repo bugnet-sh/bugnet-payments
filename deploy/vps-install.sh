@@ -760,10 +760,20 @@ do_rotate_seed() {
 # Spec 4.3, D8 A. The first run prints the archive line and removes nothing; the run with
 # --remove-previous takes the archive back on stdin and removes the seed only when it matches. No
 # seed file is ever written on the server (founder, D8).
+# [ -t fd ], a function so a test can stand in for a terminal
+on_terminal() {
+    [ -t "$1" ]
+}
+
 do_retire_seed() {
     local remove=$1 version old list n
     # stdout carries only the archive line, which deploy/retire-deposit-seed.sh captures
     exec 3>&1 1>&2
+    # A seed line shown on a screen or pasted at one is out of the pipe (D8): phase 1 never
+    # prints to a terminal and phase 2 never reads from one
+    if { [ "$remove" = 1 ] && on_terminal 0; } || { [ "$remove" = 0 ] && on_terminal 3; }; then
+        die "run deploy/retire-deposit-seed.sh from the Mac"
+    fi
     no_rotation_halfway
     if ! env_has BUGNET_DEPOSIT_SEED_PREVIOUS; then
         say "nothing to retire: $ENV_FILE has no BUGNET_DEPOSIT_SEED_PREVIOUS"
