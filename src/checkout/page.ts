@@ -364,7 +364,7 @@ h2 {
     :root { --box-pad: var(--pad); }
     code { font-size: var(--fine-size); }
     .box, .foot { width: 100%; max-width: none; }
-    .box { margin-top: 0; padding: var(--space-5) var(--box-pad); border-inline: 0; border-top: 0; }
+    .box { padding: var(--space-5) var(--box-pad); border-inline: 0; border-top: 0; }
     .foot { padding: 0 var(--box-pad); }
     .mobile-links { display: flex; }
 }
@@ -442,7 +442,7 @@ function depositSection(v: CheckoutView, deposit: DepositView): string {
 <div><dt>Address</dt><dd><code>${escapeHtml(deposit.address)}</code> ${copyButton(deposit.address)}</dd></div>
 </dl>
 <figure class="qr"${qrHidden}>
-<img src="/o/${id}/qr.svg"${qrLoading} alt="${ask.alt}">
+<img src="/o/${id}/qr.svg?r=${deposit.remainingMicros}" data-remaining="${deposit.remainingMicros}"${qrLoading} alt="${ask.alt}">
 <figcaption>${ask.caption}</figcaption>
 </figure>
 <p class="note">Send only USDC on Solana.</p>

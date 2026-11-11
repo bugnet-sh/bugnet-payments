@@ -435,7 +435,7 @@ describe("address-first page", () => {
     it("both QRs, each with its own caption", async () => {
         const html = await renderCheckout(offered);
         expect(html.match(/<figure class="qr">/g)).toHaveLength(2);
-        expect(section(html, "deposit")).toContain(`<img src="/o/${id}/qr.svg"`);
+        expect(section(html, "deposit")).toContain(`<img src="/o/${id}/qr.svg?r=50000"`);
         expect(section(html, "deposit")).toContain(
             "Scan with a Solana wallet app to send 0.05 USDC",
         );
@@ -444,6 +444,11 @@ describe("address-first page", () => {
         expect(section(html, "phone")).toContain(
             "Scan with your phone to open this page in Phantom",
         );
+    });
+
+    it("the deposit QR names what it asks for, so the first poll fetches it again only when that changed", async () => {
+        const dep = section(await renderCheckout(offered), "deposit");
+        expect(dep).toContain(`<img src="/o/${id}/qr.svg?r=50000" data-remaining="50000"`);
     });
 
     it("the deposit QR waits hidden while nothing more is owed", async () => {
@@ -455,7 +460,9 @@ describe("address-first page", () => {
         };
         const hidden = section(await renderCheckout(held), "deposit");
         expect(hidden).toContain('<figure class="qr" hidden>');
-        expect(hidden).toContain(`<img src="/o/${id}/qr.svg" loading="lazy"`);
+        expect(hidden).toContain(
+            `<img src="/o/${id}/qr.svg?r=0" data-remaining="0" loading="lazy"`,
+        );
     });
 
     it("once money has arrived, the Amount row, Copy, QR and exchange note ask for the rest", async () => {
@@ -537,6 +544,8 @@ describe("address-first page", () => {
         expect(html).toContain("min-height: 100dvh");
         expect(html).toContain("margin-block: auto");
         expect(html).not.toContain("::first-letter");
+        // On a phone too: a short card is centered, a long one starts at the top
+        expect(html).not.toContain(".box { margin-top: 0;");
     });
 
     it("the deposit QR image is sized like the phone QR", async () => {

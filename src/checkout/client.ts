@@ -287,7 +287,9 @@ function follow(p: Page, wallet: WalletSection | null): void {
     const firstLine = p.depositMessage?.textContent ?? "";
     let offset = Date.parse(p.root.dataset.now ?? "") - Date.now();
     if (Number.isNaN(offset)) offset = 0;
-    let remaining: number | null = null;
+    // What the server-drawn code asks for, so the first poll loads it again only if that changed
+    const drawn = Number(qr?.dataset.remaining ?? Number.NaN);
+    let remaining: number | null = Number.isNaN(drawn) ? null : drawn;
     let lastKey: string | null = null;
     let changedAt = Date.now();
     if (untilEl !== null) untilEl.textContent = `until ${p.ctx.deadline}`;
@@ -393,14 +395,17 @@ const COPIED_FOR_MS = 1_500;
 function offerCopy(button: HTMLButtonElement, failed: (button: HTMLButtonElement) => void): void {
     let timer: ReturnType<typeof setTimeout> | undefined;
     button.addEventListener("click", () => {
-        navigator.clipboard.writeText(button.dataset.copy ?? "").then(
-            () => {
-                button.dataset.copied = "";
-                clearTimeout(timer);
-                timer = setTimeout(() => delete button.dataset.copied, COPIED_FOR_MS);
-            },
-            () => failed(button),
-        );
+        // Without the Clipboard API writeText throws before any promise, so it goes inside one
+        Promise.resolve()
+            .then(() => navigator.clipboard.writeText(button.dataset.copy ?? ""))
+            .then(
+                () => {
+                    button.dataset.copied = "";
+                    clearTimeout(timer);
+                    timer = setTimeout(() => delete button.dataset.copied, COPIED_FOR_MS);
+                },
+                () => failed(button),
+            );
     });
 }
 
