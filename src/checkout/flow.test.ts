@@ -21,7 +21,9 @@ import { requirementsFor } from "../x402/challenge.ts";
 import {
     BUILD_FAILED,
     payWithWallet,
+    readBalance,
     reportError,
+    shortReport,
     WalletError,
     type WalletPort,
     watchOrder,
@@ -487,6 +489,220 @@ describe("payWithWallet", () => {
     });
 });
 
+describe("refusals through payWithWallet", () => {
+    const ctx = { ...CTX, formatDateTime: () => "2 Jan 2030, 00:00" };
+    const RETRY = { "Retry-After": "7" };
+    const W25 =
+        "Bugnet could not accept the transaction Phantom signed. Nothing was charged. Press Pay to try again, or send to the address above.";
+    const W24 = (wait: string) =>
+        `Bugnet cannot take the payment right now. Nothing was charged. Press Pay again ${wait}.`;
+    const settlingFor = (n: number) =>
+        Array.from({ length: n }, () => () => json(200, { orderId: id, state: "settling" }));
+    const rows: [string, Script, string][] = [
+        [
+            "W15",
+            {
+                order: () => {
+                    const bare = { ...accepts, extra: { feePayer: accepts.extra.feePayer } };
+                    const pr = challenge(bare as PaymentRequirements);
+                    return json(402, pr, { "PAYMENT-REQUIRED": encodePaymentRequiredHeader(pr) });
+                },
+            },
+            "Bugnet could not get a recent Solana block. Nothing was charged. Press Pay again in a few seconds.",
+        ],
+        [
+            "W16",
+            {
+                submit: () => json(202, { orderId: id, state: "settling" }),
+                statuses: settlingFor(60),
+            },
+            "The payment is still confirming on Solana. This page updates when it lands.",
+        ],
+        [
+            "W17",
+            {
+                submit: () => {
+                    throw new TypeError("network error");
+                },
+            },
+            "The connection dropped after sending. Checking whether the payment landed.",
+        ],
+        [
+            "W18",
+            {
+                submit: () => json(202, { orderId: id, state: "settling" }),
+                statuses: [() => json(200, { orderId: id, state: "unpaid" })],
+            },
+            "The payment did not land on Solana. Nothing was charged. Press Pay to try again.",
+        ],
+        [
+            "W19",
+            {
+                submit: () =>
+                    json(422, {
+                        refused: "payment_invalid",
+                        orderId: id,
+                        code: "invalid_exact_svm_transaction_simulation_failed",
+                    }),
+            },
+            "Solana refused the payment, most often because the account holds less than $0.05 USDC. Nothing was charged. Add USDC, or send to the address above.",
+        ],
+        [
+            "W20",
+            {
+                submit: () =>
+                    json(403, {
+                        refused: "payer_blocked",
+                        orderId: id,
+                        blockedUntil: "2030-01-02T00:00:00.000Z",
+                    }),
+            },
+            "Bugnet blocks this wallet until 2 Jan 2030, 00:00. Nothing was charged. Pay from another wallet.",
+        ],
+        [
+            "W21",
+            { submit: () => json(429, { refused: "payer_busy", orderId: id }, RETRY) },
+            "This wallet already runs as many sandboxes as Bugnet allows at once. Nothing was charged. Stop a sandbox, then press Pay.",
+        ],
+        [
+            "W22 payer_rate_limited",
+            { submit: () => json(429, { refused: "payer_rate_limited", orderId: id }, RETRY) },
+            "Too many tries from this wallet. Nothing was charged. Press Pay again in 7 s.",
+        ],
+        [
+            "W22 too_many_attempts",
+            { submit: () => json(429, { refused: "too_many_attempts", orderId: id }, RETRY) },
+            "Too many tries from this wallet. Nothing was charged. Press Pay again in 7 s.",
+        ],
+        [
+            "W23",
+            { submit: () => json(503, { refused: "x402_disabled", orderId: id }) },
+            "Bugnet is not taking allowance payments right now. Nothing was charged. Ask your agent to try again later.",
+        ],
+        [
+            "W24 with Retry-After",
+            { submit: () => json(503, { refused: "router_unavailable", orderId: id }, RETRY) },
+            W24("in 7 s"),
+        ],
+        [
+            "W24 without Retry-After",
+            { submit: () => json(503, { refused: "settlement_unavailable", orderId: id }) },
+            W24("in a minute"),
+        ],
+        [
+            "W25 payment_invalid",
+            {
+                submit: () =>
+                    json(422, {
+                        refused: "payment_invalid",
+                        orderId: id,
+                        code: "invalid_exact_svm_payload_transaction",
+                    }),
+            },
+            W25,
+        ],
+        [
+            "W25 payment_malformed",
+            { submit: () => json(400, { refused: "payment_malformed", orderId: id }) },
+            W25,
+        ],
+        [
+            "W25 payment_order_mismatch",
+            { submit: () => json(400, { refused: "payment_order_mismatch", orderId: id }) },
+            W25,
+        ],
+        [
+            "W25 payer_invalid",
+            { submit: () => json(400, { refused: "payer_invalid", orderId: id }) },
+            W25,
+        ],
+        [
+            "W26",
+            { submit: () => json(409, { refused: "payment_replayed", orderId: id }) },
+            "This signed payment was already sent once. Nothing was charged again. Press Pay to sign a new one.",
+        ],
+        [
+            "W27",
+            {
+                submit: () =>
+                    json(410, { refused: "order_closed", orderId: id, code: "allowance_ceiling" }),
+            },
+            "Paid, but this sandbox already holds the most allowance Bugnet allows. The $0.05 is being returned to the paying wallet.",
+        ],
+        [
+            "W28",
+            {
+                submit: () =>
+                    json(410, { refused: "order_closed", orderId: id, code: "sandbox_ended" }),
+            },
+            "Paid, but the sandbox has ended. The $0.05 is being returned to the paying wallet.",
+        ],
+        [
+            "W29",
+            {
+                submit: () =>
+                    json(410, {
+                        refused: "order_closed",
+                        orderId: id,
+                        code: "allowance_pool_full",
+                    }),
+            },
+            "Paid, but Bugnet holds as much allowance money as it allows right now. The $0.05 is being returned to the paying wallet.",
+        ],
+        [
+            "W30",
+            {
+                submit: () =>
+                    json(410, { refused: "order_closed", orderId: id, code: "order_expired" }),
+            },
+            "Paid after the order expired. The $0.05 is being returned to the paying wallet.",
+        ],
+        [
+            "W31",
+            { submit: () => json(400, { refused: "something_new", orderId: id }) },
+            "Bugnet refused the payment (something_new). Nothing was charged. Press Pay to try again, or write to support@bugnet.org.",
+        ],
+        [
+            "W32",
+            { submit: () => json(410, { refused: "order_closed", orderId: id }) },
+            "This order is closed and cannot be paid. Ask your agent for a new payment link.",
+        ],
+        [
+            "W33",
+            { order: () => json(404, { error: "order_unknown", orderId: id }) },
+            "Bugnet has no order for this link. Ask your agent for a new payment link.",
+        ],
+    ];
+
+    it.each(rows)("%s", async (_, script, text) => {
+        const { w, f, sleep } = harness(script);
+        const result = await payWithWallet({ fetch: f, wallet: w, orderUrl, sleep });
+        expect(messageStep(result, ctx).message).toBe(text);
+    });
+
+    it("W20 keeps blockedUntil and W21 keeps the wait out of its text", async () => {
+        const blocked = harness({
+            submit: () =>
+                json(403, {
+                    refused: "payer_blocked",
+                    orderId: id,
+                    blockedUntil: "2030-01-02T00:00:00.000Z",
+                }),
+        });
+        expect(await payWithWallet({ fetch: blocked.f, wallet: blocked.w, orderUrl })).toEqual({
+            refused: "payer_blocked",
+            blockedUntil: "2030-01-02T00:00:00.000Z",
+        });
+        const busy = harness({
+            submit: () => json(429, { refused: "payer_busy", orderId: id }, RETRY),
+        });
+        expect(await payWithWallet({ fetch: busy.f, wallet: busy.w, orderUrl })).toEqual({
+            unavailable: "payer_busy",
+            retryAfterSeconds: 7,
+        });
+    });
+});
+
 describe("watchOrder", () => {
     const settling = () => json(200, { orderId: id, state: "settling" });
 
@@ -668,6 +884,32 @@ describe("balance pre-check", () => {
         ).rejects.toBeInstanceOf(WalletError);
     });
 
+    it("readBalance skips the check on a 503 or a network failure", async () => {
+        const answer = (res: () => Response) =>
+            readBalance(
+                {
+                    fetch: (async (url: string) => {
+                        expect(url).toBe(`${orderUrl}/balance?owner=${payer.address}`);
+                        return res();
+                    }) as unknown as typeof fetch,
+                    orderUrl,
+                },
+                payer.address,
+            );
+        expect(
+            await answer(() =>
+                json(200, { owner: payer.address, usdcMicros: 7, needMicros: NEED }),
+            ),
+        ).toEqual({ usdcMicros: 7, needMicros: NEED });
+        expect(await answer(() => json(503, { error: "rpc_unavailable" }))).toBeNull();
+        expect(await answer(() => json(200, { usdcMicros: "7" }))).toBeNull();
+        expect(
+            await answer(() => {
+                throw new TypeError("network error");
+            }),
+        ).toBeNull();
+    });
+
     it("reportError posts the report", async () => {
         const posted: { url: string; method?: string; body?: string }[] = [];
         const f = (async (url: string, init?: RequestInit) => {
@@ -684,5 +926,28 @@ describe("balance pre-check", () => {
         expect(posted).toEqual([
             { url: `${orderUrl}/report`, method: "POST", body: JSON.stringify(report) },
         ]);
+
+        // A short balance, and a wallet text cut to the route's limits
+        posted.length = 0;
+        await reportError(
+            { fetch: f, orderUrl },
+            shortReport("Phantom", { haveMicros: 0, needMicros: NEED }),
+        );
+        await reportError(
+            { fetch: f, orderUrl },
+            { stage: "sign", wallet: "W".repeat(50), code: 1, message: "Z".repeat(3_000) },
+        );
+        expect(JSON.parse(posted[0]!.body!)).toEqual({
+            stage: "balance",
+            wallet: "Phantom",
+            code: null,
+            message: "short 0 50000",
+        });
+        expect(JSON.parse(posted[1]!.body!)).toEqual({
+            stage: "sign",
+            wallet: "W".repeat(40),
+            code: 1,
+            message: "Z".repeat(200),
+        });
     });
 });
