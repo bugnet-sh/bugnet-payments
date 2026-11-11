@@ -6,6 +6,7 @@ import { createPool } from "../db/pool.ts";
 export interface TestDb {
     pool: pg.Pool;
     url: string;
+    name: string;
     close(): Promise<void>;
 }
 
@@ -34,6 +35,7 @@ export async function testDb(): Promise<TestDb> {
     return {
         pool,
         url,
+        name,
         async close() {
             await pool.end();
             await dropDatabase(adminUrl, name);

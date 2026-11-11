@@ -8,6 +8,9 @@
  * the server's, so its calls count against the same daily caps. The log hides
  * secretValues(process.env), every URL of the list and both deposit seeds included, plus this
  * file's own values.
+ *
+ * Its database holds each deposit's salt, which its key needs (spec 4.2), so a run that did not
+ * pass keeps it and logs its name and how to move what the run left in its deposits.
  */
 import { randomBytes } from "node:crypto";
 import {
@@ -19,7 +22,7 @@ import {
     signature,
 } from "@solana/kit";
 import { getCreateAssociatedTokenIdempotentInstructionAsync } from "@solana-program/token";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, type RunnerTask } from "vitest";
 import { depositLine } from "../../src/checkout/messages.ts";
 import { parseStatus } from "../../src/checkout/live.ts";
 import { readSecrets, type Secrets, secretValues, type Settings } from "../../src/config.ts";
@@ -103,6 +106,8 @@ let feePayer: KeyPairSigner;
 // The first order, paid and closed, whose address the late-money step sends to again
 let paidOrder: { orderId: string; sweep: string } | undefined;
 const eventSeed = randomBytes(32);
+// The file's tests, which afterAll reads before it drops the database
+let tests: readonly RunnerTask[] = [];
 
 // Vitest's agent reporter drops the console output of passing tests, a direct write always shows
 function printLine(line: string): void {
@@ -258,6 +263,37 @@ async function memosOf(sig: string): Promise<unknown[]> {
         .map((ix) => ix.parsed);
 }
 
+// Why the database must stay, or null when every test passed and every deposit closed
+async function keepReason(d: TestDb): Promise<string | null> {
+    if (tests.length === 0 || tests.some((t) => t.result?.state !== "pass")) {
+        return "a test did not pass";
+    }
+    try {
+        const { rows } = await d.pool.query<{ order_id: string }>(
+            "select order_id from deposits where state not in ('closed', 'done') order by order_id",
+        );
+        if (rows.length === 0) return null;
+        return `deposits not closed: ${rows.map((r) => r.order_id).join(" ")}`;
+    } catch (err) {
+        return `its deposits could not be read: ${errorText(err)}`;
+    }
+}
+
+async function dropOrKeep(): Promise<void> {
+    if (db === undefined) return;
+    const why = await keepReason(db);
+    if (why === null) return await db.close();
+    log.warn(`kept database ${db.name} (${why}): only it holds this run's deposit salts`);
+    log.warn(
+        `recover: in a copy of config/dev.toml point [database] url at database ${db.name} ` +
+            "on the BUGNET_TEST_PG_URL server, run pnpm exec tsx src/main.ts -config <copy> so " +
+            "the deposit job returns and closes what is left, follow it with pnpm cli -config " +
+            "<copy> deposits list, and move late money from a done deposit with deposits " +
+            "return-late",
+    );
+    await db.pool.end();
+}
+
 // The token's middle part is its claims; the router verifies the signature, not this test
 function claimsOf(token: string): OrderClaims {
     const part = token.split(".")[1] ?? "";
@@ -270,6 +306,8 @@ describe("deposits on mainnet", () => {
         if (missing.length > 0) {
             throw new Error(`deposit live test needs ${missing.join(", ")} in .env (spec 18)`);
         }
+        // Before the database, so a kept one is always logged
+        log = jsonLog("payments", { secrets: secretValues(process.env) });
         db = await testDb();
         // A deadline two minutes out, so the expiry step needs no fifteen-minute wait
         settings = await liveSettings(db.url, eventSeed, {
@@ -277,7 +315,6 @@ describe("deposits on mainnet", () => {
             orders: { unpaid_ttl: "2m" },
         });
         secrets = readSecrets(process.env, settings);
-        log = jsonLog("payments", { secrets: secretValues(process.env) });
         restoreConsole = routeConsole(log);
         const live = liveRpcSettings(process.env);
         routed = createRouterRpc(live.settings, live.urls, {
@@ -294,11 +331,15 @@ describe("deposits on mainnet", () => {
         svc = await startService({ settings, secrets, log });
     }, 120_000);
 
+    beforeEach(({ task }) => {
+        tests = task.suite?.tasks ?? [];
+    });
+
     afterAll(async () => {
         for (const [what, step] of [
             ["service stop", () => svc?.stop()],
             ["router stop", () => routed?.router.stop()],
-            ["database drop", () => db?.close()],
+            ["database drop or keep", dropOrKeep],
             ["console restore", () => restoreConsole?.()],
         ] as const) {
             try {
