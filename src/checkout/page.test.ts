@@ -173,6 +173,13 @@ describe("checkout page", () => {
         expect(text).toContain("standard:connect");
         // @x402/core/http and the zod it pulls in would add about 750 KB here
         expect(text.length).toBeLessThan(400_000);
+        // The old raw texts are gone; every message comes from messages.ts
+        expect(text).not.toContain("payment refused:");
+        expect(text).not.toContain("did not go through");
+        const flow = await import("./flow.ts");
+        for (const gone of ["pageStep", "stateStep", "walletErrorStep"]) {
+            expect(gone in flow).toBe(false);
+        }
     });
 });
 

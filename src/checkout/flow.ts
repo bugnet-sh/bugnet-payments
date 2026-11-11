@@ -2,6 +2,7 @@ import { address, getBase64Decoder, getTransactionEncoder, isAddress } from "@so
 import type { PaymentPayload, PaymentRequired } from "@x402/core/types";
 import { safeBase64Decode, safeBase64Encode } from "@x402/core/utils";
 import type { PublicState } from "../http/public.ts";
+import { fetchStatus } from "./live.ts";
 import { buildPaymentTransaction, hasBlockhashHints } from "../x402/build.ts";
 
 export interface WalletPort {
@@ -18,8 +19,10 @@ export type PayFlowResult =
     | "settling_timeout"
     | "network_busy"
     | "unconfirmed"
-    | { unavailable: string; retryAfterSeconds?: number }
-    | { refused: string };
+    | "unpaid_after_submit"
+    | { refused: string; code?: string; blockedUntil?: string }
+    | { unavailable: string; code?: string; retryAfterSeconds?: number }
+    | { short: { haveMicros: number; needMicros: number } };
 
 export interface StatusDeps {
     fetch: typeof fetch;
@@ -29,6 +32,8 @@ export interface StatusDeps {
 
 export interface PayFlowDeps extends StatusDeps {
     wallet: WalletPort;
+    // The pre-check before signing (spec 13.1); null when the check could not run
+    balance?: (owner: string) => Promise<{ usdcMicros: number; needMicros: number } | null>;
 }
 
 export interface WatchOptions {
@@ -44,21 +49,16 @@ export interface PageStep {
     watch?: WatchOptions;
 }
 
-export const STATE_LABELS: Record<PublicState, string> = {
-    unpaid: "Awaiting payment",
-    settling: "Confirming",
-    paid: "Paid",
-    expired: "Expired",
-    refunded: "Refunded",
-    review: "Under review",
-};
-
 const POLL_EVERY_MS = 2_000;
 const WATCH_FOR_MS = 120_000;
 // The server reads unpaid until the settler's checks commit settling, a few seconds after submit
-const UNCONFIRMED_UNPAID_FOR_MS = 20_000;
-const SIMULATION_FAILED = "invalid_exact_svm_transaction_simulation_failed";
-const UNREADABLE_CHALLENGE = "the order answered an unreadable payment challenge";
+export const UNCONFIRMED_UNPAID_FOR_MS = 20_000;
+export const UNREADABLE_CHALLENGE = "the order answered an unreadable payment challenge";
+export const NO_OPTION = "the challenge offers no payment option";
+export const NO_SIGNED = "the wallet returned no signed transaction";
+export const NO_ACCOUNT = "the wallet shared no account";
+// Wallet codes that are the user's own choice or state; any other one may be a short balance
+const USER_CODES = new Set([4001, 4100, 4900, -32002]);
 const JSON_ACCEPT = { Accept: "application/json" };
 
 function wait(ms: number): Promise<void> {
@@ -106,41 +106,48 @@ function decodeChallenge(header: string | null): PaymentRequired {
     return pr;
 }
 
-const FUNDING_REFUSALS = new Set([
-    "allowance_ceiling",
-    "allowance_pool_full",
-    "sandbox_ended",
-    "order_expired",
-]);
+interface Refusal {
+    reason: string;
+    code?: string;
+    blockedUntil?: string;
+}
 
-async function reasonOf(res: Response): Promise<string> {
+async function reasonOf(res: Response): Promise<Refusal> {
     const body: unknown = await res.json().catch(() => null);
     const field = (name: string): string | undefined => {
         const v = isRecord(body) ? body[name] : undefined;
         return typeof v === "string" && v !== "" ? v : undefined;
     };
     const code = field("code");
-    if (field("refused") === "order_closed" && code !== undefined && FUNDING_REFUSALS.has(code)) {
-        return "order_closed_refunding";
-    }
-    return code ?? field("refused") ?? field("error") ?? `http_${res.status}`;
+    const blockedUntil = field("blockedUntil");
+    const reason = field("refused") ?? code ?? field("error") ?? `http_${res.status}`;
+    return {
+        reason,
+        ...(code === undefined || code === reason ? {} : { code }),
+        ...(blockedUntil === undefined ? {} : { blockedUntil }),
+    };
 }
 
 async function unavailable(res: Response): Promise<PayFlowResult> {
     // A 429 without a wait means its limit has already reset
     const retryAfter = res.headers.get("Retry-After")?.trim() || (res.status === 429 ? "0" : "");
-    const reason = await reasonOf(res);
-    if (!/^\d+$/.test(retryAfter)) return { unavailable: reason };
-    return { unavailable: reason, retryAfterSeconds: Number(retryAfter) };
+    const r = await reasonOf(res);
+    return {
+        unavailable: r.reason,
+        ...(r.code === undefined ? {} : { code: r.code }),
+        ...(/^\d+$/.test(retryAfter) ? { retryAfterSeconds: Number(retryAfter) } : {}),
+    };
 }
 
+const PUBLIC_STATES = new Set(["unpaid", "settling", "paid", "expired", "refunded", "review"]);
+
 function isPublicState(v: unknown): v is PublicState {
-    return typeof v === "string" && Object.hasOwn(STATE_LABELS, v);
+    return typeof v === "string" && PUBLIC_STATES.has(v);
 }
 
 async function currentState(d: StatusDeps): Promise<PublicState | undefined> {
     try {
-        const res = await d.fetch(`${d.orderUrl}/status`, { headers: JSON_ACCEPT });
+        const res = await fetchStatus(d);
         if (res.status !== 200) return undefined;
         const body: unknown = await res.json();
         return isRecord(body) && isPublicState(body.state) ? body.state : undefined;
@@ -175,6 +182,7 @@ async function untilSettled(d: StatusDeps): Promise<PayFlowResult> {
     const state = await watchOrder(d);
     if (state === "paid") return "paid";
     if (state === undefined || state === "settling") return "settling_timeout";
+    if (state === "unpaid") return "unpaid_after_submit";
     return { refused: `order_${state}` };
 }
 
@@ -182,25 +190,54 @@ async function outcome(d: StatusDeps, res: Response): Promise<PayFlowResult> {
     if (res.status === 200) return "paid";
     if (res.status === 202) return untilSettled(d);
     if (res.status === 429 || res.status >= 500) return unavailable(res);
-    return { refused: await reasonOf(res) };
+    const r = await reasonOf(res);
+    return {
+        refused: r.reason,
+        ...(r.code === undefined ? {} : { code: r.code }),
+        ...(r.blockedUntil === undefined ? {} : { blockedUntil: r.blockedUntil }),
+    };
+}
+
+// The pre-check's answer, or null when it could not run (a 503 or a network failure skip it)
+async function shortOf(
+    d: PayFlowDeps,
+    owner: string,
+): Promise<{ haveMicros: number; needMicros: number } | null> {
+    if (d.balance === undefined) return null;
+    const b = await d.balance(owner).catch(() => null);
+    if (b === null || b.usdcMicros >= b.needMicros) return null;
+    return { haveMicros: b.usdcMicros, needMicros: b.needMicros };
 }
 
 export async function payWithWallet(d: PayFlowDeps): Promise<PayFlowResult> {
     const account = await d.wallet.connect();
+    // Before the challenge and before signing, so a short wallet signs nothing
+    const short = await shortOf(d, account.address);
+    if (short !== null) return { short };
     // Fetched only now, so the blockhash hint is as fresh as it can be when the wallet signs
     const challenge = await d.fetch(d.orderUrl, { headers: JSON_ACCEPT });
     if (challenge.status !== 402) return outcome(d, challenge);
     const pr = decodeChallenge(challenge.headers.get("PAYMENT-REQUIRED"));
     const accepted = pr.accepts[0];
-    if (accepted === undefined) throw new Error("the challenge offers no payment option");
+    if (accepted === undefined) throw new Error(NO_OPTION);
     if (!hasBlockhashHints(accepted)) return "network_busy";
     const tx = await buildPaymentTransaction(accepted, address(account.address));
-    const [signed] = await d.wallet.signTransaction({
-        account,
-        transaction: new Uint8Array(getTransactionEncoder().encode(tx)),
-        chain: "solana:mainnet",
-    });
-    if (signed === undefined) throw new Error("the wallet returned no signed transaction");
+    let signed: { signedTransaction: Uint8Array } | undefined;
+    try {
+        [signed] = await d.wallet.signTransaction({
+            account,
+            transaction: new Uint8Array(getTransactionEncoder().encode(tx)),
+            chain: "solana:mainnet",
+        });
+    } catch (err) {
+        // Phantom answers a failed simulation with -32603: a short balance shows as one
+        if (err instanceof WalletError && (err.code === undefined || !USER_CODES.has(err.code))) {
+            const again = await shortOf(d, account.address);
+            if (again !== null) return { short: again };
+        }
+        throw err;
+    }
+    if (signed === undefined) throw new Error(NO_SIGNED);
     const payment: PaymentPayload = {
         x402Version: 2,
         resource: pr.resource,
@@ -248,102 +285,16 @@ export function walletError(wallet: string, err: unknown): WalletError {
     return new WalletError(wallet, typeof code === "number" ? code : undefined, said);
 }
 
-// Codes follow EIP-1193, which Wallet Standard wallets reuse. Phantom answers "Unexpected error"
-// when its own simulation fails, most often because the account lacks USDC
-export function walletErrorStep(e: WalletError, amount: string): PageStep {
-    const w = e.wallet;
-    switch (e.code) {
-        case 4001:
-            return {
-                message: `you declined the payment in ${w}. Press Pay to try again`,
-                payAfterMs: 0,
-            };
-        case 4100:
-            return {
-                message: `${w} did not share an account. Unlock ${w}, allow this page, then press Pay again`,
-                payAfterMs: 0,
-            };
-        case -32002:
-            return {
-                message: `${w} already has a request open. Close it in ${w}, then press Pay again`,
-                payAfterMs: 0,
-            };
-    }
-    return {
-        message:
-            `${w} stopped the payment ("${e.message}"). This usually means the account holds ` +
-            `less than ${amount} USDC on Solana. Add USDC or pick another account, then press Pay again`,
-        payAfterMs: 0,
-    };
-}
-
-export function stateStep(state: PublicState | undefined): PageStep {
-    switch (state) {
-        case undefined:
-            return { message: "could not confirm the payment, refresh this page in a minute" };
-        case "unpaid":
-            return { message: "the payment did not land, try again", state, payAfterMs: 0 };
-        case "settling":
-            return {
-                message: "the payment is still settling, refresh this page in a minute",
-                state,
-            };
-        case "paid":
-            return { message: "paid", state };
-        case "expired":
-            return { message: "this order has expired", state };
-        case "refunded":
-            return { message: "this order was refunded", state };
-        case "review":
-            return { message: "this order is under review", state };
-    }
-}
-
-export function pageStep(r: PayFlowResult): PageStep {
-    switch (r) {
-        case "paid":
-            return stateStep("paid");
-        case "settling_timeout":
-            return stateStep("settling");
-        case "network_busy":
-            return { message: "network busy, try again", payAfterMs: 0 };
-        case "unconfirmed":
-            return {
-                message: "could not confirm the payment; checking status…",
-                watch: { unpaidForMs: UNCONFIRMED_UNPAID_FOR_MS },
-            };
-    }
-    if ("unavailable" in r) {
-        const seconds = r.retryAfterSeconds;
-        if (seconds === undefined) return { message: "busy, try again", payAfterMs: 0 };
-        if (seconds === 0) return { message: "busy, try again now", payAfterMs: 0 };
-        return { message: `busy, try again in ${seconds} s`, payAfterMs: seconds * 1_000 };
-    }
-    switch (r.refused) {
-        case SIMULATION_FAILED:
-            return {
-                message: "the wallet lacks USDC or the payment expired, try again",
-                payAfterMs: 0,
-            };
-        case "order_unpaid":
-            return stateStep("unpaid");
-        case "order_expired":
-            return stateStep("expired");
-        case "order_refunded":
-            return stateStep("refunded");
-        case "order_review":
-            return stateStep("review");
-        case "order_closed_refunding":
-            return {
-                message:
-                    "paid, but this order could not be applied: the money is being refunded to the paying wallet",
-                watch: {},
-            };
-        case "order_closed":
-            return { message: "this order is closed", watch: {} };
-        case "order_unknown":
-            return { message: "this order does not exist" };
-        default:
-            return { message: `payment refused: ${r.refused}`, payAfterMs: 0 };
-    }
+// The page's own account of a wallet error (spec 13.3); a failed report is ignored
+export async function reportError(
+    d: StatusDeps,
+    r: { stage: string; wallet: string; code: number | null; message: string },
+): Promise<void> {
+    await d
+        .fetch(`${d.orderUrl}/report`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(r),
+        })
+        .catch(() => undefined);
 }

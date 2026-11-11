@@ -4,18 +4,36 @@ import {
 } from "@solana/wallet-standard-features";
 import { getWallets } from "@wallet-standard/app";
 import {
+    NO_ACCOUNT,
+    NO_SIGNED,
     type PageStep,
-    pageStep,
     payWithWallet,
-    STATE_LABELS,
+    reportError,
     type StatusDeps,
-    stateStep,
+    UNREADABLE_CHALLENGE,
     WalletError,
     type WalletPort,
     walletError,
-    walletErrorStep,
-    watchOrder,
 } from "./flow.ts";
+import {
+    fetchStatus,
+    keepPolling,
+    parseStatus,
+    pollDelay,
+    showWalletOptions,
+    type StatusView,
+    timeLeft,
+    walletNote,
+} from "./live.ts";
+import {
+    depositLine,
+    errorStep,
+    type MessageContext,
+    PAGE_TEXT,
+    pageStep,
+    STATE_LABELS,
+    walletMessage,
+} from "./messages.ts";
 
 type Wallet = ReturnType<ReturnType<typeof getWallets>["get"]>[number];
 type WalletAccount = Wallet["accounts"][number];
@@ -25,10 +43,14 @@ interface ConnectFeature {
     connect(): Promise<{ accounts: readonly WalletAccount[] }>;
 }
 
-interface View {
-    message: HTMLElement;
+interface Page {
+    root: HTMLElement;
+    message: HTMLElement | null;
+    depositMessage: HTMLElement | null;
+    walletNote: HTMLElement | null;
     stateLabel: HTMLElement;
     status: StatusDeps;
+    ctx: MessageContext;
 }
 
 const STANDARD_CONNECT = "standard:connect";
@@ -42,21 +64,24 @@ function usable(w: Wallet): boolean {
     );
 }
 
-function portFor(w: Wallet): WalletPort {
+// Shows W2 and W3 as the wallet asks, and remembers the stage for the error report
+function portFor(w: Wallet, onStage: (stage: "connect" | "sign") => void): WalletPort {
     const connector = w.features[STANDARD_CONNECT] as ConnectFeature;
     const signer = w.features[SolanaSignTransaction] as SignFeature;
     let account: WalletAccount | undefined;
     return {
         async connect() {
+            onStage("connect");
             const { accounts } = await connector.connect().catch((e: unknown) => {
                 throw walletError(w.name, e);
             });
             account = accounts.find((a) => a.chains.includes(MAINNET)) ?? accounts[0];
-            if (account === undefined) throw new Error("the wallet shared no account");
+            if (account === undefined) throw new Error(NO_ACCOUNT);
             return account;
         },
         async signTransaction(i) {
-            if (account === undefined) throw new Error("the wallet is not connected");
+            if (account === undefined) throw new Error(NO_ACCOUNT);
+            onStage("sign");
             // The wallet expects its own account object back, not the plain address
             const signed = await signer.signTransaction({ ...i, account }).catch((e: unknown) => {
                 throw walletError(w.name, e);
@@ -72,20 +97,38 @@ function element<T extends HTMLElement>(root: HTMLElement, selector: string): T 
     return el;
 }
 
-// Shows a step, follows the order's status when the step leaves it unknown, and answers payAfterMs
-async function show(v: View, step: PageStep): Promise<number | undefined> {
-    v.message.textContent = step.message;
-    if (step.state !== undefined) {
-        v.stateLabel.textContent = STATE_LABELS[step.state];
-        v.stateLabel.dataset.state = step.state;
-    }
-    if (step.watch === undefined) return step.payAfterMs;
-    return show(v, stateStep(await watchOrder(v.status, step.watch)));
+function setLabel(p: Page, label: string, state: string): void {
+    p.stateLabel.textContent = label;
+    p.stateLabel.dataset.state = state;
 }
 
-function startPayment(root: HTMLElement, v: View): void {
-    const list = element<HTMLUListElement>(root, "#wallets");
-    const button = element<HTMLButtonElement>(root, "#pay-button");
+function showStep(p: Page, step: PageStep): number | undefined {
+    if (p.message !== null) p.message.textContent = step.message;
+    if (step.state !== undefined) setLabel(p, STATE_LABELS[step.state], step.state);
+    return step.payAfterMs;
+}
+
+async function balanceOf(
+    p: Page,
+    owner: string,
+): Promise<{ usdcMicros: number; needMicros: number } | null> {
+    try {
+        const res = await p.status.fetch(
+            `${p.status.orderUrl}/balance?owner=${encodeURIComponent(owner)}`,
+            { headers: { Accept: "application/json" } },
+        );
+        if (res.status !== 200) return null;
+        const body = (await res.json()) as { usdcMicros?: unknown; needMicros?: unknown };
+        if (typeof body.usdcMicros !== "number" || typeof body.needMicros !== "number") return null;
+        return { usdcMicros: body.usdcMicros, needMicros: body.needMicros };
+    } catch {
+        return null;
+    }
+}
+
+function startPayment(p: Page): void {
+    const list = element<HTMLUListElement>(p.root, "#wallets");
+    const button = element<HTMLButtonElement>(p.root, "#pay-button");
     const wallets = getWallets();
     let chosen: Wallet | undefined;
     let busy = false;
@@ -130,9 +173,7 @@ function startPayment(root: HTMLElement, v: View): void {
         );
         if (found.length === 0) {
             const item = document.createElement("li");
-            item.textContent =
-                "No Solana wallet found in this browser. " +
-                "Install Phantom or Solflare, or open this page in their app.";
+            item.textContent = PAGE_TEXT.noWallet;
             list.append(item);
         }
         refresh();
@@ -141,24 +182,62 @@ function startPayment(root: HTMLElement, v: View): void {
     const pay = async (wallet: Wallet) => {
         busy = true;
         refresh();
-        v.message.textContent = "waiting for the wallet";
+        const ctx = { ...p.ctx, wallet: wallet.name };
+        let stage: "connect" | "sign" | "challenge" = "challenge";
+        const port = portFor(wallet, (s) => {
+            stage = s;
+            if (p.message !== null) {
+                p.message.textContent =
+                    s === "connect"
+                        ? PAGE_TEXT.connecting(wallet.name)
+                        : PAGE_TEXT.signing(wallet.name);
+            }
+        });
         let step: PageStep;
         try {
-            step = pageStep(await payWithWallet({ ...v.status, wallet: portFor(wallet) }));
+            const r = await payWithWallet({
+                ...p.status,
+                wallet: port,
+                balance: (owner) => balanceOf(p, owner),
+            });
+            if (typeof r === "object" && "short" in r) {
+                void reportError(p.status, {
+                    stage: "balance",
+                    wallet: wallet.name,
+                    code: null,
+                    message: `short ${r.short.haveMicros} ${r.short.needMicros}`,
+                });
+            }
+            step = pageStep(r, ctx);
         } catch (err) {
             if (err instanceof WalletError) {
-                step = walletErrorStep(err, root.dataset.amount ?? "the order amount");
-            } else if (err instanceof TypeError) {
-                step = {
-                    message: "could not reach Bugnet. Check your connection, then press Pay again",
-                    payAfterMs: 0,
-                };
+                void reportError(p.status, {
+                    stage,
+                    wallet: wallet.name,
+                    code: err.code ?? null,
+                    message: err.message,
+                });
+                step = walletMessage(err, ctx);
             } else {
-                const reason = err instanceof Error ? err.message : String(err);
-                step = { message: `the payment did not go through: ${reason}`, payAfterMs: 0 };
+                const message = err instanceof Error ? err.message : "error";
+                const reportStage =
+                    err instanceof TypeError
+                        ? "status"
+                        : message === UNREADABLE_CHALLENGE
+                          ? "challenge"
+                          : message === NO_SIGNED
+                            ? "sign"
+                            : stage;
+                void reportError(p.status, {
+                    stage: reportStage,
+                    wallet: wallet.name,
+                    code: null,
+                    message,
+                });
+                step = errorStep(err, ctx);
             }
         }
-        offerPayAfter(await show(v, step));
+        offerPayAfter(showStep(p, step));
         busy = false;
         refresh();
     };
@@ -171,17 +250,89 @@ function startPayment(root: HTMLElement, v: View): void {
     render();
 }
 
-async function followSettling(v: View): Promise<void> {
-    v.message.textContent = "the payment is settling; checking status…";
-    const state = await watchOrder(v.status);
-    // Only the unpaid page carries the wallet list and the QR
-    if (state === "unpaid") location.reload();
-    else await show(v, stateStep(state));
+const TICK_MS = 1_000;
+const FAILURES_BEFORE_NOTICE = 3;
+
+// Polls the order's status, keeps the countdown, and updates every live part of the page
+function follow(p: Page): void {
+    const expiresAt = Date.parse(p.root.dataset.expiresAt ?? "");
+    const settleGraceMs = Number(p.root.dataset.settleGraceMs ?? "60000");
+    const timeEl = p.root.querySelector<HTMLElement>("#time-left");
+    const untilEl = p.root.querySelector<HTMLElement>("#until");
+    const qr = p.root.querySelector<HTMLImageElement>("#deposit img");
+    let offset = Date.parse(p.root.dataset.now ?? "") - Date.now();
+    if (Number.isNaN(offset)) offset = 0;
+    let remaining: number | null = null;
+    if (untilEl !== null) untilEl.textContent = `until ${p.ctx.deadline}`;
+
+    const tick = () => {
+        if (timeEl !== null) timeEl.textContent = timeLeft(expiresAt, Date.now() + offset);
+    };
+    tick();
+    const timer = setInterval(tick, TICK_MS);
+
+    const apply = (v: StatusView) => {
+        offset = v.serverNow - Date.now();
+        const line = depositLine(v, p.ctx);
+        setLabel(p, line.label, v.state);
+        if (p.depositMessage !== null && (v.deposit !== null || v.state !== "unpaid")) {
+            p.depositMessage.textContent = [line.message, ...line.extra].join(" ");
+        }
+        if (qr !== null && v.deposit !== null && v.deposit.remainingMicros !== remaining) {
+            remaining = v.deposit.remainingMicros;
+            qr.src = `/o/${p.ctx.orderId}/qr.svg?r=${remaining}`;
+        }
+        const options = showWalletOptions(v);
+        for (const id of ["#wallet", "#phone"]) {
+            const section = p.root.querySelector<HTMLElement>(id);
+            if (section !== null) section.hidden = !options;
+        }
+        if (p.walletNote !== null) {
+            const note = walletNote(v, p.ctx);
+            p.walletNote.hidden = note === null;
+            p.walletNote.textContent = note ?? "";
+        }
+    };
+
+    let failures = 0;
+    const poll = async () => {
+        let retryAfterSeconds: number | undefined;
+        let view: StatusView | null = null;
+        try {
+            const res = await fetchStatus(p.status);
+            if (res.status === 429) {
+                retryAfterSeconds = Number(res.headers.get("Retry-After") ?? "10") || 10;
+                if (p.depositMessage !== null) {
+                    p.depositMessage.textContent = PAGE_TEXT.tooMany(retryAfterSeconds);
+                }
+            } else if (res.status === 200) {
+                view = parseStatus(await res.json());
+            }
+        } catch {
+            view = null;
+        }
+        if (view === null && retryAfterSeconds === undefined) {
+            failures += 1;
+            if (failures >= FAILURES_BEFORE_NOTICE && p.depositMessage !== null) {
+                p.depositMessage.textContent = PAGE_TEXT.unreachable;
+            }
+        } else if (view !== null) {
+            failures = 0;
+            apply(view);
+            if (!keepPolling(view, Date.now() + offset, settleGraceMs)) {
+                clearInterval(timer);
+                return;
+            }
+        }
+        const visible = document.visibilityState === "visible";
+        setTimeout(() => void poll(), pollDelay({ visible, failures, retryAfterSeconds }));
+    };
+    void poll();
 }
 
 const COPIED_FOR_MS = 1_500;
 
-function offerCopy(button: HTMLButtonElement): void {
+function offerCopy(button: HTMLButtonElement, failed: (button: HTMLButtonElement) => void): void {
     let timer: ReturnType<typeof setTimeout> | undefined;
     button.addEventListener("click", () => {
         navigator.clipboard.writeText(button.dataset.copy ?? "").then(
@@ -190,25 +341,47 @@ function offerCopy(button: HTMLButtonElement): void {
                 clearTimeout(timer);
                 timer = setTimeout(() => delete button.dataset.copied, COPIED_FOR_MS);
             },
-            () => undefined,
+            () => failed(button),
         );
     });
 }
 
-for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-copy]")) {
-    offerCopy(button);
+function localTime(ms: number): string {
+    return new Date(ms).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+    });
 }
 
 const root = document.getElementById("checkout");
 if (root !== null) {
-    const v: View = {
-        message: element<HTMLElement>(root, "#message"),
+    const expiresAt = Date.parse(root.dataset.expiresAt ?? "");
+    const p: Page = {
+        root,
+        message: root.querySelector<HTMLElement>("#message"),
+        depositMessage: root.querySelector<HTMLElement>("#deposit-message"),
+        walletNote: root.querySelector<HTMLElement>("#wallet-note"),
         stateLabel: element<HTMLElement>(root, "#state"),
         status: {
             fetch: (input, init) => fetch(input, init),
             orderUrl: `${location.origin}/o/${root.dataset.orderId}`,
         },
+        ctx: {
+            amountMicros: Number(root.dataset.amountMicros ?? "0"),
+            deadline: Number.isNaN(expiresAt) ? "" : localTime(expiresAt),
+            refundMinMicros: Number(root.dataset.refundMinMicros ?? "0"),
+            orderId: root.dataset.orderId ?? "",
+        },
     };
-    if (root.dataset.state === "unpaid") startPayment(root, v);
-    else if (root.dataset.state === "settling") void followSettling(v);
+    for (const button of root.querySelectorAll<HTMLButtonElement>("button[data-copy]")) {
+        offerCopy(button, (b) => {
+            const line = b.closest("#deposit") !== null ? p.depositMessage : p.message;
+            if (line !== null) line.textContent = PAGE_TEXT.copyFailed;
+        });
+    }
+    if (root.dataset.state === "unpaid" && root.querySelector("#pay-button") !== null) {
+        startPayment(p);
+    }
+    follow(p);
 }

@@ -2,8 +2,10 @@ import QRCode from "qrcode";
 import type { DepositView } from "../deposits/types.ts";
 import type { PublicState } from "../http/public.ts";
 import type { OrderKind } from "../orders/types.ts";
-import { STATE_LABELS } from "./flow.ts";
+import { amountLabel, decimalAmount, STATE_LABELS } from "./messages.ts";
 import { USDC_ICON } from "./usdc.ts";
+
+export { amountLabel, decimalAmount };
 
 export const CHECKOUT_CSP =
     "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
@@ -36,24 +38,6 @@ const ESCAPES: Record<string, string> = {
 
 function escapeHtml(s: string): string {
     return s.replace(/[&<>"']/g, (c) => ESCAPES[c]!);
-}
-
-export function amountLabel(micros: number): string {
-    const whole = Math.trunc(micros / 1_000_000);
-    const fraction = String(micros % 1_000_000)
-        .padStart(6, "0")
-        .replace(/0+$/, "")
-        .padEnd(2, "0");
-    return `$${whole}.${fraction}`;
-}
-
-// The amount as a wallet or an exchange takes it: "0.05", "0.000001", "1"
-export function decimalAmount(micros: number): string {
-    const whole = Math.trunc(micros / 1_000_000);
-    const fraction = String(micros % 1_000_000)
-        .padStart(6, "0")
-        .replace(/0+$/, "");
-    return fraction === "" ? String(whole) : `${whole}.${fraction}`;
 }
 
 export function walletLinks(

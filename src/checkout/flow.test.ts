@@ -18,15 +18,18 @@ import { TEST_BLOCKHASH, TEST_LVBH } from "../testing/fake-rpc.ts";
 import { testSigner } from "../testing/keys.ts";
 import { buildPaymentTransaction } from "../x402/build.ts";
 import { requirementsFor } from "../x402/challenge.ts";
-import {
-    pageStep,
-    payWithWallet,
-    stateStep,
-    walletError,
-    walletErrorStep,
-    type WalletPort,
-    watchOrder,
-} from "./flow.ts";
+import { payWithWallet, reportError, WalletError, type WalletPort, watchOrder } from "./flow.ts";
+import { pageStep as messageStep, stateStep as messageState } from "./messages.ts";
+
+const CTX = {
+    amountMicros: 50_000,
+    deadline: "14:05",
+    refundMinMicros: 1_000,
+    orderId: "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+    wallet: "Phantom",
+};
+const pageStep = (r: Parameters<typeof messageStep>[0]) => messageStep(r, CTX);
+const stateStep = (s: Parameters<typeof messageState>[0]) => messageState(s, CTX);
 
 const id = "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa";
 const orderUrl = `https://pay.bugnet.sh/o/${id}`;
@@ -157,13 +160,13 @@ describe("payWithWallet", () => {
         ]);
     });
 
-    it("names itself with Bugnet-Client: checkout on the payment request only", async () => {
+    it("names itself with Bugnet-Client: checkout on the payment request and the status polls", async () => {
         const { clients, w, f, sleep } = harness({
             submit: () => json(202, { state: "settling" }),
             statuses: [() => json(200, { state: "paid" })],
         });
         expect(await payWithWallet({ fetch: f, wallet: w, orderUrl, sleep })).toBe("paid");
-        expect(clients).toEqual(["order:null", "order:checkout", "status:null"]);
+        expect(clients).toEqual(["order:null", "order:checkout", "status:checkout"]);
     });
 
     it("asks the wallet to sign the payment built from the refetched challenge", async () => {
@@ -250,9 +253,9 @@ describe("payWithWallet", () => {
             submit: () => json(202, { state: "settling", orderId: id }),
             statuses: [() => json(200, { orderId: id, state: "unpaid" })],
         });
-        expect(await payWithWallet({ fetch: f, wallet: w, orderUrl, sleep })).toEqual({
-            refused: "order_unpaid",
-        });
+        expect(await payWithWallet({ fetch: f, wallet: w, orderUrl, sleep })).toBe(
+            "unpaid_after_submit",
+        );
     });
 
     it("answers network_busy without hints and never asks the wallet to sign", async () => {
@@ -378,10 +381,7 @@ describe("payWithWallet", () => {
             });
             const result = await payWithWallet({ fetch: f, wallet: w, orderUrl, sleep });
             expect(result).toEqual({ unavailable: reason, retryAfterSeconds: 5 });
-            expect(pageStep(result)).toEqual({
-                message: "busy, try again in 5 s",
-                payAfterMs: 5_000,
-            });
+            expect(pageStep(result).payAfterMs).toBe(reason === "payer_busy" ? 0 : 5_000);
         },
     );
 
@@ -401,7 +401,7 @@ describe("payWithWallet", () => {
             sleep: zero.sleep,
         });
         expect(result).toEqual({ unavailable: "payer_busy", retryAfterSeconds: 0 });
-        expect(pageStep(result)).toEqual({ message: "busy, try again now", payAfterMs: 0 });
+        expect(pageStep(result).payAfterMs).toBe(0);
 
         const absent = harness({ order: () => json(429, { error: "too_many_requests" }) });
         const refetched = await payWithWallet({
@@ -411,7 +411,7 @@ describe("payWithWallet", () => {
             sleep: absent.sleep,
         });
         expect(refetched).toEqual({ unavailable: "too_many_requests", retryAfterSeconds: 0 });
-        expect(pageStep(refetched)).toEqual({ message: "busy, try again now", payAfterMs: 0 });
+        expect(pageStep(refetched).payAfterMs).toBe(0);
         expect(absent.calls).not.toContain("signTransaction");
     });
 
@@ -431,7 +431,10 @@ describe("payWithWallet", () => {
                 orderUrl,
                 sleep: simulation.sleep,
             }),
-        ).toEqual({ refused: "invalid_exact_svm_transaction_simulation_failed" });
+        ).toEqual({
+            refused: "payment_invalid",
+            code: "invalid_exact_svm_transaction_simulation_failed",
+        });
 
         const blocked = harness({
             submit: () => json(403, { refused: "payer_blocked", orderId: id }),
@@ -492,7 +495,10 @@ describe("watchOrder", () => {
         const state = await watchOrder({ fetch: f, orderUrl, sleep }, step.watch);
         expect(state).toBe("paid");
         expect(sleeps).toEqual([2000, 2000, 2000, 2000]);
-        expect(stateStep(state)).toEqual({ message: "paid", state: "paid" });
+        expect(stateStep(state)).toEqual({
+            message: "Paid. Go back to your agent; it continues on its own.",
+            state: "paid",
+        });
     });
 
     it("answers unpaid for an unconfirmed payment only after 20 s of unpaid", async () => {
@@ -583,143 +589,84 @@ describe("watchOrder", () => {
     });
 });
 
-describe("pageStep", () => {
-    it("explains each result to the payer", () => {
-        expect(pageStep("network_busy").message).toBe("network busy, try again");
+describe("balance pre-check", () => {
+    const NEED = 50_000;
+
+    it("the balance pre-check stops before signing", async () => {
+        const { calls, w, f, sleep } = harness();
+        const r = await payWithWallet({
+            fetch: f,
+            wallet: w,
+            orderUrl,
+            sleep,
+            balance: async () => ({ usdcMicros: 0, needMicros: NEED }),
+        });
+        expect(r).toEqual({ short: { haveMicros: 0, needMicros: NEED } });
+        expect(calls).toEqual(["connect"]);
+    });
+
+    it("a failing balance check is skipped", async () => {
+        for (const balance of [
+            async () => {
+                throw new TypeError("network error");
+            },
+            async () => null,
+        ]) {
+            const { calls, w, f, sleep } = harness();
+            expect(await payWithWallet({ fetch: f, wallet: w, orderUrl, sleep, balance })).toBe(
+                "paid",
+            );
+            expect(calls).toContain("signTransaction");
+        }
+    });
+
+    it("a wallet error re-checks the balance", async () => {
+        const failing = (answers: number[]) => {
+            const h = harness();
+            h.w.signTransaction = async () => {
+                throw new WalletError("Phantom", -32603, "Unexpected error");
+            };
+            const balance = async () => ({ usdcMicros: answers.shift() ?? 0, needMicros: NEED });
+            return { ...h, balance };
+        };
+        const short = failing([NEED, 0]);
         expect(
-            pageStep({ refused: "invalid_exact_svm_transaction_simulation_failed" }).message,
-        ).toBe("the wallet lacks USDC or the payment expired, try again");
-        expect(pageStep("paid").message).toBe("paid");
-        expect(pageStep("settling_timeout").message).toBe(
-            "the payment is still settling, refresh this page in a minute",
-        );
-        expect(pageStep({ refused: "order_unpaid" }).message).toBe(
-            "the payment did not land, try again",
-        );
-        expect(pageStep({ refused: "payer_blocked" }).message).toBe(
-            "payment refused: payer_blocked",
-        );
+            await payWithWallet({
+                fetch: short.f,
+                wallet: short.w,
+                orderUrl,
+                sleep: short.sleep,
+                balance: short.balance,
+            }),
+        ).toEqual({ short: { haveMicros: 0, needMicros: NEED } });
+
+        const enough = failing([NEED, NEED]);
+        await expect(
+            payWithWallet({
+                fetch: enough.f,
+                wallet: enough.w,
+                orderUrl,
+                sleep: enough.sleep,
+                balance: enough.balance,
+            }),
+        ).rejects.toBeInstanceOf(WalletError);
     });
 
-    it("offers Pay again only while the order can still be paid", () => {
-        expect(pageStep("network_busy").payAfterMs).toBe(0);
-        expect(pageStep({ refused: "payer_blocked" }).payAfterMs).toBe(0);
-        expect(pageStep({ refused: "order_unpaid" })).toEqual({
-            message: "the payment did not land, try again",
-            state: "unpaid",
-            payAfterMs: 0,
-        });
-        expect(pageStep("paid")).toEqual({ message: "paid", state: "paid" });
-        expect(pageStep("settling_timeout")).toEqual({
-            message: "the payment is still settling, refresh this page in a minute",
-            state: "settling",
-        });
-        expect(pageStep({ refused: "order_expired" })).toEqual({
-            message: "this order has expired",
-            state: "expired",
-        });
-        expect(pageStep({ refused: "order_refunded" })).toEqual({
-            message: "this order was refunded",
-            state: "refunded",
-        });
-        expect(pageStep({ refused: "order_review" })).toEqual({
-            message: "this order is under review",
-            state: "review",
-        });
-        expect(pageStep({ refused: "order_unknown" })).toEqual({
-            message: "this order does not exist",
-        });
-    });
-
-    it("checks the order's status when the result leaves it unknown", () => {
-        expect(pageStep("unconfirmed")).toEqual({
-            message: "could not confirm the payment; checking status…",
-            watch: { unpaidForMs: 20_000 },
-        });
-        expect(pageStep({ refused: "order_closed" })).toEqual({
-            message: "this order is closed",
-            watch: {},
-        });
-    });
-
-    it("waits out Retry-After before offering Pay again", () => {
-        expect(pageStep({ unavailable: "rpc_unavailable", retryAfterSeconds: 5 })).toEqual({
-            message: "busy, try again in 5 s",
-            payAfterMs: 5_000,
-        });
-        expect(pageStep({ unavailable: "http_502" })).toEqual({
-            message: "busy, try again",
-            payAfterMs: 0,
-        });
-        expect(pageStep({ unavailable: "http_503", retryAfterSeconds: 0 })).toEqual({
-            message: "busy, try again now",
-            payAfterMs: 0,
-        });
-    });
-});
-
-describe("order_closed_refunding", () => {
-    it("reads a paid order that could not be applied as being refunded", async () => {
-        const h = harness({
-            submit: () =>
-                json(410, { refused: "order_closed", orderId: id, code: "sandbox_ended" }),
-        });
-        expect(await payWithWallet({ fetch: h.f, wallet: h.w, orderUrl, sleep: h.sleep })).toEqual({
-            refused: "order_closed_refunding",
-        });
-        expect(pageStep({ refused: "order_closed_refunding" })).toEqual({
-            message:
-                "paid, but this order could not be applied: the money is being refunded to the paying wallet",
-            watch: {},
-        });
-        const other = harness({
-            submit: () => json(422, { refused: "payment_invalid", orderId: id, code: "x" }),
-        });
-        expect(
-            await payWithWallet({ fetch: other.f, wallet: other.w, orderUrl, sleep: other.sleep }),
-        ).toEqual({ refused: "x" });
-    });
-});
-
-describe("stateStep", () => {
-    it("maps a watched state to the page, telling the payer to refresh when it never settled", () => {
-        expect(stateStep("unpaid")).toEqual(pageStep({ refused: "order_unpaid" }));
-        expect(stateStep("paid")).toEqual(pageStep("paid"));
-        expect(stateStep("settling")).toEqual(pageStep("settling_timeout"));
-        expect(stateStep(undefined)).toEqual({
-            message: "could not confirm the payment, refresh this page in a minute",
-        });
-    });
-});
-
-describe("walletErrorStep", () => {
-    it("names the wallet and the likely cause for Phantom's bare Unexpected error", () => {
-        const e = walletError("Phantom", { code: -32603, message: "Unexpected error" });
-        expect(e.code).toBe(-32603);
-        const step = walletErrorStep(e, "$0.05");
-        expect(step.message).toBe(
-            'Phantom stopped the payment ("Unexpected error"). This usually means the account ' +
-                "holds less than $0.05 USDC on Solana. Add USDC or pick another account, then press Pay again",
-        );
-        expect(step.payAfterMs).toBe(0);
-    });
-    it("reads an Error without a code the same way", () => {
-        const step = walletErrorStep(walletError("Solflare", new Error("boom")), "$1.00");
-        expect(step.message).toContain('Solflare stopped the payment ("boom")');
-        expect(step.message).toContain("less than $1.00 USDC on Solana");
-    });
-    it("says the user declined for 4001", () => {
-        const e = Object.assign(new Error("User rejected the request."), { code: 4001 });
-        expect(walletErrorStep(walletError("Phantom", e), "$0.05").message).toBe(
-            "you declined the payment in Phantom. Press Pay to try again",
-        );
-    });
-    it("asks to unlock for 4100 and to close the open request for -32002", () => {
-        expect(walletErrorStep(walletError("Phantom", { code: 4100 }), "$0.05").message).toBe(
-            "Phantom did not share an account. Unlock Phantom, allow this page, then press Pay again",
-        );
-        expect(walletErrorStep(walletError("Phantom", { code: -32002 }), "$0.05").message).toBe(
-            "Phantom already has a request open. Close it in Phantom, then press Pay again",
-        );
+    it("reportError posts the report", async () => {
+        const posted: { url: string; method?: string; body?: string }[] = [];
+        const f = (async (url: string, init?: RequestInit) => {
+            posted.push({ url, method: init?.method, body: init?.body as string });
+            return new Response(null, { status: 204 });
+        }) as unknown as typeof fetch;
+        const report = {
+            stage: "sign",
+            wallet: "Phantom",
+            code: -32603,
+            message: "Unexpected error",
+        };
+        await reportError({ fetch: f, orderUrl }, report);
+        expect(posted).toEqual([
+            { url: `${orderUrl}/report`, method: "POST", body: JSON.stringify(report) },
+        ]);
     });
 });
