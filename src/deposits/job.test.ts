@@ -1650,4 +1650,95 @@ describe("flows on FakeChain", () => {
         );
         expect(spent).toBe(moveFeeLamports({ kind: "return", preflightRefusedAt: null }, cfg));
     });
+
+    it("an account opened again before its close is read gives the rent to the new creator", async () => {
+        const dep = await deposit(ORDER_A, { account: false });
+        view(ORDER_A);
+        await tick();
+        await until(
+            async () => (await creates(ORDER_A))[0]?.state === "confirmed",
+            5,
+            3_000,
+            watching(),
+        );
+        chain.setBlockTime(at("00:16:00").getTime() / 1000);
+        clock = at("00:16:01");
+        await tick();
+        await until(async () => (await orderOf()).state === "expired", 3, 2_000);
+        await until(
+            async () => (await movesOf()).some((m) => m.kind === "close"),
+            5,
+            cfg.idle_every,
+        );
+        // The close has landed on chain, and the job has not read its landing yet
+        expect((await movesOf()).find((m) => m.kind === "close")!.state).toBe("sent");
+        expect(chain.accountExists(dep.tokenAccount)).toBe(false);
+        const stranger = owners.F;
+        const strangerBefore = chain.lamports(stranger.address);
+        const feePayerBefore = chain.lamports(feePayer.address);
+        await chain.createAta({ owner: dep.address, payer: stranger });
+        chain.advance(1);
+        await send("B", 2_000n);
+        await until(
+            async () => (await movesOf()).some((m) => m.kind === "return"),
+            6,
+            cfg.closed_every,
+        );
+        const ret = (await movesOf()).find((m) => m.kind === "return")!;
+        expect(ret).toMatchObject({ closes: true, closeTo: stranger.address, amountMicros: 2_000 });
+        expect((await depositOf()).lateReturns).toBe(1);
+        await until(async () => (await depositOf()).state === "closed", 10, cfg.idle_every);
+        expect(chain.lamports(stranger.address) - strangerBefore).toBe(2_039_280n);
+        // The fee payer got its own rent back from the first close, none of the stranger's
+        expect(chain.lamports(feePayer.address) - feePayerBefore).toBe(0n);
+    });
+
+    it("a close of a re-opened closed account forgets that creator for the next one", async () => {
+        const dep = await paidAndClosed();
+        const first = owners.F;
+        await chain.createAta({ owner: dep.address, payer: first });
+        chain.advance(1);
+        // Money the scan cannot attribute rides to the float in a close to its creator
+        await chain.vaultTransfer({
+            vault: sources.H,
+            to: dep.tokenAccount,
+            micros: 2_000n,
+            signer: owners.G,
+        });
+        chain.advance(1);
+        await until(
+            async () =>
+                (await movesOf()).some((m) => m.kind === "close" && m.state === "confirmed"),
+            12,
+            cfg.closed_every,
+        );
+        expect((await movesOf()).find((m) => m.kind === "close")).toMatchObject({
+            closeTo: first.address,
+            heldMicros: 2_000,
+        });
+        expect(chain.accountExists(dep.tokenAccount)).toBe(false);
+        const firstBefore = chain.lamports(first.address);
+        const payerBefore = chain.lamports(owners.B.address);
+        // The next sender's wallet creates the account and pays its rent
+        await chain.transfer({
+            authority: owners.B,
+            feePayer: owners.B,
+            source: sources.B,
+            destination: dep.tokenAccount,
+            micros: 2_000n,
+            memo: `t${++memoSeq}`,
+            createDestinationFor: dep.address,
+        });
+        chain.advance(1);
+        await until(
+            async () => (await movesOf()).some((m) => m.kind === "return"),
+            6,
+            cfg.closed_every,
+        );
+        const ret = (await movesOf()).find((m) => m.kind === "return")!;
+        expect(ret).toMatchObject({ closes: true, closeTo: owners.B.address, amountMicros: 2_000 });
+        await until(async () => (await depositOf()).state === "closed", 10, cfg.idle_every);
+        expect(chain.lamports(owners.B.address) - payerBefore).toBe(2_039_280n);
+        expect(chain.lamports(first.address)).toBe(firstBefore);
+    });
 });

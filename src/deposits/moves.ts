@@ -776,6 +776,8 @@ async function lockSent(c: pg.PoolClient, move: MoveRow): Promise<MoveRow | null
  * the attempt that moved the money and the others stay in previous_signatures. A landing clears
  * preflight_refused_at, so its fee counts. A create sets rent_payer to the fee payer only when its
  * own meta shows it made the account; otherwise a sender's transaction did, and the scan finds it.
+ * A landed close forgets rent_payer at once, as confirmSweep does: whoever opens the account
+ * before the next read is then found as its creator and gets its own rent back (spec 5, 6.7).
  */
 async function confirmMove(d: MoveDeps, move: MoveRow, landed: Landed): Promise<boolean> {
     let madeAccount = false;
@@ -817,6 +819,14 @@ async function confirmMove(d: MoveDeps, move: MoveRow, landed: Landed): Promise<
                      where order_id = $1`,
                     [move.orderId, now, madeAccount, d.feePayer.address],
                 );
+            }
+            if (current.closes) {
+                await updateDeposit(c, move.orderId, {
+                    state: "closed",
+                    closedAt: now,
+                    watchUntil: new Date(now.getTime() + d.cfg.watch_after_close),
+                    rentPayer: null,
+                });
             }
             return true;
         },
