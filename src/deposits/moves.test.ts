@@ -14,6 +14,7 @@ import { memoryLog } from "../log.ts";
 import { findPaymentByOrder, lockPayment } from "../orders/store.ts";
 import { readTokenAccount, usdcAta } from "../solana/accounts.ts";
 import { MEMO_PROGRAM, TOKEN_PROGRAM } from "../solana/constants.ts";
+import { RpcRouterError } from "../solana/router/errors.ts";
 import type { SolanaRpc } from "../solana/rpc.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
 import { type FakeChain, startFakeChain } from "../testing/fake-chain.ts";
@@ -709,8 +710,7 @@ describe("resends", () => {
         const move = await pending(returnTo(7_000, closing()), sigs);
         const sends: Sent[] = [];
         let n = 0;
-        // Before the RPC router is merged, the router answers a missing status this way while its
-        // second quorum endpoint is down: a null status from a current node
+        // The router while its second quorum endpoint is down: the one answer it has, unproven
         const rpc = onSend(
             async (wire, config) => {
                 sends.push({ wire, config });
@@ -718,10 +718,16 @@ describe("resends", () => {
             },
             {
                 getSignatureStatuses: (sigs: readonly string[]) => ({
-                    send: async () => ({
-                        context: { slot: chain.slot() },
-                        value: sigs.map(() => null),
-                    }),
+                    send: async () => {
+                        throw new RpcRouterError("absence_unconfirmed", undefined, {
+                            jsonrpc: "2.0",
+                            id: 1,
+                            result: {
+                                context: { slot: chain.slot() },
+                                value: sigs.map(() => null),
+                            },
+                        });
+                    },
                 }),
             },
         );
@@ -751,6 +757,25 @@ describe("resends", () => {
         const after = await moveRow(move.id);
         expect(after).toMatchObject({ state: "sent", expirySeenSlot: null, attempts: 1 });
         expect(landing(stored.txSignature)?.failed).toBe(false);
+
+        // Past the blockhash an unproven absence is no proof, so nothing is re-signed
+        chain.advance(200);
+        chain.finalize();
+        later(11_000);
+        expect((await run(d)).resigned).toBe(0);
+        expect(log.lines).toContainEqual(
+            expect.objectContaining({
+                msg: "deposit move rpc call failed, retrying next tick",
+                reason: "absence_unconfirmed",
+            }),
+        );
+        expect(sends).toHaveLength(2);
+        expect(await moveRow(move.id)).toMatchObject({
+            state: "sent",
+            txSignature: stored.txSignature,
+            expirySeenSlot: null,
+            attempts: 1,
+        });
     });
 });
 
