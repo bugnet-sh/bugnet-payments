@@ -1044,6 +1044,18 @@ describe("single mode", () => {
         expect(snap(t, "rpc1").state).toBe("ok");
     });
 
+    it("single mode never enters probation on a long Retry-After", async () => {
+        const t = routed(1);
+        tweak(t, t.a, (m, _p, n) =>
+            m === "getGenesisHash" && n === 0 ? httpFail(429, { "retry-after": "600" }) : undefined,
+        );
+        await t.router.start({ timers: false });
+        // The 600 s wait is capped at 60 s; past it nothing but probes could end a probation
+        t.clock.ms += 61_000;
+        await t.router.check();
+        expect(snap(t, "rpc1").state).toBe("ok");
+    });
+
     it("single mode never drops its endpoint", async () => {
         const t = routed(1);
         await t.router.start({ timers: false });

@@ -1312,15 +1312,17 @@ class Router {
 
     // A 429, or a 5xx with Retry-After (spec 6.3, 7.2)
     private cool(ep: Endpoint, method: string, o: Outcome): void {
+        // Single mode sends no probes, so a probation there would never end (spec 3.4)
+        const probation = this.mode === "routed";
         if (o.kind === "cooldown") {
             const { scope, capped } = ep.limits.hit429(method, o.retryAfterMs);
             // An endpoint-wide cooldown cut by the cap ends in probation, so probes decide
-            if (capped && scope === ENDPOINT_SCOPE) {
+            if (probation && capped && scope === ENDPOINT_SCOPE) {
                 ep.health.probationAt(ep.limits.endpointCoolingUntil());
             }
         } else if (o.kind === "failover" && o.retryAfterMs !== null) {
             const { capped } = ep.limits.coolEndpoint(o.retryAfterMs);
-            if (capped) ep.health.probationAt(ep.limits.endpointCoolingUntil());
+            if (probation && capped) ep.health.probationAt(ep.limits.endpointCoolingUntil());
         }
     }
 
