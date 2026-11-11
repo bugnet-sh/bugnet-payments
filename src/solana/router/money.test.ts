@@ -482,7 +482,50 @@ describe("money decisions over the router", () => {
             a.setLag(400, { refuse: true });
             chain.credit(hot, 5_000n);
             advance(1);
-            expect(await runMirror(d)).toMatchObject({ verified: true });
+            // A read from the lagging endpoint alone would verify too, but without the credit
+            expect(await runMirror(d)).toMatchObject({ verified: true, stored: 1 });
+        });
+
+        const pinnedReads = (ep: FakeChainEndpoint) =>
+            ep
+                .calls()
+                .filter(
+                    (c) =>
+                        c.method === "getAccountInfo" &&
+                        JSON.stringify(c.params).includes("minContextSlot"),
+                );
+
+        it("the mirror fails over when rpc1 lags and refuses its pin", async () => {
+            const a = await chain.addEndpoint();
+            const b = await chain.addEndpoint();
+            const r = await routed([a, b]);
+            const d = await mirrorDeps(r);
+            // Under max_slot_lag, so only the pin keeps a's read out; b answers the epoch read
+            a.setLag(30, { refuse: true });
+            a.failNext(500);
+            chain.credit(hot, 5_000n);
+            advance(1);
+            const before = pinnedReads(a).length;
+            expect(await runMirror(d)).toMatchObject({ verified: true, stored: 1 });
+            expect(pinnedReads(a).length - before).toBe(1);
+        });
+
+        it("an endpoint that ignores minContextSlot never serves a read below its pin", async () => {
+            const a = await chain.addEndpoint({ ignoreMinContextSlot: true });
+            const b = await chain.addEndpoint();
+            const r = await routed([a, b]);
+            expect(r.router.snapshot().endpoints[0]!.checks.pinnedAccounts).toBe("ignored");
+            const d = await mirrorDeps(r);
+            // a answers its own view, 30 slots below the pin that b's epoch read gives
+            a.setLag(30, { refuse: false });
+            a.failNext(500);
+            chain.credit(hot, 5_000n);
+            advance(1);
+            const before = pinnedReads(a).length;
+            const run = await runMirror(d);
+            expect(run).toMatchObject({ verified: true, stored: 1 });
+            expect(pinnedReads(a).length - before).toBe(1);
+            expect(run.c).toBeGreaterThanOrEqual(run.c0);
         });
 
         it("the mirror fails over when rpc1 dies", async () => {

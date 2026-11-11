@@ -773,6 +773,26 @@ describe("slots and floors", () => {
         expect(snap(t.router, "rpc1").confirmedSlot).toBe("90");
     });
 
+    it("an answer below the request's own pin is refused like -32016", async () => {
+        const pinned = ["addr", { commitment: "confirmed", minContextSlot: 100n }];
+        const t = setup(2);
+        // Above the floor, which only a's own answer sets, so the pin alone refuses it
+        t.a.answer(() => rpcOk({ context: { slot: 90n }, value: 1n }));
+        const answer = rpcOk({ context: { slot: 120n }, value: 5n });
+        t.b.answer(() => answer);
+        expect(await call(t.router, "getAccountInfo", pinned)).toBe(answer);
+        // Tried last for that pin, as after a -32016
+        await call(t.router, "getAccountInfo", pinned);
+        expect(t.a.calls).toHaveLength(1);
+        expect(t.b.calls).toHaveLength(2);
+
+        const alone = setup(2);
+        alone.a.answer(() => rpcOk({ context: { slot: 90n }, value: 1n }));
+        alone.b.answer(() => netFail());
+        const e = await rejection(call(alone.router, "getAccountInfo", pinned));
+        expect(reasonOf(e)).toBe("stale");
+    });
+
     it("a pinned read reaches an endpoint probed 50 s ago", async () => {
         const t = setup(2);
         const epoch = await via(t, "rpc2", () =>
