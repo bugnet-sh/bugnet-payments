@@ -331,7 +331,8 @@ describe("deposit moves in the fee payer alarm", () => {
 
     it("the window is (from, to], as the payment counters count it", async () => {
         const id = await deposit();
-        await move(id, { kind: "return", state: "confirmed", at: at(-5 * MIN) });
+        // Edges of different costs, so [from, to) would give the create's 2,044,680 instead
+        await move(id, { kind: "create", state: "confirmed", at: at(-5 * MIN) });
         await move(id, { kind: "return", state: "failed", at: t0 });
         expect(await depositLamports(db.pool, at(-5 * MIN), t0, FEE_PAYER, DEPOSITS)).toBe(10_400n);
     });
