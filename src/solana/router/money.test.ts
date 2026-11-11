@@ -616,6 +616,20 @@ describe("money decisions over the router", () => {
             expect(record.lastValidBlockHeight).toBeGreaterThanOrEqual(chain.height() + 250n);
         });
 
+        it("a payment settles through a lagging rpc1 that has not seen its blockhash", async () => {
+            const a = await chain.addEndpoint();
+            const b = await chain.addEndpoint();
+            const r = await routed([a, b]);
+            // Under max_slot_lag, so rpc1 serves, but its simulation misses the fresh blockhash
+            a.setLag(30, { refuse: false });
+            const simulations = (ep: FakeChainEndpoint) =>
+                ep.calls().filter((c) => c.method === "simulateTransaction").length;
+            const before = [simulations(a), simulations(b)];
+            const record = await settleUnknownBlockhash(r);
+            expect([simulations(a), simulations(b)]).toEqual([before[0]! + 1, before[1]! + 1]);
+            expect(chain.submitted().map((t) => t.signature)).toContain(record.signature);
+        });
+
         it("a lagging endpoint from boot keeps the stored height above the real one", async () => {
             const a = await chain.addEndpoint({ lag: 120, refuse: false });
             const b = await chain.addEndpoint();

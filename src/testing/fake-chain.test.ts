@@ -383,6 +383,71 @@ describe("fake chain endpoints", () => {
             .send();
     const code = (e: unknown) => (isSolanaError(e) ? e.context.__code : null);
 
+    it("an unknown before cursor gives an empty page", async () => {
+        const ep = await chain.addEndpoint();
+        await landed();
+        // A new blockhash, so the same transfer is another transaction
+        chain.advance(1);
+        await landed();
+        const rpc = createRpc(ep.url);
+        const list = (o: { before?: string } = {}) =>
+            rpc
+                .getSignaturesForAddress(address(b), {
+                    commitment: "confirmed",
+                    ...(o.before === undefined ? {} : { before: signature(o.before) }),
+                })
+                .send();
+        const all = await list();
+        expect(all).toHaveLength(2);
+        expect(await list({ before: all[0]!.signature })).toHaveLength(1);
+        const unknown = getBase58Decoder().decode(new Uint8Array(64).fill(9));
+        expect(await list({ before: unknown })).toEqual([]);
+    });
+
+    it("a lagging endpoint misses a blockhash newer than its slot", async () => {
+        const ep = await chain.addEndpoint();
+        ep.setLag(30, { refuse: false });
+        const life = (await chain.rpc.getLatestBlockhash().send()).value;
+        const message = pipe(
+            createTransactionMessage({ version: 0 }),
+            (m) => setTransactionMessageFeePayerSigner(payer, m),
+            (m) => setTransactionMessageLifetimeUsingBlockhash(life, m),
+            (m) =>
+                appendTransactionMessageInstruction(
+                    getTransferCheckedInstruction({
+                        source: address(a),
+                        mint: address(USDC_MINT),
+                        destination: address(b),
+                        authority: owner,
+                        amount: 10n,
+                        decimals: USDC_DECIMALS,
+                    }),
+                    m,
+                ),
+        );
+        const wire = getBase64EncodedWireTransaction(
+            await signTransactionMessageWithSigners(message),
+        );
+        const rpc = createRpc(ep.url);
+        const simulated = (await rpc
+            .simulateTransaction(wire as never, { encoding: "base64" })
+            .send()) as { value: { err: unknown } };
+        expect(simulated.value.err).toBe("BlockhashNotFound");
+        const before = chain.submitted().length;
+        await expect(
+            rpc.sendTransaction(wire as never, { encoding: "base64" }).send(),
+        ).rejects.toSatisfy(
+            (e) =>
+                code(e) === SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE,
+        );
+        expect(chain.submitted()).toHaveLength(before);
+        // Without a preflight the node only forwards it
+        await rpc
+            .sendTransaction(wire as never, { encoding: "base64", skipPreflight: true })
+            .send();
+        expect(chain.submitted()).toHaveLength(before + 1);
+    });
+
     it("endpoints share one chain", async () => {
         const ep = await chain.addEndpoint();
         await landed();

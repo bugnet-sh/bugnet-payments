@@ -417,7 +417,14 @@ export async function startFakeChain(
         return sig;
     }
 
-    function sendTransaction(wire: string): string {
+    // A lagging endpoint has not seen a blockhash newer than its own slot, so its simulation and
+    // its send's preflight miss it, as a lagging Agave node does
+    function unseenBlockhash(known: bigint): boolean {
+        if (current === null) return false;
+        return known + HEIGHT_OFFSET > (current.frozen?.slot ?? slot) - BigInt(current.lag);
+    }
+
+    function sendTransaction(wire: string, preflight: boolean): string {
         let tx: Transaction;
         let compiled: ReturnType<typeof decodeMessage>;
         try {
@@ -427,7 +434,11 @@ export async function startFakeChain(
             throw new RpcError(-32602, "Invalid param: failed to deserialize transaction");
         }
         const known = heights.get(compiled.lifetimeToken);
-        if (known === undefined || heightOf(slot) > known + BLOCKHASH_LIFE) {
+        if (
+            known === undefined ||
+            heightOf(slot) > known + BLOCKHASH_LIFE ||
+            (preflight && unseenBlockhash(known))
+        ) {
             throw new RpcError(-32002, "Transaction simulation failed: Blockhash not found", {
                 err: "BlockhashNotFound",
                 logs: [],
@@ -680,7 +691,11 @@ export async function startFakeChain(
         }
         const result = { logs: [], accounts: null, unitsConsumed: 0, returnData: null };
         const known = heights.get(compiled.lifetimeToken);
-        if (known === undefined || heightOf(slot) > known + BLOCKHASH_LIFE) {
+        if (
+            known === undefined ||
+            heightOf(slot) > known + BLOCKHASH_LIFE ||
+            unseenBlockhash(known)
+        ) {
             return { err: "BlockhashNotFound", ...result };
         }
         const keys = [...compiled.staticAccounts] as string[];
@@ -817,9 +832,10 @@ export async function startFakeChain(
                 let list = txs
                     .filter((t) => t.slot <= view && t.keys.includes(addr))
                     .sort((a, b) => (a.slot === b.slot ? b.seq - a.seq : a.slot > b.slot ? -1 : 1));
+                // Agave answers an unknown before cursor with an empty page, not from the top
                 if (typeof config.before === "string") {
                     const at = list.findIndex((t) => t.signature === config.before);
-                    if (at >= 0) list = list.slice(at + 1);
+                    list = at >= 0 ? list.slice(at + 1) : [];
                 }
                 if (typeof config.until === "string") {
                     const at = list.findIndex((t) => t.signature === config.until);
@@ -890,7 +906,7 @@ export async function startFakeChain(
                         },
                     );
                 }
-                return sendTransaction(wire);
+                return sendTransaction(wire, config.skipPreflight !== true);
             }
             default:
                 throw new RpcError(-32601, `Method not found: ${method}`);
