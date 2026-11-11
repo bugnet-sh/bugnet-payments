@@ -1835,6 +1835,40 @@ describe("router wiring", () => {
         }
     });
 
+    it("the deposit job's reads and the balance route use the background lane", async () => {
+        const live = createDefaultRpcTransport({ url: chain.url });
+        let router: RouterTransport | undefined;
+        const now = Date.now();
+        const { order } = await seedOrder(db.pool, {
+            createdAt: new Date(now - MIN),
+            expiresAt: new Date(now + 10 * MIN),
+        });
+        await ensureDeposit(db.pool, depositKeysFrom(secrets, 1)!, order, new Date(now - MIN));
+        const s = await startService({
+            settings: testSettings({ deposits: { busy_every: "50ms", idle_every: "50ms" } }),
+            log: memoryLog(),
+            secrets: listed(["https://a.example/", "https://b.example/"]),
+            rpcTransportFor: () => live,
+            onRouter: (r) => (router = r),
+        });
+        const money = () =>
+            router!.snapshot().endpoints.reduce((n, e) => n + e.laneRequests.money, 0);
+        const reads = () => chain.calls().filter((c) => c.method === "getMultipleAccounts").length;
+        try {
+            const before = money();
+            await until(async () => reads() >= 2, 5_000);
+            const owner = (await testSigner(31)).address;
+            const res = await fetch(
+                `http://127.0.0.1:${s.publicPort}/o/${order.id}/balance?owner=${owner}`,
+            );
+            expect(res.status).toBe(200);
+            expect(chain.calls().some((c) => c.method === "getAccountInfo")).toBe(true);
+            expect(money()).toBe(before);
+        } finally {
+            await s.stop();
+        }
+    });
+
     it("startService refuses a devnet endpoint", async () => {
         const devnet = fakeEndpoint("devnet", (method) =>
             method === "getGenesisHash"

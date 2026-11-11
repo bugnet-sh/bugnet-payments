@@ -379,8 +379,8 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             rpc,
             feePayer,
             x402: parts,
-            // Until the RPC router gives a background lane, the balance route reads through rpc0
-            backgroundRpc: rpc0,
+            // The router's background lane, outside x402's counter: the route caps its own reads
+            backgroundRpc: bg0,
             deposits:
                 deposits === null
                     ? null
@@ -464,6 +464,7 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             pool,
             rpc,
             rpc0,
+            bg0,
             backgroundRpc,
             deposits,
             router: http.router,
@@ -526,8 +527,10 @@ interface JobDeps {
     s: Settings;
     pool: pg.Pool;
     rpc: SolanaRpc;
-    // Before the x402 counter wraps it: the deposit job counts its calls on its own
+    // The router's two lanes before the x402 counter wraps them: the deposit job counts its calls
+    // on its own
     rpc0: SolanaRpc;
+    bg0: SolanaRpc;
     // Watch-only jobs: alarms and audits
     backgroundRpc: SolanaRpc;
     deposits: DepositWiring | null;
@@ -706,9 +709,9 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
 
 /**
  * The deposit job (spec 6.4, 6.5): one tick at a time under its database lock, paced busy or idle,
- * woken by a new viewer that needs an account. Until the RPC router gives two lanes, today's one
- * client serves both, and the job's queue keeps its own caps either way. Both lanes count into
- * one hourly counter of their own, never x402_rpc_budget's.
+ * woken by a new viewer that needs an account. Moves and settles go on the router's money lane,
+ * balance reads and scans on its background lane, and the job's queue keeps its own caps. Both
+ * lanes count into one hourly counter of their own, never x402_rpc_budget's.
  */
 function startDepositJob(
     d: JobDeps,
@@ -721,7 +724,7 @@ function startDepositJob(
     const cfg = s.deposits;
     const nowMs = () => now().getTime();
     const lanes = countedLanes(
-        { rpc: d.rpc0, backgroundRpc: d.rpc0 },
+        { rpc: d.rpc0, backgroundRpc: d.bg0 },
         { limitPerHour: cfg.rpc_calls_per_hour_alarm, log, now: nowMs },
     );
     const queue = depositRpcQueue(lanes, {
