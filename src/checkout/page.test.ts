@@ -557,11 +557,16 @@ describe("address-first page", () => {
         expect(await renderCheckout({ ...view, state: "refunded" })).toContain(
             "This order's payment was returned to the wallet that paid.",
         );
-        for (const state of ["unpaid", "paid", "expired"] as const) {
-            expect(await renderCheckout({ ...offered, state })).toContain(
-                "<noscript><p>This page needs JavaScript to show live status. You can still send to the address above.</p></noscript>",
-            );
+        const P4 =
+            "<noscript><p>This page needs JavaScript to show live status. You can still send to the address above.</p></noscript>";
+        expect(await renderCheckout(offered)).toContain(P4);
+        // Only a page that shows the address
+        for (const state of ["settling", "paid", "expired", "refunded", "review"] as const) {
+            expect(await renderCheckout({ ...offered, state })).not.toContain("<noscript>");
         }
+        expect(await renderCheckout({ ...offered, depositsOffered: false })).not.toContain(
+            "<noscript>",
+        );
     });
 
     it("not found tells what to do", () => {

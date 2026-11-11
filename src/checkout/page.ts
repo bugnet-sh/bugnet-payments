@@ -483,9 +483,10 @@ export async function renderCheckout(v: CheckoutView): Promise<string> {
     let tail: string;
     if (v.state === "unpaid") {
         const dep = v.depositsOffered ? v.deposit : null;
+        // P4 points at the address, so it comes only with the section that shows one
         tail =
             dep !== null
-                ? `${depositSection(v, dep)}\n${await paySections(v, amount, true)}`
+                ? `${depositSection(v, dep)}\n${await paySections(v, amount, true)}\n${NOSCRIPT}`
                 : `<p id="deposit-message" class="note" role="status">Paying by address is off right now. Pay with a browser wallet below, or reload this page later.</p>
 ${await paySections(v, amount, false)}`;
     } else {
@@ -514,7 +515,6 @@ ${
 }
 </dl>
 ${tail}
-${NOSCRIPT}
 </main>
 ${SCRIPT}`,
     );
