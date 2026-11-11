@@ -760,8 +760,16 @@ describe("scanDeposit", () => {
             expect.objectContaining({ orderId: ORDER_A, signature: debit, micros: "1000" }),
         ]);
         expect((await ledger()).deposit.reviewReason).toBe("unknown_debit");
+        expect(alarms("deposit_review")).toEqual([
+            expect.objectContaining({
+                orderId: ORDER_A,
+                signature: debit,
+                reason: "unknown_debit",
+            }),
+        ]);
         await scanDeposit(deps(), dep, trail);
         expect(alarms("deposit_unknown_debit")).toHaveLength(1);
+        expect(alarms("deposit_review")).toHaveLength(1);
     });
 
     it("a lagging index leaves the read above the ledger", async () => {

@@ -707,6 +707,12 @@ async function apply(s: Step, item: ScanItem): Promise<void> {
         await lockDeposit(c, s.deposit.orderId);
         await updateDeposit(c, s.deposit.orderId, { reviewReason: "unknown_debit" });
     });
+    // Spec 17: the operator's review alarm names this reason too
+    s.d.log.alarm("deposit_review", {
+        orderId: s.deposit.orderId,
+        signature: item.signature,
+        reason: "unknown_debit",
+    });
     s.m.debitsAlarmed.add(item.signature);
 }
 
