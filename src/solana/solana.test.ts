@@ -39,6 +39,7 @@ import {
     type FakeHandler,
     fakeEndpoint,
     netFail,
+    passAll,
     rpcOk,
     signatureStatus,
     statusesAnswer,
@@ -353,6 +354,7 @@ describe("readLanding over the router", () => {
         const eps = ["a", "b", "c"].slice(0, n).map((label) => fakeEndpoint(label));
         const deps = testDeps(eps);
         const router = createRouterTransport(testRpcSettings(), deps.urls, deps);
+        passAll(router);
         // The router serves mainnet only: its boot check refuses any other genesis
         const rpc = createSolanaRpcFromTransport(router as unknown as RpcTransportMainnet);
         return { rpc, router, eps };

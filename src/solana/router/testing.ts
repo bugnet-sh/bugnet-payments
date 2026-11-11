@@ -11,7 +11,12 @@ import {
 import type { Status } from "./absence.ts";
 import type { Commitment } from "./payload.ts";
 import { endpointName, type RpcSettings, rpcSettingsSchema } from "./settings.ts";
-import type { RouterDeps, RouterLog } from "./transport.ts";
+import {
+    type RouterDeps,
+    type RouterLog,
+    type RouterTransport,
+    setCheckState,
+} from "./transport.ts";
 
 export type FakeHandler = (method: string, params: readonly unknown[], payload: unknown) => unknown;
 
@@ -127,6 +132,19 @@ export function testRpcSettings(over: Partial<RpcSettings> = {}): RpcSettings {
         max_attempts: 3,
         ...over,
     };
+}
+
+// Every endpoint as if its checks had passed and its repeats agreed, for tests of traffic
+export function passAll(router: RouterTransport): void {
+    for (const { name } of router.snapshot().endpoints) {
+        setCheckState(router, name, {
+            genesis: "ok",
+            history: "ok",
+            pinnedAccounts: "ok",
+            pinnedSignatures: "ok",
+            consistent: "yes",
+        });
+    }
 }
 
 export interface TestLog extends RouterLog {

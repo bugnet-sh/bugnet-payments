@@ -8,6 +8,7 @@ import {
     fakeEndpoint,
     httpFail,
     netFail,
+    passAll,
     rpcFail,
     rpcOk,
     stall,
@@ -52,6 +53,7 @@ function setup(
     const eps = LABELS.slice(0, n).map((label) => fakeEndpoint(label, accepting(label)));
     const deps = testDeps(eps, more);
     const router = createRouterTransport(testRpcSettings(over), deps.urls, deps);
+    passAll(router);
     const at = (i: number) => eps[i] ?? fakeEndpoint(`unused ${LABELS[i]}`);
     return { ...deps, router, a: at(0), b: at(1), c: at(2), d: at(3) };
 }

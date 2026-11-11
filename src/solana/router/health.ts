@@ -135,7 +135,8 @@ export class EndpointHealth {
         return this.lastProbeAt === null || this.now() - this.lastProbeAt >= RECOVER_SPACING_MS;
     }
 
-    probeResult(good: boolean): void {
+    // sentAt: a slow answer must not push the next probe a whole tick later
+    probeResult(good: boolean, sentAt = this.now()): void {
         this.settle();
         if (this.state !== "probation") return;
         if (!good) {
@@ -143,8 +144,8 @@ export class EndpointHealth {
             return;
         }
         // A good probe counts only RECOVER_SPACING_MS after the last one
-        if (!this.probeDue()) return;
-        this.lastProbeAt = this.now();
+        if (this.lastProbeAt !== null && sentAt - this.lastProbeAt < RECOVER_SPACING_MS) return;
+        this.lastProbeAt = sentAt;
         this.lastGood = true;
         this.goodProbes += 1;
         if (this.goodProbes >= RECOVER_PROBES) this.close();

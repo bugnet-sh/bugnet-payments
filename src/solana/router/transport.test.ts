@@ -11,6 +11,7 @@ import {
     fakeEndpoint,
     httpFail,
     netFail,
+    passAll,
     rpcFail,
     rpcOk,
     signatureStatus as S,
@@ -86,6 +87,7 @@ function setup(
     const deps = testDeps(eps, more);
     for (const ep of eps) ep.answer(chain(deps.clock));
     const router = createRouterTransport(testRpcSettings(over), deps.urls, deps);
+    passAll(router);
     const at = (i: number) => eps[i] ?? fakeEndpoint(`unused ${LABELS[i]}`);
     return { ...deps, router, a: at(0), b: at(1), c: at(2), d: at(3) };
 }
@@ -235,7 +237,28 @@ describe("one endpoint", () => {
 });
 
 describe("priority and failover", () => {
-    it("every endpoint starts with its checks passed and consistent", () => {
+    it("every endpoint starts unchecked until its checks run", async () => {
+        const eps = [fakeEndpoint("a"), fakeEndpoint("b")];
+        const deps = testDeps(eps);
+        const router = createRouterTransport(testRpcSettings(), deps.urls, deps);
+        expect(router.snapshot()).toMatchObject({ serving: null });
+        expect(router.snapshot().endpoints[0]).toMatchObject({
+            name: "rpc1",
+            roles: ["read", "send"],
+            state: "unchecked",
+            consistent: "unknown",
+            checks: {
+                genesis: "unchecked",
+                history: "unchecked",
+                pinnedAccounts: "unchecked",
+                pinnedSignatures: "unchecked",
+            },
+        });
+        expect(reasonOf(await rejection(call(router, "getSlot")))).toBe("no_endpoint");
+        expect(eps.map((ep) => ep.calls.length)).toEqual([0, 0]);
+    });
+
+    it("an endpoint whose checks passed takes every role", () => {
         const t = setup(2);
         const s = t.router.snapshot();
         expect(s).toMatchObject({
@@ -1626,6 +1649,104 @@ describe("cursor affinity", () => {
         expect(snap(t.router, "rpc1").state).toBe("ok");
         expect(snap(t.router, "rpc2").state).toBe("ok");
         expect(alarms(t)).toEqual([]);
+    });
+});
+
+describe("recovery", () => {
+    // A probe gets the getEpochInfo first-attempt timeout of 1 s
+    const PROBED = { attempt_timeout: 3_000, first_attempt_timeouts: { getEpochInfo: 1_000 } };
+
+    async function outAtZero(t: Setup): Promise<void> {
+        t.a.answer(() => netFail());
+        for (let i = 0; i < 5; i++) await call(t.router, "getSlot");
+        expect(snap(t.router, "rpc1")).toMatchObject({ state: "open", untilMs: 30_000 });
+    }
+
+    // a answers each getEpochInfo after the next delay of clock
+    function probedIn(t: Setup, delays: number[]): void {
+        const healthy = chain(t.clock);
+        t.a.answer((method, params, p) => {
+            if (method === "getEpochInfo") t.clock.ms += delays.shift() ?? 100;
+            return healthy(method, params, p);
+        });
+    }
+
+    function probes(t: Setup): number {
+        return t.a.calls.filter((c) => c.method === "getEpochInfo").length;
+    }
+
+    // The endpoint whose answer came back: b only after a failed or was passed over
+    async function served(t: Setup, params: unknown[] = []): Promise<string> {
+        const before = t.b.calls.length;
+        await call(t.router, "getSlot", params);
+        return t.b.calls.length > before ? "b" : "a";
+    }
+
+    function back(t: Setup): Record<string, unknown>[] {
+        return t.log.lines.filter((l) => l.msg === "rpc endpoint back");
+    }
+
+    it("a recovered endpoint returns after three good probes", async () => {
+        const t = setup(2, PROBED);
+        await outAtZero(t);
+        probedIn(t, [100, 100, 100]);
+        for (const ms of [30_000, 40_000]) {
+            t.clock.ms = ms;
+            await t.router.tick();
+        }
+        expect(probes(t)).toBe(2);
+        t.clock.ms = 49_000;
+        expect(await served(t)).toBe("b");
+        t.clock.ms = 50_000;
+        await t.router.tick();
+        expect(probes(t)).toBe(3);
+        expect(await served(t)).toBe("a");
+        expect(back(t)).toEqual([{ level: "info", msg: "rpc endpoint back", endpoint: "rpc1" }]);
+    });
+
+    it("a slow probe keeps the endpoint out", async () => {
+        const t = setup(2, PROBED);
+        await outAtZero(t);
+        probedIn(t, [100, 1_200, 100]);
+        for (const ms of [30_000, 40_000, 50_000]) {
+            t.clock.ms = ms;
+            await t.router.tick();
+        }
+        expect(probes(t)).toBe(2);
+        expect(snap(t.router, "rpc1").state).toBe("open");
+        expect(await served(t)).toBe("b");
+        expect(back(t)).toEqual([]);
+    });
+
+    it("a lagging endpoint returns only at half the lag bound", async () => {
+        const t = setup(2, { ...PROBED, max_slot_lag: 50 });
+        let behind = 60n;
+        const healthy = chain(t.clock);
+        t.a.answer((method, params, p) => {
+            const slot = slotAt(t.clock.ms) - behind;
+            if (method === "getSlot") return rpcOk(slot);
+            if (method === "getEpochInfo") return rpcOk(epochAt(slot - 100n, slot));
+            return healthy(method, params, p);
+        });
+        const confirmed = [{ commitment: "confirmed" }];
+        await via(t, "rpc2", () => call(t.router, "getSlot", confirmed));
+        expect(await served(t, confirmed)).toBe("b");
+        expect(snap(t.router, "rpc1")).toMatchObject({ state: "lagging", lag: 60 });
+        // b answers first each time, so the lag has a fresh reference
+        const probeAt = async (ms: number) => {
+            t.clock.ms = ms;
+            expect(await served(t, confirmed)).toBe("b");
+            await t.router.tick();
+        };
+        behind = 30n;
+        for (const ms of [10_000, 40_000, 100_000]) await probeAt(ms);
+        expect(probes(t)).toBe(3);
+        expect(snap(t.router, "rpc1").state).toBe("open");
+        behind = 20n;
+        for (const ms of [220_000, 230_000, 240_000]) await probeAt(ms);
+        expect(probes(t)).toBe(6);
+        expect(await served(t, confirmed)).toBe("a");
+        expect(back(t)).toEqual([{ level: "info", msg: "rpc endpoint back", endpoint: "rpc1" }]);
     });
 });
 

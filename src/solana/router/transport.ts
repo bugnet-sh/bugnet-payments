@@ -12,12 +12,29 @@ import {
 import { hasNull, mergeStatuses, statusesOf, type StatusesAnswer } from "./absence.ts";
 import { CursorBook } from "./affinity.ts";
 import { classifyAnswer, classifyThrown, mayHaveDelivered, type Outcome } from "./classify.ts";
-import { type Consistency, ConsistencyBook, type DisagreeReason } from "./consistency.ts";
+import {
+    type Consistency,
+    ConsistencyBook,
+    type DisagreeReason,
+    IdentityBook,
+    type Verdict,
+    type VerdictRow,
+    type VerdictStore,
+} from "./consistency.ts";
 import { RpcRouterError } from "./errors.ts";
 import { EndpointHealth, type Lane, monthOf } from "./health.ts";
 import { LearnedLimits } from "./limits.ts";
 import { UNKNOWN_METHOD } from "./methods.ts";
 import { contextSlotOf, isObject, readRequest, type RouterRequest, rpcErrorOf } from "./payload.ts";
+import {
+    CHECK_PARTS,
+    CHECK_TOTAL_MS,
+    type CheckPart,
+    type CheckReport,
+    checkEndpoint,
+    type EndpointCheck,
+    type HistoryProbe,
+} from "./probe.ts";
 import { choose, type EndpointView } from "./select.ts";
 import { copyPayload, isMissingBlockhashSimulation } from "./send.ts";
 import {
@@ -36,6 +53,7 @@ import { observationsOf, SlotBook } from "./slots.ts";
 export const MAX_WAIT_MS = 1_000;
 
 const HOUR_MS = 3_600_000;
+const TICK_MS = 5_000;
 const ENDPOINT_SCOPE = "*";
 const ABSENCE_ALARM_EVERY_MS = 600_000;
 // Transaction history is not available from this node
@@ -60,13 +78,24 @@ export interface RouterDeps {
     transportFor: (name: string, url: string) => RpcTransport;
     // The waits for room or a cooldown; the signal ends one
     sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+    // Payments' own history for the checks; the mainnet probe without one (spec 9)
+    historyProbe?: () => Promise<HistoryProbe | null>;
+    // Consistency verdicts across restarts and processes (spec 8.10)
+    verdicts?: VerdictStore;
+    // With verdicts: an HMAC of the URL, never the URL
+    fingerprint?: (url: string) => string;
 }
 
 // Calling the router itself is the money lane
 export interface RouterTransport extends RpcTransport {
     readonly mode: "single" | "routed";
     readonly background: RpcTransport;
+    // timers: the service's 5 s tick; without it (the CLI) the whole check run is awaited
+    start(o: { timers: boolean }): Promise<CheckReport>;
+    check(): Promise<CheckReport>;
+    tick(): Promise<void>;
     snapshot(): RouterSnapshot;
+    stop(): Promise<void>;
 }
 
 // The per-endpoint check results of spec 9
@@ -143,10 +172,23 @@ interface Endpoint {
     readonly name: string;
     // Never logged, stored or shown
     readonly domain: string;
+    readonly fingerprint: string | null;
     readonly transport: RpcTransport;
     readonly health: EndpointHealth;
     readonly limits: LearnedLimits;
+    // The last result of each check, as shown
     checks: CheckState;
+    // Whether each check passed: an error keeps the last value, which at start is false
+    passed: Record<keyof CheckState, boolean>;
+    // The warns and alarms of a check's current failure, so each is raised once
+    readonly alerted: Set<"unreachable" | "history" | "pinned">;
+    // At most one check run and one probe at a time
+    checking: Promise<EndpointCheck> | null;
+    probing: boolean;
+    // The checks that ended in an error run again at `at`, and each failure doubles the wait
+    retry: { parts: ReadonlySet<CheckPart>; at: number; step: number } | null;
+    // The next run of the history and pinned checks
+    hourlyAt: number | null;
     // The pin of its last -32016 or answer below a pin, tried last for pins at or above it
     behindPin: { slot: bigint; at: number } | null;
     lastError: EndpointSnapshot["lastError"];
@@ -213,12 +255,22 @@ type Choice =
 type Config = Readonly<{ payload: unknown; signal?: AbortSignal }>;
 
 const CHECK_KEYS = ["genesis", "history", "pinnedAccounts", "pinnedSignatures"] as const;
-const PASSED: CheckState = {
-    genesis: "ok",
-    history: "ok",
-    pinnedAccounts: "ok",
-    pinnedSignatures: "ok",
+const UNCHECKED: CheckState = {
+    genesis: "unchecked",
+    history: "unchecked",
+    pinnedAccounts: "unchecked",
+    pinnedSignatures: "unchecked",
 };
+// The parts an hourly run repeats; the genesis and first slot reads are the boot run's
+const HOURLY: readonly CheckPart[] = ["identity", "pinnedAccounts", "pinnedSignatures", "history"];
+const RETRIED = ["genesis", "pinnedAccounts", "pinnedSignatures", "history"] as const;
+const EPOCH_PAYLOAD = {
+    jsonrpc: "2.0",
+    id: 0,
+    method: "getEpochInfo",
+    params: [{ commitment: "confirmed" }],
+} as const;
+const EPOCH_REQUEST = readRequest(EPOCH_PAYLOAD)!;
 const WITH_HISTORY: ReadonlySet<Role> = new Set(ROLES);
 const WITHOUT_HISTORY: ReadonlySet<Role> = new Set(ROLES.filter((r) => r !== "history"));
 const SERVING_REQUEST = readRequest({
@@ -359,6 +411,39 @@ function pageOf(answer: unknown): { signature: string }[] | null {
         : null;
 }
 
+function erroredParts(c: EndpointCheck): Set<CheckPart> {
+    return new Set<CheckPart>(RETRIED.filter((part) => c[part] === "error"));
+}
+
+// A rerun's results over the first run's, for the parts the rerun asked
+function merged(first: EndpointCheck, again: EndpointCheck): EndpointCheck {
+    const genesis = again.genesis === "unchecked" ? first : again;
+    const history = again.history === "unchecked" ? first : again;
+    return {
+        name: first.name,
+        genesis: genesis.genesis,
+        genesisError: genesis.genesisError,
+        pinnedAccounts:
+            again.pinnedAccounts === "unchecked" ? first.pinnedAccounts : again.pinnedAccounts,
+        pinnedSignatures:
+            again.pinnedSignatures === "unchecked"
+                ? first.pinnedSignatures
+                : again.pinnedSignatures,
+        history: history.history,
+        repeatsAgree: history.repeatsAgree,
+        identity: again.identity ?? first.identity,
+        slot: again.slot ?? first.slot,
+        latencyMs: again.slot === null ? first.latencyMs : again.latencyMs,
+    };
+}
+
+// The status or code a genesis failure names, for its alarm
+function failureCode(label: string | null): ErrorCode {
+    const m = /^(http|code)_(-?\d+)$/.exec(label ?? "");
+    if (m === null) return {};
+    return m[1] === "http" ? { status: Number(m[2]) } : { code: Number(m[2]) };
+}
+
 class Router {
     readonly mode: "single" | "routed";
     private readonly endpoints: Endpoint[];
@@ -366,9 +451,17 @@ class Router {
     private readonly slots: SlotBook;
     private readonly book: ConsistencyBook;
     private readonly cursors = new CursorBook();
+    private readonly identities = new IdentityBook();
     private readonly list: { domains: number; absenceQuorum: number; sendFanout: number };
     // Unconfirmed absences since the last rpc_absence_unconfirmed alarm
     private absenceAlarm: { at: number | null; count: number } = { at: null, count: 0 };
+    // Ends every check run and probe at stop
+    private readonly stopper = new AbortController();
+    private readonly runs = new Set<Promise<unknown>>();
+    private verdictsRead: Promise<void> | null = null;
+    // Verdicts are written one after another, in the order they changed
+    private saving: Promise<void> = Promise.resolve();
+    private timer: ReturnType<typeof setInterval> | null = null;
 
     constructor(
         private readonly s: RpcSettings,
@@ -378,15 +471,28 @@ class Router {
         this.mode = urls.length === 1 ? "single" : "routed";
         this.list = resolveRpcList(s, urls);
         const now = deps.now();
+        const stored = deps.verdicts !== undefined ? deps.fingerprint : undefined;
         this.endpoints = urls.map((url, i) => {
             const name = endpointName(i);
             return {
                 name,
                 domain: domainOf(url),
+                fingerprint: stored === undefined ? null : stored(url),
                 transport: deps.transportFor(name, url),
                 health: new EndpointHealth(s, deps.now, deps.random),
                 limits: new LearnedLimits(s, deps.now, deps.random),
-                checks: { ...PASSED },
+                checks: { ...UNCHECKED },
+                passed: {
+                    genesis: false,
+                    history: false,
+                    pinnedAccounts: false,
+                    pinnedSignatures: false,
+                },
+                alerted: new Set(),
+                checking: null,
+                probing: false,
+                retry: null,
+                hourlyAt: null,
                 behindPin: null,
                 lastError: null,
                 month: { key: monthOf(now), requests: 0, background: 0 },
@@ -409,8 +515,7 @@ class Router {
             onDrop: (name) => this.disagree(name, "slot_went_back"),
         });
         this.book = new ConsistencyBook({ now: deps.now, clearAfterMs: s.history_check_every });
-        // No check runs yet, so every endpoint starts as if its checks had passed
-        for (const ep of this.endpoints) this.book.checkRun(ep.name, true, now);
+        this.book.onChange((name, v) => this.saveVerdict(name, v));
     }
 
     async request(config: Config, lane: Lane): Promise<unknown> {
@@ -503,15 +608,425 @@ class Router {
         };
     }
 
+    // Each check given counts as passed exactly when it is "ok"
     setCheckState(name: string, state: Partial<CheckState> & { consistent?: "yes" | "no" }): void {
         const ep = this.endpoint(name);
         for (const key of CHECK_KEYS) {
             const value = state[key];
-            if (value !== undefined) ep.checks[key] = value;
+            if (value === undefined) continue;
+            ep.checks[key] = value;
+            ep.passed[key] = value === "ok";
         }
         if (state.consistent === "no") this.book.disagree(name, "check_disagreed");
         // A yes follows the book's own rule: a "no" clears only an hour after its mark
         else if (state.consistent === "yes") this.book.checkRun(name, true, this.deps.now());
+    }
+
+    // Spec 9: the stored verdicts first, then the checks; a wrong genesis refuses the start
+    async start(o: { timers: boolean }): Promise<CheckReport> {
+        await this.readVerdicts();
+        let report: CheckReport;
+        if (this.mode === "single") report = await this.startSingle();
+        else report = o.timers ? await this.boot() : await this.checkAll(true);
+        const wrong = report.endpoints.find((c) => c.genesis === "wrong");
+        if (wrong !== undefined) throw new RpcRouterError("wrong_network", wrong.name);
+        if (o.timers) this.startTimer();
+        return report;
+    }
+
+    // Every check once, in either mode; a wrong genesis is reported, not thrown
+    async check(): Promise<CheckReport> {
+        await this.readVerdicts();
+        return this.checkAll(false);
+    }
+
+    // The probes of spec 6.2 and 6.5, and the reruns of spec 9; single mode has none
+    async tick(): Promise<void> {
+        if (this.mode === "single") return;
+        const now = this.deps.now();
+        const work: Promise<unknown>[] = [];
+        const due: { ep: Endpoint; parts: Set<CheckPart> }[] = [];
+        for (const ep of this.endpoints) {
+            if (ep.checks.genesis === "wrong") continue;
+            const parts = this.dueParts(ep, now);
+            if (parts !== null) due.push({ ep, parts });
+            // A probe waits out a Retry-After like any call
+            if (ep.probing || ep.limits.coolingUntil(EPOCH_REQUEST.method) !== 0) continue;
+            if (ep.health.probeDue()) {
+                work.push(this.recover(ep));
+            } else if (this.marksStale(ep, now)) {
+                work.push(this.probeEpoch(ep, this.s.attempt_timeout));
+            }
+        }
+        if (due.length > 0) {
+            const probe = this.historyProbe();
+            for (const { ep, parts } of due) {
+                work.push(this.runChecks(ep, parts, probe, this.stopper.signal));
+            }
+        }
+        await Promise.all(work);
+    }
+
+    async stop(): Promise<void> {
+        if (this.timer !== null) clearInterval(this.timer);
+        this.timer = null;
+        this.stopper.abort();
+        await Promise.allSettled([...this.runs]);
+        await this.saving;
+    }
+
+    private startTimer(): void {
+        if (this.timer !== null) return;
+        this.timer = setInterval(() => {
+            this.tick().catch((err: unknown) => this.deps.log.warn("rpc tick failed", { err }));
+        }, TICK_MS);
+        this.timer.unref();
+    }
+
+    // Spec 3.4: one genesis call; only a wrong network stops the start
+    private async startSingle(): Promise<CheckReport> {
+        const ep = this.endpoints[0]!;
+        const c = await this.runChecks(ep, new Set(["genesis"]), null, this.stopper.signal);
+        if (c.genesis === "error") {
+            this.deps.log.warn("rpc genesis check failed", {
+                endpoint: ep.name,
+                outcome: c.genesisError,
+            });
+        }
+        return { endpoints: [c] };
+    }
+
+    // The service waits for each endpoint's genesis and slot reads only, and the rest of each
+    // run goes on in the background, so a stalled history call cannot hold the start (spec 9)
+    private async boot(): Promise<CheckReport> {
+        const probe = this.historyProbe();
+        const parts = new Set(CHECK_PARTS);
+        const booted = this.endpoints.map(
+            (ep) =>
+                new Promise<EndpointCheck>((resolve, reject) => {
+                    const run = this.runChecks(ep, parts, probe, this.stopper.signal, resolve);
+                    run.then(resolve, reject);
+                }),
+        );
+        return { endpoints: await Promise.all(booted) };
+    }
+
+    // The CLI and the probe command: whole runs, at most CHECK_TOTAL_MS; with rerun, each check
+    // that ended in an error runs once more within that time
+    private async checkAll(rerun: boolean): Promise<CheckReport> {
+        const cap = new AbortController();
+        const timer = setTimeout(() => cap.abort(), CHECK_TOTAL_MS);
+        const signal = AbortSignal.any([this.stopper.signal, cap.signal]);
+        try {
+            const probe = this.historyProbe();
+            const all = new Set(CHECK_PARTS);
+            const checks = this.endpoints.map(async (ep) => {
+                const first = await this.runChecks(ep, all, probe, signal);
+                const again = erroredParts(first);
+                if (!rerun || again.size === 0 || signal.aborted) return first;
+                return merged(first, await this.runChecks(ep, this.runParts(again), probe, signal));
+            });
+            return { endpoints: await Promise.all(checks) };
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    private runChecks(
+        ep: Endpoint,
+        parts: ReadonlySet<CheckPart>,
+        probe: Promise<HistoryProbe | null> | null,
+        signal: AbortSignal,
+        onBoot?: (c: EndpointCheck) => void,
+    ): Promise<EndpointCheck> {
+        // A run dates from its start: a disagreeing one marks from it, a passing one clears only
+        // an hour after the mark (spec 8.10)
+        const startedAt = this.deps.now();
+        const run = (async () => {
+            const c = await checkEndpoint(this.checkTransport(ep), ep.name, await probe, {
+                timeoutMs: this.s.attempt_timeout,
+                now: this.deps.now,
+                genesisOnly: false,
+                parts,
+                slot: this.slots.highWater("confirmed", "slot"),
+                signal,
+                onBoot:
+                    onBoot &&
+                    ((partial) => {
+                        this.applyChecks(ep, partial, startedAt);
+                        onBoot(partial);
+                    }),
+            });
+            this.applyChecks(ep, c, startedAt);
+            if (this.mode === "routed") this.schedule(ep, c, parts, startedAt);
+            return c;
+        })();
+        ep.checking = run;
+        const done = (): void => {
+            if (ep.checking === run) ep.checking = null;
+        };
+        this.track(run.then(done, done));
+        return run;
+    }
+
+    private track(work: Promise<unknown>): void {
+        this.runs.add(work);
+        const done = (): void => void this.runs.delete(work);
+        work.then(done, done);
+    }
+
+    // Every run asks the node's identity (spec 8.10); the slot read comes with a genesis check,
+    // and otherwise only when no slot is known for the pinned checks
+    private runParts(parts: Iterable<CheckPart>): Set<CheckPart> {
+        const set = new Set<CheckPart>(["identity", ...parts]);
+        const pinned = set.has("pinnedAccounts") || set.has("pinnedSignatures");
+        if (set.has("genesis") || (pinned && this.slots.highWater("confirmed", "slot") === null)) {
+            set.add("slot");
+        }
+        return set;
+    }
+
+    // The hourly run brings the errored checks along; before it, only they run (spec 9)
+    private dueParts(ep: Endpoint, now: number): Set<CheckPart> | null {
+        if (ep.checking !== null) return null;
+        const hourly = ep.hourlyAt !== null && now >= ep.hourlyAt;
+        const retry = ep.retry !== null && now >= ep.retry.at;
+        if (!hourly && !retry) return null;
+        return this.runParts([...(hourly ? HOURLY : []), ...(ep.retry?.parts ?? [])]);
+    }
+
+    private schedule(
+        ep: Endpoint,
+        c: EndpointCheck,
+        parts: ReadonlySet<CheckPart>,
+        startedAt: number,
+    ): void {
+        const errored = erroredParts(c);
+        if (errored.size === 0) {
+            ep.retry = null;
+        } else {
+            // probe_every, then twice as long each time, at most history_check_every
+            const step = ep.retry?.step ?? 0;
+            const wait = Math.min(this.s.probe_every * 2 ** step, this.s.history_check_every);
+            ep.retry = { parts: errored, at: startedAt + wait, step: step + 1 };
+        }
+        if (HOURLY.every((part) => parts.has(part))) {
+            ep.hourlyAt = startedAt + this.s.history_check_every;
+        }
+    }
+
+    // An error keeps what the endpoint had; at start that is "not passed" (spec 9)
+    private applyChecks(ep: Endpoint, c: EndpointCheck, startedAt: number): void {
+        const routed = this.mode === "routed";
+        if (c.genesis !== "unchecked") {
+            const failed = c.genesis === "error";
+            ep.checks.genesis =
+                failed && c.genesisError !== null ? `error ${c.genesisError}` : c.genesis;
+            if (!failed) ep.passed.genesis = c.genesis === "ok";
+            if (c.genesis === "ok") ep.alerted.delete("unreachable");
+            if (failed && routed && !ep.alerted.has("unreachable")) {
+                ep.alerted.add("unreachable");
+                this.deps.log.alarm("rpc_endpoint_down", {
+                    endpoint: ep.name,
+                    reason: "unreachable",
+                    ...failureCode(c.genesisError),
+                });
+            }
+        }
+        if (c.identity !== null) this.sawIdentity(ep, c.identity);
+        for (const key of ["pinnedAccounts", "pinnedSignatures"] as const) {
+            const result = c[key];
+            if (result === "unchecked") continue;
+            ep.checks[key] = result;
+            if (result !== "error") ep.passed[key] = result === "ok";
+        }
+        if (c.history !== "unchecked") {
+            ep.checks.history = c.history;
+            if (c.history === "ok") {
+                ep.passed.history = true;
+                ep.alerted.delete("history");
+                this.book.passHistory(ep.name);
+            } else if (c.history === "missing") {
+                ep.passed.history = false;
+            }
+        }
+        // A run whose repeats did not all answer decides nothing (spec 8.10)
+        if (c.repeatsAgree !== null) {
+            const before = this.book.state(ep.name);
+            this.book.checkRun(ep.name, c.repeatsAgree, startedAt);
+            if (routed) this.marked(ep.name, before, "check_disagreed");
+        }
+        if (routed) this.alertChecks(ep, c);
+    }
+
+    // After the run's consistency verdict, which decides the pinned alarm
+    private alertChecks(ep: Endpoint, c: EndpointCheck): void {
+        if (c.history === "missing" && !ep.alerted.has("history")) {
+            ep.alerted.add("history");
+            // A history that passed before and is gone now is a provider that cut its retention
+            if (this.book.historyPassed(ep.name)) {
+                this.deps.log.alarm("rpc_endpoint_down", {
+                    endpoint: ep.name,
+                    reason: "history_missing",
+                });
+            } else {
+                this.deps.log.warn("rpc endpoint has no history", { endpoint: ep.name });
+            }
+        }
+        const pinned = [c.pinnedAccounts, c.pinnedSignatures];
+        if (pinned.every((result) => result === "ok")) {
+            ep.alerted.delete("pinned");
+        } else if (
+            pinned.includes("ignored") &&
+            this.book.state(ep.name) === "yes" &&
+            !ep.alerted.has("pinned")
+        ) {
+            // An inconsistent endpoint gets no listings anyway
+            ep.alerted.add("pinned");
+            this.deps.log.alarm("rpc_endpoint_down", {
+                endpoint: ep.name,
+                reason: "min_context_slot_ignored",
+            });
+        }
+    }
+
+    // Two endpoints that ever reported one node count as one domain from then on (spec 8.10)
+    private sawIdentity(ep: Endpoint, identity: string): void {
+        const at = (name: string) => this.endpoints.findIndex((e) => e.name === name);
+        for (const other of this.identities.saw(ep.name, identity)) {
+            const endpoints = [ep.name, other].toSorted((x, y) => at(x) - at(y));
+            this.deps.log.warn("rpc endpoints share a node", { endpoints });
+        }
+    }
+
+    // Spec 6.5: an endpoint without a confirmed slot and height in probe_every
+    private marksStale(ep: Endpoint, now: number): boolean {
+        if (!ep.passed.genesis || ep.health.breaker() !== "closed") return false;
+        return (["slot", "height"] as const).some((kind) => {
+            const mark = this.slots.mark(ep.name, "confirmed", kind);
+            return mark === null || now - mark.lastSeen >= this.s.probe_every;
+        });
+    }
+
+    // Spec 6.2: good is an answer within the first-attempt timeout, at or above the floor, with
+    // a lag of at most half the bound
+    private async recover(ep: Endpoint): Promise<void> {
+        const firsts = this.s.first_attempt_timeouts;
+        const timeoutMs = Object.hasOwn(firsts, EPOCH_REQUEST.method)
+            ? firsts[EPOCH_REQUEST.method]!
+            : this.s.attempt_timeout;
+        const floors = this.floorsOf(EPOCH_REQUEST);
+        const sentAt = this.deps.now();
+        const a = await this.probeEpoch(ep, timeoutMs);
+        const good =
+            a !== null &&
+            a.elapsed <= timeoutMs &&
+            rpcErrorOf(a.answer) === null &&
+            observationsOf(EPOCH_REQUEST, a.answer).length > 0 &&
+            this.refusalOf(EPOCH_REQUEST, a.answer, floors) === null &&
+            (this.slots.lag(ep.name) ?? 0) <= this.s.max_slot_lag / 2;
+        const before = ep.health.breaker();
+        ep.health.probeResult(good, sentAt);
+        if (before !== "closed" && ep.health.breaker() === "closed") {
+            this.deps.log.info("rpc endpoint back", { endpoint: ep.name });
+        }
+    }
+
+    // Null when it got no answer in time
+    private async probeEpoch(
+        ep: Endpoint,
+        timeoutMs: number,
+    ): Promise<{ answer: unknown; elapsed: number } | null> {
+        ep.probing = true;
+        const started = this.deps.now();
+        const signal = AbortSignal.any([this.stopper.signal, AbortSignal.timeout(timeoutMs)]);
+        const sent = this.checkTransport(ep)({ payload: EPOCH_PAYLOAD, signal });
+        this.track(sent);
+        try {
+            const answer = await sent;
+            return { answer, elapsed: this.deps.now() - started };
+        } catch {
+            return null;
+        } finally {
+            ep.probing = false;
+        }
+    }
+
+    // A check or probe call is counted and observed like traffic, but it never strikes, never
+    // fails over and logs nothing: its result is the check's
+    private checkTransport(ep: Endpoint): RpcTransport {
+        return (async ({ payload, signal }: Config) => {
+            const req = readRequest(payload) ?? opaqueRequest(payload);
+            ep.limits.record(req.method, "background");
+            this.count(ep, "background");
+            ep.health.begin();
+            const started = this.deps.now();
+            try {
+                const answer = await ep.transport({ payload, signal });
+                ep.health.sample(this.deps.now() - started);
+                // Any answer, not only a result, says the endpoint is not rate limiting
+                ep.limits.succeeded(req.method);
+                this.observe(ep, req, answer);
+                const error = rpcErrorOf(answer);
+                this.outcome(ep, req.method, error === null ? "ok" : codeLabel(error.code));
+                return answer;
+            } catch (err) {
+                if (signal?.aborted) {
+                    this.outcome(ep, req.method, "timeout");
+                } else {
+                    this.outcome(ep, req.method, thrownLabel(err));
+                    ep.lastError = { at: this.deps.now(), ...thrownError(err) };
+                    this.cool(ep, req.method, classifyThrown(err, false, this.deps.now()));
+                }
+                throw err;
+            } finally {
+                ep.health.end();
+            }
+        }) as RpcTransport;
+    }
+
+    private historyProbe(): Promise<HistoryProbe | null> {
+        const read = this.deps.historyProbe;
+        if (read === undefined) return Promise.resolve(null);
+        // The mainnet probe is older than any payment, so it still proves a history
+        return read().catch((err: unknown) => {
+            this.deps.log.warn("rpc history probe not read", { err });
+            return null;
+        });
+    }
+
+    // A row only ever adds a mark or a passed check (spec 8.10)
+    private readVerdicts(): Promise<void> {
+        this.verdictsRead ??= (async () => {
+            const store = this.deps.verdicts;
+            if (store === undefined || this.endpoints.every((ep) => ep.fingerprint === null)) {
+                return;
+            }
+            let rows: VerdictRow[];
+            try {
+                rows = await store.load();
+            } catch (err) {
+                this.deps.log.warn("rpc verdicts not loaded", { err });
+                return;
+            }
+            for (const ep of this.endpoints) {
+                const row = rows.find((r) => r.fingerprint === ep.fingerprint);
+                if (row !== undefined) this.book.load(ep.name, row);
+            }
+        })();
+        return this.verdictsRead;
+    }
+
+    private saveVerdict(name: string, v: Verdict): void {
+        const store = this.deps.verdicts;
+        const fingerprint = this.byName.get(name)?.fingerprint ?? null;
+        if (store === undefined || fingerprint === null) return;
+        const row: VerdictRow = { fingerprint, endpoint: name, ...v };
+        this.saving = this.saving
+            .then(() => store.save(row))
+            .catch((err: unknown) => {
+                this.deps.log.warn("rpc verdict not stored", { endpoint: name, err });
+            });
     }
 
     // Spec 3.4: the caller's payload and signal, once, and the answer or error unchanged
@@ -679,19 +1194,11 @@ class Router {
         switch (o.kind) {
             case "failover":
                 if (o.strike) this.strike(ep, elapsed, code);
-                if (o.retryAfterMs !== null) {
-                    const { capped } = ep.limits.coolEndpoint(o.retryAfterMs);
-                    if (capped) ep.health.probationAt(ep.limits.endpointCoolingUntil());
-                }
+                this.cool(ep, req.method, o);
                 return;
-            case "cooldown": {
-                const { scope, capped } = ep.limits.hit429(req.method, o.retryAfterMs);
-                // An endpoint-wide cooldown cut by the cap ends in probation, so probes decide
-                if (capped && scope === ENDPOINT_SCOPE) {
-                    ep.health.probationAt(ep.limits.endpointCoolingUntil());
-                }
+            case "cooldown":
+                this.cool(ep, req.method, o);
                 return;
-            }
             case "auth":
                 ep.health.authFailed();
                 this.down(ep, "auth", code);
@@ -725,6 +1232,20 @@ class Router {
         }
     }
 
+    // A 429, or a 5xx with Retry-After (spec 6.3, 7.2)
+    private cool(ep: Endpoint, method: string, o: Outcome): void {
+        if (o.kind === "cooldown") {
+            const { scope, capped } = ep.limits.hit429(method, o.retryAfterMs);
+            // An endpoint-wide cooldown cut by the cap ends in probation, so probes decide
+            if (capped && scope === ENDPOINT_SCOPE) {
+                ep.health.probationAt(ep.limits.endpointCoolingUntil());
+            }
+        } else if (o.kind === "failover" && o.retryAfterMs !== null) {
+            const { capped } = ep.limits.coolEndpoint(o.retryAfterMs);
+            if (capped) ep.health.probationAt(ep.limits.endpointCoolingUntil());
+        }
+    }
+
     // Spec 8.6 step 3: a refusal or error returns as it is only while no attempt of this send may
     // have delivered it, because a later one can be caused by that delivery
     private sendStep(req: RouterRequest, a: Attempt, step: Step, run: Run): Step {
@@ -747,15 +1268,19 @@ class Router {
         // readRequest read this payload as a send, so it holds its params array
         const copy = copyPayload(payload as { params: readonly unknown[] });
         const req = readRequest(copy)!;
-        const domains = new Set([accepted.domain]);
+        const used = [accepted];
         const now = this.deps.now();
         for (const v of choose(req, this.views(req, "money"), { now, lane: "money" })) {
-            if (domains.size > fanout) return;
+            if (used.length > fanout) return;
             const ep = this.endpoint(v.name);
-            if (run.tried.has(ep.name) || v.breaker !== "closed" || domains.has(ep.domain)) {
+            if (
+                run.tried.has(ep.name) ||
+                v.breaker !== "closed" ||
+                used.some((u) => this.sameSource(u, ep))
+            ) {
                 continue;
             }
-            domains.add(ep.domain);
+            used.push(ep);
             // A detached copy must never become an unhandled rejection
             this.copy(ep, req, copy).catch(() => undefined);
         }
@@ -890,13 +1415,14 @@ class Router {
         let merged = statusesOf(firstAnswer);
         if (merged === null || !hasNull(merged)) return firstAnswer;
         const received = [{ name: first.name, answer: merged }];
-        const counted = new Set<string>();
-        if (this.votes(first)) counted.add(first.domain);
-        const voter = (v: EndpointView) =>
-            v.consistent && !counted.has(this.endpoint(v.name).domain);
-        while (counted.size < this.list.absenceQuorum && hasNull(merged)) {
+        // One vote per domain, and endpoints that reported one node are one domain (spec 8.10)
+        const counted: Endpoint[] = [];
+        const independent = (ep: Endpoint) => !counted.some((c) => this.sameSource(c, ep));
+        if (this.votes(first)) counted.push(first);
+        const voter = (v: EndpointView) => v.consistent && independent(this.endpoint(v.name));
+        while (counted.length < this.list.absenceQuorum && hasNull(merged)) {
             const ep = await this.nextVoter(req, lane, run, voter, signal);
-            if (ep === null) throw this.unconfirmed(counted.size, merged);
+            if (ep === null) throw this.unconfirmed(counted.length, merged);
             run.tried.add(ep.name);
             const timeoutMs = this.s.attempt_timeout;
             const a = await this.attempt(ep, req, payload, signal, lane, timeoutMs);
@@ -913,7 +1439,7 @@ class Router {
             }
             merged = both;
             received.push({ name: ep.name, answer });
-            if (this.votes(ep)) counted.add(ep.domain);
+            if (this.votes(ep) && independent(ep)) counted.push(ep);
         }
         return merged;
     }
@@ -943,6 +1469,10 @@ class Router {
 
     private votes(ep: Endpoint): boolean {
         return this.book.state(ep.name) === "yes";
+    }
+
+    private sameSource(a: Endpoint, b: Endpoint): boolean {
+        return a.domain === b.domain || this.identities.shares(a.name, b.name);
     }
 
     // At most one alarm per 10 min, counting the unconfirmed absences since the last one
@@ -1030,10 +1560,10 @@ class Router {
             const sends = this.sends(ep, req, cursor);
             return {
                 name: ep.name,
-                roles: ep.checks.history === "ok" ? WITH_HISTORY : WITHOUT_HISTORY,
-                checked: ep.checks.genesis === "ok",
+                roles: ep.passed.history ? WITH_HISTORY : WITHOUT_HISTORY,
+                checked: ep.passed.genesis,
                 consistent: this.book.state(ep.name) === "yes",
-                pinnedSignatures: ep.checks.pinnedSignatures === "ok",
+                pinnedSignatures: ep.passed.pinnedSignatures,
                 breaker: ep.health.breaker(),
                 openUntil: ep.health.openUntil(),
                 lastProbeGood: ep.health.lastProbeGood(),
@@ -1217,7 +1747,7 @@ class Router {
 
     private stateOf(ep: Endpoint): Pick<EndpointSnapshot, "state" | "untilMs"> {
         if (ep.checks.genesis === "wrong") return { state: "wrong_network", untilMs: null };
-        if (ep.checks.genesis !== "ok") return { state: "unchecked", untilMs: null };
+        if (!ep.passed.genesis) return { state: "unchecked", untilMs: null };
         const breaker = ep.health.breaker();
         if (breaker === "open") return { state: "open", untilMs: ep.health.openUntil() };
         if (this.lagging(ep)) return { state: "lagging", untilMs: null };
@@ -1233,7 +1763,7 @@ class Router {
         const mark = this.slots.mark(ep.name, "confirmed", "slot");
         return {
             name: ep.name,
-            roles: ROLES.filter((r) => r !== "history" || ep.checks.history === "ok"),
+            roles: ROLES.filter((r) => r !== "history" || ep.passed.history),
             ...this.stateOf(ep),
             latencyMs: ep.health.latencyMs(),
             errorRate: ep.health.errorRate(),
@@ -1278,7 +1808,15 @@ export function createRouterTransport(
     const background = ((config: Config) => router.request(config, "background")) as RpcTransport;
     const money: RouterTransport = Object.assign(
         ((config: Config) => router.request(config, "money")) as RpcTransport,
-        { mode: router.mode, background, snapshot: () => router.snapshot() },
+        {
+            mode: router.mode,
+            background,
+            start: (o: { timers: boolean }) => router.start(o),
+            check: () => router.check(),
+            tick: () => router.tick(),
+            snapshot: () => router.snapshot(),
+            stop: () => router.stop(),
+        },
     );
     ROUTERS.set(money, router);
     return money;

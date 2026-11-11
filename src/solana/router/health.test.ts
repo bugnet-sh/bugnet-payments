@@ -64,6 +64,19 @@ describe("EndpointHealth", () => {
         expect(health.breaker()).toBe("closed");
     });
 
+    it("probe spacing counts from when each probe was sent", () => {
+        strikes(5);
+        ms = 30_100;
+        health.probeResult(true, 30_000);
+        ms = 40_000;
+        expect(health.probeDue()).toBe(true);
+        ms = 40_100;
+        health.probeResult(true, 40_000);
+        ms = 50_100;
+        health.probeResult(true, 50_000);
+        expect(health.breaker()).toBe("closed");
+    });
+
     it("a good probe sooner than 10 s after the last does not count", () => {
         strikes(5);
         ms = 30_000;
