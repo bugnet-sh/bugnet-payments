@@ -827,6 +827,43 @@ describe("expiry", () => {
         expect(resigned.expirySeenSlot).toBeNull();
     });
 
+    it("a statuses answer short of one entry per signature is asked again, not expired", async () => {
+        const { sigs } = await funded([{ micros: 7_000n }]);
+        const move = await pending(returnTo(7_000), sigs);
+        await run(deps({ rpc: dropFirst() }));
+        const old = (await moveRow(move.id)).txSignature!;
+        expireAll();
+
+        // Past the blockhash, a missing entry read as null would start the expiry and its proof
+        const short = onSend(forward, {
+            getSignatureStatuses: (asked: readonly string[]) => ({
+                send: async () => ({
+                    context: { slot: chain.slot() },
+                    value: asked.slice(1).map(() => null),
+                }),
+            }),
+        });
+        const mark = chain.calls().length;
+        const tick = await run(deps({ rpc: short }));
+        expect(tick).toMatchObject({ resent: 0, resigned: 0, failed: 0, waitingProof: 0 });
+        expect(log.lines).toContainEqual(
+            expect.objectContaining({
+                msg: "deposit move rpc call failed, retrying next tick",
+                moveId: move.id,
+            }),
+        );
+        expect(await moveRow(move.id)).toMatchObject({
+            state: "sent",
+            txSignature: old,
+            expirySeenSlot: null,
+            attempts: 1,
+        });
+        expect(callsOf("getSignaturesForAddress", mark)).toHaveLength(0);
+
+        expect((await run()).resigned).toBe(1);
+        expect((await moveRow(move.id)).previousSignatures).toEqual([old]);
+    });
+
     it("a proof whose listing spans several ticks goes on where it stopped", async () => {
         const { sigs } = await funded([{ micros: 7_000n }]);
         const move = await pending(returnTo(7_000), sigs);
