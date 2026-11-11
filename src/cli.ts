@@ -18,7 +18,7 @@ import {
 } from "./refunds/request.ts";
 import { usdcAta } from "./solana/accounts.ts";
 import { isCanonicalAddress, isCanonicalSignature } from "./solana/base58.ts";
-import { cliRouter } from "./solana/cli-router.ts";
+import { cliRouter, startOrStop } from "./solana/cli-router.ts";
 import {
     domainOf,
     type CheckReport,
@@ -228,7 +228,7 @@ export async function cliMain(
                     ...(o.rpcTransportFor === undefined ? {} : { transportFor: o.rpcTransportFor }),
                 });
                 if (r === null) return null;
-                await r.router.start({ timers: false });
+                await startOrStop(r);
                 await warnOtherList(db, r, log, o.now ?? (() => new Date()));
                 return r;
             })());

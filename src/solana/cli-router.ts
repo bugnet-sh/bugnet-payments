@@ -38,11 +38,15 @@ export function cliRouter(
     if (problems.length > 0) throw new ConfigError(problems.join("\n"));
     const pool = o.pool;
     const claimKey = claimKeyOf(env);
+    // Without the stored verdicts a vote the service took away counts again in this command
+    if (pool !== undefined && claimKey === null && urls.length > 1) {
+        o.log.warn("rpc stored verdicts are not used without a valid BUGNET_CLAIM_KEY");
+    }
     const verdicts =
         pool === undefined || claimKey === null
             ? undefined
             : readOnly(
-                  pgVerdictStore(pool, () => new Date()),
+                  pgVerdictStore(pool, () => new Date(), rpc.history_check_every),
                   o.verdictsReadOnly === true,
               );
     const recipientAta = o.recipientAta;
@@ -70,4 +74,14 @@ function claimKeyOf(env: NodeJS.ProcessEnv): Buffer | null {
 
 function readOnly(store: VerdictStore, on: boolean): VerdictStore {
     return on ? { load: () => store.load(), save: async () => {} } : store;
+}
+
+// A start refused by a wrong genesis still made calls, so the router stops to flush their usage
+export async function startOrStop(r: RoutedRpc): Promise<void> {
+    try {
+        await r.router.start({ timers: false });
+    } catch (err) {
+        await r.router.stop();
+        throw err;
+    }
 }

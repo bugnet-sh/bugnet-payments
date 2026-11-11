@@ -20,7 +20,7 @@ import {
     type KeyPairSigner,
 } from "@solana/kit";
 import { ASSOCIATED_TOKEN_PROGRAM_ADDRESS } from "@solana-program/token";
-import { loadSettings, secretValues } from "../config.ts";
+import { DEFAULT_RPC_TIMEOUT, loadSettings, parseDuration, secretValues } from "../config.ts";
 import { createPool } from "../db/pool.ts";
 import { jsonLog, type Log } from "../log.ts";
 import { orderPublicKeyBase64 } from "../orders/token.ts";
@@ -28,7 +28,7 @@ import { inspectTokenAccount, usdcAta } from "../solana/accounts.ts";
 import { type Landing, readLanding } from "../solana/landing.ts";
 import { hotLedgerEmpty } from "../x402/tail.ts";
 import { loadKeypair } from "../solana/keys.ts";
-import { cliRouter } from "../solana/cli-router.ts";
+import { cliRouter, startOrStop } from "../solana/cli-router.ts";
 import { rpcSettingsSchema } from "../solana/router/index.ts";
 import type { RoutedRpc, SolanaRpc } from "../solana/rpc.ts";
 import { signV0Transaction } from "../solana/transfer.ts";
@@ -219,8 +219,6 @@ interface KeysRpc {
     close(): Promise<void>;
 }
 
-// rpc_timeout's default in config.ts, for the commands run without a settings file
-const DEFAULT_RPC_TIMEOUT_MS = 10_000;
 // drain --allowance checks the key against this file's allowance wallet when no -config is given
 const DEFAULT_ALLOWANCE_CONFIG = "config/dev.toml";
 
@@ -230,12 +228,12 @@ function keysRpc(env: NodeJS.ProcessEnv, config: string | null, log: Log): KeysR
         const settings = config === null ? null : loadSettings(config);
         const r = cliRouter(env, settings?.solana.rpc ?? rpcSettingsSchema.parse({}), {
             log,
-            rpcTimeoutMs: settings?.solana.rpc_timeout ?? DEFAULT_RPC_TIMEOUT_MS,
+            rpcTimeoutMs: settings?.solana.rpc_timeout ?? parseDuration(DEFAULT_RPC_TIMEOUT),
         });
         if (r === null) {
             throw new Error("BUGNET_SOLANA_RPC_URLS or BUGNET_SOLANA_RPC_URL must be set");
         }
-        await r.router.start({ timers: false });
+        await startOrStop(r);
         return r;
     };
     return {

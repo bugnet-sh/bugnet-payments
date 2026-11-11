@@ -22,6 +22,8 @@ const MAINNET = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const ONLY_V0 = "only [0] is supported";
 const MIN_TOKEN_LENGTH = 32;
+// solana.rpc_timeout's default, which the keys commands also use without a settings file
+export const DEFAULT_RPC_TIMEOUT = "10s";
 
 const duration = z
     .string()
@@ -146,7 +148,7 @@ const settingsSchema = z
                 blockhash_cache_ttl: duration.prefault("8s"),
                 rpc_timeout: duration
                     .refine((ms) => ms >= 1_000 && ms <= 60_000, "from 1s to 60s")
-                    .prefault("10s"),
+                    .prefault(DEFAULT_RPC_TIMEOUT),
                 fee_payer_boot_min_lamports: amount.default(100_000_000),
                 rpc: rpcSettingsSchema.prefault({}),
             })

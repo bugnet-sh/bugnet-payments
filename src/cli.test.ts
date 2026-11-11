@@ -531,7 +531,9 @@ describe("cliMain hot-wallet queue", () => {
         });
         const io = captureIo();
         expect(await cli(["manual", "retry", String(id)], io)).toBe(1);
-        expect(io.errText()).toContain("BUGNET_SOLANA_RPC_URL must be set");
+        expect(io.errText()).toContain(
+            "BUGNET_SOLANA_RPC_URLS or BUGNET_SOLANA_RPC_URL must be set",
+        );
     });
 
     it("manual resolve <refundId> --tx on a pending row while refunds are held", async () => {
@@ -1118,7 +1120,9 @@ describe("the x402 operator commands", () => {
             const account = await seedAccount(db.pool, {});
             const io = captureIo();
             expect(await cli(["x402", "ledger-check", account.id], io)).toBe(1);
-            expect(io.errText()).toContain("BUGNET_SOLANA_RPC_URL must be set");
+            expect(io.errText()).toContain(
+                "BUGNET_SOLANA_RPC_URLS or BUGNET_SOLANA_RPC_URL must be set",
+            );
         });
     });
 });
@@ -1289,8 +1293,8 @@ describe("rpc commands", () => {
         });
         const r = await probe(TWO, [devnet, checkNode("b")]);
         expect(r.out.some((l) => l.startsWith("rpc1  genesis: wrong"))).toBe(true);
-        expect(r.out.some((l) => l.startsWith("rpc2  genesis: ok  pinned-accounts: ok"))).toBe(
-            true,
+        expect(r.out.find((l) => l.startsWith("rpc2"))).toMatch(
+            /^rpc2 {2}genesis: ok {2}pinned-accounts: ok {2}pinned-signatures: ok {2}history: ok {2}consistent: yes {2}slot: 500 {2}latency: \d+ms$/,
         );
         expect(r.code).toBe(1);
     });
@@ -1327,9 +1331,29 @@ describe("rpc commands", () => {
     });
 
     it("rpc probe never prints a URL", async () => {
-        const r = await probe(TWO, [checkNode("a"), checkNode("b")]);
-        expect(r.text).not.toContain("a.example");
-        expect(r.text).not.toContain("b.example");
+        const keyed = {
+            BUGNET_SOLANA_RPC_URLS:
+                "https://one.a.example/0123456789abcdef0123456789abcdef?api-key=KEYONE12345678,https://two.b.example/",
+        };
+        const refusing = checkNode("b", { getGenesisHash: () => httpFail(403) });
+        for (const nodes of [
+            [checkNode("a"), checkNode("b")],
+            [checkNode("a"), refusing],
+        ]) {
+            const r = await probe(keyed, nodes);
+            for (const part of [
+                "one.a.example",
+                "a.example",
+                "two.b.example",
+                "b.example",
+                "0123456789abcdef0123456789abcdef",
+                "KEYONE12345678",
+            ]) {
+                expect(r.text).not.toContain(part);
+            }
+        }
+        const failed = await probe(keyed, [checkNode("a"), refusing]);
+        expect(failed.text).toContain("rpc2  genesis: error http_403");
     });
 
     it("the CLI names list problems by position", async () => {

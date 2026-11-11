@@ -15,6 +15,7 @@ import {
 const AT = new Date("2026-11-10T14:00:15.000Z");
 const ATA = "AtaRecipient1111111111111111111111111111111";
 const FP = "0123456789abcdef0123456789abcdef";
+const HOUR = 3_600_000;
 
 let db: TestDb;
 beforeAll(async () => {
@@ -46,7 +47,7 @@ describe("pgVerdictStore", () => {
     };
 
     it("verdicts round-trip by fingerprint", async () => {
-        const store = pgVerdictStore(db.pool, () => AT);
+        const store = pgVerdictStore(db.pool, () => AT, HOUR);
         await store.save(no);
         expect(await store.load()).toEqual([no]);
         const cleared: VerdictRow = { ...no, endpoint: "rpc3", noAt: null, reason: null };
@@ -60,6 +61,37 @@ describe("pgVerdictStore", () => {
         expect(await codeOf(store.save({ ...no, endpoint: "a.example" }))).toBe("23514");
         expect(await codeOf(store.save({ ...no, noAt: null }))).toBe("23514");
         expect(await store.load()).toEqual([cleared]);
+    });
+
+    it("a clear never erases a mark another process stored within the hour", async () => {
+        let at = AT;
+        const service = pgVerdictStore(db.pool, () => at, HOUR);
+        const cli = pgVerdictStore(db.pool, () => at, HOUR);
+        const marked: VerdictRow = { ...no, noAt: AT.getTime(), historyPassed: false };
+        await service.save(marked);
+        // The CLI read the rows before the mark, and its own run agreed
+        at = new Date(AT.getTime() + 5_000);
+        await cli.save({ ...marked, noAt: null, reason: null, historyPassed: true });
+        expect(await cli.load()).toEqual([{ ...marked, historyPassed: true }]);
+
+        // An earlier mark leaves the later one
+        await cli.save({ ...marked, noAt: AT.getTime() - 60_000, reason: "slot_went_back" });
+        expect(await cli.load()).toEqual([{ ...marked, historyPassed: true }]);
+        // A later mark replaces it
+        const later: VerdictRow = {
+            ...marked,
+            noAt: AT.getTime() + 1_000,
+            reason: "slot_went_back",
+        };
+        await service.save(later);
+        expect(await service.load()).toEqual([{ ...later, historyPassed: true }]);
+
+        // A run an hour after the mark clears it
+        at = new Date(AT.getTime() + 1_000 + HOUR + 1);
+        await service.save({ ...later, noAt: null, reason: null });
+        expect(await service.load()).toEqual([
+            { ...later, noAt: null, reason: null, historyPassed: true },
+        ]);
     });
 });
 

@@ -116,7 +116,17 @@ export async function historyProbe(
         : { address: recipientAta, oldest: row.oldest, later: row.later };
 }
 
-export function pgVerdictStore(pool: pg.Pool, now: () => Date): VerdictStore {
+// The service and every routed CLI command write these rows. A process clears a mark only from a
+// run started history_check_every after it, so a clear that meets a younger stored mark comes from
+// a process that read the rows before another one marked: that mark stays (spec 8.10), and of two
+// marks the later one. $6 is now(), $7 history_check_every in ms.
+const KEEP_STORED_MARK = `(rpc_verdicts.inconsistent_at is not null and case
+    when excluded.inconsistent_at is null
+        then rpc_verdicts.inconsistent_at
+            > $6::timestamptz - $7::double precision * interval '1 millisecond'
+    else rpc_verdicts.inconsistent_at > excluded.inconsistent_at end)`;
+
+export function pgVerdictStore(pool: pg.Pool, now: () => Date, clearAfterMs: number): VerdictStore {
     return {
         async load() {
             const res = await pool.query<{
@@ -143,9 +153,13 @@ export function pgVerdictStore(pool: pg.Pool, now: () => Date): VerdictStore {
                      inconsistent_reason, history_passed, updated_at)
                  values ($1, $2, $3, $4, $5, $6)
                  on conflict (fingerprint) do update set
-                     endpoint = excluded.endpoint, inconsistent_at = excluded.inconsistent_at,
-                     inconsistent_reason = excluded.inconsistent_reason,
-                     history_passed = excluded.history_passed, updated_at = excluded.updated_at`,
+                     endpoint = excluded.endpoint,
+                     inconsistent_at = case when ${KEEP_STORED_MARK}
+                         then rpc_verdicts.inconsistent_at else excluded.inconsistent_at end,
+                     inconsistent_reason = case when ${KEEP_STORED_MARK}
+                         then rpc_verdicts.inconsistent_reason else excluded.inconsistent_reason end,
+                     history_passed = rpc_verdicts.history_passed or excluded.history_passed,
+                     updated_at = excluded.updated_at`,
                 [
                     row.fingerprint,
                     row.endpoint,
@@ -153,6 +167,7 @@ export function pgVerdictStore(pool: pg.Pool, now: () => Date): VerdictStore {
                     row.reason,
                     row.historyPassed,
                     now(),
+                    clearAfterMs,
                 ],
             );
         },
