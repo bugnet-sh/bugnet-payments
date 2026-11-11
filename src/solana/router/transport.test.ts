@@ -1816,6 +1816,30 @@ describe("recovery", () => {
         expect(back(t)).toEqual([]);
     });
 
+    it("a 401 that reopens an endpoint out for errors alarms auth once an outage", async () => {
+        const t = setup(2, PROBED);
+        const reasons = () => alarms(t).map((l) => String(l.reason));
+        const tickAt = async (ms: number) => {
+            t.clock.ms = ms;
+            await t.router.tick();
+        };
+        await outAtZero(t);
+        t.a.answer(() => httpFail(401));
+        // Each probe reopens it for 10 min
+        for (const ms of [30_000, 630_000]) await tickAt(ms);
+        expect(probes(t)).toBe(2);
+        expect(reasons()).toEqual(["errors", "auth"]);
+
+        t.a.answer(chain(t.clock));
+        for (const ms of [1_230_000, 1_240_000, 1_250_000]) await tickAt(ms);
+        expect(back(t)).toHaveLength(1);
+        t.a.answer(() => netFail());
+        for (let i = 0; i < 5; i++) await call(t.router, "getSlot");
+        t.a.answer(() => httpFail(401));
+        await tickAt(1_250_000 + 30_000);
+        expect(reasons()).toEqual(["errors", "auth", "errors", "auth"]);
+    });
+
     it("a lagging endpoint returns only at half the lag bound", async () => {
         const t = setup(2, { ...PROBED, max_slot_lag: 50 });
         let behind = 60n;

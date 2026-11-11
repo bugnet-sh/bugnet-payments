@@ -185,6 +185,9 @@ interface Endpoint {
     passed: Record<keyof CheckState, boolean>;
     // The warns and alarms of a check's current failure, so each is raised once
     readonly alerted: Set<"unreachable" | "history" | "pinned">;
+    // The rpc_endpoint_down reasons raised since the breaker last closed, so each is raised once
+    // an outage
+    readonly downReasons: Set<string>;
     // At most one check run and one probe at a time
     checking: Promise<EndpointCheck> | null;
     probing: boolean;
@@ -520,6 +523,7 @@ class Router {
                     pinnedSignatures: false,
                 },
                 alerted: new Set(),
+                downReasons: new Set(),
                 checking: null,
                 probing: false,
                 idleProbeAt: null,
@@ -989,6 +993,7 @@ class Router {
         const before = ep.health.breaker();
         ep.health.probeResult(good, sentAt);
         if (before !== "closed" && ep.health.breaker() === "closed") {
+            ep.downReasons.clear();
             this.deps.log.info("rpc endpoint back", { endpoint: ep.name });
         }
     }
@@ -1710,21 +1715,22 @@ class Router {
         if (before === "closed" && ep.health.breaker() === "open") this.down(ep, "errors", code);
     }
 
-    // A 401 to 410 is about the URL: open for 10 min (spec 6.4). Like a strike, it alarms only
-    // when it takes a closed endpoint out, so a reopening in probation repeats no alarm (10.2)
+    // A 401 to 410 is about the URL: open for 10 min (spec 6.4). Its reason alarms once an
+    // outage, so a reopening in probation repeats no alarm (10.2), but a key revoked on an
+    // endpoint already out for errors still names the operator's next step
     private shutOut(
         ep: Endpoint,
         o: Extract<Outcome, { kind: "auth" | "down" }>,
         code: ErrorCode,
     ): void {
-        const before = ep.health.breaker();
         if (o.kind === "auth") ep.health.authFailed();
         else ep.health.endpointDown();
-        if (before !== "closed") return;
-        this.down(ep, o.kind === "auth" ? "auth" : `http_${o.status}`, code);
+        const reason = o.kind === "auth" ? "auth" : `http_${o.status}`;
+        if (!ep.downReasons.has(reason)) this.down(ep, reason, code);
     }
 
     private down(ep: Endpoint, reason: string, code: ErrorCode): void {
+        ep.downReasons.add(reason);
         this.deps.log.alarm("rpc_endpoint_down", { endpoint: ep.name, reason, ...code });
     }
 
