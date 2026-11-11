@@ -6,7 +6,7 @@ import type { Log } from "./log.ts";
 import { inspectTokenAccount, usdcAta } from "./solana/accounts.ts";
 import { TOKEN_PROGRAM, USDC_MINT } from "./solana/constants.ts";
 import { loadKeypair } from "./solana/keys.ts";
-import type { SolanaRpc } from "./solana/rpc.ts";
+import { deadline, type SolanaRpc } from "./solana/rpc.ts";
 import { recordIncident } from "./x402/incidents.ts";
 import { loadIndex, type IndexCopy } from "./x402/index-file.ts";
 import { checkTlsFiles, type SignerGate, type TlsFiles } from "./x402/listener.ts";
@@ -28,6 +28,8 @@ export interface BootDeps {
     feePayerMinLamports: bigint;
     refundsEnabled: boolean;
     eventPublicKey: string;
+    // Each boot read gets its own deadline, so a stalled endpoint fails the start instead of hanging it
+    rpcTimeoutMs: number;
 }
 
 async function requireUsdcAccount(
@@ -35,9 +37,10 @@ async function requireUsdcAccount(
     label: string,
     owner: Address,
     fix: string,
+    rpcTimeoutMs: number,
 ): Promise<Address> {
     const ata = await usdcAta(owner);
-    const info = await inspectTokenAccount(rpc, ata);
+    const info = await inspectTokenAccount(rpc, ata, deadline(rpcTimeoutMs));
     if (info === null) {
         throw new BootCheckError(`${label} USDC account ${ata} does not exist: ${fix}`);
     }
@@ -88,9 +91,12 @@ export async function bootChecks(
         "recipient",
         d.recipient,
         `create it once with: pnpm cli keys fund --create-recipient-ata ${d.recipient}`,
+        d.rpcTimeoutMs,
     );
 
-    const { value: feePayerLamports } = await d.rpc.getBalance(d.feePayer).send();
+    const { value: feePayerLamports } = await d.rpc
+        .getBalance(d.feePayer)
+        .send(deadline(d.rpcTimeoutMs));
     if (feePayerLamports < d.feePayerMinLamports) {
         throw new BootCheckError(
             `fee payer holds ${feePayerLamports} lamports, needs at least ${d.feePayerMinLamports}: send SOL to ${d.feePayer}`,
@@ -103,6 +109,7 @@ export async function bootChecks(
             "refund",
             d.refundWallet,
             "create it once with: pnpm cli keys fund --create-refund-ata, or set refunds.enabled = false",
+            d.rpcTimeoutMs,
         );
     }
     return { recipientAta, feePayerLamports: BigInt(feePayerLamports) };
@@ -125,6 +132,7 @@ export interface X402BootDeps {
     runMirror: () => Promise<MirrorRun | "skipped">;
     log: Log;
     now: () => Date;
+    rpcTimeoutMs: number;
 }
 
 const TLS_SERVER_NAME = "bugnet-payments.internal";
@@ -206,7 +214,10 @@ export async function x402BootChecks(
     let info: Awaited<ReturnType<typeof inspectTokenAccount>> = null;
     let rpcError = false;
     try {
-        info = await inspectTokenAccount(rpc, hot, { commitment: "finalized" });
+        info = await inspectTokenAccount(rpc, hot, {
+            commitment: "finalized",
+            ...deadline(d.rpcTimeoutMs),
+        });
     } catch (err) {
         // An open tail already pins this account; a failed read only delays the live check
         if (tail.tokenAccount !== hot) throw err;

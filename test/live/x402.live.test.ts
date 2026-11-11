@@ -12,7 +12,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { address, type Address, type KeyPairSigner, signature } from "@solana/kit";
 import type pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { Secrets } from "../../src/config.ts";
+import { rpcUrlsOf, type Secrets, secretValues } from "../../src/config.ts";
 import { parseEnvText } from "../../src/keys/tool.ts";
 import { loadTestPayer } from "../../src/keys/test-payer.ts";
 import { jsonLog, type Log } from "../../src/log.ts";
@@ -239,17 +239,9 @@ describe("x402 on mainnet", () => {
         allowanceWallet = allowance.address;
         const testPayer = (await loadTestPayer(process.env))!;
 
+        // Every URL of the list, its key parts and its host, with every other secret variable
         const hidden = [
-            process.env.BUGNET_SOLANA_RPC_URL,
-            process.env.BUGNET_PAYMENTS_TOKEN,
-            process.env.BUGNET_FEE_PAYER_KEY,
-            process.env.BUGNET_REFUND_KEY,
-            process.env.BUGNET_ALLOWANCE_KEY,
-            process.env.BUGNET_TEST_PAYER_KEY,
-            process.env.BUGNET_TEST_PAYER_MNEMONIC,
-            process.env.BUGNET_RECIPIENT_KEY,
-            process.env.BUGNET_ORDER_PRIVATE_KEY,
-            process.env.BUGNET_CLAIM_KEY,
+            ...secretValues(process.env),
             process.env.BUGNET_SPIKE_SELLER_URL,
             ...Object.values(sellerKeys),
         ].filter(Boolean) as string[];
@@ -257,7 +249,8 @@ describe("x402 on mainnet", () => {
         // The facilitator writes RPC errors with console.error
         restoreConsole = routeConsole(log);
 
-        rpcUrl = process.env.BUGNET_SOLANA_RPC_URL!;
+        // The seller and facilitator libraries take one URL: the first of the list
+        rpcUrl = rpcUrlsOf(process.env)[0]!;
         rpc = createRpc(rpcUrl);
         live = await startX402Live({
             dbUrl: db.url,

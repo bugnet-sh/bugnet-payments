@@ -1,4 +1,6 @@
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Address, getBase58Encoder, type Instruction, type KeyPairSigner } from "@solana/kit";
@@ -10,10 +12,12 @@ import {
     getCloseAccountInstructionDataDecoder,
     getTransferCheckedInstructionDataDecoder,
 } from "@solana-program/token";
+import { stringify } from "smol-toml";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { cliMain } from "../cli.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { generateExportableKeypair } from "../solana/keys.ts";
+import { type FakeChain, startFakeChain } from "../testing/fake-chain.ts";
 import { TEST_RENT_EXEMPT_MIN_LAMPORTS } from "../testing/fake-rpc.ts";
 import { testSigner } from "../testing/keys.ts";
 import { KEYS_USAGE } from "./commands.ts";
@@ -381,6 +385,117 @@ describe("keys commands without settings", () => {
             expect(io.outText()).not.toContain(secret);
             expect(io.errText()).not.toContain(secret);
         }
+    });
+
+    describe("through the router", () => {
+        let chain: FakeChain;
+        beforeAll(async () => {
+            chain = await startFakeChain();
+        });
+        afterAll(() => chain.close());
+        // Every balance is zero, so drain only reads before it says so
+        async function drainEnv(rpc: Record<string, string>): Promise<NodeJS.ProcessEnv> {
+            return {
+                BUGNET_TEST_PAYER_MNEMONIC: ABANDON,
+                BUGNET_FEE_PAYER_KEY: (await generateExportableKeypair()).secretBase58,
+                BUGNET_REFUND_KEY: (await generateExportableKeypair()).secretBase58,
+                ...rpc,
+            };
+        }
+        const balanceReads = () => chain.calls().filter((c) => c.method === "getBalance").length;
+
+        it("keys commands use the router", async () => {
+            const io = captureIo();
+            const before = balanceReads();
+            // Nothing listens on port 1, so rpc1 fails and rpc2 serves
+            const env = await drainEnv({
+                BUGNET_SOLANA_RPC_URLS: `http://127.0.0.1:1/,${chain.url}`,
+            });
+            expect(await cliMain(["keys", "drain"], env, io)).toBe(0);
+            expect(io.outText()).toBe("nothing to drain");
+            expect(balanceReads()).toBeGreaterThan(before);
+        });
+
+        it("keys commands work without a config file", async () => {
+            const both: Record<string, string>[] = [
+                { BUGNET_SOLANA_RPC_URL: chain.url },
+                { BUGNET_SOLANA_RPC_URLS: `http://127.0.0.1:1/,${chain.url}` },
+            ];
+            for (const rpc of both) {
+                const io = captureIo();
+                const before = balanceReads();
+                expect(await cliMain(["keys", "drain"], await drainEnv(rpc), io)).toBe(0);
+                expect(io.outText()).toBe("nothing to drain");
+                expect(balanceReads()).toBeGreaterThan(before);
+            }
+        });
+
+        it("a send that may have been delivered is checked by its landing", async () => {
+            const a = await chain.addEndpoint();
+            const b = await chain.addEndpoint();
+            // rpc1 lands the transfer and never answers; rpc2's preflight then finds it processed
+            a.stall("after", { methods: ["sendTransaction"] });
+            b.alreadyProcessed(true);
+            const funded = await generateExportableKeypair();
+            chain.fundLamports(funded.signer.address, 1_000_000n);
+            const env = {
+                ...(await drainEnv({ BUGNET_SOLANA_RPC_URLS: `${a.url},${b.url}` })),
+                BUGNET_FEE_PAYER_KEY: funded.secretBase58,
+            };
+            const file = join(dir, "keys-send.toml");
+            writeFileSync(
+                file,
+                stringify({
+                    solana: { recipient: recipient.address, rpc: { attempt_timeout: "2s" } },
+                }),
+            );
+            const before = chain.submitted().length;
+            const io = captureIo();
+            expect(await cliMain(["-config", file, "keys", "drain"], env, io)).toBe(0);
+            const landed = chain.submitted().slice(before);
+            expect(landed).toHaveLength(1);
+            expect(io.outText()).toBe(`confirmed ${landed[0]!.signature}`);
+            expect(b.calls().some((c) => c.method === "sendTransaction")).toBe(true);
+        });
+
+        it("keys commands take the router settings from -config", async () => {
+            // rpc1 takes each request and never answers, so each of its attempts runs to the
+            // attempt timeout
+            const held: { at: number; ms: number | null }[] = [];
+            const stalling = createServer((req, res) => {
+                const call = { at: Date.now(), ms: null as number | null };
+                held.push(call);
+                res.on("close", () => {
+                    call.ms = Date.now() - call.at;
+                });
+                req.resume();
+            });
+            await new Promise<void>((resolve) => stalling.listen(0, "127.0.0.1", resolve));
+            const port = (stalling.address() as AddressInfo).port;
+            try {
+                const file = join(dir, "keys-rpc.toml");
+                writeFileSync(
+                    file,
+                    stringify({
+                        solana: { recipient: recipient.address, rpc: { attempt_timeout: "2s" } },
+                    }),
+                );
+                const env = await drainEnv({
+                    BUGNET_SOLANA_RPC_URLS: `http://127.0.0.1:${port}/,${chain.url}`,
+                });
+                const io = captureIo();
+                expect(await cliMain(["-config", file, "keys", "drain"], env, io)).toBe(0);
+                expect(io.outText()).toBe("nothing to drain");
+                const first = held[0]!.ms;
+                expect(first).not.toBeNull();
+                // 2 s from the file, not the 3 s default
+                expect(first!).toBeGreaterThanOrEqual(1_900);
+                expect(first!).toBeLessThan(2_900);
+            } finally {
+                stalling.closeAllConnections();
+                await new Promise<void>((resolve) => stalling.close(() => resolve()));
+            }
+        });
     });
 
     it("lists --create-refund-ata in the usage text", () => {

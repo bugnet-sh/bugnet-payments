@@ -1,5 +1,5 @@
 import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
-import { createServer, type IncomingMessage } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
     type Address,
@@ -33,6 +33,7 @@ import { isRecord } from "../is-record.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { MEMO_PROGRAM, TOKEN_PROGRAM, USDC_DECIMALS, USDC_MINT } from "../solana/constants.ts";
 import { createRpc, type SolanaRpc } from "../solana/rpc.ts";
+import { MAINNET_GENESIS, MAINNET_HISTORY_PROBE } from "../solana/router/index.ts";
 
 export interface FakeChain {
     url: string;
@@ -68,8 +69,52 @@ export interface FakeChain {
         lifetime?: { blockhash: string; lastValidBlockHeight: bigint };
     }): Promise<string>;
     withholdTransaction(signature: string, times: number): void;
+    // SOL balances getBalance answers, 0 for an unknown address
+    lamports(address: string): bigint;
+    fundLamports(address: string, lamports: bigint): void;
+    calls(): { method: string; params: unknown[] }[];
+    // Another RPC endpoint over this same chain, on its own loopback port (so its own domain)
+    addEndpoint(o?: {
+        lag?: number;
+        refuse?: boolean;
+        history?: boolean | "short" | "alternate";
+        genesis?: string;
+        ignoreMinContextSlot?: boolean;
+    }): Promise<FakeChainEndpoint>;
+    close(): Promise<void>;
+}
+
+export interface FakeChainEndpoint {
+    url: string;
+    setLag(slots: number, o?: { refuse?: boolean }): void;
+    // Answers the slot it had when frozen
+    freeze(on: boolean): void;
+    // false: -32011 for every history lookup; "short": null; "alternate": every second one null
+    setHistory(mode: boolean | "short" | "alternate"): void;
+    ignoreMinContextSlot(on: boolean): void;
+    rateLimit(times: number, retryAfterSeconds?: number): void;
+    failNext(status?: number): void;
+    // "after": handles the request, never answers; with methods, only those calls stall
+    stall(mode: "off" | "before" | "after", o?: { methods?: readonly string[] }): void;
+    // A known signature sent with preflight answers -32002 AlreadyProcessed
+    alreadyProcessed(on: boolean): void;
+    // The next sendTransaction answers its signature and lands nothing
+    dropNext(): void;
     calls(): { method: string; params: unknown[] }[];
     close(): Promise<void>;
+}
+
+// One added endpoint's own view of the shared chain
+interface EndpointView {
+    lag: number;
+    refuse: boolean;
+    frozen: { slot: bigint; finalized: bigint } | null;
+    ignoreMin: boolean;
+    history: boolean | "short" | "alternate";
+    historyLookups: number;
+    alreadyProcessed: boolean;
+    dropNext: boolean;
+    genesis: string;
 }
 
 const GENESIS_SLOT = 1_000n;
@@ -197,6 +242,12 @@ export async function startFakeChain(
     const hidden = new Map<string, number>();
     const withheld = new Map<string, number>();
     const requests: { method: string; params: unknown[] }[] = [];
+    const lamportsByAddress = new Map<string, bigint>();
+    // Set while an added endpoint's request is answered; answer() runs synchronously
+    let current: EndpointView | null = null;
+    const endpointClosers: (() => Promise<void>)[] = [];
+    // The router's history check asks for this old mainnet transaction before any payment exists
+    const probeSlot = GENESIS_SLOT - 1n;
     const heights = new Map<string, bigint>([
         [blockhashOf(GENESIS_SLOT), GENESIS_SLOT - HEIGHT_OFFSET],
     ]);
@@ -366,7 +417,14 @@ export async function startFakeChain(
         return sig;
     }
 
-    function sendTransaction(wire: string): string {
+    // A lagging endpoint has not seen a blockhash newer than its own slot, so its simulation and
+    // its send's preflight miss it, as a lagging Agave node does
+    function unseenBlockhash(known: bigint): boolean {
+        if (current === null) return false;
+        return known + HEIGHT_OFFSET > (current.frozen?.slot ?? slot) - BigInt(current.lag);
+    }
+
+    function sendTransaction(wire: string, preflight: boolean): string {
         let tx: Transaction;
         let compiled: ReturnType<typeof decodeMessage>;
         try {
@@ -376,7 +434,11 @@ export async function startFakeChain(
             throw new RpcError(-32602, "Invalid param: failed to deserialize transaction");
         }
         const known = heights.get(compiled.lifetimeToken);
-        if (known === undefined || heightOf(slot) > known + BLOCKHASH_LIFE) {
+        if (
+            known === undefined ||
+            heightOf(slot) > known + BLOCKHASH_LIFE ||
+            (preflight && unseenBlockhash(known))
+        ) {
             throw new RpcError(-32002, "Transaction simulation failed: Blockhash not found", {
                 err: "BlockhashNotFound",
                 logs: [],
@@ -451,8 +513,10 @@ export async function startFakeChain(
     function viewSlot(method: string, commitment: unknown): bigint {
         // Kit strips an explicit finalized and injects confirmed when none is given, so a request
         // that arrives with no commitment is the finalized one, as on a real node
-        const base = commitment === undefined || commitment === "finalized" ? finalized() : slot;
-        const at = base - BigInt(lagFor(method));
+        const head = current?.frozen?.slot ?? slot;
+        const fin = current?.frozen?.finalized ?? finalized();
+        const base = commitment === undefined || commitment === "finalized" ? fin : head;
+        const at = base - BigInt(current === null ? lagFor(method) : current.lag);
         return at < 0n ? 0n : at;
     }
 
@@ -597,14 +661,84 @@ export async function startFakeChain(
         };
     }
 
+    // An added endpoint's history: full, short (a node whose history does not reach the slot), or
+    // none (-32011, a node run without transaction history)
+    function historyMode(): "full" | "short" {
+        if (current === null || current.history === true) return "full";
+        if (current.history === false) {
+            throw new RpcError(-32011, "Transaction history is not available from this node");
+        }
+        if (current.history === "short") return "short";
+        current.historyLookups += 1;
+        return current.historyLookups % 2 === 1 ? "full" : "short";
+    }
+
+    function signatureOfWire(wire: string): string {
+        const tx = getTransactionDecoder().decode(getBase64Encoder().encode(wire));
+        const first = Object.values(tx.signatures)[0];
+        return getBase58Decoder().decode(first ?? new Uint8Array(64));
+    }
+
+    // A dry run of apply() on the current state: nothing lands
+    function simulate(wire: string): Record<string, unknown> {
+        let tx: Transaction;
+        let compiled: ReturnType<typeof decodeMessage>;
+        try {
+            tx = getTransactionDecoder().decode(getBase64Encoder().encode(wire));
+            compiled = decodeMessage(tx);
+        } catch {
+            throw new RpcError(-32602, "Invalid param: failed to deserialize transaction");
+        }
+        const result = { logs: [], accounts: null, unitsConsumed: 0, returnData: null };
+        const known = heights.get(compiled.lifetimeToken);
+        if (
+            known === undefined ||
+            heightOf(slot) > known + BLOCKHASH_LIFE ||
+            unseenBlockhash(known)
+        ) {
+            return { err: "BlockhashNotFound", ...result };
+        }
+        const keys = [...compiled.staticAccounts] as string[];
+        const instructions = compiled.instructions.map((ix) => ({
+            program: keys[ix.programAddressIndex]!,
+            accounts: (ix.accountIndices ?? []).map((i) => keys[i]!),
+            data: new Uint8Array(ix.data ?? []),
+        }));
+        const { err } = apply(keys, compiled.header.numSignerAccounts, instructions);
+        return { err, ...result, unitsConsumed: 1_000 };
+    }
+
+    function probeTransaction(): Record<string, unknown> {
+        return {
+            slot: probeSlot,
+            blockTime: null,
+            version: 0,
+            transaction: ["", "base64"],
+            meta: {
+                err: null,
+                fee: 5000,
+                preBalances: [],
+                postBalances: [],
+                preTokenBalances: [],
+                postTokenBalances: [],
+                innerInstructions: [],
+                logMessages: [],
+                loadedAddresses: { writable: [], readonly: [] },
+            },
+        };
+    }
+
     function answer(method: string, params: unknown[]): unknown {
         const last = params[params.length - 1];
         const config = isRecord(last) ? last : {};
         const view = viewSlot(method, config.commitment);
+        // Above the head every node refuses; below it only a lagged view that is set to refuse
+        const head = current?.frozen?.slot ?? slot;
+        const refuseLagged = current === null ? lagRefuses : current.refuse;
         if (
             typeof config.minContextSlot === "number" &&
-            lagRefuses &&
-            view < config.minContextSlot
+            current?.ignoreMin !== true &&
+            (config.minContextSlot > head || (refuseLagged && view < config.minContextSlot))
         ) {
             throw new RpcError(
                 MIN_CONTEXT_SLOT_NOT_REACHED,
@@ -616,6 +750,12 @@ export async function startFakeChain(
         }
         const context = { slot: view };
         switch (method) {
+            case "getGenesisHash":
+                return current?.genesis ?? MAINNET_GENESIS;
+            case "getBalance":
+                return { context, value: lamportsByAddress.get(params[0] as string) ?? 0n };
+            case "simulateTransaction":
+                return { context, value: simulate(params[0] as string) };
             case "getSlot":
                 return view;
             case "getBlockHeight":
@@ -658,9 +798,23 @@ export async function startFakeChain(
             }
             case "getSignatureStatuses": {
                 const sigs = params[0] as string[];
+                if (config.searchTransactionHistory === true && historyMode() === "short") {
+                    return {
+                        context: { slot: viewSlot(method, "confirmed") },
+                        value: sigs.map(() => null),
+                    };
+                }
                 return {
                     context: { slot: viewSlot(method, "confirmed") },
                     value: sigs.map((s) => {
+                        if (s === MAINNET_HISTORY_PROBE.signature) {
+                            return {
+                                slot: probeSlot,
+                                confirmations: null,
+                                err: null,
+                                confirmationStatus: "finalized",
+                            };
+                        }
                         const t = bySignature.get(s);
                         if (t === undefined || t.slot > viewSlot(method, "confirmed")) return null;
                         return {
@@ -674,12 +828,14 @@ export async function startFakeChain(
             }
             case "getSignaturesForAddress": {
                 const addr = params[0] as string;
+                if (historyMode() === "short") return [];
                 let list = txs
                     .filter((t) => t.slot <= view && t.keys.includes(addr))
                     .sort((a, b) => (a.slot === b.slot ? b.seq - a.seq : a.slot > b.slot ? -1 : 1));
+                // Agave answers an unknown before cursor with an empty page, not from the top
                 if (typeof config.before === "string") {
                     const at = list.findIndex((t) => t.signature === config.before);
-                    if (at >= 0) list = list.slice(at + 1);
+                    list = at >= 0 ? list.slice(at + 1) : [];
                 }
                 if (typeof config.until === "string") {
                     const at = list.findIndex((t) => t.signature === config.until);
@@ -701,7 +857,21 @@ export async function startFakeChain(
             }
             case "getTransaction": {
                 const sig = params[0] as string;
+                if (historyMode() === "short") return null;
                 const t = bySignature.get(sig);
+                const probe = sig === MAINNET_HISTORY_PROBE.signature;
+                // Every transaction here is v0, which Agave refuses to a caller without the field
+                if (
+                    (t !== undefined || probe) &&
+                    config.maxSupportedTransactionVersion === undefined
+                ) {
+                    throw new RpcError(
+                        -32015,
+                        "Transaction version (0) is not supported by the requesting client. " +
+                            'Please try the request again with the following configuration parameter: "maxSupportedTransactionVersion": 0',
+                    );
+                }
+                if (probe) return probeTransaction();
                 const left = withheld.get(sig) ?? 0;
                 if (left > 0) {
                     withheld.set(sig, left - 1);
@@ -714,7 +884,29 @@ export async function startFakeChain(
                 if (config.encoding !== "base64") {
                     throw new RpcError(-32602, "fake chain supports base64 only");
                 }
-                return sendTransaction(params[0] as string);
+                const wire = params[0] as string;
+                if (current?.dropNext === true) {
+                    current.dropNext = false;
+                    return signatureOfWire(wire);
+                }
+                if (
+                    current?.alreadyProcessed === true &&
+                    config.skipPreflight !== true &&
+                    bySignature.has(signatureOfWire(wire))
+                ) {
+                    throw new RpcError(
+                        -32002,
+                        "Transaction simulation failed: This transaction has already been processed",
+                        {
+                            err: "AlreadyProcessed",
+                            logs: [],
+                            accounts: null,
+                            unitsConsumed: 0,
+                            returnData: null,
+                        },
+                    );
+                }
+                return sendTransaction(wire, config.skipPreflight !== true);
             }
             default:
                 throw new RpcError(-32601, `Method not found: ${method}`);
@@ -726,35 +918,145 @@ export async function startFakeChain(
         id,
         error: { code, message, ...(data === undefined ? {} : { data }) },
     });
+    function respond(
+        body: string,
+        view: EndpointView | null,
+        log: { method: string; params: unknown[] }[],
+    ): unknown {
+        let id: unknown = null;
+        try {
+            const parsed: unknown = JSON.parse(body);
+            if (!isRecord(parsed) || typeof parsed.method !== "string") {
+                return rpcError(null, -32600, "Invalid request");
+            }
+            id = parsed.id ?? null;
+            const params = Array.isArray(parsed.params) ? (parsed.params as unknown[]) : [];
+            log.push({ method: parsed.method, params });
+            current = view;
+            try {
+                return { jsonrpc: "2.0", id, result: answer(parsed.method, params) };
+            } finally {
+                current = null;
+            }
+        } catch (e) {
+            if (e instanceof RpcError) return rpcError(id, e.code, e.message, e.data);
+            if (e instanceof SyntaxError) return rpcError(null, -32700, "Parse error");
+            return rpcError(id, -32603, "Internal error");
+        }
+    }
+    const send = (res: ServerResponse, payload: unknown) => {
+        res.setHeader("content-type", "application/json");
+        res.end(
+            JSON.stringify(payload, (_k, v: unknown) => (typeof v === "bigint" ? Number(v) : v)),
+        );
+    };
     const server = createServer((req, res) => {
         void readBody(req)
-            .then((body): unknown => {
-                let id: unknown = null;
-                try {
-                    const parsed: unknown = JSON.parse(body);
-                    if (!isRecord(parsed) || typeof parsed.method !== "string") {
-                        return rpcError(null, -32600, "Invalid request");
-                    }
-                    id = parsed.id ?? null;
-                    const params = Array.isArray(parsed.params) ? (parsed.params as unknown[]) : [];
-                    requests.push({ method: parsed.method, params });
-                    return { jsonrpc: "2.0", id, result: answer(parsed.method, params) };
-                } catch (e) {
-                    if (e instanceof RpcError) return rpcError(id, e.code, e.message, e.data);
-                    if (e instanceof SyntaxError) return rpcError(null, -32700, "Parse error");
-                    return rpcError(id, -32603, "Internal error");
-                }
-            })
+            .then((body) => respond(body, null, requests))
             .catch(() => rpcError(null, -32603, "Internal error"))
-            .then((payload) => {
-                res.setHeader("content-type", "application/json");
-                res.end(
-                    JSON.stringify(payload, (_k, v: unknown) =>
-                        typeof v === "bigint" ? Number(v) : v,
-                    ),
-                );
-            });
+            .then((payload) => send(res, payload));
     });
+
+    async function addEndpoint(
+        o: Parameters<FakeChain["addEndpoint"]>[0] = {},
+    ): Promise<FakeChainEndpoint> {
+        const view: EndpointView = {
+            lag: o.lag ?? 0,
+            refuse: o.refuse ?? true,
+            frozen: null,
+            ignoreMin: o.ignoreMinContextSlot ?? false,
+            history: o.history ?? true,
+            historyLookups: 0,
+            alreadyProcessed: false,
+            dropNext: false,
+            genesis: o.genesis ?? MAINNET_GENESIS,
+        };
+        const log: { method: string; params: unknown[] }[] = [];
+        let limited = 0;
+        // Without one, a 429 carries no Retry-After, as some endpoints answer
+        let retryAfter: number | null = null;
+        let failStatus: number | null = null;
+        let stallMode: "off" | "before" | "after" = "off";
+        let stalled: ReadonlySet<string> | null = null;
+        const stalls = (body: string): boolean => {
+            if (stalled === null) return true;
+            try {
+                const parsed: unknown = JSON.parse(body);
+                return isRecord(parsed) && stalled.has(String(parsed.method));
+            } catch {
+                return false;
+            }
+        };
+        const ep = createServer((req, res) => {
+            void readBody(req)
+                .then((body) => {
+                    if (stallMode === "before" && stalls(body)) return;
+                    if (limited > 0) {
+                        limited -= 1;
+                        res.writeHead(
+                            429,
+                            retryAfter === null ? {} : { "retry-after": String(retryAfter) },
+                        );
+                        res.end();
+                        return;
+                    }
+                    if (failStatus !== null) {
+                        const status = failStatus;
+                        failStatus = null;
+                        res.writeHead(status);
+                        res.end();
+                        return;
+                    }
+                    const payload = respond(body, view, log);
+                    if (stallMode === "after" && stalls(body)) return;
+                    send(res, payload);
+                })
+                // A client that aborts during the body read leaves nothing to answer
+                .catch(() => res.destroy());
+        });
+        await new Promise<void>((resolve) => ep.listen(0, "127.0.0.1", resolve));
+        const close = async () => {
+            ep.closeAllConnections();
+            await new Promise<void>((resolve) => ep.close(() => resolve()));
+        };
+        endpointClosers.push(close);
+        return {
+            url: `http://127.0.0.1:${(ep.address() as AddressInfo).port}`,
+            setLag(slots, opts = {}) {
+                view.lag = slots;
+                view.refuse = opts.refuse ?? true;
+            },
+            freeze(on) {
+                view.frozen = on ? { slot, finalized: finalized() } : null;
+            },
+            setHistory(mode) {
+                view.history = mode;
+                view.historyLookups = 0;
+            },
+            ignoreMinContextSlot(on) {
+                view.ignoreMin = on;
+            },
+            rateLimit(times, retryAfterSeconds) {
+                limited = times;
+                retryAfter = retryAfterSeconds ?? null;
+            },
+            failNext(status = 500) {
+                failStatus = status;
+            },
+            stall(mode, opts = {}) {
+                stallMode = mode;
+                stalled = opts.methods === undefined ? null : new Set(opts.methods);
+            },
+            alreadyProcessed(on) {
+                view.alreadyProcessed = on;
+            },
+            dropNext() {
+                view.dropNext = true;
+            },
+            calls: () => log.map((r) => ({ ...r })),
+            close,
+        };
+    }
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     const rpc = createRpc(url);
@@ -868,6 +1170,10 @@ export async function startFakeChain(
             );
         },
         hideFromIndex: (sig, ms) => hidden.set(sig, Date.now() + ms),
+        lamports: (address) => lamportsByAddress.get(address) ?? 0n,
+        fundLamports: (address, lamports) => {
+            lamportsByAddress.set(address, lamports);
+        },
         lagNode(slots, opts = {}) {
             lag = slots;
             lagRefuses = opts.refuse ?? true;
@@ -879,8 +1185,10 @@ export async function startFakeChain(
         transfer: buildAndSend,
         withholdTransaction: (sig, times) => withheld.set(sig, times),
         calls: () => requests.map((r) => ({ ...r })),
+        addEndpoint,
         async close() {
             if (timer !== undefined) clearInterval(timer);
+            for (const closeEndpoint of endpointClosers) await closeEndpoint().catch(() => {});
             server.closeAllConnections();
             await new Promise<void>((resolve) => server.close(() => resolve()));
         },

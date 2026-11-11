@@ -46,9 +46,17 @@ import { orderPublicKeyBase64 } from "./orders/token.ts";
 import { runRefunds } from "./refunds/executor.ts";
 import type { RouterClient } from "./router/client.ts";
 import { usdcAta } from "./solana/accounts.ts";
-import { countingRpc } from "./solana/budget.ts";
+import { countingRpc, rpcCounter } from "./solana/budget.ts";
 import { loadKeypair } from "./solana/keys.ts";
-import { createRpc, type SolanaRpc } from "./solana/rpc.ts";
+import { createRouterRpc, type RoutedRpc, type SolanaRpc } from "./solana/rpc.ts";
+import { type RouterDeps, type RouterTransport, RpcRouterError } from "./solana/router/index.ts";
+import {
+    endpointFingerprint,
+    historyProbe,
+    pgSnapshotStore,
+    pgUsageStore,
+    pgVerdictStore,
+} from "./solana/rpc-store.ts";
 import { auditX402 } from "./x402/audit.ts";
 import { runCloseCheck, runCloseJob } from "./x402/close.ts";
 import { advanceColdTransfers, runColdTransfer } from "./x402/cold.ts";
@@ -76,6 +84,10 @@ export interface StartOptions {
     rpc?: SolanaRpc;
     log?: Log;
     now?: () => Date;
+    // Tests map each list position to their own endpoint
+    rpcTransportFor?: RouterDeps["transportFor"];
+    // Tests read the router's snapshot, which the service only writes on its tick
+    onRouter?: (router: RouterTransport) => void;
 }
 
 export interface RunningService {
@@ -171,15 +183,57 @@ export async function startService(o: StartOptions): Promise<RunningService> {
         const feePayer = await loadKeypair(secrets.feePayerKey, "BUGNET_FEE_PAYER_KEY");
         const refundSigner = await loadKeypair(secrets.refundKey, "BUGNET_REFUND_KEY");
         const x402On = s.x402.allowance_wallet !== "";
-        const rpc0 = o.rpc ?? createRpc(secrets.rpcUrl);
-        const rpc = x402On
-            ? countingRpc(rpc0, {
+        const recipient = address(s.solana.recipient);
+        // Before the router starts, so a list that fails its checks still shows which line counts
+        if (secrets.rpcSingleIgnored) {
+            log.warn("rpc BUGNET_SOLANA_RPC_URL is ignored while BUGNET_SOLANA_RPC_URLS is set");
+        }
+        let routed: RoutedRpc | null = null;
+        let rpc0: SolanaRpc;
+        let bg0: SolanaRpc;
+        if (o.rpc !== undefined) {
+            rpc0 = o.rpc;
+            bg0 = o.rpc;
+        } else {
+            const recipientAta = await usdcAta(recipient);
+            routed = createRouterRpc(s.solana.rpc, secrets.rpcUrls, {
+                log,
+                now: () => now().getTime(),
+                random: Math.random,
+                usage: pgUsageStore(pool),
+                snapshots: pgSnapshotStore(pool, now),
+                verdicts: pgVerdictStore(pool, now, s.solana.rpc.history_check_every),
+                fingerprint: endpointFingerprint(secrets.claimKey),
+                historyProbe: () => historyProbe(pool, recipientAta),
+                ...(o.rpcTransportFor === undefined ? {} : { transportFor: o.rpcTransportFor }),
+            });
+            const router = routed.router;
+            o.onRouter?.(router);
+            closers.push(() => router.stop());
+            try {
+                // Resolves after the genesis and slot reads; the slower checks finish behind it
+                await router.start({ timers: true });
+            } catch (err) {
+                if (err instanceof RpcRouterError && err.reason === "wrong_network") {
+                    throw new BootCheckError(
+                        `RPC endpoint ${err.endpoint} is not on Solana mainnet`,
+                    );
+                }
+                throw err;
+            }
+            rpc0 = routed.rpc;
+            bg0 = routed.backgroundRpc;
+        }
+        // One counter under both lanes, so the hourly alarm counts each logical call once
+        const counter = x402On
+            ? rpcCounter({
                   limitPerHour: s.x402.rpc_calls_per_hour_alarm,
                   log,
                   now: () => now().getTime(),
               })
-            : rpc0;
-        const recipient = address(s.solana.recipient);
+            : null;
+        const rpc = counter === null ? rpc0 : countingRpc(rpc0, counter);
+        const backgroundRpc = counter === null ? bg0 : countingRpc(bg0, counter);
 
         const boot = await bootChecks({
             rpc,
@@ -189,6 +243,7 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             feePayerMinLamports: BigInt(s.solana.fee_payer_boot_min_lamports),
             refundsEnabled: s.refunds.enabled,
             eventPublicKey: s.router.event_public_key,
+            rpcTimeoutMs: s.solana.rpc_timeout,
         });
         if (s.orders.max_amount_micros > s.refunds.daily_cap_micros) {
             log.warn(
@@ -260,6 +315,7 @@ export async function startService(o: StartOptions): Promise<RunningService> {
                 runMirror: mirrorOnce,
                 log,
                 now,
+                rpcTimeoutMs: s.solana.rpc_timeout,
             });
             const index = indexHolder(s.x402.indexed_services_file, log, checked.index);
             wiring = {
@@ -361,6 +417,7 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             s,
             pool,
             rpc,
+            backgroundRpc,
             router: http.router,
             feePayer,
             refundSigner,
@@ -378,7 +435,11 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             feePayer: feePayer.address,
             feePayerLamports: boot.feePayerLamports,
             refunds: s.refunds.enabled,
+            ...(routed === null ? {} : { rpc: rpcStartFields(routed) }),
         });
+        if (routed !== null && routed.router.mode === "routed") {
+            if (routed.router.snapshot().absenceQuorum === 1) log.warn("rpc absence quorum is 1");
+        }
 
         return {
             internalPort: internal.port,
@@ -401,10 +462,24 @@ export async function startService(o: StartOptions): Promise<RunningService> {
     }
 }
 
+// Names and counts only, never a URL or a domain
+function rpcStartFields(routed: RoutedRpc): Record<string, unknown> {
+    const snap = routed.router.snapshot();
+    return {
+        mode: snap.mode,
+        endpoints: snap.endpoints.map((e) => e.name),
+        domains: snap.domains,
+        absenceQuorum: snap.absenceQuorum,
+        sendFanout: snap.sendFanout,
+    };
+}
+
 interface JobDeps {
     s: Settings;
     pool: pg.Pool;
     rpc: SolanaRpc;
+    // Watch-only jobs: alarms and audits
+    backgroundRpc: SolanaRpc;
     router: RouterClient;
     feePayer: KeyPairSigner;
     refundSigner: KeyPairSigner;
@@ -468,7 +543,7 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
                 snapshot = await checkAlarms(
                     {
                         pool,
-                        rpc,
+                        rpc: d.backgroundRpc,
                         feePayer: d.feePayer.address,
                         refundWallet: d.refundSigner.address,
                         alarms: s.alarms,
@@ -488,7 +563,7 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
             tracked(async () => {
                 const r = await auditInflows({
                     pool,
-                    rpc,
+                    rpc: d.backgroundRpc,
                     recipient: d.recipient,
                     rpcTimeoutMs,
                     log,
@@ -504,7 +579,7 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
                 try {
                     await auditX402({
                         pool,
-                        rpc,
+                        rpc: d.backgroundRpc,
                         hotTokenAccount: x.hotTokenAccount,
                         x402: s.x402,
                         rpcTimeoutMs,

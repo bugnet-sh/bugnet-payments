@@ -23,7 +23,12 @@ import { orderPublicKeyBase64 } from "./orders/token.ts";
 import { usdcAta } from "./solana/accounts.ts";
 import { TOKEN_PROGRAM, USDC_MINT } from "./solana/constants.ts";
 import { testDb, type TestDb } from "./testing/db.ts";
-import { createFakeRpc, type FakeRpc, type FakeRpcScript } from "./testing/fake-rpc.ts";
+import {
+    createFakeRpc,
+    type FakeRpc,
+    type FakeRpcScript,
+    neverAnswers,
+} from "./testing/fake-rpc.ts";
 import { testSigner } from "./testing/keys.ts";
 import { memoryLog } from "./log.ts";
 import { makeTestPki } from "./testing/pki.ts";
@@ -86,8 +91,32 @@ function deps(rpc: FakeRpc) {
         feePayerMinLamports: 100_000_000n,
         refundsEnabled: false,
         eventPublicKey: EVENT_KEY,
+        rpcTimeoutMs: 1_000,
     };
 }
+
+// The deadline's own abort, not a fast failure of another cause, ends the read
+async function endsAtDeadline(run: Promise<unknown>): Promise<void> {
+    const started = Date.now();
+    await expect(run).rejects.toThrow(/abort|timeout/i);
+    const took = Date.now() - started;
+    expect(took).toBeGreaterThanOrEqual(900);
+    expect(took).toBeLessThan(1_500);
+}
+
+describe("boot deadlines", () => {
+    it("boot reads have a deadline", async () => {
+        await endsAtDeadline(bootChecks(deps(okAccounts({ getBalance: neverAnswers }))));
+        await endsAtDeadline(bootChecks(deps(okAccounts({ getAccountInfo: neverAnswers }))));
+        // The refund wallet's account is read last, with refunds on
+        const recipientAta = await usdcAta(recipient);
+        const refundStalls = okAccounts({
+            getAccountInfo: (ata: Address) =>
+                ata === recipientAta ? tokenAccount(recipient) : neverAnswers(),
+        });
+        await endsAtDeadline(bootChecks({ ...deps(refundStalls), refundsEnabled: true }));
+    });
+});
 
 describe("bootChecks", () => {
     it("refuses a missing recipient USDC account", async () => {
@@ -265,6 +294,7 @@ describe("x402BootChecks", () => {
             runMirror: vi.fn(async () => "skipped" as const),
             log,
             now: () => T0,
+            rpcTimeoutMs: 1_000,
             ...over,
         };
     }
@@ -279,6 +309,12 @@ describe("x402BootChecks", () => {
             [accountId, JSON.stringify({ order_id: accountId })],
         );
     }
+
+    it("the hot account read has a deadline", async () => {
+        await endsAtDeadline(
+            x402BootChecks(createFakeRpc({ getAccountInfo: neverAnswers }), x402Deps()),
+        );
+    });
 
     it("refuses a key whose address is not allowance_wallet", async () => {
         const other = await secretKey(12);

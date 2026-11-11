@@ -14,6 +14,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { join, resolve } from "node:path";
 import { address, type Address } from "@solana/kit";
 import { decodePaymentResponseHeader } from "@x402/core/http";
+import { rpcUrlsOf } from "../../src/config.ts";
 import { loadTestPayer } from "../../src/keys/test-payer.ts";
 import { inspectTokenAccount, usdcAta } from "../../src/solana/accounts.ts";
 import { SOLANA_MAINNET, USDC_MINT } from "../../src/solana/constants.ts";
@@ -536,8 +537,7 @@ async function runPay(argv: string[]): Promise<void> {
     if (process.env.BUGNET_INDEX_CALLS_PAY !== "yes") {
         throw new Error("--pay needs BUGNET_INDEX_CALLS_PAY=yes as well");
     }
-    const rpcUrl = (process.env.BUGNET_SOLANA_RPC_URL ?? "").trim();
-    if (rpcUrl === "") throw new Error("BUGNET_SOLANA_RPC_URL is not set");
+    const rpcUrl = rpcUrlsOf(process.env)[0]!;
     const signer = await loadTestPayer(process.env);
     if (signer === null) {
         throw new Error("BUGNET_TEST_PAYER_KEY or BUGNET_TEST_PAYER_MNEMONIC is not set");
