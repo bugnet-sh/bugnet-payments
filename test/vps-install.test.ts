@@ -1,5 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+    chmodSync,
+    existsSync,
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -11,7 +19,11 @@ let dir: string;
 beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "bn-vps-install-"));
 });
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
+afterEach(() => {
+    // A test may leave the folder read only
+    chmodSync(dir, 0o700);
+    rmSync(dir, { recursive: true, force: true });
+});
 
 // Sources the script as a library and runs one function, as a non-root user
 function call(fn: string, args: string[], stdin = "", envFile = join(dir, "payments.env")) {
@@ -69,6 +81,95 @@ describe("vps-install.sh RPC list", () => {
         );
         expect(r.out.trim()).toBe(`BUGNET_SOLANA_RPC_URLS set in ${file}: 2 URLs`);
         expect(r.all).not.toContain("a.example");
+    });
+
+    it("rpc_env_ok refuses a second list line", () => {
+        const r = call("rpc_env_ok", [
+            envFile(
+                "BUGNET_SOLANA_RPC_URLS=https://a.example ;x\nBUGNET_SOLANA_RPC_URLS=https://b.example\n",
+            ),
+        ]);
+        expect(r.code).toBe(1);
+        expect(r.err).toContain("holds 2 BUGNET_SOLANA_RPC_URLS lines");
+        expect(r.all).not.toContain("a.example");
+    });
+
+    it("write_rpc_list keeps the env file whole when it cannot write beside it", () => {
+        const before =
+            "BUGNET_FEE_PAYER_KEY=madeupfeepayer\nBUGNET_SOLANA_RPC_URLS=https://old.example\n";
+        const file = envFile(before);
+        // No new file can be made in the folder, while the env file itself stays writable
+        chmodSync(dir, 0o500);
+        const r = spawnSync(
+            "bash",
+            ["-c", `. "${SCRIPT}"; write_rpc_list "$1" || echo failed`, "bash", file],
+            {
+                input: "BUGNET_SOLANA_RPC_URLS=https://a.example,https://b.example\n",
+                encoding: "utf8",
+                env: { ...process.env, VPS_INSTALL_LIB: "1", BUGNET_PAYMENTS_ENV: file },
+            },
+        );
+        chmodSync(dir, 0o700);
+        expect(r.stdout.trim()).toBe("failed");
+        expect(r.stderr).toContain("cannot create a temporary file");
+        expect(readFileSync(file, "utf8")).toBe(before);
+        expect(r.stdout + r.stderr).not.toContain("a.example");
+    });
+
+    it("--start restarts a running unit so it loads a changed list", () => {
+        const bin = join(dir, "bin");
+        const etc = join(dir, "etc");
+        const log = join(dir, "systemctl.log");
+        mkdirSync(bin);
+        mkdirSync(join(etc, "payments"), { recursive: true });
+        for (const f of [
+            "internal-ca.pem",
+            "payments/x402-server.pem",
+            "payments/x402-index.json",
+        ]) {
+            writeFileSync(join(etc, f), "");
+        }
+        writeFileSync(join(etc, "payments.toml"), "[solana]\n");
+        writeFileSync(join(etc, "payments.release"), "v9\n");
+        const names = [
+            "BUGNET_PAYMENTS_TOKEN",
+            "BUGNET_PAYMENTS_ROUTER_TOKEN",
+            "BUGNET_ORDER_PRIVATE_KEY",
+            "BUGNET_CLAIM_KEY",
+            "BUGNET_FEE_PAYER_KEY",
+            "BUGNET_REFUND_KEY",
+            "BUGNET_ALLOWANCE_KEY",
+            "BUGNET_X402_TLS_KEY",
+        ];
+        const file = envFile(
+            `${names.map((n) => `${n}=x`).join("\n")}\nBUGNET_SOLANA_RPC_URLS=https://a.example\n`,
+        );
+        // systemctl records its arguments and says every unit is active; curl answers health
+        writeFileSync(join(bin, "systemctl"), `#!/usr/bin/env bash\necho "$*" >> "${log}"\n`);
+        writeFileSync(join(bin, "curl"), "#!/usr/bin/env bash\nexit 0\n");
+        writeFileSync(join(bin, "journalctl"), "#!/usr/bin/env bash\nexit 0\n");
+        for (const tool of ["systemctl", "curl", "journalctl"]) chmodSync(join(bin, tool), 0o755);
+        const r = spawnSync(
+            "bash",
+            [
+                "-c",
+                `. "${SCRIPT}"; ETC="$1"; TOML="$1/payments.toml"; RELEASE_FILE="$1/payments.release"; do_start`,
+                "bash",
+                etc,
+            ],
+            {
+                encoding: "utf8",
+                env: {
+                    ...process.env,
+                    PATH: `${bin}:${process.env.PATH ?? ""}`,
+                    VPS_INSTALL_LIB: "1",
+                    BUGNET_PAYMENTS_ENV: file,
+                },
+            },
+        );
+        expect(r.stderr).toBe("");
+        expect(r.status).toBe(0);
+        expect(readFileSync(log, "utf8")).toContain("restart bugnet-payments@v9\n");
     });
 
     it("write_rpc_list refuses two lines, none, or a bad line", () => {

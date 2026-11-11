@@ -3,7 +3,7 @@
 # the installed release's vps-install.sh --rpc-urls. Run in bugnet-payments on the Mac:
 #
 #   deploy/push-rpc-urls.sh [ssh options] HOST
-#   for example: deploy/push-rpc-urls.sh -p 2222 -i ~/.ssh/bugnet_deploy bugnet@62.72.21.74
+#   for example: deploy/push-rpc-urls.sh -p PORT -i KEY_FILE USER@HOST
 #
 # The line only travels through pipes: never an argument, an echoed variable or a file, so it
 # shows in no process list and no shell history. It prints counts and names, never a URL.
