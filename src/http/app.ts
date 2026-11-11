@@ -33,8 +33,8 @@ export interface HttpAppDeps {
     rpc: SolanaRpc;
     feePayer: KeyPairSigner;
     x402?: HttpX402Parts;
-    // The balance route's reads; the money client until the RPC router gives a background lane
-    backgroundRpc?: SolanaRpc;
+    // The balance route's reads, on the router's background lane, never the money lane
+    backgroundRpc: SolanaRpc;
     // null without a deposit seed
     deposits?: PublicDeposits | null;
     log: Log;
@@ -162,7 +162,7 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
         checkoutJsPath: o.checkoutJsPath ?? CHECKOUT_JS,
         depositSettings: s.deposits,
         deposits: d.deposits ?? null,
-        backgroundRpc: d.backgroundRpc ?? rpc,
+        backgroundRpc: d.backgroundRpc,
         balancePerIp: ipPerMinute(s.limits.balance_per_ip_per_minute),
         balanceRpc: perMinute(s.limits.balance_rpc_per_minute),
         reportPerIp: ipPerMinute(s.limits.report_per_ip_per_minute),

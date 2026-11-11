@@ -169,7 +169,8 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
                     recipient: recipient.address,
                 }),
             },
-            ...(over.backgroundRpc === undefined ? {} : { backgroundRpc: over.backgroundRpc }),
+            // Tests that leave it out share the one fake client
+            backgroundRpc: over.backgroundRpc ?? over.solanaRpc ?? rpc,
             deposits:
                 watch === null
                     ? null
