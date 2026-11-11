@@ -4,26 +4,31 @@ import {
 } from "@solana/wallet-standard-features";
 import { getWallets } from "@wallet-standard/app";
 import {
+    errorStage,
+    fetchStatus,
     NO_ACCOUNT,
-    NO_SIGNED,
     type PageStep,
     payWithWallet,
+    readBalance,
     reportError,
+    shortReport,
     type StatusDeps,
-    UNREADABLE_CHALLENGE,
     WalletError,
     type WalletPort,
     walletError,
 } from "./flow.ts";
 import {
-    fetchStatus,
     keepPolling,
+    needsReload,
     parseStatus,
     pollDelay,
     showWalletOptions,
+    statusKey,
     type StatusView,
     timeLeft,
+    type WalletWatch,
     walletNote,
+    watchWallet,
 } from "./live.ts";
 import {
     depositLine,
@@ -32,6 +37,7 @@ import {
     PAGE_TEXT,
     pageStep,
     STATE_LABELS,
+    stateStep,
     walletMessage,
 } from "./messages.ts";
 
@@ -108,31 +114,20 @@ function showStep(p: Page, step: PageStep): number | undefined {
     return step.payAfterMs;
 }
 
-async function balanceOf(
-    p: Page,
-    owner: string,
-): Promise<{ usdcMicros: number; needMicros: number } | null> {
-    try {
-        const res = await p.status.fetch(
-            `${p.status.orderUrl}/balance?owner=${encodeURIComponent(owner)}`,
-            { headers: { Accept: "application/json" } },
-        );
-        if (res.status !== 200) return null;
-        const body = (await res.json()) as { usdcMicros?: unknown; needMicros?: unknown };
-        if (typeof body.usdcMicros !== "number" || typeof body.needMicros !== "number") return null;
-        return { usdcMicros: body.usdcMicros, needMicros: body.needMicros };
-    } catch {
-        return null;
-    }
+// The wallet section's side of the poller: each status answer it is handed
+interface WalletSection {
+    seen(v: StatusView): void;
 }
 
-function startPayment(p: Page): void {
+function startPayment(p: Page): WalletSection {
     const list = element<HTMLUListElement>(p.root, "#wallets");
     const button = element<HTMLButtonElement>(p.root, "#pay-button");
     const wallets = getWallets();
     let chosen: Wallet | undefined;
     let busy = false;
     let payable = true;
+    // Set after W16 or W17, until the order shows whether the payment landed
+    let watch: WalletWatch | null = null;
 
     const refresh = () => {
         button.disabled = busy || !payable || chosen === undefined;
@@ -198,15 +193,10 @@ function startPayment(p: Page): void {
             const r = await payWithWallet({
                 ...p.status,
                 wallet: port,
-                balance: (owner) => balanceOf(p, owner),
+                balance: (owner) => readBalance(p.status, owner),
             });
             if (typeof r === "object" && "short" in r) {
-                void reportError(p.status, {
-                    stage: "balance",
-                    wallet: wallet.name,
-                    code: null,
-                    message: `short ${r.short.haveMicros} ${r.short.needMicros}`,
-                });
+                void reportError(p.status, shortReport(wallet.name, r.short));
             }
             step = pageStep(r, ctx);
         } catch (err) {
@@ -219,24 +209,19 @@ function startPayment(p: Page): void {
                 });
                 step = walletMessage(err, ctx);
             } else {
-                const message = err instanceof Error ? err.message : "error";
-                const reportStage =
-                    err instanceof TypeError
-                        ? "status"
-                        : message === UNREADABLE_CHALLENGE
-                          ? "challenge"
-                          : message === NO_SIGNED
-                            ? "sign"
-                            : stage;
                 void reportError(p.status, {
-                    stage: reportStage,
+                    stage: errorStage(err, stage),
                     wallet: wallet.name,
                     code: null,
-                    message,
+                    message: err instanceof Error ? err.message : "error",
                 });
                 step = errorStep(err, ctx);
             }
         }
+        watch =
+            step.watch === undefined
+                ? null
+                : { unpaidForMs: step.watch.unpaidForMs ?? 0, unpaidSince: null };
         offerPayAfter(showStep(p, step));
         busy = false;
         refresh();
@@ -248,21 +233,54 @@ function startPayment(p: Page): void {
     wallets.on("register", render);
     wallets.on("unregister", render);
     render();
+    return {
+        seen(v) {
+            if (watch === null || busy) return;
+            const next = watchWallet(watch, v.state, Date.now());
+            if (next !== "unpaid") {
+                watch = next;
+                return;
+            }
+            watch = null;
+            offerPayAfter(showStep(p, stateStep("unpaid", p.ctx)));
+            refresh();
+        },
+    };
 }
 
 const TICK_MS = 1_000;
 const FAILURES_BEFORE_NOTICE = 3;
 
+const RELOADED_KEY = "bugnet-reloaded";
+const RELOAD_GUARD_MS = 30_000;
+
+// At most one reload in RELOAD_GUARD_MS per order, so a page can never reload in a loop
+function reloadOnce(orderId: string): void {
+    try {
+        const key = `${RELOADED_KEY}:${orderId}`;
+        const last = Number(sessionStorage.getItem(key) ?? "0");
+        if (Date.now() - last < RELOAD_GUARD_MS) return;
+        sessionStorage.setItem(key, String(Date.now()));
+    } catch {
+        // Without storage the page reloads anyway: the new page is drawn for unpaid
+    }
+    location.reload();
+}
+
 // Polls the order's status, keeps the countdown, and updates every live part of the page
-function follow(p: Page): void {
+function follow(p: Page, wallet: WalletSection | null): void {
     const expiresAt = Date.parse(p.root.dataset.expiresAt ?? "");
     const settleGraceMs = Number(p.root.dataset.settleGraceMs ?? "60000");
     const timeEl = p.root.querySelector<HTMLElement>("#time-left");
     const untilEl = p.root.querySelector<HTMLElement>("#until");
     const qr = p.root.querySelector<HTMLImageElement>("#deposit img");
+    // M20 on a page without a deposit, put back once a status error line is no longer true
+    const firstLine = p.depositMessage?.textContent ?? "";
     let offset = Date.parse(p.root.dataset.now ?? "") - Date.now();
     if (Number.isNaN(offset)) offset = 0;
     let remaining: number | null = null;
+    let lastKey: string | null = null;
+    let changedAt = Date.now();
     if (untilEl !== null) untilEl.textContent = `until ${p.ctx.deadline}`;
 
     const tick = () => {
@@ -272,16 +290,37 @@ function follow(p: Page): void {
     const timer = setInterval(tick, TICK_MS);
 
     const apply = (v: StatusView) => {
+        if (needsReload(p.root.dataset.state, v)) {
+            reloadOnce(p.ctx.orderId);
+            return;
+        }
         offset = v.serverNow - Date.now();
+        const key = statusKey(v);
+        if (key !== lastKey) {
+            lastKey = key;
+            changedAt = Date.now();
+        }
         const line = depositLine(v, p.ctx);
         setLabel(p, line.label, v.state);
-        if (p.depositMessage !== null && (v.deposit !== null || v.state !== "unpaid")) {
-            p.depositMessage.textContent = [line.message, ...line.extra].join(" ");
+        if (p.depositMessage !== null) {
+            p.depositMessage.textContent =
+                v.deposit !== null || v.state !== "unpaid"
+                    ? [line.message, ...line.extra].join(" ")
+                    : firstLine;
         }
-        if (qr !== null && v.deposit !== null && v.deposit.remainingMicros !== remaining) {
-            remaining = v.deposit.remainingMicros;
+        // The QR asks for money only while the order takes it
+        const d = v.deposit;
+        if (
+            qr !== null &&
+            d !== null &&
+            v.state === "unpaid" &&
+            d.remainingMicros > 0 &&
+            d.remainingMicros !== remaining
+        ) {
+            remaining = d.remainingMicros;
             qr.src = `/o/${p.ctx.orderId}/qr.svg?r=${remaining}`;
         }
+        wallet?.seen(v);
         const options = showWalletOptions(v);
         for (const id of ["#wallet", "#phone"]) {
             const section = p.root.querySelector<HTMLElement>(id);
@@ -319,7 +358,7 @@ function follow(p: Page): void {
         } else if (view !== null) {
             failures = 0;
             apply(view);
-            if (!keepPolling(view, Date.now() + offset, settleGraceMs)) {
+            if (!keepPolling(view, Date.now() + offset, settleGraceMs, changedAt + offset)) {
                 clearInterval(timer);
                 return;
             }
@@ -380,8 +419,9 @@ if (root !== null) {
             if (line !== null) line.textContent = PAGE_TEXT.copyFailed;
         });
     }
-    if (root.dataset.state === "unpaid" && root.querySelector("#pay-button") !== null) {
-        startPayment(p);
-    }
-    follow(p);
+    const wallet =
+        root.dataset.state === "unpaid" && root.querySelector("#pay-button") !== null
+            ? startPayment(p)
+            : null;
+    follow(p, wallet);
 }

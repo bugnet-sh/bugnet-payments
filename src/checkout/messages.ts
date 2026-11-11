@@ -1,5 +1,6 @@
 import type { PublicState } from "../http/public.ts";
 import {
+    BUILD_FAILED,
     NO_ACCOUNT,
     NO_OPTION,
     type PageStep,
@@ -143,14 +144,24 @@ function heldLine(v: NonNullable<StatusView["deposit"]>, c: MessageContext): str
     }
 }
 
+// M17: money below refund_min_micros stays in the deposit
+function keptLine(v: NonNullable<StatusView["deposit"]>, c: MessageContext): string {
+    return `${amountLabel(v.keptMicros)} arrived, which is below the ${amountLabel(c.refundMinMicros)} Bugnet returns, so it was kept.`;
+}
+
+const P2 = "The payment is confirming on Solana. This page updates when it lands.";
+
 export function depositLine(
     v: StatusView,
     c: MessageContext,
 ): { label: string; message: string; extra: string[] } {
     const d = v.deposit;
-    if (d === null)
-        return { label: STATE_LABELS[v.state], message: stateStep(v.state, c).message, extra: [] };
+    if (d === null) {
+        const message = v.state === "settling" ? P2 : stateStep(v.state, c).message;
+        return { label: STATE_LABELS[v.state], message, extra: [] };
+    }
     const plain = decimalAmount(c.amountMicros);
+    const kept = d.reason === "below_minimum";
     let message: string;
     switch (d.status) {
         case "waiting":
@@ -191,6 +202,11 @@ export function depositLine(
                       "Money is being returned to the address that sent it.");
             break;
         case "refunded":
+            // An expired order whose only money was kept reads refunded too (spec 8.3)
+            if (kept && d.returnedMicros === 0) {
+                message = keptLine(d, c);
+                break;
+            }
             message =
                 d.reason === "unpaid"
                     ? `Time ran out before the full amount arrived. The ${amountLabel(d.returnedMicros > 0 ? d.returnedMicros : d.reasonMicros)} you sent was returned. ${ASK_NEW_LINK}`
@@ -203,11 +219,12 @@ export function depositLine(
         case "expired":
         default:
             message =
-                d.reason === "below_minimum" || (d.keptMicros > 0 && d.receivedMicros === 0)
-                    ? `${amountLabel(d.keptMicros)} arrived, which is below the ${amountLabel(c.refundMinMicros)} Bugnet returns, so it was kept.`
+                kept || (d.keptMicros > 0 && d.receivedMicros === 0)
+                    ? keptLine(d, c)
                     : `This order expired at ${c.deadline} and nothing was charged. ${ASK_NEW_LINK}`;
     }
     const extra: string[] = [];
+    if (d.keptMicros > 0 && message !== keptLine(d, c)) extra.push(keptLine(d, c));
     if ((d.status === "partial" || d.status === "waiting") && d.reason === "payer_blocked") {
         extra.push(blockedLine(d.reasonMicros, d.blockedUntil, c));
     }
@@ -290,7 +307,7 @@ export function errorStep(err: unknown, c: MessageContext & { wallet: string }):
             `${c.wallet} shared no Solana account. Unlock it, pick an account, then press Pay.`,
         );
     }
-    if (message === UNREADABLE_CHALLENGE || message === NO_OPTION) {
+    if (message === UNREADABLE_CHALLENGE || message === NO_OPTION || message === BUILD_FAILED) {
         return step(
             "This page could not read Bugnet's payment request. Nothing was charged. Reload the page, or send to the address above.",
         );
@@ -333,10 +350,12 @@ export function pageStep(r: PayFlowResult, c: MessageContext & { wallet: string 
                 state: "paid",
             };
         case "settling_timeout":
+            // The poller keeps watching: if the payment falls back to unpaid, Pay comes back
             return {
                 message:
                     "The payment is still confirming on Solana. This page updates when it lands.",
                 state: "settling",
+                watch: {},
             };
         case "network_busy":
             return {

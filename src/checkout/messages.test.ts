@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { DepositView } from "../deposits/types.ts";
-import { NO_ACCOUNT, NO_OPTION, NO_SIGNED, UNREADABLE_CHALLENGE, walletError } from "./flow.ts";
+import {
+    BUILD_FAILED,
+    errorStage,
+    NO_ACCOUNT,
+    NO_OPTION,
+    NO_SIGNED,
+    UNREADABLE_CHALLENGE,
+    walletError,
+} from "./flow.ts";
 import type { StatusView } from "./live.ts";
 import { depositLine, errorStep, PAGE_TEXT, pageStep, walletMessage } from "./messages.ts";
 
@@ -263,6 +271,32 @@ describe("wallet messages", () => {
         expect(PAGE_TEXT.connecting("Phantom")).toBe("Approve the connection in Phantom.");
         expect(PAGE_TEXT.signing("Phantom")).toBe("Approve the payment in Phantom.");
         expect(PAGE_TEXT.copyFailed).toBe("Copy failed. Select the text and copy it by hand.");
+        expect(PAGE_TEXT.unreachable).toBe(
+            "Cannot reach Bugnet. This page keeps trying; check your connection.",
+        );
+        expect(PAGE_TEXT.tooMany(7)).toBe(
+            "Too many requests from your network. This page tries again in 7 s.",
+        );
+    });
+
+    it("a page without a deposit shows P2, P3 and the order's own lines", () => {
+        const bare = (state: StatusView["state"]) =>
+            depositLine({ ...view({}, state), deposit: null }, C);
+        expect(bare("settling")).toEqual({
+            label: "Confirming",
+            message: "The payment is confirming on Solana. This page updates when it lands.",
+            extra: [],
+        });
+        expect(bare("refunded").message).toBe(
+            "This order's payment was returned to the wallet that paid.",
+        );
+        expect(bare("paid").message).toBe("Paid. Go back to your agent; it continues on its own.");
+        expect(bare("expired").message).toBe(
+            "This order expired at 14:05 and nothing was charged. Ask your agent for a new payment link.",
+        );
+        expect(bare("review").message).toBe(
+            `This payment needs a check by hand. The money is safe. Write to support@bugnet.org with order ${ID}.`,
+        );
     });
 
     it("errorStep never shows the error's text", () => {
@@ -273,6 +307,7 @@ describe("wallet messages", () => {
             "This page could not read Bugnet's payment request. Nothing was charged. Reload the page, or send to the address above.";
         expect(errorStep(new Error(UNREADABLE_CHALLENGE), W).message).toBe(unreadable);
         expect(errorStep(new Error(NO_OPTION), W).message).toBe(unreadable);
+        expect(errorStep(new Error(BUILD_FAILED), W).message).toBe(unreadable);
         const noSigned =
             "Phantom returned no signed payment. Nothing was charged. Press Pay to try again.";
         expect(errorStep(new Error(NO_SIGNED), W).message).toBe(noSigned);
@@ -307,6 +342,17 @@ describe("wallet messages", () => {
             expect(text).not.toContain("payment refused:");
             expect(text).not.toContain("did not go through");
         }
+    });
+});
+
+describe("error report stages", () => {
+    it("names the stage that failed, never the wallet for Bugnet's own errors", () => {
+        for (const message of [UNREADABLE_CHALLENGE, NO_OPTION, BUILD_FAILED]) {
+            expect(errorStage(new Error(message), "connect")).toBe("challenge");
+        }
+        expect(errorStage(new Error(NO_SIGNED), "connect")).toBe("sign");
+        expect(errorStage(new TypeError("fetch failed"), "sign")).toBe("status");
+        expect(errorStage(new Error(NO_ACCOUNT), "connect")).toBe("connect");
     });
 });
 

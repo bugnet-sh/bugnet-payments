@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { publicState } from "../http/public.ts";
+import { depositLine } from "../checkout/messages.ts";
+import { publicState, type PublicState } from "../http/public.ts";
 import type { OrderRow } from "../orders/types.ts";
 import type { RefundRow } from "../refunds/request.ts";
 import type { DepositRow, HoldRow, MoveRow, TransferRow } from "./types.ts";
@@ -667,5 +668,54 @@ describe("publicState with deposits", () => {
         expect(publicState(row("refunding"), late, d)).toBe("refunded");
         expect(publicState(row("refunded"), late, d)).toBe("refunded");
         expect(publicState(row("manual"), late, d)).toBe("review");
+    });
+});
+
+describe("the page's line for the server's own view", () => {
+    const C = {
+        amountMicros: 50_000,
+        deadline: "00:15",
+        refundMinMicros: 1_000,
+        orderId: ORDER_ID,
+    };
+    const line = (o: Order, l: Ledger, state: PublicState) =>
+        depositLine(
+            {
+                state,
+                expiresAt: EXPIRES.getTime(),
+                serverNow: at("00:20:00").getTime(),
+                amountMicros: 50_000,
+                kind: "start",
+                deposit: view(o, l, at("00:20:00")),
+            },
+            C,
+        );
+    const K1 = t("K1", "OwnK", 500, 101, { outcome: "keep", reason: "below_minimum" });
+    const kept = "$0.0005 arrived, which is below the $0.001 Bugnet returns, so it was kept.";
+
+    it("an expired order whose only money was kept says it was kept", () => {
+        const l = ledger({ deposit: deposit({ state: "closed" }), transfers: [K1] });
+        expect(view(order("expired"), l, at("00:20:00")).status).toBe("refunded");
+        expect(line(order("expired"), l, "refunded")).toEqual({
+            label: "Refunded",
+            message: kept,
+            extra: [],
+        });
+    });
+
+    it("kept dust beside returned money adds M17 after the main line", () => {
+        const a1 = t("A1", "OwnA", 30_000, 100, {
+            outcome: "return",
+            reason: "unpaid",
+            moveId: 1,
+        });
+        const l = ledger({
+            deposit: deposit({ state: "closed" }),
+            transfers: [a1, K1],
+            moves: [move(1, "return", "confirmed")],
+        });
+        const r = line(order("expired"), l, "refunded");
+        expect(r.message).not.toBe(kept);
+        expect(r.extra).toEqual([kept]);
     });
 });

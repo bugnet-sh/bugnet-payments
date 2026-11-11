@@ -18,7 +18,14 @@ import { TEST_BLOCKHASH, TEST_LVBH } from "../testing/fake-rpc.ts";
 import { testSigner } from "../testing/keys.ts";
 import { buildPaymentTransaction } from "../x402/build.ts";
 import { requirementsFor } from "../x402/challenge.ts";
-import { payWithWallet, reportError, WalletError, type WalletPort, watchOrder } from "./flow.ts";
+import {
+    BUILD_FAILED,
+    payWithWallet,
+    reportError,
+    WalletError,
+    type WalletPort,
+    watchOrder,
+} from "./flow.ts";
 import { pageStep as messageStep, stateStep as messageState } from "./messages.ts";
 
 const CTX = {
@@ -447,6 +454,15 @@ describe("payWithWallet", () => {
                 sleep: blocked.sleep,
             }),
         ).toEqual({ refused: "payer_blocked" });
+    });
+
+    it("a transaction that cannot be built never reaches the wallet", async () => {
+        const { calls, w, f, sleep } = harness();
+        (w.account as { address: string }).address = "not-an-address";
+        await expect(payWithWallet({ fetch: f, wallet: w, orderUrl, sleep })).rejects.toThrow(
+            new Error(BUILD_FAILED),
+        );
+        expect(calls).not.toContain("signTransaction");
     });
 
     it("never signs when the refetch shows the order is no longer payable", async () => {

@@ -2,7 +2,6 @@ import { address, getBase64Decoder, getTransactionEncoder, isAddress } from "@so
 import type { PaymentPayload, PaymentRequired } from "@x402/core/types";
 import { safeBase64Decode, safeBase64Encode } from "@x402/core/utils";
 import type { PublicState } from "../http/public.ts";
-import { fetchStatus } from "./live.ts";
 import { buildPaymentTransaction, hasBlockhashHints } from "../x402/build.ts";
 
 export interface WalletPort {
@@ -57,6 +56,7 @@ export const UNREADABLE_CHALLENGE = "the order answered an unreadable payment ch
 export const NO_OPTION = "the challenge offers no payment option";
 export const NO_SIGNED = "the wallet returned no signed transaction";
 export const NO_ACCOUNT = "the wallet shared no account";
+export const BUILD_FAILED = "the payment transaction could not be built";
 // Wallet codes that are the user's own choice or state; any other one may be a short balance
 const USER_CODES = new Set([4001, 4100, 4900, -32002]);
 const JSON_ACCEPT = { Accept: "application/json" };
@@ -141,6 +141,14 @@ async function unavailable(res: Response): Promise<PayFlowResult> {
 
 const PUBLIC_STATES = new Set(["unpaid", "settling", "paid", "expired", "refunded", "review"]);
 
+// The only status request the page makes; without Bugnet-Client the server never notes a viewer.
+// It lives here, below live.ts and messages.ts, so the checkout modules import in one direction.
+export function fetchStatus(d: { fetch: typeof fetch; orderUrl: string }): Promise<Response> {
+    return d.fetch(`${d.orderUrl}/status`, {
+        headers: { Accept: "application/json", "Bugnet-Client": "checkout" },
+    });
+}
+
 function isPublicState(v: unknown): v is PublicState {
     return typeof v === "string" && PUBLIC_STATES.has(v);
 }
@@ -198,6 +206,40 @@ async function outcome(d: StatusDeps, res: Response): Promise<PayFlowResult> {
     };
 }
 
+// GET /o/{id}/balance (spec 13.1): null for a 503, any other answer it cannot use, or a network
+// failure, so the flow skips the check
+export async function readBalance(
+    d: StatusDeps,
+    owner: string,
+): Promise<{ usdcMicros: number; needMicros: number } | null> {
+    try {
+        const res = await d.fetch(`${d.orderUrl}/balance?owner=${encodeURIComponent(owner)}`, {
+            headers: JSON_ACCEPT,
+        });
+        if (res.status !== 200) return null;
+        const body: unknown = await res.json();
+        if (!isRecord(body)) return null;
+        const { usdcMicros, needMicros } = body;
+        if (typeof usdcMicros !== "number" || typeof needMicros !== "number") return null;
+        return { usdcMicros, needMicros };
+    } catch {
+        return null;
+    }
+}
+
+// The report a short balance sends (spec 13.3)
+export function shortReport(
+    wallet: string,
+    short: { haveMicros: number; needMicros: number },
+): { stage: string; wallet: string; code: number | null; message: string } {
+    return {
+        stage: "balance",
+        wallet,
+        code: null,
+        message: `short ${short.haveMicros} ${short.needMicros}`,
+    };
+}
+
 // The pre-check's answer, or null when it could not run (a 503 or a network failure skip it)
 async function shortOf(
     d: PayFlowDeps,
@@ -221,7 +263,13 @@ export async function payWithWallet(d: PayFlowDeps): Promise<PayFlowResult> {
     const accepted = pr.accepts[0];
     if (accepted === undefined) throw new Error(NO_OPTION);
     if (!hasBlockhashHints(accepted)) return "network_busy";
-    const tx = await buildPaymentTransaction(accepted, address(account.address));
+    let tx: Awaited<ReturnType<typeof buildPaymentTransaction>>;
+    try {
+        tx = await buildPaymentTransaction(accepted, address(account.address));
+    } catch {
+        // The wallet was never asked, so neither it nor the network is to blame (W13)
+        throw new Error(BUILD_FAILED);
+    }
     let signed: { signedTransaction: Uint8Array } | undefined;
     try {
         [signed] = await d.wallet.signTransaction({
@@ -285,16 +333,27 @@ export function walletError(wallet: string, err: unknown): WalletError {
     return new WalletError(wallet, typeof code === "number" ? code : undefined, said);
 }
 
-// The page's own account of a wallet error (spec 13.3); a failed report is ignored
+// The page's own account of a wallet error (spec 13.3); a failed report is ignored. The strings
+// are cut to the route's limits here, so a long wallet text never makes the body too large.
 export async function reportError(
     d: StatusDeps,
     r: { stage: string; wallet: string; code: number | null; message: string },
 ): Promise<void> {
+    const body = { ...r, wallet: r.wallet.slice(0, 40), message: r.message.slice(0, 200) };
     await d
         .fetch(`${d.orderUrl}/report`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(r),
+            body: JSON.stringify(body),
         })
         .catch(() => undefined);
+}
+
+// The report stage of an error the flow threw that is not a wallet's
+export function errorStage(err: unknown, stage: "connect" | "sign" | "challenge"): string {
+    if (err instanceof TypeError) return "status";
+    const message = err instanceof Error ? err.message : "";
+    if ([UNREADABLE_CHALLENGE, NO_OPTION, BUILD_FAILED].includes(message)) return "challenge";
+    if (message === NO_SIGNED) return "sign";
+    return stage;
 }
