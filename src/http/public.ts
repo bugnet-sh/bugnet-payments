@@ -4,6 +4,7 @@ import { encodePaymentResponseHeader } from "@x402/core/http";
 import type pg from "pg";
 import { sendFont } from "../checkout/fonts.ts";
 import { CHECKOUT_CSP, renderCheckout, renderNotFound } from "../checkout/page.ts";
+import type { DepositSummary } from "../deposits/view.ts";
 import type { Log } from "../log.ts";
 import { isOrderId } from "../orders/ids.ts";
 import { type PayDeps, type PayOutcome, payOrder } from "../orders/pay.ts";
@@ -55,17 +56,25 @@ function unreachable(state: never): never {
     throw new Error(`unhandled order state ${String(state)}`);
 }
 
-export function publicState(o: OrderRow, now: Date): PublicState {
+// dep is the order's deposit summary. Past the deadline the deposit job may still settle the
+// order, so it reads settling until a pinned read decided it; and an expired order whose deposit
+// took money must not read expired, which the bridge words as "nothing was charged" (spec 8.4).
+export function publicState(o: OrderRow, now: Date, dep?: DepositSummary): PublicState {
     const state: OrderState = o.state;
     switch (state) {
         case "unpaid":
-            return now.getTime() >= o.expiresAt.getTime() ? "expired" : "unpaid";
+            if (now.getTime() < o.expiresAt.getTime()) return "unpaid";
+            if (dep !== undefined && (dep.onTimeMicros > 0 || !dep.decided)) return "settling";
+            return "expired";
         case "settling":
             return "settling";
         case "paid":
         case "redeemed":
             return "paid";
         case "expired":
+            if (dep !== undefined && dep.returnedOrReturningMicros + dep.keptMicros > 0) {
+                return "refunded";
+            }
             return "expired";
         case "refunding":
         case "refunded":
