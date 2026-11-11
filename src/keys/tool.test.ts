@@ -432,13 +432,15 @@ describe("deposit seed commands", () => {
 
         const io = piped(`# deposit-seeds.env\nBUGNET_DEPOSIT_SEED_V1=${A}\n`);
         expect(await cliMain(args, {}, io)).toBe(0);
-        expect(io.outText()).toBe("removed BUGNET_DEPOSIT_SEED_PREVIOUS");
+        expect(io.outText()).toBe("");
+        expect(io.errText()).toContain("removed BUGNET_DEPOSIT_SEED_PREVIOUS");
         expect(readFileSync(p, "utf8")).toBe(`BUGNET_DEPOSIT_SEED=${CURRENT}\n`);
         expect(statSync(p).mode & 0o777).toBe(0o600);
 
         const again = piped(`BUGNET_DEPOSIT_SEED_V1=${A}\n`);
         expect(await cliMain(args, {}, again)).toBe(0);
-        expect(again.outText()).toBe("nothing to retire");
+        expect(again.outText()).toBe("");
+        expect(again.errText()).toContain("nothing to retire");
         for (const value of [A, CURRENT, THIRD]) {
             expect(printed(io, again, ...refused)).not.toContain(value);
         }

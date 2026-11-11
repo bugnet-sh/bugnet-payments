@@ -353,7 +353,7 @@ function retireSeed(flags: Flags, io: Io, piped: Readonly<Record<string, string>
     return 0;
 }
 
-// D8 A: status lines go to stderr, so stdout carries only the archive line
+// D8 A: status lines go to stderr in both phases, so stdout carries only the archive line
 function retireThroughStdio(
     envPath: string,
     version: number,
@@ -369,13 +369,13 @@ function retireThroughStdio(
     const name = `BUGNET_DEPOSIT_SEED_V${version}`;
     switch (removeArchivedSeed(envPath, version, piped)) {
         case "nothing":
-            io.out("nothing to retire");
+            io.err("nothing to retire");
             return 0;
         case "mismatch":
             io.err(`${name} on stdin does not match BUGNET_DEPOSIT_SEED_PREVIOUS; nothing removed`);
             return 1;
         case "removed":
-            io.out("removed BUGNET_DEPOSIT_SEED_PREVIOUS");
+            io.err("removed BUGNET_DEPOSIT_SEED_PREVIOUS");
             return 0;
     }
 }

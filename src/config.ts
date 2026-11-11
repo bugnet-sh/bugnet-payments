@@ -513,7 +513,7 @@ function httpsOrLoopback(url: string): boolean {
 }
 
 // The round trip refuses padding errors and stray characters that Buffer.from skips silently
-function isBase64Of32(s: string): boolean {
+export function isBase64Of32(s: string): boolean {
     const b = Buffer.from(s, "base64");
     return b.length === 32 && b.toString("base64") === s;
 }

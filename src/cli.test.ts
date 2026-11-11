@@ -13,7 +13,10 @@ import { stringify } from "smol-toml";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { type CliOptions, cliMain, formatRpcStatus } from "./cli.ts";
 import { loadSettings } from "./config.ts";
+import { DepositKeys } from "./deposits/keys.ts";
+import { advanceMoves } from "./deposits/moves.ts";
 import { type PlanInput, planDeposit } from "./deposits/plan.ts";
+import { TxCache } from "./deposits/scan.ts";
 import { depositLedger, findDeposit, findMove } from "./deposits/store.ts";
 import {
     type FakeEndpoint,
@@ -2002,9 +2005,11 @@ describe("deposits commands", () => {
             manualReason?: string | null;
             txSignature?: string | null;
             createdAt?: Date;
+            closes?: boolean;
+            closeTo?: string;
         },
     ): Promise<number> {
-        const closes = m.kind === "close";
+        const closes = m.closes ?? m.kind === "close";
         const res = await db.pool.query<{ id: string }>(
             `insert into deposit_moves (order_id, kind, amount_micros, held_micros, destination,
                 closes, close_to, state, attempts, manual_reason, tx_signature, created_at)
@@ -2016,7 +2021,7 @@ describe("deposits commands", () => {
                 m.heldMicros ?? 0,
                 m.destination ?? null,
                 closes,
-                closes ? "Fee" : null,
+                closes ? (m.closeTo ?? "Fee") : null,
                 m.state,
                 m.attempts ?? 1,
                 m.manualReason ?? null,
@@ -2324,6 +2329,12 @@ describe("deposits commands", () => {
         expect(inserted.code).toBe(0);
         const id = (await heldRefundId(db.pool, ORDER_A, SIG(64)))!;
         expect(inserted.io.outText()).toBe(`refund ${id} pays ${first}`);
+        expect(logLine(inserted.io, "deposit return-to")).toMatchObject({ outcome: "refund" });
+        const shown = captureIo();
+        expect(await cli(["deposits", "show", ORDER_A], shown)).toBe(0);
+        expect(shown.outText()).toContain(
+            `refund deposit part 0 ${ownA.address} 7000 pending to=${first} id=${id}`,
+        );
         expect(await refundOf(id)).toMatchObject({
             kind: "deposit",
             amountMicros: 7_000,
@@ -2344,6 +2355,7 @@ describe("deposits commands", () => {
         const repointed = await run(second);
         expect(repointed.code).toBe(0);
         expect(repointed.io.outText()).toBe(`refund ${id} now pays ${second}`);
+        expect(logLine(repointed.io, "deposit return-to")).toMatchObject({ outcome: "repointed" });
         expect(await refundOf(id)).toMatchObject({
             destination: second,
             payer: ownA.address,
@@ -2372,7 +2384,35 @@ describe("deposits commands", () => {
         expect(io.errText()).toContain(
             `deposit ${ORDER_A} has a move in flight; try again shortly`,
         );
+        expect(logLine(io, "deposit return-to")).toMatchObject({
+            proof: "owner",
+            outcome: "refused",
+            refused: `deposit ${ORDER_A} has a move in flight; try again shortly`,
+        });
         expect(await depositLedger(db.pool, ORDER_A)).toEqual(before);
+    });
+
+    it("return-to refuses held money whose carrying move is not confirmed", async () => {
+        const ownA = await testSigner(73);
+        const first = await usdcAta(ownA.address);
+        await heldTransfer(
+            ORDER_A,
+            {
+                signature: SIG(64),
+                reason: "return_destination_invalid",
+                owner: ownA.address,
+                source: "SrcGone",
+            },
+            "manual",
+        );
+        const moveId = (await depositLedger(db.pool, ORDER_A))!.moves[0]!.id;
+        const io = captureIo();
+        const rpc = accountsRpc({ [first]: ownA.address });
+        expect(await cli(["deposits", "return-to", ORDER_A, SIG(64), first], io, { rpc })).toBe(1);
+        expect(io.errText()).toContain(
+            `move ${moveId} carrying ${SIG(64)} is manual; try again shortly`,
+        );
+        expect(await heldRefundId(db.pool, ORDER_A, SIG(64))).toBeNull();
     });
 
     it("return-to refuses an account with another mint", async () => {
@@ -2533,6 +2573,7 @@ describe("deposits commands", () => {
         let strangerAta: string;
         let feePayerKey: string;
         let feePayer: string;
+        let feeSigner: KeyPairSigner;
 
         beforeEach(async () => {
             chain = await startFakeChain();
@@ -2550,6 +2591,7 @@ describe("deposits commands", () => {
             const fee = await generateExportableKeypair();
             feePayerKey = fee.secretBase58;
             feePayer = fee.signer.address;
+            feeSigner = fee.signer;
         });
         afterEach(async () => {
             await chain.close();
@@ -2678,6 +2720,134 @@ describe("deposits commands", () => {
             expect(refused.code).toBe(1);
             expect(refused.io.errText()).toContain(`credit ${pooled} has no signer-owned source`);
             expect(chain.balance(TOKEN_A)).toBe(3_001n);
+        });
+
+        it("a retried closing sweep is signed against money that came during review", async () => {
+            await seedDeposit(ORDER_A, {
+                order: { state: "settling" },
+                deposit: {
+                    state: "settling",
+                    review_reason: "move_expired_repeatedly",
+                    rent_payer: feePayer,
+                },
+            });
+            const settings = loadSettings(config);
+            const recipient = settings.solana.recipient;
+            const recipientAta = await usdcAta(address(recipient));
+            chain.setTokenAccount({ address: recipientAta, owner: recipient, amount: 0n });
+            await chain.transfer({
+                authority: payer,
+                feePayer: payer,
+                source: payerAta,
+                destination: TOKEN_A,
+                micros: 50_000n,
+                createDestinationFor: ADDRESS_A,
+            });
+            const sweep = await seedMove(ORDER_A, {
+                kind: "sweep",
+                state: "manual",
+                amountMicros: 50_000,
+                destination: recipientAta,
+                attempts: 3,
+                manualReason: "move_expired_repeatedly",
+                txSignature: SIG(66),
+                closes: true,
+                closeTo: feePayer,
+            });
+            await chain.transfer({
+                authority: stranger,
+                feePayer: stranger,
+                source: strangerAta,
+                destination: TOKEN_A,
+                micros: 1n,
+            });
+            expect((await run(["retry", ORDER_A])).code).toBe(0);
+
+            const tick = await advanceMoves({
+                pool: db.pool,
+                rpc: chain.rpc,
+                feePayer: feeSigner,
+                keys: new DepositKeys(new Map([[1, Buffer.alloc(32, 7)]]), 1),
+                cfg: settings.deposits,
+                recipientTokenAccount: address(recipientAta),
+                floatTokenAccount: address(strangerAta),
+                hotTokenAccount: null,
+                paid: null,
+                rpcTimeoutMs: 10_000,
+                log: silentLog,
+                now: () => LATER,
+                cache: new TxCache(100),
+                confirmSweep: async () => {},
+                onSweepSigned: async () => {},
+            });
+            expect(tick).toMatchObject({ signed: 1, dropped: 0 });
+            expect(await findMove(db.pool, sweep)).toMatchObject({
+                state: "sent",
+                closes: false,
+                closeTo: null,
+                previousSignatures: [SIG(66)],
+            });
+            expect(chain.balance(recipientAta)).toBe(50_000n);
+            expect(chain.balance(TOKEN_A)).toBe(1n);
+        });
+
+        it("return-late waits for a transaction whose send errored after forwarding", async () => {
+            const { paid } = await lateMoney(ORDER_A, ADDRESS_A);
+            // The endpoint forwards the transaction, then its answer is lost
+            const lossy = new Proxy(chain.rpc, {
+                get: (target, prop, recv) => {
+                    if (prop !== "sendTransaction") return Reflect.get(target, prop, recv);
+                    return (wire: string, config: Record<string, unknown>) => ({
+                        send: async () => {
+                            await chain.rpc.sendTransaction(wire as never, config as never).send();
+                            throw new Error("rpc1.example timed out");
+                        },
+                    });
+                },
+            });
+            const io = captureIo();
+            const args = ["return-late", ORDER_A, "--signature", paid];
+            expect(
+                await cliMain(["-config", config, "deposits", ...args], chainEnv(), io, {
+                    rpc: lossy,
+                }),
+            ).toBe(0);
+            const [line] = io.outText().split("\n");
+            expect(line).toMatch(/^confirmed \S+$/);
+            const sent = line!.replace("confirmed ", "");
+            expect(io.errText()).toContain(`sending ${sent}`);
+            expect(chain.balance(payerAta)).toBe(100_000n);
+
+            const again = await run(args);
+            expect(again.code).toBe(1);
+            expect(again.io.errText()).toContain(`credit ${paid} was returned in ${sent}`);
+            expect(chain.balance(payerAta)).toBe(100_000n);
+            expect(chain.balance(TOKEN_A)).toBe(1n);
+        });
+
+        it("an error line never shows a secret", async () => {
+            await seedDeposit(ORDER_A, { order: { state: "paid" }, deposit: { state: "done" } });
+            const echoing = new Proxy(chain.rpc, {
+                get: (target, prop, recv) =>
+                    prop !== "getBalance"
+                        ? Reflect.get(target, prop, recv)
+                        : () => ({
+                              send: async () => {
+                                  throw new Error(`refused ${feePayerKey}`);
+                              },
+                          }),
+            });
+            const io = captureIo();
+            expect(
+                await cliMain(
+                    ["-config", config, "deposits", "return-sol", ORDER_A, feePayer],
+                    chainEnv(),
+                    io,
+                    { rpc: echoing },
+                ),
+            ).toBe(1);
+            expect(io.errText()).toContain("error: refused [redacted]");
+            expect(io.errText()).not.toContain(feePayerKey);
         });
 
         it("--archive signs an old version", async () => {

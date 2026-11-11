@@ -16,7 +16,7 @@ import {
 import { getTransferSolInstruction } from "@solana-program/system";
 import { getCloseAccountInstruction } from "@solana-program/token";
 import type pg from "pg";
-import { loadSettings, rpcUrlsOf, secretValues, type Settings } from "./config.ts";
+import { isBase64Of32, loadSettings, rpcUrlsOf, secretValues, type Settings } from "./config.ts";
 import { createPool, withTx, type Queryable } from "./db/pool.ts";
 import { DepositKeys, depositKeysFrom } from "./deposits/keys.ts";
 import { type CachedTx, classifyTx, createdBy, fetchTx, TxCache } from "./deposits/scan.ts";
@@ -31,7 +31,7 @@ import type { DepositRow, NewTransfer, TransferRow } from "./deposits/types.ts";
 import { isRecord } from "./is-record.ts";
 import { isKeysCommand, KEYS_USAGE, runKeys, waitForLanding } from "./keys/commands.ts";
 import { parseEnvText } from "./keys/tool.ts";
-import { jsonLog, type Log } from "./log.ts";
+import { jsonLog, type Log, makeScrubber } from "./log.ts";
 import { isOrderId } from "./orders/ids.ts";
 import { findOrder, findPaymentByOrder, lockOrder, setOrderState } from "./orders/store.ts";
 import type { OrderRow } from "./orders/types.ts";
@@ -319,10 +319,12 @@ export async function cliMain(
     }
     let pool: pg.Pool | undefined;
     let routed: Promise<RoutedRpc | null> | undefined;
+    let secrets: string[] = [];
     try {
+        secrets = secretValues(env);
         const settings = loadSettings(configFile);
         const archive = flags.archive === undefined ? null : await readArchive(flags.archive, io);
-        const secrets = [...secretValues(env), ...Object.values(archive ?? {})]
+        secrets = [...secrets, ...Object.values(archive ?? {})]
             .filter((v) => v.trim() !== "")
             .sort((a, b) => b.length - a.length);
         const log = jsonLog("payments-cli", { secrets, write: io.err });
@@ -364,7 +366,9 @@ export async function cliMain(
         };
         return await cmd.run(ctx, io, rest, flags);
     } catch (err) {
-        io.err(`error: ${err instanceof Error ? err.message : String(err)}`);
+        // An RPC or library error can echo what it was given, a key or an endpoint URL included
+        const scrub = makeScrubber(secrets);
+        io.err(`error: ${scrub(err instanceof Error ? err.message : String(err))}`);
         return 1;
     } finally {
         // The router flushes its usage into the pool, so it stops first
@@ -1414,10 +1418,12 @@ async function depositsShow(
     );
     const parts = rows.map(toRefund);
     for (const r of parts) {
+        // Deposit rows each return one transfer, so they are not parts of one split
         const n = parts.filter((p) => p.kind === r.kind).length;
+        const part = r.kind === "deposit" ? `${r.part}` : `${r.part}/${n}`;
         io.out(
             [
-                `refund ${r.kind} part ${r.part}/${n} ${r.payer} ${r.amountMicros} ${r.state}`,
+                `refund ${r.kind} part ${part} ${r.payer} ${r.amountMicros} ${r.state}`,
                 `to=${r.destination}`,
                 `id=${r.id}`,
                 `reason=${orDash(r.manualReason)}`,
@@ -1428,8 +1434,13 @@ async function depositsShow(
     return 0;
 }
 
-// Spec 17: the planner counts only sweeps that fail after this, so the sweep gets a fresh
-// max_attempts while the failures stay on record
+/**
+ * Spec 17: the planner counts only sweeps that fail after this, so the sweep gets a fresh
+ * max_attempts while the failures stay on record. The requeued sweep no longer closes: money may
+ * have come during review, a closing move is then dropped by the guard, and a row with
+ * signatures can never be deleted, so it would stay pending for good. The planner closes the
+ * account separately once the sweep lands (spec 10.4).
+ */
 async function depositsRetry(
     ctx: CliContext,
     io: CliIo,
@@ -1442,7 +1453,8 @@ async function depositsRetry(
             if (deposit === null) return noDeposit(orderId);
             if (await moveInFlight(c, orderId)) return inFlight(orderId);
             const requeued = await c.query(
-                `update deposit_moves set state = 'pending', attempts = 0, manual_reason = null
+                `update deposit_moves set state = 'pending', attempts = 0, manual_reason = null,
+                    closes = false, close_to = null
                  where id = (select max(id) from deposit_moves
                     where order_id = $1 and kind = 'sweep' and state = 'manual')`,
                 [orderId],
@@ -1506,29 +1518,34 @@ async function depositsReturnTo(
         proof = "signed";
         proofSha256 = createHash("sha256").update(file).digest("hex");
     }
+    const decided = await withTx(
+        ctx.pool,
+        (c) =>
+            returnHeld(c, { orderId, signature: sig, account, owner: info.owner, at: ctx.now() }),
+        ctx.log,
+    );
+    const refused = "refused" in decided;
     ctx.log.info("deposit return-to", {
         orderId,
         signature: sig,
         destination: account,
         proof,
         proofSha256,
+        outcome: refused ? "refused" : decided.outcome,
+        ...(refused ? { refused: decided.refused } : {}),
     });
-    const outcome = await withTx(
-        ctx.pool,
-        (c) =>
-            returnHeld(c, { orderId, signature: sig, account, owner: info.owner, at: ctx.now() }),
-        ctx.log,
-    );
-    if ("refused" in outcome) return fail(io, outcome.refused);
-    io.out(outcome.line);
+    if (refused) return fail(io, decided.refused);
+    io.out(decided.line);
     return 0;
 }
+
+type ReturnOutcome = "return" | "refund" | "repointed";
 
 // Decided under the deposit lock, so no move of the deposit can start in between
 async function returnHeld(
     c: pg.PoolClient,
     o: { orderId: string; signature: string; account: string; owner: string; at: Date },
-): Promise<{ refused: string } | { line: string }> {
+): Promise<{ refused: string } | { line: string; outcome: ReturnOutcome }> {
     if ((await lockDeposit(c, o.orderId)) === null) return { refused: noDeposit(o.orderId) };
     if (await moveInFlight(c, o.orderId)) return { refused: inFlight(o.orderId) };
     const { rows } = await c.query<{
@@ -1558,7 +1575,7 @@ async function returnHeld(
              where order_id = $1 and signature = $2`,
             [o.orderId, o.signature, o.account, o.owner],
         );
-        return { line: `transfer ${o.signature} returns to ${o.account}` };
+        return { line: `transfer ${o.signature} returns to ${o.account}`, outcome: "return" };
     }
     if (t.refund_id !== null && (t.refund_state !== "manual" || t.refund_reason === BY_HAND)) {
         const state = t.refund_reason === BY_HAND ? "resolved by hand" : t.refund_state;
@@ -1572,9 +1589,16 @@ async function returnHeld(
         at: o.at,
     });
     if (r === "refused") {
+        if (t.move_state !== "confirmed") {
+            const move = `move ${t.move_id} carrying ${o.signature}`;
+            return { refused: `${move} is ${t.move_state}; try again shortly` };
+        }
         return { refused: `transfer ${o.signature} was not carried to the refund float` };
     }
-    return { line: `refund ${r.id} ${r.repointed ? "now pays" : "pays"} ${o.account}` };
+    return {
+        line: `refund ${r.id} ${r.repointed ? "now pays" : "pays"} ${o.account}`,
+        outcome: r.repointed ? "repointed" : "refund",
+    };
 }
 
 // Null when the transaction cannot be decoded: it then names no signer (spec 17)
@@ -1632,11 +1656,10 @@ async function signedBy(signer: string, sig: SignatureBytes, data: Uint8Array): 
 function seedOf(env: Readonly<Record<string, string | undefined>>, name: string): Buffer | null {
     const value = env[name] ?? "";
     if (value === "") return null;
-    const seed = Buffer.from(value, "base64");
-    if (seed.length !== 32 || seed.toString("base64") !== value) {
+    if (!isBase64Of32(value)) {
         throw new Error(`${name} must be standard base64 of exactly 32 bytes`);
     }
-    return seed;
+    return Buffer.from(value, "base64");
 }
 
 // The seed of the deposit's key version from .env, or from the archive once it was retired; it
@@ -1675,9 +1698,14 @@ async function feePayerOf(env: NodeJS.ProcessEnv): Promise<KeyPairSigner> {
     return loadKeypair(key, FEE_PAYER_KEY);
 }
 
-// Signed by the deposit key with Bugnet's fee payer, sent, and followed until it lands
+/**
+ * Signed by the deposit key with Bugnet's fee payer, sent, and followed until it lands. A send
+ * can error after the endpoint forwarded the transaction, so an error never ends the command:
+ * only the landing or the expired blockhash says whether a second run would pay twice.
+ */
 async function sendSigned(
     ctx: CliContext,
+    io: CliIo,
     rpc: SolanaRpc,
     feePayer: KeyPairSigner,
     instructions: readonly Instruction[],
@@ -1701,9 +1729,17 @@ async function sendSigned(
         throw new Error(`the transaction is ${bytes} bytes, above ${MAX_TRANSACTION_BYTES}`);
     }
     const sent = getSignatureFromTransaction(signed);
-    await rpc
-        .sendTransaction(wire, { encoding: "base64", preflightCommitment: "confirmed" })
-        .send(deadline(timeoutMs));
+    io.err(`sending ${sent}`);
+    try {
+        await rpc
+            .sendTransaction(wire, { encoding: "base64", preflightCommitment: "confirmed" })
+            .send(deadline(timeoutMs));
+    } catch (err) {
+        ctx.log.warn("send failed, waiting for the transaction to land or expire", {
+            signature: sent,
+            err,
+        });
+    }
     await waitForLanding(rpc, sent, latest.lastValidBlockHeight);
     return sent;
 }
@@ -1908,7 +1944,7 @@ async function depositsReturnLate(
     }
     // One return move's budget per credit: each carries a transfer and a memo
     const units = ctx.settings.deposits.compute_unit_limit * picked.length;
-    const sent = await sendSigned(ctx, rpc, feePayer, instructions, units);
+    const sent = await sendSigned(ctx, io, rpc, feePayer, instructions, units);
     io.out(`confirmed ${sent}`);
     for (const c of picked) io.out(`returned ${c.signature} ${c.micros} to ${c.source}`);
     if (closeTo !== null) io.out(`closed the account to ${closeTo}`);
@@ -1941,6 +1977,7 @@ async function depositsReturnSol(
     });
     const sent = await sendSigned(
         ctx,
+        io,
         rpc,
         feePayer,
         [transfer],

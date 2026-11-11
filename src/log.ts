@@ -78,7 +78,7 @@ const REDACTED_LOWER: ReadonlySet<string> = new Set([...REDACTED_KEYS].map((k) =
 
 const REDACTED = "[redacted]";
 
-function makeScrubber(secrets: readonly string[]): (s: string) => string {
+export function makeScrubber(secrets: readonly string[]): (s: string) => string {
     const list = secrets.filter((s) => s.length > 0);
     return (s) => list.reduce((acc, secret) => acc.split(secret).join(REDACTED), s);
 }
