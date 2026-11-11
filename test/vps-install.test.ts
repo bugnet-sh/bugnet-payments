@@ -190,8 +190,12 @@ describe("push-rpc-urls.sh", () => {
     function push(envText: string) {
         const bin = join(dir, "bin");
         const got = join(dir, "ssh-stdin");
+        const args = join(dir, "ssh-args");
         spawnSync("mkdir", ["-p", bin]);
-        writeFileSync(join(bin, "ssh"), `#!/usr/bin/env bash\ncat > "${got}"\n`);
+        writeFileSync(
+            join(bin, "ssh"),
+            `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "${args}"\ncat > "${got}"\n`,
+        );
         chmodSync(join(bin, "ssh"), 0o755);
         const local = join(dir, "local.env");
         writeFileSync(local, envText, { mode: 0o600 });
@@ -204,7 +208,8 @@ describe("push-rpc-urls.sh", () => {
             },
         });
         const sent = existsSync(got) ? readFileSync(got, "utf8") : null;
-        return { code: r.status, all: r.stdout + r.stderr, sent };
+        const sshArgs = existsSync(args) ? readFileSync(args, "utf8").split("\n") : null;
+        return { code: r.status, all: r.stdout + r.stderr, sent, sshArgs };
     }
 
     it("push-rpc-urls.sh sends only the list line", () => {
@@ -213,6 +218,8 @@ describe("push-rpc-urls.sh", () => {
         );
         expect(r.code).toBe(0);
         expect(r.sent).toBe("BUGNET_SOLANA_RPC_URLS=https://a.example/key1,https://b.example\n");
+        // No remote terminal, which would echo the line back
+        expect(r.sshArgs?.slice(0, 2)).toEqual(["-T", "server.example"]);
         for (const secret of ["madeupfeepayer", "madeupclaim", "key1", "a.example"]) {
             expect(r.all).not.toContain(secret);
         }

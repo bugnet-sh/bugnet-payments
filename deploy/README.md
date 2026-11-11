@@ -238,7 +238,15 @@ and stays for a rollback to a release without the router.
 **After changing the list:** copy it, run `pcli rpc probe`, then `vps-install.sh --start`, which
 restarts a running service so it loads the new list. The probe must exit 0 with
 `quorum: 2 of 2 domains ready`. Before `[deposits] enabled = true` it must
-also name two endpoints on `listings:`. After the first day, post `pcli rpc status --outcomes`.
+also name two endpoints on `listings:`. After the first day, post the day's failed attempts per
+position, method and outcome; `pcli rpc status --outcomes` shows the current UTC hour only, so the
+day comes from the journal:
+
+```sh
+journalctl -u "bugnet-payments@$v" --since -24h -o cat | grep '"msg":"rpc attempt failed"' \
+    | grep -o '"endpoint":"rpc[0-9]*","method":"[^"]*","outcome":"[^"]*"' | sort | uniq -c
+```
+
 The mainnet smoke test checks a list without moving money, and runs only with the founder's go:
 `set -a; . ./.env; set +a; pnpm test:live test/live/rpc-router.live.test.ts` on the Mac. It prints
 the probe's lines, each URL's 2021 history note and its `minContextSlot` with `until` answer, by
@@ -264,9 +272,11 @@ journalctl -u "bugnet-payments@$v" -o cat | grep '"level":"alarm"'
 ```
 
 Logs are one JSON line each on stderr, in the journal. A failed boot check is one line,
-`"msg":"boot check failed"`, whose `reason` names the fix; the unit restarts every 2 s, so it
-comes up by itself once the cause is fixed. Two versions bind the same ports, so an upgrade stops
-the old one first: `sudo systemctl disable --now bugnet-payments@<old>`, then enable the new one.
+`"msg":"boot check failed"`, whose `reason` names the fix; the unit restarts after 2 s, then
+slower each time up to every 5 minutes (each start calls every RPC URL), so it comes up by itself
+within 5 minutes once the cause is fixed, or at once with `sudo systemctl restart`. Two versions
+bind the same ports, so an upgrade stops the old one first:
+`sudo systemctl disable --now bugnet-payments@<old>`, then enable the new one.
 Stopping lets running jobs finish, then closes the listeners and the database pool.
 
 Operator commands that read the database (`manual`, `refunds`, `x402`, `keys drain --allowance`)

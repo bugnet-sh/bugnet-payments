@@ -362,6 +362,8 @@ write_rpc_list() {
 }
 
 do_rpc_urls() {
+    # A line pasted at a terminal echoes on the screen; it comes only through the copy step's pipe
+    [ ! -t 0 ] || die "pipe the list line with deploy/push-rpc-urls.sh from the Mac"
     [ -f "$ENV_FILE" ] || die "$ENV_FILE does not exist; run the install step first"
     write_rpc_list "$ENV_FILE" || die "the RPC list was not changed"
     chown root:root "$ENV_FILE"

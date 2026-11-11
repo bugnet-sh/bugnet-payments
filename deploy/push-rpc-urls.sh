@@ -26,5 +26,6 @@ env_file=${BUGNET_LOCAL_ENV:-.env}
 n=$(grep -c '^BUGNET_SOLANA_RPC_URLS=' "$env_file" || true)
 [ "$n" = 1 ] || die "$env_file must hold exactly one BUGNET_SOLANA_RPC_URLS line, it holds $n"
 grep '^BUGNET_SOLANA_RPC_URLS=' "$env_file" | rpc_list_ok || die "nothing was sent"
+# -T: a remote terminal would echo the line back to this screen; an option beats ~/.ssh/config
 grep '^BUGNET_SOLANA_RPC_URLS=' "$env_file" |
-    ssh "$@" 'sudo -n /opt/bugnet/payments/$(cat /etc/bugnet/payments.release)/deploy/vps-install.sh --rpc-urls'
+    ssh -T "$@" 'sudo -n /opt/bugnet/payments/$(cat /etc/bugnet/payments.release)/deploy/vps-install.sh --rpc-urls'

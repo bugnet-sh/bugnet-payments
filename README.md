@@ -17,8 +17,8 @@ pnpm proto     # generates src/gen from ../bugnet-proto
 `.env` (mode 0600, never committed) holds secrets only; `.env.example` lists every variable.
 Every other setting lives in `config/*.toml`: `config/example.toml` shows each one at its default,
 `config/dev.toml` is the local run. Load the secrets into the shell with `set -a; . ./.env; set +a`.
-The RPC list line (`BUGNET_SOLANA_RPC_URLS`) holds no spaces or quotes, or the shell splits it and
-prints part of it.
+The RPC list line (`BUGNET_SOLANA_RPC_URLS`) holds no spaces, quotes or shell characters
+(``& ; | < > ( ) $ ` \``), or the shell splits it, runs part of it or prints it.
 
 Payments reaches Solana through its RPC router: `BUGNET_SOLANA_RPC_URLS` is an ordered list of URLs,
 the first serving while it is healthy and the rest as fallbacks, with no provider named in code
@@ -41,5 +41,6 @@ the first serving while it is healthy and the rest as fallbacks, with no provide
 redeems and refunds it. It fails up front, naming each missing variable, unless `.env` holds the
 RPC URL, the fee-payer, refund and recipient keys, the order and claim keys, the payments token and
 a test payer (key or mnemonic). Run it as `set -a; . ./.env; set +a; pnpm test:live`, with the RPC
-list line free of spaces and quotes, as above. `test/live/rpc-router.live.test.ts` checks every URL
-of the list without moving money; `pnpm test:live test/live/rpc-router.live.test.ts` runs it alone.
+list line free of spaces, quotes and shell characters, as above. `test/live/rpc-router.live.test.ts`
+checks every URL of the list without moving money;
+`pnpm test:live test/live/rpc-router.live.test.ts` runs it alone.
