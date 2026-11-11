@@ -244,10 +244,9 @@ describe("money decisions over the router", () => {
             .send();
         const report = await reconcile(r);
         expect(report.reverted).toBe(0);
-        const state = (await findOrder(db.pool, id))?.state;
-        // paid when c answered found; a null from c is no vote, so then the order waits
-        expect(["paid", "settling"]).toContain(state);
-        if (state === "settling") expect(absenceAlarms(r)).toHaveLength(1);
+        // c's null is no vote, so the order waits
+        expect((await findOrder(db.pool, id))?.state).toBe("settling");
+        expect(absenceAlarms(r)).toHaveLength(1);
     });
 
     describe("refunds", () => {
@@ -324,6 +323,9 @@ describe("money decisions over the router", () => {
             const first = await runRefunds(d, "refund");
             expect(first.sent).toBe(0);
             expect(a.calls().some((c) => c.method === "sendTransaction")).toBe(true);
+            expect(b.calls().some((c) => c.method === "sendTransaction")).toBe(true);
+            const rpc2 = r.router.snapshot().endpoints.find((e) => e.name === "rpc2");
+            expect(rpc2?.outcomes.sendTransaction).toEqual({ "code_-32002": 1 });
             expect(JSON.stringify((d.log as ReturnType<typeof memoryLog>).lines)).toContain(
                 "send_unconfirmed",
             );

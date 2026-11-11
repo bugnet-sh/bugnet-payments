@@ -65,6 +65,50 @@ vi.mock("./x402/listener.ts", async (importOriginal) => {
     };
 });
 
+// The rpc each job was handed: the lane test pins the alarms job's to the background lane, and
+// a daily audit moved to the money lane must show as a different object
+const jobRpcs = vi.hoisted(() => new Map<string, unknown>());
+vi.mock("./jobs/alarms.ts", async (importOriginal) => {
+    const real = await importOriginal<typeof import("./jobs/alarms.ts")>();
+    return {
+        ...real,
+        checkAlarms: (...args: Parameters<typeof real.checkAlarms>) => {
+            jobRpcs.set("alarms", args[0].rpc);
+            return real.checkAlarms(...args);
+        },
+    };
+});
+vi.mock("./jobs/reconciler.ts", async (importOriginal) => {
+    const real = await importOriginal<typeof import("./jobs/reconciler.ts")>();
+    return {
+        ...real,
+        reconcileSettling: (...args: Parameters<typeof real.reconcileSettling>) => {
+            jobRpcs.set("reconcile", args[0].rpc);
+            return real.reconcileSettling(...args);
+        },
+    };
+});
+vi.mock("./jobs/audit.ts", async (importOriginal) => {
+    const real = await importOriginal<typeof import("./jobs/audit.ts")>();
+    return {
+        ...real,
+        auditInflows: (...args: Parameters<typeof real.auditInflows>) => {
+            jobRpcs.set("auditInflows", args[0].rpc);
+            return real.auditInflows(...args);
+        },
+    };
+});
+vi.mock("./x402/audit.ts", async (importOriginal) => {
+    const real = await importOriginal<typeof import("./x402/audit.ts")>();
+    return {
+        ...real,
+        auditX402: (...args: Parameters<typeof real.auditX402>) => {
+            jobRpcs.set("auditX402", args[0].rpc);
+            return real.auditX402(...args);
+        },
+    };
+});
+
 type Tables = Record<string, Record<string, unknown>>;
 
 const MIN = 60_000;
@@ -1273,6 +1317,32 @@ describe("x402 wiring", () => {
             await until(async () => log.lines.some((l) => l.alarm === "x402_cert_expiry"), 5_000);
             const alarm = log.lines.find((l) => l.alarm === "x402_cert_expiry");
             expect(alarm?.expiring).toEqual(["server"]);
+        } finally {
+            await s.stop();
+        }
+    });
+
+    it("the daily audits use the alarms job's background rpc", async () => {
+        // The audit job runs at audit_at_utc, so the clock starts just before it
+        const target = new Date();
+        target.setUTCHours(3, 30, 0, 0);
+        if (target.getTime() <= Date.now() + 60_000) target.setUTCDate(target.getUTCDate() + 1);
+        const shift = target.getTime() - Date.now() - 1_500;
+        jobRpcs.clear();
+        const s = await startService({
+            settings: x402Settings({ jobs: { audit_at_utc: "03:30", alarms_every: "50ms" } }),
+            secrets: x402Secrets,
+            rpc: withBalance(chain.rpc),
+            log: silentLog,
+            now: () => new Date(Date.now() + shift),
+        });
+        try {
+            await until(async () => jobRpcs.has("auditX402") && jobRpcs.has("alarms"), 5_000);
+            const background = jobRpcs.get("alarms");
+            expect(jobRpcs.get("reconcile")).toBeDefined();
+            expect(jobRpcs.get("reconcile")).not.toBe(background);
+            expect(jobRpcs.get("auditInflows")).toBe(background);
+            expect(jobRpcs.get("auditX402")).toBe(background);
         } finally {
             await s.stop();
         }
