@@ -298,6 +298,14 @@ const ROLE_REQUESTS: Readonly<Record<Role, RouterRequest>> = {
     })!,
 };
 const SYSTEM_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
+// A result that is not what the method returns, like a 200 that is not JSON
+const UNFIT: Outcome = {
+    kind: "failover",
+    strike: true,
+    history: false,
+    retryAfterMs: null,
+    ambiguous: true,
+};
 
 const ROUTERS = new WeakMap<RpcTransport, Router>();
 
@@ -388,6 +396,13 @@ function isOnly(answer: unknown, signature: string): boolean {
     }
     const [first] = answer.result;
     return isObject(first) && first.signature === signature;
+}
+
+// R8: a caller reads a missing entry as null, so statuses that are not one per signature asked
+// could turn a landed transaction into a missing one
+function unfitStatuses(req: RouterRequest, answer: unknown): boolean {
+    if (req.method !== "getSignatureStatuses" || req.signatures.length === 0) return false;
+    return statusesOf(answer)?.result.value.length !== req.signatures.length;
 }
 
 function hasStatus(answer: unknown): boolean {
@@ -1157,7 +1172,9 @@ class Router {
         const floors = this.floorsOf(req);
         this.observe(ep, req, answer);
         this.remember(ep, req, answer);
-        const o = classifyAnswer(req.method, answer);
+        const classified = classifyAnswer(req.method, answer);
+        const unfit = classified.kind === "ok" && unfitStatuses(req, answer);
+        const o = unfit ? UNFIT : classified;
         const error = rpcErrorOf(answer);
         if (o.kind === "ok") {
             ep.health.succeed(a.elapsed);
@@ -1188,7 +1205,10 @@ class Router {
                 err: "SolanaError",
                 ...code,
             });
-        } else if (isObject(answer) && "result" in answer) {
+        } else if (unfit || !isObject(answer) || !("result" in answer)) {
+            this.react(ep, req, o, a.elapsed, {}, run);
+            this.failed(run, ep, req.method, "invalid", { err: "invalid_answer" });
+        } else {
             // R2: a context method's result without its slot could skip every slot check
             run.stale = ep.name;
             this.react(ep, req, o, a.elapsed, {}, run);
@@ -1196,9 +1216,6 @@ class Router {
                 err: "RpcRouterError",
                 reason: "stale",
             });
-        } else {
-            this.react(ep, req, o, a.elapsed, {}, run);
-            this.failed(run, ep, req.method, "invalid", { err: "invalid_answer" });
         }
         return { kind: "next" };
     }

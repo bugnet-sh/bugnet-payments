@@ -1053,6 +1053,29 @@ describe("absence quorum", () => {
         expect((valueOf(answer) as Status[])[0]?.confirmationStatus).toBe("confirmed");
     });
 
+    it("statuses that are not one per signature are never returned", async () => {
+        for (const params of [searching, [[SIG]]]) {
+            for (const value of [[], {}, [null, null]]) {
+                const t = setup(2);
+                t.a.answer(
+                    chain(t.clock, {
+                        getSignatureStatuses: () =>
+                            rpcOk({ context: { slot: slotAt(t.clock.ms) }, value }),
+                    }),
+                );
+                t.b.answer(statuses(t, [S(7n, "finalized")]));
+                const answer = await call(t.router, "getSignatureStatuses", params);
+                expect((valueOf(answer) as Status[])[0]?.confirmationStatus).toBe("finalized");
+                expect(snap(t.router, "rpc1").errorRate).toBe(1);
+            }
+        }
+        const t = setup(2);
+        for (const ep of [t.a, t.b]) ep.answer(statuses(t, []));
+        expect(reasonOf(await rejection(call(t.router, "getSignatureStatuses", searching)))).toBe(
+            "no_endpoint",
+        );
+    });
+
     it("same-domain endpoints do not make a quorum", async () => {
         const t = setup(3, {}, { urls: ONE_DOMAIN });
         t.a.answer(statuses(t, [null]));
