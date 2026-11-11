@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { missingLiveEnv, missingX402Env } from "./live-env.ts";
+import { missingDepositEnv, missingLiveEnv, missingX402Env } from "./live-env.ts";
 
 const PAYER = "BUGNET_TEST_PAYER_KEY or BUGNET_TEST_PAYER_MNEMONIC";
 const RPC = "BUGNET_SOLANA_RPC_URLS or BUGNET_SOLANA_RPC_URL";
@@ -95,5 +95,15 @@ describe("missingLiveEnv", () => {
                 () => true,
             ),
         ).toEqual([]);
+    });
+});
+
+describe("missingDepositEnv", () => {
+    it("missingDepositEnv names the seed", () => {
+        expect(missingDepositEnv({})).toEqual(["BUGNET_DEPOSIT_SEED"]);
+        expect(missingDepositEnv({ BUGNET_DEPOSIT_SEED: " " })).toEqual(["BUGNET_DEPOSIT_SEED"]);
+        expect(missingDepositEnv({ BUGNET_DEPOSIT_SEED: "seed" })).toEqual([]);
+        // The v1 and x402 live files never ask for it
+        expect(missingLiveEnv(fullEnv())).toEqual([]);
     });
 });
