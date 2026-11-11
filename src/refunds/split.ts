@@ -46,15 +46,21 @@ export function splitRefund(
         }
     }
     parts[0] = first;
-    return shares
+    const kept = shares
         .map((s, i) => ({ share: s, amount: parts[i]! }))
-        .filter((p) => p.amount > 0n)
-        .map((p, part) => ({
-            part,
-            destination: p.share.sourceTokenAccount,
-            payer: p.share.owner,
-            amountMicros: Number(p.amount),
-        }));
+        .filter((p) => p.amount > 0n);
+    // Shares out of order would send refund part i to another share's owner
+    for (const [part, p] of kept.entries()) {
+        if (p.share.part !== part) {
+            throw new Error(`refund part ${part} would go to share part ${p.share.part}`);
+        }
+    }
+    return kept.map((p, part) => ({
+        part,
+        destination: p.share.sourceTokenAccount,
+        payer: p.share.owner,
+        amountMicros: Number(p.amount),
+    }));
 }
 
 export async function refundTargets(

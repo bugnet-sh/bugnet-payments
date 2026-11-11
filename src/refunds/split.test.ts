@@ -65,6 +65,13 @@ describe("splitRefund", () => {
         ]);
     });
 
+    it("refuses shares out of order, which would give a refund part another share's owner", () => {
+        // The middle share is merged away, so the last one would become refund part 1
+        expect(() => splitRefund(150_500, shares(100_000, 500, 50_000), 1_000)).toThrow(
+            "refund part 1 would go to share part 2",
+        );
+    });
+
     it("drops parts left at 0 and numbers the rest from 0", () => {
         expect(amounts(1, shares(30_000, 20_000), 0)).toEqual([[0, 1]]);
         expect(amounts(4, shares(30_000, 15_000, 5_000), 0)).toEqual([
