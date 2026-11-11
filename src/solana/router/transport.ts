@@ -1025,6 +1025,8 @@ class Router {
     private checkTransport(ep: Endpoint): RpcTransport {
         return (async ({ payload, signal }: Config) => {
             const req = readRequest(payload) ?? opaqueRequest(payload);
+            // Counted but never held for background room: an hourly history check held on a busy
+            // rpc1 would delay catching a provider that cut its retention (spec 6.3)
             ep.limits.record(req.method, "background");
             ep.counters.count("background");
             ep.health.begin();
