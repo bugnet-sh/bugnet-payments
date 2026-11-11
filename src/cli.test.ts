@@ -1464,7 +1464,11 @@ describe("rpc commands", () => {
             const id = await waitingRow(sig);
             const dead = fakeEndpoint("a", () => netFail());
             const b = proofNode("b", sig);
-            await retry(id, TWO, [dead, b]);
+            const r = await retry(id, TWO, [dead, b]);
+            // Without the claim key the stored verdicts are off, and the command says so
+            expect(r.io.errText()).toContain(
+                "rpc stored verdicts are not used without a valid BUGNET_CLAIM_KEY",
+            );
             const asked = b.calls.filter(
                 (c) =>
                     c.method === "getSignatureStatuses" && (c.params[0] as string[]).includes(sig),
