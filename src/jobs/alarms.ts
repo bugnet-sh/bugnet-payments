@@ -131,7 +131,8 @@ async function refundsCreatedLastHour(pool: pg.Pool, now: Date): Promise<number>
     return res.rows[0]?.n ?? 0;
 }
 
-// The fee payer's SOL that deposit moves used in [from, to): every landed or failed move's fee
+// The fee payer's SOL that deposit moves used in (from, to], the window the payment counters
+// use: every landed or failed move's fee
 // (a refused preflight costs nothing), a create's rent out, and a close's rent back to itself
 export async function depositLamports(
     pool: pg.Pool,
@@ -148,8 +149,8 @@ export async function depositLamports(
         preflight_refused_at: Date | null;
     }>(
         `select kind, state, closes, close_to, preflight_refused_at from deposit_moves
-         where (state = 'confirmed' and confirmed_at >= $1 and confirmed_at < $2)
-            or (state = 'failed' and failed_at >= $1 and failed_at < $2)`,
+         where (state = 'confirmed' and confirmed_at > $1 and confirmed_at <= $2)
+            or (state = 'failed' and failed_at > $1 and failed_at <= $2)`,
         [from, to],
     );
     let sum = 0n;

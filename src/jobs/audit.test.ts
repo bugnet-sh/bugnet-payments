@@ -146,7 +146,7 @@ describe("auditInflows", () => {
             deps(
                 rpcWith([
                     inflow({ name: "S1", memo: order.id, amount: "10000" }),
-                    inflow({ name: "K1", memo: `bugnet-return ${other.id}`, amount: "500" }),
+                    inflow({ name: "K1", memo: `bugnet-kept ${other.id}`, amount: "500" }),
                 ]),
             ),
         );
