@@ -1872,6 +1872,17 @@ describe("runRefunds on refund groups", () => {
         expect((await runRefunds(deps(rpc, later(30_000)), "refund")).confirmed).toBe(1);
         expect((await findRefundById(db.pool, a.id))!.state).toBe("confirmed");
         expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
+
+        // With every deposit row confirmed the order still stays: those rows never move it
+        await db.pool.query(
+            `update refunds set amount_micros = 8000, state = 'pending', manual_reason = null
+             where id = $1`,
+            [b.id],
+        );
+        expect((await runRefunds(deps(rpc, later(60_000)), "refund")).sent).toBe(1);
+        expect((await runRefunds(deps(rpc, later(90_000)), "refund")).confirmed).toBe(1);
+        expect((await findRefundById(db.pool, b.id))!.state).toBe("confirmed");
+        expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
     });
 });
 
