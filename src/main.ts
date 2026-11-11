@@ -305,6 +305,17 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             };
             parts = { index: index.current, signer: gate, addresses, funding };
         }
+        const deposits: DepositWiring | null =
+            depositKeys === null || secrets.depositSeed === null
+                ? null
+                : {
+                      keys: depositKeys,
+                      seed: secrets.depositSeed,
+                      watch: createDepositWatch(s.deposits.viewer_ttl, s.deposits.busy_every),
+                      recipientTokenAccount: await usdcAta(recipient),
+                      floatTokenAccount: await usdcAta(refundSigner.address),
+                      addresses,
+                  };
         const http = createHttpApp({
             settings: s,
             secrets,
@@ -312,6 +323,12 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             rpc,
             feePayer,
             x402: parts,
+            // Until the RPC router gives a background lane, the balance route reads through rpc0
+            backgroundRpc: rpc0,
+            deposits:
+                deposits === null
+                    ? null
+                    : { keys: deposits.keys, watch: deposits.watch, enabled: s.deposits.enabled },
             log,
             now,
         });
@@ -386,17 +403,6 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             reload = () => log.info("reload ignored: allowance_wallet is empty");
         }
 
-        const deposits: DepositWiring | null =
-            depositKeys === null || secrets.depositSeed === null
-                ? null
-                : {
-                      keys: depositKeys,
-                      seed: secrets.depositSeed,
-                      watch: createDepositWatch(s.deposits.viewer_ttl, s.deposits.busy_every),
-                      recipientTokenAccount: await usdcAta(recipient),
-                      floatTokenAccount: await usdcAta(refundSigner.address),
-                      addresses,
-                  };
         const jobs = startJobs({
             s,
             pool,

@@ -1,3 +1,4 @@
+import type { IpKey } from "./http/ipkey.ts";
 interface Window {
     start: number;
     count: number;
@@ -37,10 +38,50 @@ export class RateLimiter {
         return { ok: true };
     }
 
+    // What take would answer, without counting the call
+    peek(key: string): { ok: true } | { ok: false; retryAfterSeconds: number } {
+        const t = this.now();
+        const w = this.windows.get(key);
+        if (w === undefined || t - w.start >= this.windowMs || w.count < this.limit) {
+            return { ok: true };
+        }
+        return {
+            ok: false,
+            retryAfterSeconds: Math.ceil((Math.min(w.start, t) + this.windowMs - t) / 1000),
+        };
+    }
+
     private prune(t: number): void {
         for (const [key, w] of this.windows) {
             if (t - w.start < this.windowMs) return;
             this.windows.delete(key);
         }
+    }
+}
+
+// Per IP key (spec 5): a /64 is one key, and its /48 block may take blockMultiple times as many, so
+// one host cannot spread over a /48's addresses to multiply its limit
+export class IpLimiter {
+    private readonly keys: RateLimiter;
+    private readonly blocks: RateLimiter;
+
+    constructor(
+        limit: number,
+        windowMs: number,
+        blockMultiple: number,
+        now: () => number = () => performance.now(),
+    ) {
+        this.keys = new RateLimiter(limit, windowMs, now);
+        this.blocks = new RateLimiter(limit * blockMultiple, windowMs, now);
+    }
+
+    take(ip: IpKey): { ok: true } | { ok: false; retryAfterSeconds: number } {
+        const own = this.keys.peek(ip.key);
+        if (!own.ok) return own;
+        if (ip.block !== null) {
+            const block = this.blocks.take(ip.block);
+            if (!block.ok) return block;
+        }
+        return this.keys.take(ip.key);
     }
 }

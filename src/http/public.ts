@@ -4,18 +4,32 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { encodePaymentResponseHeader } from "@x402/core/http";
 import type pg from "pg";
 import { sendFont } from "../checkout/fonts.ts";
-import { CHECKOUT_CSP, renderCheckout, renderNotFound } from "../checkout/page.ts";
-import type { DepositSummary } from "../deposits/view.ts";
+import {
+    CHECKOUT_CSP,
+    decimalAmount,
+    qrSvg,
+    renderCheckout,
+    renderNotFound,
+} from "../checkout/page.ts";
+import type { DepositWatch } from "../deposits/job.ts";
+import type { DepositKeys } from "../deposits/keys.ts";
+import { depositLedger, ensureDeposit } from "../deposits/store.ts";
+import type { DepositView } from "../deposits/types.ts";
+import { depositSummary, depositView, type DepositSummary } from "../deposits/view.ts";
 import type { Log } from "../log.ts";
 import { isOrderId } from "../orders/ids.ts";
 import { type PayDeps, type PayOutcome, payOrder } from "../orders/pay.ts";
 import { findOrder } from "../orders/store.ts";
 import type { OrderRow, OrderState } from "../orders/types.ts";
-import type { RateLimiter } from "../ratelimit.ts";
+import type { IpLimiter, RateLimiter } from "../ratelimit.ts";
+import { readTokenAccount, usdcAta } from "../solana/accounts.ts";
+import { deadline, type SolanaRpc } from "../solana/rpc.ts";
 import type { BlockhashCache } from "../solana/blockhash.ts";
 import { decodeCursor } from "../stats/cursor.ts";
 import { statsPayments } from "../stats/payments.ts";
-import { SOLANA_MAINNET } from "../solana/constants.ts";
+import { SOLANA_MAINNET, USDC_MINT } from "../solana/constants.ts";
+import { address, isAddress } from "@solana/kit";
+import { type IpKey, ipKey } from "./ipkey.ts";
 import {
     type ChallengeContext,
     challengeFor,
@@ -30,6 +44,7 @@ import {
     drainBody,
     hangupSignal,
     paidVia,
+    readBody,
     requestPath,
     sendJson,
 } from "./server.ts";
@@ -41,18 +56,44 @@ export interface PublicDeps {
     challenge: ChallengeContext;
     hints: BlockhashCache;
     pay: PayDeps;
-    perIp: RateLimiter;
-    statusPerIp: RateLimiter;
+    perIp: IpLimiter;
+    statusPerIp: IpLimiter;
     trustedProxies: readonly string[];
     maxBodyBytes: number;
     checkoutJsPath: string;
     // What the page shows about returns and how long it keeps checking past the deadline
-    deposits: Pick<Settings["deposits"], "refund_min_micros" | "settle_grace">;
+    depositSettings: Settings["deposits"];
+    // null only without a deposit seed; enabled false keeps existing deposits but makes none
+    deposits: PublicDeposits | null;
+    // The balance route's reads, on the router's background lane once it is merged (spec 13.1)
+    backgroundRpc: SolanaRpc;
+    balancePerIp: IpLimiter;
+    // Process-wide: every balance read, key "all"
+    balanceRpc: RateLimiter;
+    reportPerIp: IpLimiter;
+    rpcTimeoutMs: number;
     log: Log;
     now: () => Date;
 }
 
-const ORDER_PATH = /^\/o\/([^/]+)(\/status)?$/;
+export interface PublicDeposits {
+    keys: DepositKeys;
+    watch: DepositWatch;
+    enabled: boolean;
+    salt?: () => Buffer;
+}
+
+export interface BalanceAnswer {
+    owner: string;
+    usdcMicros: number;
+    needMicros: number;
+}
+
+const ORDER_PATH = /^\/o\/([^/]+)(?:\/(status|balance|report|qr\.svg))?$/;
+const REPORT_MAX_BYTES = 2_048;
+const REPORT_STAGES = new Set(["connect", "balance", "challenge", "sign", "submit", "status"]);
+const BALANCE_CACHE_MS = 15_000;
+const BALANCE_CACHE_SIZE = 1_000;
 const STATS_PAYMENTS = "/api/stats/payments";
 
 function unreachable(state: never): never {
@@ -139,7 +180,15 @@ async function sendCheckout(
         sendHtml(res, 404, renderNotFound());
         return;
     }
-    const state = publicState(order, d.now());
+    const now = d.now();
+    let deposit: DepositView | null = null;
+    if (d.deposits !== null) {
+        // The page makes the order's address; the job creates its account once a viewer polls
+        if (d.deposits.enabled)
+            await ensureDeposit(d.pool, d.deposits.keys, order, now, d.deposits.salt);
+        deposit = await depositView(d.pool, order, now, d.depositSettings);
+    }
+    const state = publicState(order, now);
     const html = await renderCheckout({
         orderId: order.id,
         description: order.description,
@@ -148,13 +197,13 @@ async function sendCheckout(
         pageUrl: payUrlFor(d.challenge.publicUrl, order.id),
         origin: new URL(d.challenge.publicUrl).origin,
         expiresAt: order.expiresAt,
-        now: d.now(),
+        now,
         kind: order.kind,
-        // Task 16 passes the order's deposit once the route reads it
-        deposit: null,
-        depositsOffered: false,
-        refundMinMicros: d.deposits.refund_min_micros,
-        settleGraceMs: d.deposits.settle_grace,
+        deposit,
+        // An existing address still shows when new ones are off
+        depositsOffered: deposit !== null,
+        refundMinMicros: d.depositSettings.refund_min_micros,
+        settleGraceMs: d.depositSettings.settle_grace,
     });
     sendHtml(res, closedAnswer(order, state)?.status ?? 200, html);
 }
@@ -244,6 +293,8 @@ async function sendStatsPayments(
 }
 
 export function createPublicHandler(d: PublicDeps): Handler {
+    // Each owner's balance for 15 s, so repeated checks of one wallet cost one read
+    const balances = new Map<string, { at: number; micros: number }>();
     return async (req, res) => {
         const path = requestPath(req.url);
         if (req.method === "GET" && path === "/healthz") {
@@ -251,16 +302,22 @@ export function createPublicHandler(d: PublicDeps): Handler {
             return;
         }
         const route = ORDER_PATH.exec(path);
-        const isStatus = route?.[2] !== undefined;
-        const header = route === null || isStatus ? undefined : paymentHeader(req);
+        const sub = route?.[2];
+        const isStatus = sub === "status";
+        const header = route === null || sub !== undefined ? undefined : paymentHeader(req);
+        const ip = ipKey(clientIp(req, d.trustedProxies));
         const refuse = (status: number, reason: string, headers: Record<string, string> = {}) =>
             sendJson(res, status, header === undefined ? { error: reason } : { refused: reason }, {
                 ...headers,
             });
-        const limit = (isStatus ? d.statusPerIp : d.perIp).take(clientIp(req, d.trustedProxies));
-        // No public route takes a body; it is counted against the cap and discarded
+        const limit = (isStatus ? d.statusPerIp : d.perIp).take(ip);
+        // Only the report route takes a body; every other one is counted against the cap and
+        // discarded
+        let body = "";
         try {
-            if (!(await drainBody(req, d.maxBodyBytes))) {
+            if (sub === "report") {
+                body = (await readBody(req, REPORT_MAX_BYTES)).toString("utf8");
+            } else if (!(await drainBody(req, d.maxBodyBytes))) {
                 d.log.info("client hung up mid-body", { path });
                 return;
             }
@@ -287,9 +344,12 @@ export function createPublicHandler(d: PublicDeps): Handler {
             sendJson(res, 404, { error: "not_found" });
             return;
         }
-        const allowed = isStatus
-            ? req.method === "GET"
-            : req.method === "GET" || req.method === "POST";
+        const allowed =
+            sub === "report"
+                ? req.method === "POST"
+                : sub !== undefined
+                  ? req.method === "GET"
+                  : req.method === "GET" || req.method === "POST";
         if (!allowed) {
             refuse(405, "method_not_allowed");
             return;
@@ -315,7 +375,7 @@ export function createPublicHandler(d: PublicDeps): Handler {
             return;
         }
         const order = isOrderId(id) ? await findOrder(d.pool, id) : null;
-        if (!isStatus && wantsHtml(req)) {
+        if (sub === undefined && wantsHtml(req)) {
             await sendCheckout(res, d, order);
             return;
         }
@@ -323,15 +383,11 @@ export function createPublicHandler(d: PublicDeps): Handler {
             sendJson(res, 404, { error: "order_unknown" });
             return;
         }
+        if (sub === "report") return sendReport(res, d, order, ip, body);
+        if (sub === "balance") return sendBalance(req, res, d, order, ip, balances);
+        if (sub === "qr.svg") return sendQr(res, d, order);
+        if (isStatus) return sendStatus(req, res, d, order, ip);
         const state = publicState(order, d.now());
-        if (isStatus) {
-            sendJson(res, 200, {
-                orderId: order.id,
-                state,
-                expiresAt: order.expiresAt.toISOString(),
-            });
-            return;
-        }
         const closed = closedAnswer(order, state);
         if (closed !== undefined) {
             sendJson(res, closed.status, closed.body);
@@ -359,4 +415,195 @@ export function createPublicHandler(d: PublicDeps): Handler {
         d.log.error("order state left without an answer", { orderId: order.id, state });
         sendJson(res, 500, { error: "internal" });
     };
+}
+
+async function orderDeposit(d: PublicDeps, order: OrderRow, now: Date) {
+    const ledger = await depositLedger(d.pool, order.id);
+    return {
+        view: ledger === null ? null : await depositView(d.pool, order, now, d.depositSettings),
+        summary:
+            ledger === null
+                ? undefined
+                : depositSummary(order, ledger, d.depositSettings.settle_grace),
+        row: ledger?.deposit ?? null,
+    };
+}
+
+async function sendStatus(
+    req: IncomingMessage,
+    res: ServerResponse,
+    d: PublicDeps,
+    order: OrderRow,
+    ip: IpKey,
+): Promise<void> {
+    const now = d.now();
+    const dep = await orderDeposit(d, order, now);
+    // The checkout page's poll marks a viewer, which keeps the deposit job busy for this order
+    if (d.deposits !== null && dep.row !== null && req.headers["bugnet-client"] === "checkout") {
+        d.deposits.watch.noteViewer(order.id, ip, now.getTime(), {
+            state: dep.row.state,
+            expiresAtMs: order.expiresAt.getTime(),
+            needsCreate: dep.row.readyAt === null,
+        });
+    }
+    sendJson(
+        res,
+        200,
+        {
+            orderId: order.id,
+            state: publicState(order, now, dep.summary),
+            expiresAt: order.expiresAt.toISOString(),
+            now: now.toISOString(),
+            amountMicros: order.amountMicros,
+            kind: order.kind,
+            deposit: dep.view,
+        },
+        { "Cache-Control": "no-store" },
+    );
+}
+
+// The page's pre-check before a wallet signs (spec 13.1): reads are cached per owner and capped
+// for the whole process, so random owners cannot spend Bugnet's RPC
+async function sendBalance(
+    req: IncomingMessage,
+    res: ServerResponse,
+    d: PublicDeps,
+    order: OrderRow,
+    ip: IpKey,
+    cache: Map<string, { at: number; micros: number }>,
+): Promise<void> {
+    const limit = d.balancePerIp.take(ip);
+    if (!limit.ok) {
+        sendJson(
+            res,
+            429,
+            { error: "too_many_requests" },
+            {
+                "Retry-After": String(limit.retryAfterSeconds),
+            },
+        );
+        return;
+    }
+    const owner = new URL(req.url ?? "/", "http://x").searchParams.get("owner") ?? "";
+    if (!isAddress(owner)) {
+        sendJson(res, 400, { error: "bad_owner" });
+        return;
+    }
+    const now = d.now();
+    if (order.state !== "unpaid" || now.getTime() >= order.expiresAt.getTime()) {
+        sendJson(res, 409, { error: "order_not_payable" });
+        return;
+    }
+    const answer = (micros: number): BalanceAnswer => ({
+        owner,
+        usdcMicros: micros,
+        needMicros: order.amountMicros,
+    });
+    const hit = cache.get(owner);
+    if (hit !== undefined && now.getTime() - hit.at < BALANCE_CACHE_MS) {
+        sendJson(res, 200, answer(hit.micros));
+        return;
+    }
+    if (!d.balanceRpc.take("all").ok) {
+        sendJson(res, 503, { error: "rpc_unavailable" });
+        return;
+    }
+    let micros: number;
+    try {
+        const read = await readTokenAccount(d.backgroundRpc, await usdcAta(address(owner)), {
+            commitment: "confirmed",
+            ...deadline(d.rpcTimeoutMs),
+        });
+        micros = Number(read.info?.amount ?? 0n);
+    } catch {
+        sendJson(res, 503, { error: "rpc_unavailable" });
+        return;
+    }
+    if (cache.size >= BALANCE_CACHE_SIZE) cache.delete(cache.keys().next().value!);
+    cache.set(owner, { at: now.getTime(), micros });
+    sendJson(res, 200, answer(micros));
+}
+
+export function cleanReport(
+    body: unknown,
+): { stage: string; wallet: string; code: number | null; message: string } | null {
+    if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
+    const allowed = new Set(["stage", "wallet", "code", "message"]);
+    if (Object.keys(body).some((k) => !allowed.has(k))) return null;
+    const b = body as Record<string, unknown>;
+    if (typeof b.stage !== "string" || !REPORT_STAGES.has(b.stage)) return null;
+    if (typeof b.wallet !== "string" || typeof b.message !== "string") return null;
+    if (b.code !== null && (typeof b.code !== "number" || !Number.isFinite(b.code))) return null;
+    // eslint-disable-next-line no-control-regex
+    const clean = (s: string, max: number) => s.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, max);
+    return {
+        stage: b.stage,
+        wallet: clean(b.wallet, 40),
+        code: b.code as number | null,
+        message: clean(b.message, 200),
+    };
+}
+
+// The page's own account of a wallet error (spec 13.3): the wallet's text goes to the log only
+function sendReport(
+    res: ServerResponse,
+    d: PublicDeps,
+    order: OrderRow,
+    ip: IpKey,
+    body: string,
+): void {
+    const limit = d.reportPerIp.take(ip);
+    if (!limit.ok) {
+        sendJson(
+            res,
+            429,
+            { error: "too_many_requests" },
+            {
+                "Retry-After": String(limit.retryAfterSeconds),
+            },
+        );
+        return;
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(body);
+    } catch {
+        parsed = null;
+    }
+    const report = cleanReport(parsed);
+    if (report === null) {
+        sendJson(res, 400, { error: "bad_report" });
+        return;
+    }
+    d.log.warn("checkout wallet error", { orderId: order.id, ...report, ip: ip.key });
+    res.writeHead(204);
+    res.end();
+}
+
+// A Solana Pay transfer request for what the order still lacks (spec 15.1)
+export function solanaPayUrl(address: string, amountMicros: number, description: string): string {
+    return (
+        `solana:${address}?amount=${decimalAmount(amountMicros)}&spl-token=${USDC_MINT}` +
+        `&label=Bugnet&message=${encodeURIComponent(description)}`
+    );
+}
+
+async function sendQr(res: ServerResponse, d: PublicDeps, order: OrderRow): Promise<void> {
+    const now = d.now();
+    const view =
+        order.state === "unpaid" && now.getTime() < order.expiresAt.getTime()
+            ? await depositView(d.pool, order, now, d.depositSettings)
+            : null;
+    if (view === null || view.remainingMicros <= 0) {
+        sendJson(res, 404, { error: "not_found" });
+        return;
+    }
+    const svg = await qrSvg(solanaPayUrl(view.address, view.remainingMicros, order.description));
+    res.writeHead(200, {
+        "Content-Type": "image/svg+xml",
+        "Content-Length": String(Buffer.byteLength(svg)),
+        "Content-Security-Policy": "default-src 'none'",
+        "Cache-Control": "no-store",
+    });
+    res.end(svg);
 }

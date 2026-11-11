@@ -5,7 +5,7 @@ import { eventPublicKey, handleEvent } from "../events/handler.ts";
 import type { Log } from "../log.ts";
 import { createPayDeps, payOrder } from "../orders/pay.ts";
 import { orderKey } from "../orders/token.ts";
-import { RateLimiter } from "../ratelimit.ts";
+import { IpLimiter, RateLimiter } from "../ratelimit.ts";
 import { createRouterClient, type RouterClient } from "../router/client.ts";
 import { BlockhashCache } from "../solana/blockhash.ts";
 import type { SolanaRpc } from "../solana/rpc.ts";
@@ -15,7 +15,7 @@ import type { BugnetAddresses, SignerHealth } from "../x402/types.ts";
 import { type AllowanceFunding, createAllowanceFunding } from "../x402/funding.ts";
 import { createSettler } from "../x402/settler.ts";
 import { createInternalHandler } from "./internal.ts";
-import { createPublicHandler } from "./public.ts";
+import { createPublicHandler, type PublicDeposits } from "./public.ts";
 import type { Handler } from "./server.ts";
 
 export interface HttpX402Parts {
@@ -33,6 +33,10 @@ export interface HttpAppDeps {
     rpc: SolanaRpc;
     feePayer: KeyPairSigner;
     x402?: HttpX402Parts;
+    // The balance route's reads; the money client until the RPC router gives a background lane
+    backgroundRpc?: SolanaRpc;
+    // null without a deposit seed
+    deposits?: PublicDeposits | null;
     log: Log;
     now: () => Date;
 }
@@ -66,6 +70,8 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
         }),
     };
     const perMinute = (limit: number) => new RateLimiter(limit, MINUTE_MS, o.limiterClock);
+    const ipPerMinute = (limit: number) =>
+        new IpLimiter(limit, MINUTE_MS, s.limits.ipv6_block_multiple, o.limiterClock);
     const hints = new BlockhashCache(rpc, s.solana.blockhash_cache_ttl, () => now().getTime());
     const settler = createSettler({
         feePayer,
@@ -149,12 +155,18 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
         challenge,
         hints,
         pay,
-        perIp: perMinute(s.limits.public_per_ip_per_minute),
-        statusPerIp: perMinute(s.limits.status_per_ip_per_minute),
+        perIp: ipPerMinute(s.limits.public_per_ip_per_minute),
+        statusPerIp: ipPerMinute(s.limits.status_per_ip_per_minute),
         trustedProxies: s.http.trusted_proxies,
         maxBodyBytes: s.http.max_body_bytes,
         checkoutJsPath: o.checkoutJsPath ?? CHECKOUT_JS,
-        deposits: s.deposits,
+        depositSettings: s.deposits,
+        deposits: d.deposits ?? null,
+        backgroundRpc: d.backgroundRpc ?? rpc,
+        balancePerIp: ipPerMinute(s.limits.balance_per_ip_per_minute),
+        balanceRpc: perMinute(s.limits.balance_rpc_per_minute),
+        reportPerIp: ipPerMinute(s.limits.report_per_ip_per_minute),
+        rpcTimeoutMs: s.solana.rpc_timeout,
         log,
         now,
     });

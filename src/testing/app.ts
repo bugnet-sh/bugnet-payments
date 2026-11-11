@@ -1,4 +1,7 @@
 import { randomBytes } from "node:crypto";
+import type { SolanaRpc } from "../solana/rpc.ts";
+import { createDepositWatch, type DepositWatch } from "../deposits/job.ts";
+import { DepositKeys } from "../deposits/keys.ts";
 import type { ServiceImpl } from "@connectrpc/connect";
 import { getAddressEncoder, getBase58Decoder, type KeyPairSigner } from "@solana/kit";
 import type { PaymentRequirements } from "@x402/core/types";
@@ -35,6 +38,10 @@ export interface TestAppOptions {
     allowanceClaim?: boolean;
     signerOpen?: boolean;
     rpc?: Partial<FakeRpcScript>;
+    // Deposits with seed Buffer.alloc(32, 7) and salt Buffer.alloc(16, 1); off when left out
+    deposits?: Partial<Settings["deposits"]>;
+    // The balance route's reads; the scripted rpc when left out
+    backgroundRpc?: SolanaRpc;
 }
 
 export interface TestApp {
@@ -52,8 +59,13 @@ export interface TestApp {
     settings: Settings;
     secrets: Secrets;
     now: { get(): Date; set(d: Date): void };
+    // With deposits: the viewer watch the public status route notes viewers in
+    watch: DepositWatch | null;
     close(): Promise<void>;
 }
+
+export const TEST_DEPOSIT_SEED = Buffer.alloc(32, 7);
+export const TEST_DEPOSIT_SALT = Buffer.alloc(16, 1);
 
 const DEFAULT_NOW = new Date("2030-01-01T00:00:00Z");
 // Router events in tests are signed with this seed
@@ -111,6 +123,7 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
                 allowance_claim: over.allowanceClaim ?? true,
             },
             x402: { enabled: true, allowance_wallet: allowance.address, ...over.x402 },
+            ...(over.deposits === undefined ? {} : { deposits: { ...over.deposits } }),
         }),
         "testApp",
     );
@@ -124,9 +137,13 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
         rpcUrl: "",
         allowanceKey: keypairSecret(ALLOWANCE_SEED, allowance),
         x402TlsKey: "",
-        depositSeed: null,
+        depositSeed: over.deposits === undefined ? null : TEST_DEPOSIT_SEED,
         depositSeedPrevious: null,
     };
+    const watch =
+        over.deposits === undefined
+            ? null
+            : createDepositWatch(settings.deposits.viewer_ttl, settings.deposits.busy_every);
     const rpc = createFakeRpc({
         getAccountInfo: () => usdcAccountAnswer(TEST_PAYTO),
         ...over.rpc,
@@ -148,6 +165,16 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
                     recipient: recipient.address,
                 }),
             },
+            ...(over.backgroundRpc === undefined ? {} : { backgroundRpc: over.backgroundRpc }),
+            deposits:
+                watch === null
+                    ? null
+                    : {
+                          keys: new DepositKeys(new Map([[1, TEST_DEPOSIT_SEED]]), 1),
+                          watch,
+                          enabled: settings.deposits.enabled,
+                          salt: () => TEST_DEPOSIT_SALT,
+                      },
             log,
             now: appNow,
         },
@@ -175,6 +202,7 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
         index,
         settings,
         secrets,
+        watch,
         now: {
             get: appNow,
             set(d: Date) {

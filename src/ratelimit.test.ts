@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RateLimiter } from "./ratelimit.ts";
+import { IpLimiter, RateLimiter } from "./ratelimit.ts";
+import { ipKey } from "./http/ipkey.ts";
 
 describe("RateLimiter", () => {
     afterEach(() => {
@@ -74,5 +75,30 @@ describe("RateLimiter", () => {
         expect(l.take("k")).toEqual({ ok: false, retryAfterSeconds: 60 });
         now.mockReturnValue(61_000);
         expect(l.take("k").ok).toBe(true);
+    });
+});
+
+describe("IpLimiter", () => {
+    it("one /64 is one key", () => {
+        const t = 0;
+        const limiter = new IpLimiter(2, 60_000, 4, () => t);
+        const take = (ip: string) => limiter.take(ipKey(ip)).ok;
+        // Two addresses of one /64 share its 2 takes
+        expect([take("2001:db8:1:1::1"), take("2001:db8:1:1::2"), take("2001:db8:1:1::3")]).toEqual(
+            [true, true, false],
+        );
+        // Other /64s of the same /48 get their own 2, until the /48 has taken 8
+        const results: boolean[] = [];
+        for (let n = 2; n <= 6; n++)
+            results.push(take(`2001:db8:1:${n}::1`), take(`2001:db8:1:${n}::2`));
+        expect(results.filter(Boolean)).toHaveLength(6);
+        expect(results.slice(0, 6)).toEqual([true, true, true, true, true, true]);
+        expect(results.slice(6)).toEqual([false, false, false, false]);
+        // An IPv4 address is its own key
+        expect([take("203.0.113.7"), take("203.0.113.7"), take("203.0.113.7")]).toEqual([
+            true,
+            true,
+            false,
+        ]);
     });
 });

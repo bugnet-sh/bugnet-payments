@@ -535,6 +535,10 @@ describe("public order routes", () => {
             orderId: order.id,
             state: "unpaid",
             expiresAt: order.expiresAt.toISOString(),
+            now: app.now.get().toISOString(),
+            amountMicros: order.amountMicros,
+            kind: order.kind,
+            deposit: null,
         });
         const lapsed = await unpaid({ expiresAt: inFuture(-1_000) });
         expect(
