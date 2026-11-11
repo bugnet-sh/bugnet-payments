@@ -170,9 +170,13 @@ export async function sweep(d: SweepDeps): Promise<SweepReport> {
 
     const unredeemedBefore = new Date(now.getTime() - d.orders.unredeemed_refund_after);
     await each(
-        await ids(d.pool, "state = 'paid' and paid_at <= $1 and kind in ('start', 'extend')", [
-            unredeemedBefore,
-        ]),
+        // A transfer's paid_at is its chain time, so the wait counts from when Payments confirmed it
+        await ids(
+            d.pool,
+            `state = 'paid' and kind in ('start', 'extend') and greatest(paid_at,
+                (select p.confirmed_at from payments p where p.order_id = orders.id)) <= $1`,
+            [unredeemedBefore],
+        ),
         (id) => refund(id, "unredeemed", (o) => o.state === "paid"),
     );
 

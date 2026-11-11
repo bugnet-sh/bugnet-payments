@@ -9,6 +9,8 @@
  * under the row lock so it never races the refund sweeper. Every answer comes from the stored
  * order, never from the request's terms.
  */
+import { depositLedger } from "../deposits/store.ts";
+import { depositSummary, type DepositSummary } from "../deposits/view.ts";
 import type { KeyObject } from "node:crypto";
 import type { SettleResponse } from "@x402/core/types";
 import type pg from "pg";
@@ -350,8 +352,24 @@ function termsDiffer(r: OrderRequest, o: OrderRow): boolean {
     );
 }
 
-function lapsed(o: OrderRow, now: Date): boolean {
-    return now.getTime() >= o.expiresAt.getTime();
+// True only where publicState answers expired: past the deadline with no deposit, or with one a
+// pinned read decided holds nothing on time; until then the deposit job may still settle it
+function lapsed(o: OrderRow, now: Date, dep: DepositSummary | null): boolean {
+    if (now.getTime() < o.expiresAt.getTime()) return false;
+    return dep === null || (dep.onTimeMicros === 0 && dep.decided);
+}
+
+// One query, and only for an unpaid order past its deadline
+async function unpaidAnswer(
+    d: OrderServiceDeps,
+    o: OrderRow,
+): Promise<"open" | "expired" | "settling"> {
+    const now = d.now();
+    if (now.getTime() < o.expiresAt.getTime()) return "open";
+    const ledger = await depositLedger(d.pool, o.id);
+    const dep =
+        ledger === null ? null : depositSummary(o, ledger, d.settings.deposits.settle_grace);
+    return lapsed(o, now, dep) ? "expired" : "settling";
 }
 
 async function closedAnswer(db: Queryable, o: OrderRow): Promise<Refused> {
@@ -370,7 +388,9 @@ async function answerUnauthorized(
 ): Promise<OrderResult> {
     switch (o.state) {
         case "unpaid": {
-            if (lapsed(o, d.now())) return refused("order_expired", o.id);
+            const at = await unpaidAnswer(d, o);
+            if (at === "expired") return refused("order_expired", o.id);
+            if (at === "settling") return refused("settling", o.id);
             const claim =
                 idempotencyHit && o.claimBox !== null
                     ? openClaim(d.claimKey, o.id, o.claimBox)
@@ -392,8 +412,12 @@ async function answerAuthorized(
     retryStale: boolean,
 ): Promise<OrderResult> {
     switch (o.state) {
-        case "unpaid":
-            return lapsed(o, d.now()) ? refused("order_expired", o.id) : paymentRequired(d, o);
+        case "unpaid": {
+            const at = await unpaidAnswer(d, o);
+            if (at === "expired") return refused("order_expired", o.id);
+            if (at === "settling") return refused("settling", o.id);
+            return paymentRequired(d, o);
+        }
         case "settling":
             return refused("settling", o.id);
         case "paid":
@@ -461,8 +485,15 @@ async function paid(
     if (payer === undefined) throw new Error(`paid order ${o.id} has no payer`);
     let proof: PaymentProof | undefined;
     if (d.settings.router.token_payer_claims) {
-        proof = paymentProof(payment?.payer, d.challenge.feePayer, payment?.txSignature);
-        if (proof === undefined) d.log.warn("order token payer claims dropped", { orderId: o.id });
+        // A payment from several wallets names no one payer, so it carries no payer claims
+        if (payment !== null && !payment.payerCounted) {
+            d.log.info("payer claims left out: several sending wallets", { orderId: o.id });
+        } else {
+            proof = paymentProof(payment?.payer, d.challenge.feePayer, payment?.txSignature);
+            if (proof === undefined) {
+                d.log.warn("order token payer claims dropped", { orderId: o.id });
+            }
+        }
     }
     const out: Paid = {
         status: "paid",

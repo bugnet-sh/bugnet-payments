@@ -229,6 +229,20 @@ describe("paid orders", () => {
         expect((await findOrderRefund(db.pool, order.id))?.reason).toBe("late");
     });
 
+    it("unredeemed waits for the confirmation clock", async () => {
+        // A transfer's paid_at is its chain time; Payments confirmed it much later
+        const { order } = await seedOrder(db.pool, {
+            state: "paid",
+            expiresAt: at(15 * MIN),
+            paidAt: at(4 * MIN),
+        });
+        await seedPayment(db.pool, order.id, { confirmedAt: at(40 * MIN) });
+        expect((await sweep(deps(at(50 * MIN)))).refunds.unredeemed).toBe(0);
+        expect((await stateOf(order.id)).state).toBe("paid");
+        expect((await sweep(deps(at(70 * MIN)))).refunds.unredeemed).toBe(1);
+        expect((await stateOf(order.id)).state).toBe("refunding");
+    });
+
     it("refunds paid orders unredeemed for 30 minutes", async () => {
         const { order } = await seedOrder(db.pool, {
             state: "paid",
