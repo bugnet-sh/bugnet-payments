@@ -916,7 +916,9 @@ describe("retire-deposit-seed.sh", () => {
         expect(statSync(r.archive).mode & 0o777).toBe(0o600);
         expect(r.calls).toHaveLength(2);
         // No remote terminal, which would echo the seed line back to this screen
-        expect(r.calls[0]).toMatch(/^-T -p 2222 server\.example sudo -n .*--retire-deposit-seed -$/);
+        expect(r.calls[0]).toMatch(
+            /^-T -p 2222 server\.example sudo -n .*--retire-deposit-seed -$/,
+        );
         expect(r.calls[1]).toMatch(/^-T -p 2222 .*--retire-deposit-seed - --remove-previous$/);
         expect(r.sent).toBe(`${LINE}\n`);
         expect(r.calls.join("\n")).not.toContain(OLD_SEED);
