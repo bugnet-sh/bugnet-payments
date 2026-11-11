@@ -645,10 +645,16 @@ describe("scanDeposit", () => {
                 closeTo: feePayer.address,
             },
             failed,
-            "failed",
         );
         const r = await readNow();
         trail.push(r);
+        expect((await scanDeposit(deps(), dep, trail)).invariant).not.toBe("held");
+        expect((await ledger()).moves.find((m) => m.id === move.id)?.landedSlot).toBeNull();
+
+        await db.pool.query(
+            "update deposit_moves set state = 'failed', failed_at = $2 where id = $1",
+            [move.id, clock],
+        );
         expect((await scanDeposit(deps(), dep, trail)).invariant).toBe("held");
         const l = await ledger();
         expect(l.moves.find((m) => m.id === move.id)?.landedSlot).toBeNull();
@@ -862,6 +868,41 @@ describe("scanDeposit", () => {
             sourceTokenAccount: payerAta,
             sourceOwner: payer.address,
         });
+    });
+
+    it("one fetch with no meta never records, however long its run lasts", async () => {
+        const { dep, trail } = await deposit();
+        for (let i = 0; i < 40; i++) await chain.noOp({ touching: TOKEN_A, signer: payer });
+        const sig = await send(5_000n);
+        chain.badAnswer(sig, 2, { meta: "null" });
+        trail.push(await readNow());
+        const mark = chain.calls().length;
+        const fetchesOfSig = () =>
+            callsSince(mark, "getTransaction").filter((c) => c.params[0] === sig);
+        const run = async () => {
+            for (;;) {
+                later(1_000);
+                const step = await scanStep(deps(), dep, trail);
+                if (step.done) return step.result;
+            }
+        };
+
+        const start = clock.getTime();
+        expect((await run()).complete).toBe(false);
+        expect(clock.getTime() - start).toBeGreaterThan(CFG.index_lag_alarm_after);
+        expect(fetchesOfSig()).toHaveLength(1);
+        expect((await ledger()).transfers).toEqual([]);
+
+        expect((await run()).invariant).toBe("held");
+        expect(fetchesOfSig()).toHaveLength(2);
+        expect((await ledger()).transfers).toEqual([
+            expect.objectContaining({
+                signature: sig,
+                amountMicros: 5_000,
+                outcome: "review",
+                reason: "unreadable",
+            }),
+        ]);
     });
 
     it("an interval left unexplained drops its cache entries", async () => {

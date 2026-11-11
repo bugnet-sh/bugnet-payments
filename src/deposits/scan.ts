@@ -488,8 +488,9 @@ interface Memory {
     lagAlarmed: boolean;
     stuckSince: Date | null;
     droppedAt: Date | null;
-    // The first of two fetches that both must answer with no meta before the money is recorded
-    noMetaSince: Map<string, Date>;
+    // The first and the latest of the fetches in a row that answered with no meta. A run keeps its
+    // answer, so the clock alone could pass index_lag_alarm_after on a single fetch.
+    noMeta: Map<string, { first: Date; last: Date }>;
     debitsAlarmed: Set<string>;
 }
 
@@ -505,7 +506,7 @@ function memoryOf(trail: ReadTrail): Memory {
             lagAlarmed: false,
             stuckSince: null,
             droppedAt: null,
-            noMetaSince: new Map(),
+            noMeta: new Map(),
             debitsAlarmed: new Set(),
         };
         memories.set(trail, m);
@@ -599,8 +600,11 @@ function fetchNext(s: Step, e: Entry): Next | "bound" {
             );
             if (calls > 0) s.run.fetches++;
             s.run.answers.set(e.signature, tx);
-            if (tx?.noMeta !== true) s.m.noMetaSince.delete(e.signature);
-            else if (!s.m.noMetaSince.has(e.signature)) s.m.noMetaSince.set(e.signature, s.now);
+            if (tx?.noMeta !== true) s.m.noMeta.delete(e.signature);
+            else {
+                const first = s.m.noMeta.get(e.signature)?.first ?? s.now;
+                s.m.noMeta.set(e.signature, { first, last: s.now });
+            }
             return calls;
         },
     };
@@ -739,11 +743,16 @@ async function explain(
         }
         if (noMeta.length > 0) {
             const only = noMeta.length === 1 ? noMeta[0]! : null;
-            const first = only === null ? undefined : s.m.noMetaSince.get(only.entry.signature);
-            if (only === null || u < 0n || first === undefined || since(s, first) < lagMs(s)) {
+            const fetched = only === null ? undefined : s.m.noMeta.get(only.entry.signature);
+            if (
+                only === null ||
+                u < 0n ||
+                fetched === undefined ||
+                fetched.last.getTime() - fetched.first.getTime() < lagMs(s)
+            ) {
                 return "waiting";
             }
-            // Two answers 30 s apart with no meta: the remainder is held for a person to check
+            // Two fetches 30 s apart with no meta: the remainder is held for a person to check
             await record(
                 s,
                 {
@@ -760,7 +769,7 @@ async function explain(
                 },
                 true,
             );
-            s.m.noMetaSince.delete(only.entry.signature);
+            s.m.noMeta.delete(only.entry.signature);
             continue;
         }
         s.m.stuckSince ??= s.now;
