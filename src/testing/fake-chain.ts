@@ -94,8 +94,8 @@ export interface FakeChainEndpoint {
     ignoreMinContextSlot(on: boolean): void;
     rateLimit(times: number, retryAfterSeconds?: number): void;
     failNext(status?: number): void;
-    // "after": handles the request, never answers
-    stall(mode: "off" | "before" | "after"): void;
+    // "after": handles the request, never answers; with methods, only those calls stall
+    stall(mode: "off" | "before" | "after", o?: { methods?: readonly string[] }): void;
     // A known signature sent with preflight answers -32002 AlreadyProcessed
     alreadyProcessed(on: boolean): void;
     // The next sendTransaction answers its signature and lands nothing
@@ -961,10 +961,20 @@ export async function startFakeChain(
         let retryAfter: number | null = null;
         let failStatus: number | null = null;
         let stallMode: "off" | "before" | "after" = "off";
+        let stalled: ReadonlySet<string> | null = null;
+        const stalls = (body: string): boolean => {
+            if (stalled === null) return true;
+            try {
+                const parsed: unknown = JSON.parse(body);
+                return isRecord(parsed) && stalled.has(String(parsed.method));
+            } catch {
+                return false;
+            }
+        };
         const ep = createServer((req, res) => {
             void readBody(req)
                 .then((body) => {
-                    if (stallMode === "before") return;
+                    if (stallMode === "before" && stalls(body)) return;
                     if (limited > 0) {
                         limited -= 1;
                         res.writeHead(
@@ -982,7 +992,7 @@ export async function startFakeChain(
                         return;
                     }
                     const payload = respond(body, view, log);
-                    if (stallMode === "after") return;
+                    if (stallMode === "after" && stalls(body)) return;
                     send(res, payload);
                 })
                 // A client that aborts during the body read leaves nothing to answer
@@ -1017,8 +1027,9 @@ export async function startFakeChain(
             failNext(status = 500) {
                 failStatus = status;
             },
-            stall(mode) {
+            stall(mode, opts = {}) {
                 stallMode = mode;
+                stalled = opts.methods === undefined ? null : new Set(opts.methods);
             },
             alreadyProcessed(on) {
                 view.alreadyProcessed = on;

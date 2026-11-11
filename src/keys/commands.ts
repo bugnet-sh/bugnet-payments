@@ -29,7 +29,7 @@ import { type Landing, readLanding } from "../solana/landing.ts";
 import { hotLedgerEmpty } from "../x402/tail.ts";
 import { loadKeypair } from "../solana/keys.ts";
 import { cliRouter, startOrStop } from "../solana/cli-router.ts";
-import { rpcSettingsSchema } from "../solana/router/index.ts";
+import { RpcRouterError, rpcSettingsSchema } from "../solana/router/index.ts";
 import type { RoutedRpc, SolanaRpc } from "../solana/rpc.ts";
 import { signV0Transaction } from "../solana/transfer.ts";
 import { loadTestPayer } from "./test-payer.ts";
@@ -558,12 +558,17 @@ async function sendAndConfirm(
         instructions: tx.instructions,
     });
     const signature = getSignatureFromTransaction(signed);
-    await rpc
-        .sendTransaction(getBase64EncodedWireTransaction(signed), {
-            encoding: "base64",
-            preflightCommitment: "confirmed",
-        })
-        .send();
+    try {
+        await rpc
+            .sendTransaction(getBase64EncodedWireTransaction(signed), {
+                encoding: "base64",
+                preflightCommitment: "confirmed",
+            })
+            .send();
+    } catch (err) {
+        // The transfer may have gone out, so only its landing can say whether to retry
+        if (!(err instanceof RpcRouterError && err.reason === "send_unconfirmed")) throw err;
+    }
     await waitForLanding(rpc, signature, latest.lastValidBlockHeight);
     return signature;
 }
