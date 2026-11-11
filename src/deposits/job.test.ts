@@ -17,6 +17,7 @@ import { findOrder, findPaymentByOrder } from "../orders/store.ts";
 import type { OrderRow } from "../orders/types.ts";
 import { createRouterClient, type RouterClient } from "../router/client.ts";
 import { usdcAta } from "../solana/accounts.ts";
+import { RpcRouterError } from "../solana/router/errors.ts";
 import type { SolanaRpc } from "../solana/rpc.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
 import { createFakeRpc, epochAt } from "../testing/fake-rpc.ts";
@@ -646,10 +647,7 @@ function failing(): SolanaRpc {
             if (typeof value !== "function") return value;
             return () => ({
                 send: async () => {
-                    throw Object.assign(new Error("no endpoint"), {
-                        name: "RpcRouterError",
-                        reason: "no_endpoint",
-                    });
+                    throw new RpcRouterError("no_endpoint");
                 },
             });
         },
