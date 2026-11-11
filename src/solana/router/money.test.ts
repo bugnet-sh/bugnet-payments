@@ -295,9 +295,12 @@ describe("money decisions over the router", () => {
 
         for (const mode of [false, "short"] as const) {
             it(`a history-less endpoint never re-signs a landed refund (history ${String(mode)})`, async () => {
-                const a = await chain.addEndpoint({ history: mode });
+                const a = await chain.addEndpoint();
                 const b = await chain.addEndpoint();
                 const r = await routed([a, b]);
+                // a keeps the history role it earned at boot, so its null is the first answer
+                // and only the quorum asks b
+                a.setHistory(mode);
                 const orderId = await pendingRefund();
                 expect((await runRefunds(deps(r), "refund")).sent).toBe(1);
                 advance(200);
@@ -391,9 +394,11 @@ describe("money decisions over the router", () => {
         });
 
         it("resignProof never answers absent while one endpoint knows the transaction", async () => {
-            const a = await chain.addEndpoint({ history: "short" });
+            const a = await chain.addEndpoint();
             const b = await chain.addEndpoint();
             const r = await routed([a, b]);
+            // a keeps its history role, so its null answers first
+            a.setHistory("short");
             const sig = await pay();
             const expirySeenSlot = chain.slot();
             advance(400);
@@ -411,9 +416,11 @@ describe("money decisions over the router", () => {
         });
 
         it("checkLanded never releases while one endpoint knows the transaction", async () => {
-            const a = await chain.addEndpoint({ history: "short" });
+            const a = await chain.addEndpoint();
             const b = await chain.addEndpoint();
             const r = await routed([a, b]);
+            // a keeps its history role, so its null answers first
+            a.setHistory("short");
             const sig = await pay();
             const landedSlot = chain.slot();
             const row = await signedRow(db.pool, {

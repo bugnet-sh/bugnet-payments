@@ -1479,19 +1479,9 @@ describe("rpc commands", () => {
         it("the CLI proof uses the quorum", async () => {
             const sig = SIG(32);
             const id = await waitingRow(sig);
-            // a has no history at all; b knows the refund landed
-            const a = checkNode(
-                "a",
-                {
-                    getSignatureStatuses: (_m, params) =>
-                        statusesAnswer(
-                            AT,
-                            (params[0] as string[]).map(() => null),
-                        ),
-                    getTransaction: () => rpcOk(null),
-                },
-                AT,
-            );
+            // a passes its history check and answers null for sig alone, so its null is the first
+            // answer and only the quorum asks b, which knows the refund landed
+            const a = proofNode("a", sig);
             const knows = proofNode("b", sig, { getSignatureStatuses: statusesFor(sig, true) });
             const r = await retry(id, TWO, [a, knows]);
             expect(r.code).toBe(1);
