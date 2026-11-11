@@ -83,6 +83,8 @@ export interface FakeChain {
     withholdTransaction(signature: string, times: number): void;
     // SOL balances getBalance answers, 0 for an unknown address
     lamports(address: string): bigint;
+    // Adds to the balance at the current slot, never sets it; getBalance reads it at the
+    // request's commitment
     fundLamports(address: string, lamports: bigint): void;
     calls(): { method: string; params: unknown[] }[];
     // Another RPC endpoint over this same chain, on its own loopback port (so its own domain)

@@ -706,7 +706,9 @@ allowance wallet, money already swept, or review money already carried to the re
 - `deposits return-late <orderId> [--signature SIG]... [--archive FILE|-]`: for a `done` deposit.
   Without `--signature` it lists the credits sent after the close, each with its source, owner and
   whether the owner signed; with it, it returns exactly those credits, each to its own
-  signer-owned source, and closes the account only when it is empty afterwards.
+  signer-owned source, and closes the account only when it is empty afterwards. It prints
+  `sending <signature>` before it sends; if the command is cut off, check that signature on chain
+  before running it again.
 - `deposits return-sol <orderId> <to> [--archive FILE|-]`: SOL sent to a deposit address, on
   request.
 - `manual list`, `manual retry`, `manual resolve` and `manual refund` take split refund parts and

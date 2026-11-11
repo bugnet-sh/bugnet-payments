@@ -1454,7 +1454,7 @@ async function depositsShow(
 
 /**
  * Spec 17: the planner counts only sweeps that fail after this, so the sweep gets a fresh
- * max_attempts while the failures stay on record. The requeued sweep no longer closes: money may
+ * max_attempts while the failures stay on record. The requeued sweep does not close: money may
  * have come during review, a closing move is then dropped by the guard, and a row with
  * signatures can never be deleted, so it would stay pending for good. The planner closes the
  * account separately once the sweep lands (spec 10.4).
