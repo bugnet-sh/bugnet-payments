@@ -1584,6 +1584,75 @@ describe("flows on FakeChain", () => {
         expect(await rentHolding(db.pool, feePayer.address)).toBe(0);
     });
 
+    it("a return-to between the planner's read and its move is never carried to the float", async () => {
+        const dep = await deposit();
+        await updateDeposit(db.pool, ORDER_A, { closeSeparately: true });
+        await ticks(1, 3_000, watching());
+        await send("A", 50_000n);
+        await until(async () => (await orderOf()).state === "paid", 6, 3_000, watching());
+        const held = await chain.vaultTransfer({
+            vault: sources.H,
+            to: dep.tokenAccount,
+            micros: 2_000n,
+            signer: owners.G,
+        });
+        chain.advance(1);
+        await until(
+            async () => (await transferOf(held))?.outcome === "review",
+            6,
+            3_000,
+            watching(),
+        );
+        expect((await movesOf()).filter((m) => m.kind === "close")).toEqual([]);
+        const floatBefore = chain.balance(floatAta);
+        const ownerBefore = chain.balance(sources.C);
+        // The operator's return-to commits right after the planner read the ledger
+        let fired = false;
+        const pool = new Proxy(db.pool, {
+            get(target, prop) {
+                const value: unknown = Reflect.get(target, prop);
+                if (prop !== "query") {
+                    return typeof value === "function" ? value.bind(target) : value;
+                }
+                return async (...args: Parameters<typeof db.pool.query>) => {
+                    const text = typeof args[0] === "string" ? args[0] : "";
+                    const planning =
+                        text.startsWith("select * from deposit_moves where order_id") &&
+                        (new Error().stack ?? "").includes("planAndApply");
+                    const result = await (target.query as (...a: unknown[]) => unknown)(...args);
+                    if (planning && !fired) {
+                        fired = true;
+                        await db.pool.query(
+                            `update deposit_transfers set outcome = 'return', reason = 'operator',
+                                source_token_account = $2, source_owner = $3, move_id = null
+                             where signature = $1`,
+                            [held, sources.C, owners.C.address],
+                        );
+                    }
+                    return result;
+                };
+            },
+        });
+        // A draining deposit with only review money is read at the idle pace
+        later(cfg.idle_every);
+        await tick({ pool });
+        expect(fired).toBe(true);
+        const carrierOf = async () => {
+            const { moveId } = await transferOf(held);
+            return (await movesOf()).find((m) => m.id === moveId);
+        };
+        await until(async () => (await carrierOf())?.state === "confirmed", 6, 3_000, watching());
+        const carrier = (await carrierOf())!;
+        expect(carrier).toMatchObject({
+            kind: "return",
+            destination: sources.C,
+            amountMicros: 2_000,
+        });
+        expect((await movesOf()).filter((m) => m.heldMicros > 0)).toEqual([]);
+        expect(chain.balance(sources.C) - ownerBefore).toBe(2_000n);
+        expect(chain.balance(floatAta)).toBe(floatBefore);
+    });
+
     // Paid and closed with Bugnet's rent, the order's watch window then open for late money
     async function paidAndClosed(): Promise<DepositRow> {
         const dep = await deposit();

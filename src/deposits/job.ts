@@ -50,6 +50,7 @@ import {
     rentedBy,
     rentHolding,
     setTransferOutcomes,
+    transfersChanged,
     unpaidCreateLamports,
     updateDeposit,
     watchedDeposits,
@@ -933,7 +934,7 @@ async function apply(
             await withDeposit(c, orderId, (tx) => updateDeposit(tx, orderId, { readyAt: c.now }));
             return true;
         case "assign":
-            await assign(c, orderId, plan);
+            await assign(c, orderId, ledger, plan);
             return true;
         case "need_slot":
             return await pinExpirySlot(c, order);
@@ -941,8 +942,8 @@ async function apply(
             if (await expire(c, order)) c.tick.expired++;
             return true;
         case "move":
-            await storeMove(c, ledger.deposit, plan);
-            return false;
+            // A move not stored because the ledger changed is planned again from the new one
+            return !(await storeMove(c, ledger, plan));
         case "settle": {
             const settleDeps: SettleDeps = { ...d, rpc: d.queue.rpc("deposits.move"), routerCalls };
             const outcome = await settleDeposit(
@@ -975,8 +976,16 @@ async function withDeposit(
     );
 }
 
-async function assign(c: TickContext, orderId: string, plan: Extract<Plan, { kind: "assign" }>) {
+async function assign(
+    c: TickContext,
+    orderId: string,
+    ledger: Ledger,
+    plan: Extract<Plan, { kind: "assign" }>,
+): Promise<void> {
+    let changed = false;
     await withDeposit(c, orderId, async (tx) => {
+        changed = await transfersChanged(tx, orderId, ledger.transfers);
+        if (changed) return;
         await setTransferOutcomes(tx, orderId, plan.rows);
         if (plan.review !== undefined) {
             await updateDeposit(tx, orderId, { reviewReason: plan.review });
@@ -986,6 +995,7 @@ async function assign(c: TickContext, orderId: string, plan: Extract<Plan, { kin
             await clearHolds(tx, orderId);
         }
     });
+    if (changed) return;
     if (plan.review !== undefined) {
         c.d.log.alarm("deposit_review", { orderId, reason: plan.review });
     }
@@ -1054,11 +1064,13 @@ function heldOf(ledger: Ledger, nowMs: number): Held {
 // A metered move spends the tick's budget at once, so later deposits of the tick see it
 async function storeMove(
     c: TickContext,
-    deposit: DepositRow,
+    ledger: Ledger,
     plan: Extract<Plan, { kind: "move" }>,
-): Promise<void> {
-    const { orderId } = deposit;
+): Promise<boolean> {
+    const { orderId } = ledger.deposit;
+    let stored = false;
     await withDeposit(c, orderId, async (tx, current) => {
+        if (await transfersChanged(tx, orderId, ledger.transfers)) return;
         await insertMove(tx, plan.move, plan.transfers, c.now);
         if (plan.lateReturn === true && current.state === "closed") {
             await updateDeposit(tx, orderId, {
@@ -1066,12 +1078,15 @@ async function storeMove(
                 lateReturns: current.lateReturns + 1,
             });
         }
+        stored = true;
     });
+    if (!stored) return false;
     c.planned.add(orderId);
-    if (!plan.metered) return;
+    if (!plan.metered) return true;
     c.feeLeft -= moveFeeLamports({ kind: plan.move.kind, preflightRefusedAt: null }, c.cfg);
     const payer = plan.move.payer;
     if (payer !== null) c.returnsByOwner.set(payer, (c.returnsByOwner.get(payer) ?? 0) + 1);
+    return true;
 }
 
 // Money owed back with nothing in flight: past the budget, its metered move is what waits

@@ -421,6 +421,37 @@ export async function insertMove(
     return move;
 }
 
+/**
+ * The planner reads the ledger without a lock. A step it plans checks under the deposit lock that
+ * no transfer changed since that read, so an operator's return-to that committed in between is
+ * never carried by a stale move or overwritten by a stale outcome (spec 17); the tick plans again.
+ */
+export async function transfersChanged(
+    c: pg.PoolClient,
+    orderId: string,
+    read: readonly TransferRow[],
+): Promise<boolean> {
+    const { rows } = await c.query<TransferDbRow>(
+        "select * from deposit_transfers where order_id = $1",
+        [orderId],
+    );
+    if (rows.length !== read.length) return true;
+    const before = new Map(read.map((t) => [t.signature, t]));
+    return rows.map(toTransfer).some((t) => {
+        const b = before.get(t.signature);
+        return (
+            b === undefined ||
+            b.outcome !== t.outcome ||
+            b.reason !== t.reason ||
+            b.appliedMicros !== t.appliedMicros ||
+            b.moveId !== t.moveId ||
+            b.refundId !== t.refundId ||
+            b.sourceTokenAccount !== t.sourceTokenAccount ||
+            b.sourceOwner !== t.sourceOwner
+        );
+    });
+}
+
 // Only a never-signed pending row may go: a signed one may still land
 export async function deletePendingMove(c: pg.PoolClient, moveId: number): Promise<boolean> {
     const { rows } = await c.query<{ order_id: string }>(
