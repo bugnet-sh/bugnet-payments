@@ -48,8 +48,8 @@ import {
     fetchTx,
     readDepositBalances,
     ReadTrail,
-    scanDeposit,
     type ScanDeps,
+    scanStep,
     type TxCache,
 } from "./scan.ts";
 import {
@@ -325,6 +325,9 @@ export async function advanceMoves(d: MoveDeps, orderIds?: readonly string[]): P
          order by id`,
         [orderIds ?? null],
     );
+    // Proofs share one scan_time_box a call, as the job's scans do, so a padded proof never
+    // holds up the reads and settles after it (spec 6.4)
+    const proofUntilMs = d.now().getTime() + d.cfg.scan_time_box;
     // A move no longer in flight drops its proof, however it left
     const live = new Set(rows.map((r) => Number(r.id)));
     const scans = proofScansOf(d.pool);
@@ -336,7 +339,7 @@ export async function advanceMoves(d: MoveDeps, orderIds?: readonly string[]): P
     for (const r of rows) {
         const ids = { moveId: Number(r.id), orderId: r.order_id };
         try {
-            await advanceOne(d, Number(r.id), tick);
+            await advanceOne(d, Number(r.id), tick, proofUntilMs);
         } catch (err) {
             if (err instanceof RpcUnavailable) {
                 d.log.warn("deposit move rpc call failed, retrying next tick", {
@@ -351,14 +354,19 @@ export async function advanceMoves(d: MoveDeps, orderIds?: readonly string[]): P
     return tick;
 }
 
-async function advanceOne(d: MoveDeps, id: number, tick: MoveTick): Promise<void> {
+async function advanceOne(
+    d: MoveDeps,
+    id: number,
+    tick: MoveTick,
+    proofUntilMs: number,
+): Promise<void> {
     const move = await findMove(d.pool, id);
     if (move === null || !IN_FLIGHT.has(move.state)) return;
     if (move.state === "pending") {
         await signPending(d, move, tick);
         return;
     }
-    await checkInFlight(d, move, tick);
+    await checkInFlight(d, move, tick, proofUntilMs);
 }
 
 async function loadLedger(d: MoveDeps, orderId: string) {
@@ -578,7 +586,12 @@ export async function sendMove(
     return true;
 }
 
-async function checkInFlight(d: MoveDeps, move: MoveRow, tick: MoveTick): Promise<void> {
+async function checkInFlight(
+    d: MoveDeps,
+    move: MoveRow,
+    tick: MoveTick,
+    proofUntilMs: number,
+): Promise<void> {
     // A scan listed one of its signatures as landed (spec 10.3), which no status read can undo
     if (move.landedSlot !== null) {
         const signature = await landedSignature(d, move);
@@ -622,12 +635,18 @@ async function checkInFlight(d: MoveDeps, move: MoveRow, tick: MoveTick): Promis
             if (await sendMove(d, move, wireTx, RESEND)) tick.resent++;
             return;
         case "blockhash_expired":
-            await expired(d, move, read.slot, tick);
+            await expired(d, move, read.slot, tick, proofUntilMs);
             return;
     }
 }
 
-async function expired(d: MoveDeps, move: MoveRow, slot: bigint, tick: MoveTick): Promise<void> {
+async function expired(
+    d: MoveDeps,
+    move: MoveRow,
+    slot: bigint,
+    tick: MoveTick,
+    proofUntilMs: number,
+): Promise<void> {
     let current = move;
     if (move.expirySeenSlot === null) {
         await d.pool.query(
@@ -639,7 +658,7 @@ async function expired(d: MoveDeps, move: MoveRow, slot: bigint, tick: MoveTick)
     }
     const deposit = await findDeposit(d.pool, move.orderId);
     if (deposit === null) throw new Error(`no deposit for ${move.orderId}`);
-    const proof = await proveAbsent(d, deposit, current);
+    const proof = await proveAbsent(d, deposit, current, proofUntilMs);
     if (proof.kind === "wait") {
         tick.waitingProof++;
         return;
@@ -688,8 +707,15 @@ async function viaScan<T>(call: () => Promise<T>): Promise<T> {
  * hold several senders' money, so a node that answers null for a transaction that did land must
  * never be enough to pay twice. A signature the scan finds landed confirms the move instead. The
  * balance is judged at the read the scan was pinned to, the newest moment its listing proves.
+ * Each proof makes at least one scan call a tick, and goes on past it only until proofUntilMs;
+ * an unfinished scan keeps its listing and its read for the next tick.
  */
-async function proveAbsent(d: MoveDeps, deposit: DepositRow, move: MoveRow): Promise<Proof> {
+async function proveAbsent(
+    d: MoveDeps,
+    deposit: DepositRow,
+    move: MoveRow,
+    proofUntilMs: number,
+): Promise<Proof> {
     const scans = proofScansOf(d.pool);
     let p = scans.get(move.id);
     if (p === undefined || p.signature !== move.txSignature) {
@@ -728,7 +754,12 @@ async function proveAbsent(d: MoveDeps, deposit: DepositRow, move: MoveRow): Pro
         log: d.log,
         now: d.now,
     };
-    const result = await viaScan(() => scanDeposit(scanDeps, deposit, trail));
+    let step = await viaScan(() => scanStep(scanDeps, deposit, trail));
+    while (!step.done) {
+        if (d.now().getTime() >= proofUntilMs) return { kind: "wait" };
+        step = await viaScan(() => scanStep(scanDeps, deposit, trail));
+    }
+    const { result } = step;
     p.readAgain = result.complete;
     const ledger = await loadLedger(d, deposit.orderId);
     const scanned = ledger.moves.find((m) => m.id === move.id);

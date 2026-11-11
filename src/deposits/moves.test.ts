@@ -892,6 +892,50 @@ describe("expiry", () => {
         expect(callsOf("getMultipleAccounts", mark)).toHaveLength(2);
     });
 
+    it("a proof's scan stops at the scan time box and goes on next tick", async () => {
+        const { sigs } = await funded([{ micros: 7_000n }]);
+        const move = await pending(returnTo(7_000), sigs);
+        await run(deps({ rpc: dropFirst() }));
+        const old = (await moveRow(move.id)).txSignature!;
+        // New money, then padding beside it: the proof fetches every padding entry first
+        chain.credit(TOKEN_A, 1n);
+        for (let i = 0; i < 60; i++) await chain.noOp({ touching: TOKEN_A, signer: stranger });
+        expireAll();
+
+        // Each call costs 100 ms of the clock, as a rate-limited lane does
+        const slow = new Proxy(chain.rpc, {
+            get: (target, prop, recv) => {
+                const value: unknown = Reflect.get(target, prop, recv);
+                if (typeof value !== "function") return value;
+                return (...args: unknown[]) => {
+                    const call = (
+                        value as (...a: unknown[]) => { send: (...a: unknown[]) => unknown }
+                    ).apply(target, args);
+                    return {
+                        ...call,
+                        send: (...a: unknown[]) => {
+                            later(100);
+                            return call.send(...a);
+                        },
+                    };
+                };
+            },
+        });
+        const d = deps({ rpc: slow, cfg: { ...cfg, scan_time_box: 1_500 } });
+        const fetches: number[] = [];
+        let last: MoveTick | undefined;
+        while (fetches.length < 12 && last?.resigned !== 1) {
+            const mark = chain.calls().length;
+            last = await run(d);
+            fetches.push(callsOf("getTransaction", mark).length);
+        }
+        // Within one box of 1.5 s plus the call that crosses it, and done over several ticks
+        expect(Math.max(...fetches)).toBeLessThanOrEqual(16);
+        expect(fetches.length).toBeGreaterThan(3);
+        expect(last!.resigned).toBe(1);
+        expect((await moveRow(move.id)).previousSignatures).toEqual([old]);
+    });
+
     it("every sweep signing calls the payments hook", async () => {
         await funded([{ micros: 50_000n }]);
         await seedPayment(db.pool, ORDER_A, { txSignature: "seeded" });
