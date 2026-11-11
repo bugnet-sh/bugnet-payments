@@ -902,6 +902,13 @@ describe("slots and floors", () => {
         }
     });
 
+    it("a -32005 with numSlotsBehind is a lag sample", async () => {
+        const t = setup(2);
+        t.a.answer(() => rpcFail(-32005, "Node is behind by 99 slots", { numSlotsBehind: 99n }));
+        expect(resultOf(await call(t.router, "getSlot"))).toBe(1_000n);
+        expect(snap(t.router, "rpc1")).toMatchObject({ lag: 99, state: "lagging" });
+    });
+
     it("the floor is per commitment", async () => {
         // A lag of 20 puts the confirmed floor above the finalized high water
         const t = setup(2, { max_slot_lag: 20 });

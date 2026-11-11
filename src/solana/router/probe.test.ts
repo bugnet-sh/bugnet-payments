@@ -923,6 +923,31 @@ describe("unreachable endpoints", () => {
     });
 });
 
+describe("the tick timer", () => {
+    it("the service's start ticks every 5 s until stop, and a CLI start never ticks", async () => {
+        vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+        onTestFinished(() => void vi.useRealTimers());
+        for (const timers of [true, false]) {
+            // A snapshot is written on the tick alone, once snapshot_every has passed
+            const written: unknown[] = [];
+            const t = routed(2, {}, { snapshots: { write: async (s) => void written.push(s) } });
+            await t.router.start({ timers });
+            const ticks = async (n: number) => {
+                for (let i = 0; i < n; i++) {
+                    t.clock.ms += 60_000;
+                    await vi.advanceTimersByTimeAsync(5_000);
+                    for (let j = 0; j < 5; j++) await new Promise((r) => setImmediate(r));
+                }
+            };
+            await ticks(3);
+            expect(written).toHaveLength(timers ? 3 : 0);
+            await t.router.stop();
+            await ticks(2);
+            expect(written).toHaveLength(timers ? 3 : 0);
+        }
+    });
+});
+
 describe("start line", () => {
     it("a routed start names its positions", async () => {
         const t = routed(2);
