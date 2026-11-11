@@ -32,6 +32,7 @@ import {
     watchWallet,
 } from "./live.ts";
 import {
+    depositAsk,
     depositLine,
     errorStep,
     type MessageContext,
@@ -275,6 +276,12 @@ function follow(p: Page, wallet: WalletSection | null): void {
     const timeEl = p.root.querySelector<HTMLElement>("#time-left");
     const untilEl = p.root.querySelector<HTMLElement>("#until");
     const qr = p.root.querySelector<HTMLImageElement>("#deposit img");
+    const askEls = {
+        amount: p.root.querySelector<HTMLElement>("#deposit-amount"),
+        copy: p.root.querySelector<HTMLButtonElement>("#deposit-amount-copy"),
+        caption: p.root.querySelector<HTMLElement>("#deposit figcaption"),
+        exchange: p.root.querySelector<HTMLElement>("#exchange-note"),
+    };
     // M20 on a page without a deposit, put back once a status error line is no longer true
     const firstLine = p.depositMessage?.textContent ?? "";
     let offset = Date.parse(p.root.dataset.now ?? "") - Date.now();
@@ -311,6 +318,14 @@ function follow(p: Page, wallet: WalletSection | null): void {
         }
         // The QR asks for money only while the order lacks some
         const d = v.deposit;
+        if (d !== null && v.state === "unpaid") {
+            const ask = depositAsk(p.ctx.amountMicros, d);
+            if (askEls.amount !== null) askEls.amount.textContent = `${ask.plain} USDC`;
+            if (askEls.copy !== null) askEls.copy.dataset.copy = ask.plain;
+            if (askEls.caption !== null) askEls.caption.textContent = ask.caption;
+            if (askEls.exchange !== null) askEls.exchange.textContent = ask.exchange;
+            if (qr !== null) qr.alt = ask.alt;
+        }
         const qrShown = showDepositQr(v);
         const figure = qr?.closest("figure") ?? null;
         if (figure !== null) figure.hidden = !qrShown;

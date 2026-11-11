@@ -10,7 +10,14 @@ import {
     walletError,
 } from "./flow.ts";
 import type { StatusView } from "./live.ts";
-import { depositLine, errorStep, PAGE_TEXT, pageStep, walletMessage } from "./messages.ts";
+import {
+    depositAsk,
+    depositLine,
+    errorStep,
+    PAGE_TEXT,
+    pageStep,
+    walletMessage,
+} from "./messages.ts";
 
 const ID = "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa";
 const C = {
@@ -75,6 +82,28 @@ describe("deposit lines", () => {
         expect(line({ status: "confirming", receivedMicros: 50_000 }).message).toBe(
             "Received $0.05. Confirming the payment on Solana.",
         );
+    });
+
+    it("once money has arrived, the section asks for the rest and the line says what arrived", () => {
+        expect(depositAsk(50_000, { remainingMicros: 50_000 })).toEqual({
+            plain: "0.05",
+            alt: "Solana Pay code for 0.05 USDC",
+            caption: "Scan with a Solana wallet app to send 0.05 USDC",
+            exchange:
+                "From an exchange, send exactly 0.05 USDC. Anything returned goes back to the sending address, which an exchange may not credit to you.",
+        });
+        expect(depositAsk(50_000, { remainingMicros: 20_000 })).toEqual({
+            plain: "0.02",
+            alt: "Solana Pay code for 0.02 USDC",
+            caption: "Scan with a Solana wallet app to send 0.02 USDC",
+            exchange:
+                "From an exchange, send exactly 0.02 USDC. Anything returned goes back to the sending address, which an exchange may not credit to you.",
+        });
+        // Covered only with a held wallet's money: another wallet still pays the price (M24)
+        expect(depositAsk(50_000, { remainingMicros: 0 }).plain).toBe("0.05");
+        expect(
+            line({ status: "partial", receivedMicros: 30_000, remainingMicros: 20_000 }).message,
+        ).toBe("Received $0.03. Send $0.02 more to the same address by 14:05.");
     });
 
     it("partial with a blocked sender's money returning adds M13", () => {

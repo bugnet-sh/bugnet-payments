@@ -1,3 +1,4 @@
+import type { DepositView } from "../deposits/types.ts";
 import type { PublicState } from "../http/public.ts";
 import {
     BUILD_FAILED,
@@ -150,6 +151,23 @@ function keptLine(v: NonNullable<StatusView["deposit"]>, c: MessageContext): str
 }
 
 const P2 = "The payment is confirming on Solana. This page updates when it lands.";
+
+// The deposit section's Amount row, its Copy value, the QR's alt and caption and the exchange
+// note. Once part of the price has arrived they name what is left, as the QR does (spec 14.2):
+// a payer copying the price would overpay and pay for the return. With nothing left, the price,
+// which a payment from another wallet still needs while the money waits (M24).
+export function depositAsk(
+    amountMicros: number,
+    d: Pick<DepositView, "remainingMicros">,
+): { plain: string; alt: string; caption: string; exchange: string } {
+    const plain = decimalAmount(d.remainingMicros > 0 ? d.remainingMicros : amountMicros);
+    return {
+        plain,
+        alt: `Solana Pay code for ${plain} USDC`,
+        caption: `Scan with a Solana wallet app to send ${plain} USDC`,
+        exchange: `From an exchange, send exactly ${plain} USDC. Anything returned goes back to the sending address, which an exchange may not credit to you.`,
+    };
+}
 
 export function depositLine(
     v: StatusView,

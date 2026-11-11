@@ -2,7 +2,7 @@ import QRCode from "qrcode";
 import type { DepositView } from "../deposits/types.ts";
 import type { PublicState } from "../http/public.ts";
 import type { OrderKind } from "../orders/types.ts";
-import { amountLabel, decimalAmount, STATE_LABELS } from "./messages.ts";
+import { amountLabel, decimalAmount, depositAsk, STATE_LABELS } from "./messages.ts";
 import { USDC_ICON } from "./usdc.ts";
 
 export { amountLabel, decimalAmount };
@@ -411,8 +411,9 @@ const NOSCRIPT =
     "<noscript><p>This page needs JavaScript to show live status. You can still send to the address above.</p></noscript>";
 const COPY_LABELS = "<span>Copy</span><span>Copied</span>";
 
-function copyButton(value: string): string {
-    return `<button class="copy" type="button" data-copy="${escapeHtml(value)}">${COPY_LABELS}</button>`;
+function copyButton(value: string, id?: string): string {
+    const idAttr = id === undefined ? "" : ` id="${id}"`;
+    return `<button${idAttr} class="copy" type="button" data-copy="${escapeHtml(value)}">${COPY_LABELS}</button>`;
 }
 
 // mm:ss until the deadline, which the script keeps counting down
@@ -422,7 +423,7 @@ function timeLeft(expiresAt: Date, now: Date): string {
 }
 
 function depositSection(v: CheckoutView, deposit: DepositView): string {
-    const plain = decimalAmount(v.amountMicros);
+    const ask = depositAsk(v.amountMicros, deposit);
     const id = escapeHtml(v.orderId);
     // With the price covered the QR route answers 404, so the code waits hidden, unloaded
     const qrHidden = deposit.remainingMicros > 0 ? "" : " hidden";
@@ -430,16 +431,16 @@ function depositSection(v: CheckoutView, deposit: DepositView): string {
     return `<section id="deposit">
 <h2>Send USDC to this address</h2>
 <dl class="facts">
-<div><dt>Amount</dt><dd>${USDC_ICON} <span>${plain} USDC</span> ${copyButton(plain)}</dd></div>
+<div><dt>Amount</dt><dd>${USDC_ICON} <span id="deposit-amount">${ask.plain} USDC</span> ${copyButton(ask.plain, "deposit-amount-copy")}</dd></div>
 <div><dt>Network</dt><dd>Solana</dd></div>
 <div><dt>Address</dt><dd><code>${escapeHtml(deposit.address)}</code> ${copyButton(deposit.address)}</dd></div>
 </dl>
 <figure class="qr"${qrHidden}>
-<img src="/o/${id}/qr.svg"${qrLoading} alt="Solana Pay code for ${plain} USDC">
-<figcaption>Scan with a Solana wallet app to send ${plain} USDC</figcaption>
+<img src="/o/${id}/qr.svg"${qrLoading} alt="${ask.alt}">
+<figcaption>${ask.caption}</figcaption>
 </figure>
 <p class="note">Send only USDC on Solana.</p>
-<p class="note">From an exchange, send exactly ${plain} USDC. Anything returned goes back to the sending address, which an exchange may not credit to you.</p>
+<p id="exchange-note" class="note">${ask.exchange}</p>
 <p id="deposit-message" role="status" aria-live="polite"></p>
 </section>`;
 }

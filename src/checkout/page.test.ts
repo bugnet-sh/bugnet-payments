@@ -458,6 +458,33 @@ describe("address-first page", () => {
         expect(hidden).toContain(`<img src="/o/${id}/qr.svg" loading="lazy"`);
     });
 
+    it("once money has arrived, the Amount row, Copy, QR and exchange note ask for the rest", async () => {
+        const partial = {
+            ...offered,
+            deposit: {
+                ...offered.deposit!,
+                status: "partial" as const,
+                receivedMicros: 30_000,
+                remainingMicros: 20_000,
+            },
+        };
+        const html = await renderCheckout(partial);
+        const dep = section(html, "deposit");
+        expect(dep).toContain('<span id="deposit-amount">0.02 USDC</span>');
+        expect(dep).toContain(
+            '<button id="deposit-amount-copy" class="copy" type="button" data-copy="0.02">',
+        );
+        expect(dep).toContain('alt="Solana Pay code for 0.02 USDC"');
+        expect(dep).toContain(
+            "<figcaption>Scan with a Solana wallet app to send 0.02 USDC</figcaption>",
+        );
+        expect(dep).toContain("From an exchange, send exactly 0.02 USDC.");
+        expect(dep).not.toContain("0.05");
+        // The price and the wallet payment stay whole
+        expect(html).toContain('<span class="amount-value">$0.05</span>');
+        expect(html).toContain(">Pay $0.05</button>");
+    });
+
     it("phone links stay", async () => {
         const phone = section(await renderCheckout(offered), "phone");
         expect(phone).toContain("Open in Phantom");
