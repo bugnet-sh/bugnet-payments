@@ -335,6 +335,16 @@ describe("alarms", () => {
         });
     }
 
+    it("an endpoint whose probes fail is probed once per probe_every", async () => {
+        for (const fail of [() => netFail("ECONNREFUSED"), () => httpFail(503)]) {
+            const t = setup();
+            t.b.answer(fail);
+            for (let ms = 0; ms <= 600_000; ms += 5_000) await tickAt(t, ms);
+            // At 0, 60 s, ... 600 s, as for an endpoint that answers (spec 13.3)
+            expect(t.b.calls).toHaveLength(11);
+        }
+    });
+
     it("the lag alarm waits 2 minutes", async () => {
         const t = setup();
         const behind = node(t.clock, "a", {

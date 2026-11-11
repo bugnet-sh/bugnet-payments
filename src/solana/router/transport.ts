@@ -188,6 +188,8 @@ interface Endpoint {
     // At most one check run and one probe at a time
     checking: Promise<EndpointCheck> | null;
     probing: boolean;
+    // When tick() last sent an idle probe: one that got no slot must not repeat on every tick
+    idleProbeAt: number | null;
     // The checks that ended in an error run again at `at`, and each failure doubles the wait
     retry: { parts: ReadonlySet<CheckPart>; at: number; step: number } | null;
     // The next run of the history and pinned checks
@@ -520,6 +522,7 @@ class Router {
                 alerted: new Set(),
                 checking: null,
                 probing: false,
+                idleProbeAt: null,
                 retry: null,
                 hourlyAt: null,
                 behindPin: null,
@@ -689,7 +692,8 @@ class Router {
             if (ep.probing || ep.limits.coolingUntil(EPOCH_REQUEST.method) !== 0) continue;
             if (ep.health.probeDue()) {
                 work.push(this.recover(ep));
-            } else if (this.marksStale(ep, now)) {
+            } else if (this.idleProbeDue(ep, now)) {
+                ep.idleProbeAt = now;
                 work.push(this.probeEpoch(ep, this.s.attempt_timeout));
             }
         }
@@ -935,9 +939,11 @@ class Router {
         }
     }
 
-    // Spec 6.5: an endpoint without a confirmed slot and height in probe_every
-    private marksStale(ep: Endpoint, now: number): boolean {
+    // Spec 6.5: an endpoint without a confirmed slot and height in probe_every, at most once in
+    // probe_every whatever the probe got (spec 13.3)
+    private idleProbeDue(ep: Endpoint, now: number): boolean {
         if (!ep.passed.genesis || ep.health.breaker() !== "closed") return false;
+        if (ep.idleProbeAt !== null && now - ep.idleProbeAt < this.s.probe_every) return false;
         return (["slot", "height"] as const).some((kind) => {
             const mark = this.slots.mark(ep.name, "confirmed", kind);
             return mark === null || now - mark.lastSeen >= this.s.probe_every;
