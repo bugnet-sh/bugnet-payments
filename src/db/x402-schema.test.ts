@@ -71,11 +71,11 @@ async function account(): Promise<string> {
 }
 
 describe("migration 00003", () => {
-    it("applies 00003 and 00004 after 00001 and 00002", async () => {
+    it("applies 00003, 00004 and 00006 after 00001 and 00002", async () => {
         const fresh = await testDb();
         try {
             await fresh.pool.query(RESET);
-            expect(await migrate(fresh.pool)).toBe(4);
+            expect(await migrate(fresh.pool)).toBe(5);
             expect(await migrate(fresh.pool)).toBe(0);
         } finally {
             await fresh.close();
@@ -109,7 +109,7 @@ describe("migration 00003", () => {
                  values ($1, 'full', 'late', 10000, 'dest', 'payer', 'pending')`,
                 [start],
             );
-            expect(await migrate(fresh.pool)).toBe(2);
+            expect(await migrate(fresh.pool)).toBe(3);
             const o = await fresh.pool.query(
                 `select pay_into, allowance_micros::text, fee_micros::text, x402_setup,
                     hot_router_refund_micros::text from orders where id = $1`,
