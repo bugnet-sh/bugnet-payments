@@ -58,16 +58,28 @@ describe("schema", () => {
             const r = await fresh.pool.query(
                 "select version from schema_migrations order by version",
             );
-            // Later migrations may follow 00005; these five come first, in this order
-            expect(r.rows.slice(0, 5)).toEqual([
+            // Later migrations may follow 00006; these six come first, in this order
+            expect(r.rows.slice(0, 6)).toEqual([
                 { version: "00001_init.sql" },
                 { version: "00002_payment_key.sql" },
                 { version: "00003_x402.sql" },
                 { version: "00004_paid_via.sql" },
                 { version: "00005_deposits.sql" },
+                { version: "00006_rpc.sql" },
             ]);
         } finally {
             await fresh.close();
+        }
+    });
+
+    it("migrations include 00006_rpc.sql", async () => {
+        const r = await db.pool.query<{ version: string }>(
+            "select version from schema_migrations order by version",
+        );
+        const versions = r.rows.map((row) => row.version);
+        expect(versions.at(-1)).toBe("00006_rpc.sql");
+        if ((await readdir("migrations")).includes("00005_deposits.sql")) {
+            expect(versions.at(-2)).toBe("00005_deposits.sql");
         }
     });
 

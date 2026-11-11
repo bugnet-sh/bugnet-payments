@@ -1,5 +1,5 @@
 import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
-import { createServer, type IncomingMessage } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
     AccountRole,
@@ -40,6 +40,7 @@ import { isRecord } from "../is-record.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { MEMO_PROGRAM, TOKEN_PROGRAM, USDC_DECIMALS, USDC_MINT } from "../solana/constants.ts";
 import { createRpc, type SolanaRpc } from "../solana/rpc.ts";
+import { MAINNET_GENESIS, MAINNET_HISTORY_PROBE } from "../solana/router/index.ts";
 
 export type BadAnswer = { meta: "null" } | { dropTokenEntryFor: string };
 
@@ -80,7 +81,18 @@ export interface FakeChain {
         createDestinationFor?: string;
     }): Promise<string>;
     withholdTransaction(signature: string, times: number): void;
+    // SOL balances getBalance answers, 0 for an unknown address
+    lamports(address: string): bigint;
+    fundLamports(address: string, lamports: bigint): void;
     calls(): { method: string; params: unknown[] }[];
+    // Another RPC endpoint over this same chain, on its own loopback port (so its own domain)
+    addEndpoint(o?: {
+        lag?: number;
+        refuse?: boolean;
+        history?: boolean | "short" | "alternate";
+        genesis?: string;
+        ignoreMinContextSlot?: boolean;
+    }): Promise<FakeChainEndpoint>;
     close(): Promise<void>;
     accountExists(address: string): boolean;
     // null: the node gives no block time for transactions landing from now on
@@ -99,8 +111,6 @@ export interface FakeChain {
         micros: bigint;
         signer: KeyPairSigner;
     }): Promise<string>;
-    lamports(address: string): bigint;
-    fundLamports(address: string, lamports: bigint): void;
     // History padding: names the accounts read-only and moves nothing
     noOp(o: {
         touching: string | readonly string[];
@@ -115,6 +125,39 @@ export interface FakeChain {
     undecodable(signature: string): void;
     // One backend's wrong answer behind an endpoint that mixes backends
     badAnswer(signature: string, times: number, o: BadAnswer): void;
+}
+
+export interface FakeChainEndpoint {
+    url: string;
+    setLag(slots: number, o?: { refuse?: boolean }): void;
+    // Answers the slot it had when frozen
+    freeze(on: boolean): void;
+    // false: -32011 for every history lookup; "short": null; "alternate": every second one null
+    setHistory(mode: boolean | "short" | "alternate"): void;
+    ignoreMinContextSlot(on: boolean): void;
+    rateLimit(times: number, retryAfterSeconds?: number): void;
+    failNext(status?: number): void;
+    // "after": handles the request, never answers
+    stall(mode: "off" | "before" | "after"): void;
+    // A known signature sent with preflight answers -32002 AlreadyProcessed
+    alreadyProcessed(on: boolean): void;
+    // The next sendTransaction answers its signature and lands nothing
+    dropNext(): void;
+    calls(): { method: string; params: unknown[] }[];
+    close(): Promise<void>;
+}
+
+// One added endpoint's own view of the shared chain
+interface EndpointView {
+    lag: number;
+    refuse: boolean;
+    frozen: { slot: bigint; finalized: bigint } | null;
+    ignoreMin: boolean;
+    history: boolean | "short" | "alternate";
+    historyLookups: number;
+    alreadyProcessed: boolean;
+    dropNext: boolean;
+    genesis: string;
 }
 
 const GENESIS_SLOT = 1_000n;
@@ -321,6 +364,11 @@ export async function startFakeChain(
     const withheldTxTime = new Map<bigint, number>();
     const withheldBlockTime = new Map<bigint, number>();
     const requests: { method: string; params: unknown[] }[] = [];
+    // Set while an added endpoint's request is answered; answer() runs synchronously
+    let current: EndpointView | null = null;
+    const endpointClosers: (() => Promise<void>)[] = [];
+    // The router's history check asks for this old mainnet transaction before any payment exists
+    const probeSlot = GENESIS_SLOT - 1n;
     const heights = new Map<string, bigint>([
         [blockhashOf(GENESIS_SLOT), GENESIS_SLOT - HEIGHT_OFFSET],
     ]);
@@ -405,8 +453,19 @@ export async function startFakeChain(
     setAccount({ address: outsideAta, owner: outside, amount: OUTSIDE_FUNDS });
 
     // The associated token program checks the address it creates, which takes an async
-    // derivation, so a send derives its owners' addresses before it lands
-    async function deriveAtas(instructions: readonly StoredInstruction[]): Promise<void> {
+    // derivation, so a send or a dry run derives its owners' addresses before answer() runs
+    async function deriveAtasFor(method: string, params: unknown[]): Promise<void> {
+        if (method !== "sendTransaction" && method !== "simulateTransaction") return;
+        let instructions: readonly StoredInstruction[];
+        try {
+            const wire = params[0] as string;
+            instructions = readMessage(
+                getTransactionDecoder().decode(getBase64Encoder().encode(wire)),
+            ).instructions;
+        } catch {
+            // answer() refuses a wire it cannot read
+            return;
+        }
         for (const ix of instructions) {
             const owner = ix.accounts[2];
             if (ix.program !== ATA_PROGRAM || owner === undefined || atas.has(owner)) continue;
@@ -685,7 +744,20 @@ export async function startFakeChain(
         return sig;
     }
 
-    async function sendTransaction(wire: string, config: Record<string, unknown>): Promise<string> {
+    // A dry run of apply() on the current state: nothing lands. simulateTransaction answers
+    // with it, and a send under preflight is refused with its error
+    function dryRun(message: ReturnType<typeof readMessage>): Record<string, unknown> {
+        const result = { logs: [], accounts: null, unitsConsumed: 0, returnData: null };
+        const { compiled, keys, instructions } = message;
+        const known = heights.get(compiled.lifetimeToken);
+        if (known === undefined || heightOf(slot) > known + BLOCKHASH_LIFE) {
+            return { err: "BlockhashNotFound", ...result };
+        }
+        const { err } = apply(keys, compiled.header.numSignerAccounts, instructions);
+        return { err, ...result, unitsConsumed: 1_000 };
+    }
+
+    function sendTransaction(wire: string, config: Record<string, unknown>): string {
         let tx: Transaction;
         let message: ReturnType<typeof readMessage>;
         try {
@@ -694,8 +766,7 @@ export async function startFakeChain(
         } catch {
             throw new RpcError(-32602, "Invalid param: failed to deserialize transaction");
         }
-        await deriveAtas(message.instructions);
-        const { compiled, keys, instructions } = message;
+        const { compiled } = message;
         const known = heights.get(compiled.lifetimeToken);
         if (known === undefined || heightOf(slot) > known + BLOCKHASH_LIFE) {
             throw new RpcError(-32002, "Transaction simulation failed: Blockhash not found", {
@@ -716,18 +787,12 @@ export async function startFakeChain(
         const first = Object.values(tx.signatures)[0];
         const sig = getBase58Decoder().decode(first ?? new Uint8Array(64));
         if (preflightOn && config.skipPreflight !== true && !bySignature.has(sig)) {
-            const simulated = apply(keys, compiled.header.numSignerAccounts, instructions);
+            const simulated = dryRun(message);
             if (simulated.err !== null) {
                 const [index] = (simulated.err as { InstructionError: [number, unknown] })
                     .InstructionError;
                 const failed = `Error processing Instruction ${index}: custom program error: 0x1`;
-                throw new RpcError(-32002, `Transaction simulation failed: ${failed}`, {
-                    err: simulated.err,
-                    logs: [],
-                    accounts: null,
-                    unitsConsumed: 0,
-                    returnData: null,
-                });
+                throw new RpcError(-32002, `Transaction simulation failed: ${failed}`, simulated);
             }
         }
         return land(tx, wire, true);
@@ -790,15 +855,18 @@ export async function startFakeChain(
         return lag > 0 && (lagMethods === undefined || lagMethods.includes(method)) ? lag : 0;
     }
 
+    // An added endpoint answers from its own lag and frozen head; the main URL from lagNode's
     const lagged = (method: string, base: bigint): bigint => {
-        const at = base - BigInt(lagFor(method));
+        const at = base - BigInt(current === null ? lagFor(method) : current.lag);
         return at < 0n ? 0n : at;
     };
+    const head = (): bigint => current?.frozen?.slot ?? slot;
 
     function viewSlot(method: string, commitment: unknown): bigint {
         // Kit strips an explicit finalized and injects confirmed when none is given, so a request
         // that arrives with no commitment is the finalized one, as on a real node
-        const base = commitment === undefined || commitment === "finalized" ? finalized() : slot;
+        const fin = current?.frozen?.finalized ?? finalized();
+        const base = commitment === undefined || commitment === "finalized" ? fin : head();
         return lagged(method, base);
     }
 
@@ -807,7 +875,7 @@ export async function startFakeChain(
             // Agave checks a send's minContextSlot against its preflight bank, which is the
             // processed head when preflight is skipped
             return config.skipPreflight === true
-                ? lagged(method, slot)
+                ? lagged(method, head())
                 : viewSlot(method, config.preflightCommitment);
         }
         if (method === "getBlockTime") return viewSlot(method, "confirmed");
@@ -1031,9 +1099,32 @@ export async function startFakeChain(
         return true;
     };
 
+    // An added endpoint's history: full, short (a node whose history does not reach the slot), or
+    // none (-32011, a node run without transaction history)
+    function historyMode(): "full" | "short" {
+        if (current === null || current.history === true) return "full";
+        if (current.history === false) {
+            throw new RpcError(-32011, "Transaction history is not available from this node");
+        }
+        if (current.history === "short") return "short";
+        current.historyLookups += 1;
+        return current.historyLookups % 2 === 1 ? "full" : "short";
+    }
+
     function getTransaction(sig: string, config: Record<string, unknown>, view: bigint) {
-        if (takeOne(withheld, sig)) return null;
+        if (historyMode() === "short") return null;
         const t = bySignature.get(sig);
+        const probe = sig === MAINNET_HISTORY_PROBE.signature;
+        // Every transaction here is v0, which Agave refuses to a caller without the field
+        if ((t !== undefined || probe) && config.maxSupportedTransactionVersion === undefined) {
+            throw new RpcError(
+                -32015,
+                "Transaction version (0) is not supported by the requesting client. " +
+                    'Please try the request again with the following configuration parameter: "maxSupportedTransactionVersion": 0',
+            );
+        }
+        if (probe) return probeTransaction();
+        if (takeOne(withheld, sig)) return null;
         if (t === undefined || t.slot > view) return null;
         const bad = badAnswers.get(sig);
         const kind = bad !== undefined && bad.left > 0 ? bad.kind : null;
@@ -1060,6 +1151,7 @@ export async function startFakeChain(
     }
 
     function getSignaturesForAddress(addr: string, config: Record<string, unknown>, view: bigint) {
+        if (historyMode() === "short") return [];
         let list = txs
             .filter(
                 (t) =>
@@ -1093,14 +1185,53 @@ export async function startFakeChain(
             }));
     }
 
-    async function answer(method: string, params: unknown[]): Promise<unknown> {
+    function signatureOfWire(wire: string): string {
+        const tx = getTransactionDecoder().decode(getBase64Encoder().encode(wire));
+        const first = Object.values(tx.signatures)[0];
+        return getBase58Decoder().decode(first ?? new Uint8Array(64));
+    }
+
+    function simulate(wire: string): Record<string, unknown> {
+        let message: ReturnType<typeof readMessage>;
+        try {
+            message = readMessage(getTransactionDecoder().decode(getBase64Encoder().encode(wire)));
+        } catch {
+            throw new RpcError(-32602, "Invalid param: failed to deserialize transaction");
+        }
+        return dryRun(message);
+    }
+
+    function probeTransaction(): Record<string, unknown> {
+        return {
+            slot: probeSlot,
+            blockTime: null,
+            version: 0,
+            transaction: ["", "base64"],
+            meta: {
+                err: null,
+                fee: 5000,
+                preBalances: [],
+                postBalances: [],
+                preTokenBalances: [],
+                postTokenBalances: [],
+                innerInstructions: [],
+                logMessages: [],
+                loadedAddresses: { writable: [], readonly: [] },
+            },
+        };
+    }
+
+    // Synchronous, so the added endpoint's view in current holds for the whole answer
+    function answer(method: string, params: unknown[]): unknown {
         const last = params[params.length - 1];
         const config = isRecord(last) ? last : {};
         const view = viewFor(method, config);
+        // Above the head every node refuses; below it only a lagged view that is set to refuse
+        const refuseLagged = current === null ? lagRefuses : current.refuse;
         if (
             typeof config.minContextSlot === "number" &&
-            lagRefuses &&
-            view < config.minContextSlot
+            current?.ignoreMin !== true &&
+            (config.minContextSlot > head() || (refuseLagged && view < config.minContextSlot))
         ) {
             throw new RpcError(
                 MIN_CONTEXT_SLOT_NOT_REACHED,
@@ -1112,6 +1243,10 @@ export async function startFakeChain(
         }
         const context = { slot: view };
         switch (method) {
+            case "getGenesisHash":
+                return current?.genesis ?? MAINNET_GENESIS;
+            case "simulateTransaction":
+                return { context, value: simulate(params[0] as string) };
             case "getSlot":
                 return view;
             case "getBlockHeight":
@@ -1161,9 +1296,23 @@ export async function startFakeChain(
             }
             case "getSignatureStatuses": {
                 const sigs = params[0] as string[];
+                if (config.searchTransactionHistory === true && historyMode() === "short") {
+                    return {
+                        context: { slot: viewSlot(method, "confirmed") },
+                        value: sigs.map(() => null),
+                    };
+                }
                 return {
                     context: { slot: viewSlot(method, "confirmed") },
                     value: sigs.map((s) => {
+                        if (s === MAINNET_HISTORY_PROBE.signature) {
+                            return {
+                                slot: probeSlot,
+                                confirmations: null,
+                                err: null,
+                                confirmationStatus: "finalized",
+                            };
+                        }
                         const t = bySignature.get(s);
                         if (t === undefined || t.slot > viewSlot(method, "confirmed")) return null;
                         if (hiddenFromStatus.has(s)) return null;
@@ -1184,7 +1333,29 @@ export async function startFakeChain(
                 if (config.encoding !== "base64") {
                     throw new RpcError(-32602, "fake chain supports base64 only");
                 }
-                return await sendTransaction(params[0] as string, config);
+                const wire = params[0] as string;
+                if (current?.dropNext === true) {
+                    current.dropNext = false;
+                    return signatureOfWire(wire);
+                }
+                if (
+                    current?.alreadyProcessed === true &&
+                    config.skipPreflight !== true &&
+                    bySignature.has(signatureOfWire(wire))
+                ) {
+                    throw new RpcError(
+                        -32002,
+                        "Transaction simulation failed: This transaction has already been processed",
+                        {
+                            err: "AlreadyProcessed",
+                            logs: [],
+                            accounts: null,
+                            unitsConsumed: 0,
+                            returnData: null,
+                        },
+                    );
+                }
+                return sendTransaction(wire, config);
             }
             default:
                 throw new RpcError(-32601, `Method not found: ${method}`);
@@ -1196,35 +1367,135 @@ export async function startFakeChain(
         id,
         error: { code, message, ...(data === undefined ? {} : { data }) },
     });
+    async function respond(
+        body: string,
+        view: EndpointView | null,
+        log: { method: string; params: unknown[] }[],
+    ): Promise<unknown> {
+        let id: unknown = null;
+        try {
+            const parsed: unknown = JSON.parse(body);
+            if (!isRecord(parsed) || typeof parsed.method !== "string") {
+                return rpcError(null, -32600, "Invalid request");
+            }
+            id = parsed.id ?? null;
+            const params = Array.isArray(parsed.params) ? (parsed.params as unknown[]) : [];
+            log.push({ method: parsed.method, params });
+            await deriveAtasFor(parsed.method, params);
+            current = view;
+            try {
+                return { jsonrpc: "2.0", id, result: answer(parsed.method, params) };
+            } finally {
+                current = null;
+            }
+        } catch (e) {
+            if (e instanceof RpcError) return rpcError(id, e.code, e.message, e.data);
+            if (e instanceof SyntaxError) return rpcError(null, -32700, "Parse error");
+            return rpcError(id, -32603, "Internal error");
+        }
+    }
+    const send = (res: ServerResponse, payload: unknown) => {
+        res.setHeader("content-type", "application/json");
+        res.end(
+            JSON.stringify(payload, (_k, v: unknown) => (typeof v === "bigint" ? Number(v) : v)),
+        );
+    };
     const server = createServer((req, res) => {
         void readBody(req)
-            .then(async (body): Promise<unknown> => {
-                let id: unknown = null;
-                try {
-                    const parsed: unknown = JSON.parse(body);
-                    if (!isRecord(parsed) || typeof parsed.method !== "string") {
-                        return rpcError(null, -32600, "Invalid request");
-                    }
-                    id = parsed.id ?? null;
-                    const params = Array.isArray(parsed.params) ? (parsed.params as unknown[]) : [];
-                    requests.push({ method: parsed.method, params });
-                    return { jsonrpc: "2.0", id, result: await answer(parsed.method, params) };
-                } catch (e) {
-                    if (e instanceof RpcError) return rpcError(id, e.code, e.message, e.data);
-                    if (e instanceof SyntaxError) return rpcError(null, -32700, "Parse error");
-                    return rpcError(id, -32603, "Internal error");
-                }
-            })
+            .then((body) => respond(body, null, requests))
             .catch(() => rpcError(null, -32603, "Internal error"))
-            .then((payload) => {
-                res.setHeader("content-type", "application/json");
-                res.end(
-                    JSON.stringify(payload, (_k, v: unknown) =>
-                        typeof v === "bigint" ? Number(v) : v,
-                    ),
-                );
-            });
+            .then((payload) => send(res, payload));
     });
+
+    async function addEndpoint(
+        o: Parameters<FakeChain["addEndpoint"]>[0] = {},
+    ): Promise<FakeChainEndpoint> {
+        const view: EndpointView = {
+            lag: o.lag ?? 0,
+            refuse: o.refuse ?? true,
+            frozen: null,
+            ignoreMin: o.ignoreMinContextSlot ?? false,
+            history: o.history ?? true,
+            historyLookups: 0,
+            alreadyProcessed: false,
+            dropNext: false,
+            genesis: o.genesis ?? MAINNET_GENESIS,
+        };
+        const log: { method: string; params: unknown[] }[] = [];
+        let limited = 0;
+        // Without one, a 429 carries no Retry-After, as some endpoints answer
+        let retryAfter: number | null = null;
+        let failStatus: number | null = null;
+        let stallMode: "off" | "before" | "after" = "off";
+        const ep = createServer((req, res) => {
+            void readBody(req)
+                .then(async (body) => {
+                    if (stallMode === "before") return;
+                    if (limited > 0) {
+                        limited -= 1;
+                        res.writeHead(
+                            429,
+                            retryAfter === null ? {} : { "retry-after": String(retryAfter) },
+                        );
+                        res.end();
+                        return;
+                    }
+                    if (failStatus !== null) {
+                        const status = failStatus;
+                        failStatus = null;
+                        res.writeHead(status);
+                        res.end();
+                        return;
+                    }
+                    const payload = await respond(body, view, log);
+                    if (stallMode === "after") return;
+                    send(res, payload);
+                })
+                // A client that aborts during the body read leaves nothing to answer
+                .catch(() => res.destroy());
+        });
+        await new Promise<void>((resolve) => ep.listen(0, "127.0.0.1", resolve));
+        const close = async () => {
+            ep.closeAllConnections();
+            await new Promise<void>((resolve) => ep.close(() => resolve()));
+        };
+        endpointClosers.push(close);
+        return {
+            url: `http://127.0.0.1:${(ep.address() as AddressInfo).port}`,
+            setLag(slots, opts = {}) {
+                view.lag = slots;
+                view.refuse = opts.refuse ?? true;
+            },
+            freeze(on) {
+                view.frozen = on ? { slot, finalized: finalized() } : null;
+            },
+            setHistory(mode) {
+                view.history = mode;
+                view.historyLookups = 0;
+            },
+            ignoreMinContextSlot(on) {
+                view.ignoreMin = on;
+            },
+            rateLimit(times, retryAfterSeconds) {
+                limited = times;
+                retryAfter = retryAfterSeconds ?? null;
+            },
+            failNext(status = 500) {
+                failStatus = status;
+            },
+            stall(mode) {
+                stallMode = mode;
+            },
+            alreadyProcessed(on) {
+                view.alreadyProcessed = on;
+            },
+            dropNext() {
+                view.dropNext = true;
+            },
+            calls: () => log.map((r) => ({ ...r })),
+            close,
+        };
+    }
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     const rpc = createRpc(url);
@@ -1370,8 +1641,10 @@ export async function startFakeChain(
         transfer: buildAndSend,
         withholdTransaction: (sig, times) => withheld.set(sig, times),
         calls: () => requests.map((r) => ({ ...r })),
+        addEndpoint,
         async close() {
             if (timer !== undefined) clearInterval(timer);
+            for (const closeEndpoint of endpointClosers) await closeEndpoint().catch(() => {});
             server.closeAllConnections();
             await new Promise<void>((resolve) => server.close(() => resolve()));
         },

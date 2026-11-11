@@ -36,6 +36,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FRESH_SEND, RESEND } from "../refunds/executor.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { TOKEN_PROGRAM, USDC_DECIMALS, USDC_MINT } from "../solana/constants.ts";
+import { domainOf, MAINNET_GENESIS, MAINNET_HISTORY_PROBE } from "../solana/router/index.ts";
+import { createRpc } from "../solana/rpc.ts";
 import { buildSellerPayment, randomSellerMemo, signSellerPayment } from "../x402/build.ts";
 import { type FakeChain, startFakeChain } from "./fake-chain.ts";
 import { testSigner } from "./keys.ts";
@@ -96,6 +98,95 @@ describe("fake chain", () => {
                 maxSupportedTransactionVersion: 0,
             })
             .send();
+
+    const transferWire = async (
+        micros: bigint,
+        lifetime?: { blockhash: string; lastValidBlockHeight: bigint },
+    ): Promise<string> => {
+        const life = lifetime ?? (await chain.rpc.getLatestBlockhash().send()).value;
+        const message = pipe(
+            createTransactionMessage({ version: 0 }),
+            (m) => setTransactionMessageFeePayerSigner(payer, m),
+            (m) => setTransactionMessageLifetimeUsingBlockhash(life as never, m),
+            (m) =>
+                appendTransactionMessageInstruction(
+                    getTransferCheckedInstruction({
+                        source: address(a),
+                        mint: address(USDC_MINT),
+                        destination: address(b),
+                        authority: owner,
+                        amount: micros,
+                        decimals: USDC_DECIMALS,
+                    }),
+                    m,
+                ),
+        );
+        return getBase64EncodedWireTransaction(await signTransactionMessageWithSigners(message));
+    };
+    const simulate = async (wire: string) =>
+        (
+            (await chain.rpc.simulateTransaction(wire as never, { encoding: "base64" }).send()) as {
+                value: { err: unknown };
+            }
+        ).value.err;
+
+    it("the fake chain answers getGenesisHash", async () => {
+        expect(await chain.rpc.getGenesisHash().send()).toBe(MAINNET_GENESIS);
+    });
+
+    it("the fake chain answers getBalance", async () => {
+        chain.fundLamports(payer.address, 5n);
+        const funded = await chain.rpc.getBalance(payer.address).send();
+        expect(funded.value).toBe(5n);
+        expect(typeof funded.context.slot).toBe("bigint");
+        expect((await chain.rpc.getBalance(other.address).send()).value).toBe(0n);
+        expect(chain.lamports(other.address)).toBe(0n);
+    });
+
+    it("the fake chain simulates without landing", async () => {
+        const fresh = await transferWire(10n);
+        expect(await simulate(fresh)).toBeNull();
+        expect(chain.submitted()).toHaveLength(0);
+        expect(chain.balance(a)).toBe(1_000_000n);
+        expect(chain.balance(b)).toBe(0n);
+
+        const life = (await chain.rpc.getLatestBlockhash().send()).value;
+        chain.advance(200);
+        expect(await simulate(await transferWire(10n, life))).toBe("BlockhashNotFound");
+        expect(await simulate(await transferWire(2_000_000n))).toEqual({
+            InstructionError: [0n, { Custom: 1n }],
+        });
+    });
+
+    it("the fake chain knows the mainnet probe", async () => {
+        const { value } = await chain.rpc
+            .getSignatureStatuses([signature(MAINNET_HISTORY_PROBE.signature)], {
+                searchTransactionHistory: true,
+            })
+            .send();
+        expect(value[0]?.confirmationStatus).toBe("finalized");
+    });
+
+    it("the fake chain refuses a v0 transaction without the version field", async () => {
+        const s = await send(10n);
+        await expect(
+            chain.rpc.getTransaction(signature(s), { encoding: "base64" }).send(),
+        ).rejects.toSatisfy((e: unknown) => isSolanaError(e) && e.context.__code === -32015);
+        expect(await getTx(s)).not.toBeNull();
+    });
+
+    it("the fake chain refuses a slot above its head", async () => {
+        const far = chain.slot() + 1_000_000n;
+        const ask = () =>
+            chain.rpc
+                .getAccountInfo(address(a), { encoding: "jsonParsed", minContextSlot: far })
+                .send();
+        const refused = (e: unknown) =>
+            isSolanaError(e, SOLANA_ERROR__JSON_RPC__SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED);
+        await expect(ask()).rejects.toSatisfy(refused);
+        chain.lagNode(10, { refuse: false });
+        await expect(ask()).rejects.toSatisfy(refused);
+    });
 
     it("a signed TransferChecked moves balances and is listed newest first", async () => {
         expect(chain.slot()).toBe(1_000n);
@@ -685,5 +776,130 @@ describe("fake chain", () => {
         const { value } = await chain.rpc.getSignatureStatuses([signature(s)]).send();
         expect(value[0]).toBeNull();
         expect(await getTx(s)).not.toBeNull();
+    });
+});
+
+describe("fake chain endpoints", () => {
+    let chain: FakeChain;
+    let owner: KeyPairSigner, payer: KeyPairSigner, other: KeyPairSigner;
+    let a: string, b: string;
+    beforeEach(async () => {
+        chain = await startFakeChain();
+        [owner, payer, other] = await Promise.all([testSigner(31), testSigner(32), testSigner(33)]);
+        a = await usdcAta(owner.address);
+        b = await usdcAta(other.address);
+        chain.setTokenAccount({ address: a, owner: owner.address, amount: 1_000_000n });
+        chain.setTokenAccount({ address: b, owner: other.address, amount: 0n });
+    });
+    afterEach(() => chain.close());
+    const landed = () =>
+        chain.transfer({
+            authority: owner,
+            feePayer: payer,
+            source: a,
+            destination: b,
+            micros: 10n,
+        });
+    const statuses = (url: string, sig: string) =>
+        createRpc(url)
+            .getSignatureStatuses([signature(sig)], { searchTransactionHistory: true })
+            .send();
+    const code = (e: unknown) => (isSolanaError(e) ? e.context.__code : null);
+
+    it("endpoints share one chain", async () => {
+        const ep = await chain.addEndpoint();
+        await landed();
+        const { value } = await createRpc(ep.url).getTokenAccountBalance(address(b)).send();
+        expect(value.amount).toBe("10");
+    });
+
+    it("a history-less endpoint answers -32011", async () => {
+        const ep = await chain.addEndpoint({ history: false });
+        const sig = await landed();
+        const rpc = createRpc(ep.url);
+        await expect(statuses(ep.url, sig)).rejects.toSatisfy((e) => code(e) === -32011);
+        await expect(
+            rpc
+                .getTransaction(signature(sig), {
+                    encoding: "base64",
+                    maxSupportedTransactionVersion: 0,
+                })
+                .send(),
+        ).rejects.toSatisfy((e) => code(e) === -32011);
+        await expect(rpc.getSignaturesForAddress(address(b)).send()).rejects.toSatisfy(
+            (e) => code(e) === -32011,
+        );
+    });
+
+    it("a short-history endpoint answers null at a current slot", async () => {
+        const ep = await chain.addEndpoint({ history: "short" });
+        const sig = await landed();
+        const r = await statuses(ep.url, sig);
+        expect(r.value).toEqual([null]);
+        expect(r.context.slot).toBe(chain.slot());
+    });
+
+    it("rate limits answer 429 with Retry-After", async () => {
+        const ep = await chain.addEndpoint();
+        ep.rateLimit(1, 10);
+        const err = await createRpc(ep.url)
+            .getSlot()
+            .send()
+            .catch((e: unknown) => e);
+        expect(code(err)).toBe(8100002);
+        const ctx = (err as { context: { statusCode?: number; headers?: Headers } }).context;
+        expect(ctx.statusCode).toBe(429);
+        expect(ctx.headers?.get("retry-after")).toBe("10");
+        expect(await createRpc(ep.url).getSlot().send()).toBe(chain.slot());
+
+        ep.rateLimit(1);
+        const bare = await createRpc(ep.url)
+            .getSlot()
+            .send()
+            .catch((e: unknown) => e);
+        const headers = (bare as { context: { headers?: Headers } }).context.headers;
+        expect(headers?.get("retry-after") ?? null).toBeNull();
+    });
+
+    it("a frozen endpoint keeps its slot", async () => {
+        const ep = await chain.addEndpoint();
+        const before = await createRpc(ep.url).getSlot().send();
+        ep.freeze(true);
+        chain.advance(100);
+        expect(await createRpc(ep.url).getSlot().send()).toBe(before);
+        expect(await chain.rpc.getSlot().send()).toBe(before + 100n);
+    });
+
+    it("an endpoint can ignore an unreachable minContextSlot", async () => {
+        const ep = await chain.addEndpoint({ ignoreMinContextSlot: true });
+        const far = chain.slot() + 1_000_000n;
+        const info = await createRpc(ep.url)
+            .getAccountInfo(address(a), { encoding: "jsonParsed", minContextSlot: far })
+            .send();
+        expect(info.value).not.toBeNull();
+    });
+
+    it("history can be turned off after start", async () => {
+        const ep = await chain.addEndpoint();
+        const sig = await landed();
+        expect((await statuses(ep.url, sig)).value[0]).not.toBeNull();
+        ep.setHistory("short");
+        expect((await statuses(ep.url, sig)).value).toEqual([null]);
+        ep.setHistory(false);
+        await expect(statuses(ep.url, sig)).rejects.toSatisfy((e) => code(e) === -32011);
+    });
+
+    it("an alternating endpoint flips its history answers", async () => {
+        const ep = await chain.addEndpoint();
+        const sig = await landed();
+        ep.setHistory("alternate");
+        const seen: boolean[] = [];
+        for (let i = 0; i < 4; i++) seen.push((await statuses(ep.url, sig)).value[0] !== null);
+        expect(seen).toEqual([true, false, true, false]);
+    });
+
+    it("each endpoint is its own domain", async () => {
+        const [e1, e2] = await Promise.all([chain.addEndpoint(), chain.addEndpoint()]);
+        expect(domainOf(e1.url)).not.toBe(domainOf(e2.url));
     });
 });

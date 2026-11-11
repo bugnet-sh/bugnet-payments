@@ -28,7 +28,7 @@ describe("jsonLog", () => {
     });
 
     it("scrubs configured secret strings from messages and errors", () => {
-        const rpc = "https://mainnet.helius-rpc.com/?api-key=K";
+        const rpc = "https://rpc1.example/?api-key=K";
         const { out, log } = capture({ secrets: [rpc] });
         log.error(`fetch ${rpc} failed`, { err: new Error(`POST ${rpc}: 429`) });
         expect(out[0]).not.toContain("api-key=K");
@@ -108,6 +108,29 @@ describe("test loggers", () => {
     it("REDACTED_KEYS lists the secret keys", () => {
         expect(REDACTED_KEYS.has("mnemonic")).toBe(true);
         expect(REDACTED_KEYS.has("orderId")).toBe(false);
+    });
+
+    it("rpcUrls is a redacted key", () => {
+        const out: string[] = [];
+        jsonLog("payments", { write: (l) => out.push(l) }).info("rpc", {
+            rpcUrls: ["https://a.example/?api-key=k1"],
+        });
+        expect(JSON.parse(out[0]!).rpcUrls).toBe("[redacted]");
+        expect(out[0]).not.toContain("a.example");
+    });
+});
+
+describe("rpc alarms", () => {
+    it("knows every rpc alarm of 10.2", () => {
+        const names: AlarmName[] = [
+            "rpc_endpoint_down",
+            "rpc_all_endpoints_down",
+            "rpc_endpoint_lag",
+            "rpc_absence_unconfirmed",
+        ];
+        const log = memoryLog();
+        for (const n of names) log.alarm(n, { endpoint: "rpc2" });
+        expect(log.lines.map((l) => [l.alarm, l.endpoint])).toEqual(names.map((n) => [n, "rpc2"]));
     });
 });
 

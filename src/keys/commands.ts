@@ -10,6 +10,10 @@
  * against the configured allowance wallet and the hot ledger: `fund --create-recipient-ata` takes
  * the recipient address itself, so it never reads a config that names another wallet. The test
  * payer pays every fee and every ATA rent, so no other wallet needs SOL for these commands.
+ *
+ * The commands that touch Solana read the same RPC list as the service, through the router. Only
+ * with -config do they parse the TOML, and then only for [solana] rpc and rpc_timeout; without
+ * one they use the router's defaults. pubkey, show --no-balances and generate never read a TOML.
  */
 import {
     type Address,
@@ -19,7 +23,7 @@ import {
     type KeyPairSigner,
 } from "@solana/kit";
 import { ASSOCIATED_TOKEN_PROGRAM_ADDRESS } from "@solana-program/token";
-import { loadSettings, secretValues } from "../config.ts";
+import { DEFAULT_RPC_TIMEOUT, loadSettings, parseDuration, secretValues } from "../config.ts";
 import { createPool } from "../db/pool.ts";
 import { jsonLog, type Log } from "../log.ts";
 import { orderPublicKeyBase64 } from "../orders/token.ts";
@@ -27,7 +31,9 @@ import { inspectTokenAccount, usdcAta } from "../solana/accounts.ts";
 import { type Landing, readLanding } from "../solana/landing.ts";
 import { hotLedgerEmpty } from "../x402/tail.ts";
 import { loadKeypair } from "../solana/keys.ts";
-import { createRpc, type SolanaRpc } from "../solana/rpc.ts";
+import { cliRouter, startOrStop } from "../solana/cli-router.ts";
+import { rpcSettingsSchema } from "../solana/router/index.ts";
+import type { RoutedRpc, SolanaRpc } from "../solana/rpc.ts";
 import { signV0Transaction } from "../solana/transfer.ts";
 import { loadTestPayer } from "./test-payer.ts";
 import {
@@ -145,7 +151,8 @@ export async function runKeys(
     words: readonly string[],
     env: NodeJS.ProcessEnv,
     io: Io,
-    config = "config/dev.toml",
+    // null when no -config was given
+    config: string | null = null,
 ): Promise<number> {
     const flags = parseFlags(action ?? "", words);
     if (typeof flags === "string") {
@@ -177,6 +184,7 @@ export async function runKeys(
         ],
         write: io.err,
     });
+    const rpcs = keysRpc(env, config, log);
     try {
         switch (action) {
             case "generate":
@@ -188,11 +196,11 @@ export async function runKeys(
             case "pubkey":
                 return pubkey(env, io);
             case "show":
-                return await show(env, flags, io);
+                return await show(env, flags, io, rpcs);
             case "fund":
-                return await fund(env, flags, io, log);
+                return await fund(env, flags, io, log, rpcs);
             case "testseller":
-                return await testSeller(env, flags, io, log);
+                return await testSeller(env, flags, io, log, rpcs);
             default: {
                 if (flags.switches.has("--allowance") && flags.switches.has("--testseller")) {
                     io.err("--allowance and --testseller cannot be combined");
@@ -210,18 +218,57 @@ export async function runKeys(
                     return 2;
                 }
                 if (flags.switches.has("--allowance")) {
-                    return await drainAllowance(env, io, log, config);
+                    return await drainAllowance(
+                        env,
+                        io,
+                        log,
+                        config ?? DEFAULT_ALLOWANCE_CONFIG,
+                        rpcs,
+                    );
                 }
                 if (flags.switches.has("--testseller")) {
-                    return await drainTestSeller(env, flags, io, log);
+                    return await drainTestSeller(env, flags, io, log, rpcs);
                 }
-                return await drain(env, flags, io, log);
+                return await drain(env, flags, io, log, rpcs);
             }
         }
     } catch (err) {
         log.error(`keys ${action} failed`, { err });
         return 1;
+    } finally {
+        await rpcs.close();
     }
+}
+
+interface KeysRpc {
+    get(): Promise<SolanaRpc>;
+    close(): Promise<void>;
+}
+
+// drain --allowance checks the key against this file's allowance wallet when no -config is given
+const DEFAULT_ALLOWANCE_CONFIG = "config/dev.toml";
+
+function keysRpc(env: NodeJS.ProcessEnv, config: string | null, log: Log): KeysRpc {
+    let routed: Promise<RoutedRpc> | undefined;
+    const open = async (): Promise<RoutedRpc> => {
+        const settings = config === null ? null : loadSettings(config);
+        const r = cliRouter(env, settings?.solana.rpc ?? rpcSettingsSchema.parse({}), {
+            log,
+            rpcTimeoutMs: settings?.solana.rpc_timeout ?? parseDuration(DEFAULT_RPC_TIMEOUT),
+        });
+        if (r === null) {
+            throw new Error("BUGNET_SOLANA_RPC_URLS or BUGNET_SOLANA_RPC_URL must be set");
+        }
+        await startOrStop(r);
+        return r;
+    };
+    return {
+        get: async () => (await (routed ??= open())).rpc,
+        async close() {
+            const r = await routed?.catch(() => null);
+            await r?.router.stop();
+        },
+    };
 }
 
 const SELLER_VARS = ["TESTSELLER_FEE_PAYER_KEY", "TESTSELLER_PAYTO_KEY"] as const;
@@ -279,14 +326,20 @@ function retireSeed(flags: Flags, io: Io): number {
     return 0;
 }
 
-async function testSeller(env: NodeJS.ProcessEnv, flags: Flags, io: Io, log: Log): Promise<number> {
+async function testSeller(
+    env: NodeJS.ProcessEnv,
+    flags: Flags,
+    io: Io,
+    log: Log,
+    rpcs: KeysRpc,
+): Promise<number> {
     const file = flags.values.get("--env");
     if (file === undefined) {
         io.err("keys testseller needs --env FILE");
         return 2;
     }
     const testPayer = await testPayerOf(env);
-    const rpc = createRpc(required(env, "BUGNET_SOLANA_RPC_URL"));
+    const rpc = await rpcs.get();
     const { feePayer, payTo } = await writeTestSellerEnv(file);
     io.out(`testseller_fee_payer=${feePayer}`);
     io.out(`testseller_payto=${payTo}`);
@@ -299,6 +352,7 @@ async function drainTestSeller(
     flags: Flags,
     io: Io,
     log: Log,
+    rpcs: KeysRpc,
 ): Promise<number> {
     const file = flags.values.get("--env");
     if (file === undefined) {
@@ -312,7 +366,7 @@ async function drainTestSeller(
         "TESTSELLER_FEE_PAYER_KEY",
     );
     const payTo = await loadKeypair(required(keys, "TESTSELLER_PAYTO_KEY"), "TESTSELLER_PAYTO_KEY");
-    const rpc = createRpc(required(env, "BUGNET_SOLANA_RPC_URL"));
+    const rpc = await rpcs.get();
     const plan = await testSellerDrainPlan(
         { testPayer, feePayer, payTo },
         {
@@ -335,6 +389,7 @@ async function drainAllowance(
     io: Io,
     log: Log,
     config: string,
+    rpcs: KeysRpc,
 ): Promise<number> {
     const settings = loadSettings(config);
     const pool = createPool(settings.database.url, log);
@@ -355,7 +410,7 @@ async function drainAllowance(
         return 1;
     }
     const testPayer = await testPayerOf(env);
-    const rpc = createRpc(required(env, "BUGNET_SOLANA_RPC_URL"));
+    const rpc = await rpcs.get();
     const plan = await allowanceDrainPlan(
         { testPayer, allowance },
         await usdcOf(rpc, allowance.address),
@@ -376,14 +431,12 @@ function pubkey(env: NodeJS.ProcessEnv, io: Io): number {
     return 0;
 }
 
-async function show(env: NodeJS.ProcessEnv, flags: Flags, io: Io): Promise<number> {
+async function show(env: NodeJS.ProcessEnv, flags: Flags, io: Io, rpcs: KeysRpc): Promise<number> {
     const wallets: { name: string; signer: KeyPairSigner }[] = [];
     const testPayer = await loadTestPayer(env);
     if (testPayer !== null) wallets.push({ name: "test_payer", signer: testPayer });
     wallets.push(...(await walletAddresses(env)));
-    const rpc = flags.switches.has("--no-balances")
-        ? null
-        : createRpc(required(env, "BUGNET_SOLANA_RPC_URL"));
+    const rpc = flags.switches.has("--no-balances") ? null : await rpcs.get();
     for (const { name, signer } of wallets) {
         if (rpc === null) {
             io.out(`${name}=${signer.address}`);
@@ -404,7 +457,13 @@ async function usdcOf(rpc: SolanaRpc, owner: Address): Promise<bigint> {
     return (await inspectTokenAccount(rpc, await usdcAta(owner)))?.amount ?? 0n;
 }
 
-async function fund(env: NodeJS.ProcessEnv, flags: Flags, io: Io, log: Log): Promise<number> {
+async function fund(
+    env: NodeJS.ProcessEnv,
+    flags: Flags,
+    io: Io,
+    log: Log,
+    rpcs: KeysRpc,
+): Promise<number> {
     const lamports = whole(flags, "--fee-payer-lamports");
     const micros = whole(flags, "--refund-usdc-micros");
     if (typeof lamports === "string" || typeof micros === "string") {
@@ -433,7 +492,7 @@ async function fund(env: NodeJS.ProcessEnv, flags: Flags, io: Io, log: Log): Pro
               "BUGNET_ALLOWANCE_KEY",
           )
         : null;
-    const rpc = createRpc(required(env, "BUGNET_SOLANA_RPC_URL"));
+    const rpc = await rpcs.get();
 
     const rentExemptMin = await rpc.getMinimumBalanceForRentExemption(0n).send();
     const ataRent = await rpc.getMinimumBalanceForRentExemption(165n).send();
@@ -480,7 +539,13 @@ async function fund(env: NodeJS.ProcessEnv, flags: Flags, io: Io, log: Log): Pro
     return 0;
 }
 
-async function drain(env: NodeJS.ProcessEnv, flags: Flags, io: Io, log: Log): Promise<number> {
+async function drain(
+    env: NodeJS.ProcessEnv,
+    flags: Flags,
+    io: Io,
+    log: Log,
+    rpcs: KeysRpc,
+): Promise<number> {
     const testPayer = await testPayerOf(env);
     const feePayer = await loadKeypair(
         required(env, "BUGNET_FEE_PAYER_KEY"),
@@ -490,7 +555,7 @@ async function drain(env: NodeJS.ProcessEnv, flags: Flags, io: Io, log: Log): Pr
     const recipientKey = (env.BUGNET_RECIPIENT_KEY ?? "").trim();
     const recipient =
         recipientKey === "" ? undefined : await loadKeypair(recipientKey, "BUGNET_RECIPIENT_KEY");
-    const rpc = createRpc(required(env, "BUGNET_SOLANA_RPC_URL"));
+    const rpc = await rpcs.get();
     const plan = await drainPlan(
         {
             testPayer,

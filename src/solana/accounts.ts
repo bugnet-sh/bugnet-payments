@@ -1,7 +1,8 @@
 import type { Address } from "@solana/kit";
 import { findAssociatedTokenPda } from "@solana-program/token";
 import { USDC_MINT, TOKEN_PROGRAM } from "./constants.ts";
-import { deadline, type SolanaRpc } from "./rpc.ts";
+import { deadline } from "./deadline.ts";
+import type { SolanaRpc } from "./rpc.ts";
 
 export async function usdcAta(owner: Address): Promise<Address> {
     const [ata] = await findAssociatedTokenPda({

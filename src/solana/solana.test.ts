@@ -1,12 +1,14 @@
 import {
     address,
     appendTransactionMessageInstruction,
+    createSolanaRpcFromTransport,
     createTransactionMessage,
     getBase58Decoder,
     getBase58Encoder,
     getBase64EncodedWireTransaction,
     getSignatureFromTransaction,
     pipe,
+    type RpcTransportMainnet,
     setTransactionMessageFeePayerSigner,
     setTransactionMessageLifetimeUsingBlockhash,
     SOLANA_ERROR__JSON_RPC__SERVER_ERROR_NODE_UNHEALTHY,
@@ -15,6 +17,7 @@ import {
     signTransactionMessageWithSigners,
 } from "@solana/kit";
 import { getTransferSolInstruction } from "@solana-program/system";
+import { toFacilitatorSvmSigner } from "@x402/svm";
 import { describe, expect, it } from "vitest";
 import {
     createFakeRpc,
@@ -23,13 +26,30 @@ import {
     TEST_LVBH,
     TEST_SLOT,
 } from "../testing/fake-rpc.ts";
+import { memoryLog } from "../log.ts";
 import { testSigner } from "../testing/keys.ts";
 import { BlockhashCache } from "./blockhash.ts";
 import { inspectTokenAccount, ownedUsdcAccount } from "./accounts.ts";
-import { MEMO_PROGRAM, TOKEN_PROGRAM, USDC_MINT } from "./constants.ts";
+import { MEMO_PROGRAM, SOLANA_MAINNET, TOKEN_PROGRAM, USDC_MINT } from "./constants.ts";
 import { generateExportableKeypair, loadKeypair } from "./keys.ts";
 import { readLanding } from "./landing.ts";
-import { createRpc, rpcErrorFields } from "./rpc.ts";
+import { createRouterRpc, createRpc, rpcErrorFields, type SolanaRpc } from "./rpc.ts";
+import { countingRpc, rpcCounter } from "./budget.ts";
+import type { Status } from "./router/absence.ts";
+import { RpcRouterError } from "./router/errors.ts";
+import {
+    type FakeEndpoint,
+    type FakeHandler,
+    fakeEndpoint,
+    netFail,
+    passAll,
+    rpcOk,
+    signatureStatus,
+    statusesAnswer,
+    testDeps,
+    testRpcSettings,
+} from "./router/testing.ts";
+import { createRouterTransport, type RouterTransport, setCheckState } from "./router/transport.ts";
 
 describe("constants", () => {
     it("pins the program addresses", () => {
@@ -67,6 +87,23 @@ describe("rpcErrorFields", () => {
             err: "TimeoutError",
         });
         expect(rpcErrorFields("x")).toEqual({ err: "error" });
+    });
+    it("rpcErrorFields names a router error", () => {
+        expect(rpcErrorFields(new RpcRouterError("stale"))).toEqual({
+            err: "RpcRouterError",
+            reason: "stale",
+        });
+        const partial = { value: [null] };
+        expect(rpcErrorFields(new RpcRouterError("absence_unconfirmed", "rpc2", partial))).toEqual({
+            err: "RpcRouterError",
+            reason: "absence_unconfirmed",
+        });
+        const refused = Object.assign(new Error("connect https://a.example/?api-key=k1"), {
+            code: "ECONNREFUSED",
+        });
+        const fields = rpcErrorFields(new TypeError("fetch failed", { cause: refused }));
+        expect(fields).toEqual({ err: "TypeError", cause: "ECONNREFUSED" });
+        expect(JSON.stringify(fields)).not.toContain("a.example");
     });
 });
 
@@ -320,6 +357,155 @@ describe("readLanding", () => {
             landing: "landed",
             signature: earlier,
             slot: 777n,
+        });
+    });
+});
+
+describe("createRouterRpc", () => {
+    function routedRpc() {
+        const eps = ["a", "b"].map((label) => fakeEndpoint(label));
+        const deps = testDeps(eps);
+        const routed = createRouterRpc(testRpcSettings(), deps.urls, deps);
+        passAll(routed.router);
+        return { routed, eps };
+    }
+    const slotOnly =
+        (slot: bigint): FakeHandler =>
+        (method) =>
+            method === "getSlot" ? rpcOk(slot) : netFail();
+
+    it("createRouterRpc gives a SolanaRpc", async () => {
+        const { routed, eps } = routedRpc();
+        eps[0]!.answer(slotOnly(5n));
+        eps[1]!.answer(slotOnly(9n));
+        expect(await routed.rpc.getSlot().send()).toBe(5n);
+        expect(await routed.backgroundRpc.getSlot().send()).toBe(5n);
+    });
+
+    it("countingRpc counts logical calls over both lanes", async () => {
+        const { routed, eps } = routedRpc();
+        eps[0]!.answer(() => netFail());
+        eps[1]!.answer(slotOnly(9n));
+        const log = memoryLog();
+        const counter = rpcCounter({ limitPerHour: 1, log, now: () => 0 });
+        await countingRpc(routed.rpc, counter).getSlot().send();
+        await countingRpc(routed.backgroundRpc, counter).getSlot().send();
+        expect(log.lines.filter((l) => l.alarm === "x402_rpc_budget")).toHaveLength(1);
+        const http = routed.router
+            .snapshot()
+            .endpoints.reduce(
+                (sum, e) => sum + e.laneRequests.money + e.laneRequests.background,
+                0,
+            );
+        expect(http).toBe(4);
+    });
+
+    it("the settler's x402 map still works", async () => {
+        const { routed, eps } = routedRpc();
+        const blockhash = getBase58Decoder().decode(new Uint8Array(32).fill(3));
+        eps[0]!.answer((method) =>
+            method === "getLatestBlockhash"
+                ? rpcOk({
+                      context: { slot: 5_000n },
+                      value: { blockhash, lastValidBlockHeight: 4_000n },
+                  })
+                : netFail(),
+        );
+        eps[1]!.answer(() => netFail());
+        const signer = toFacilitatorSvmSigner(await testSigner(1), {
+            [SOLANA_MAINNET]: routed.rpc,
+        });
+        const latest = (
+            signer as unknown as {
+                getLatestBlockhash(network: string): Promise<{ blockhash: string }>;
+            }
+        ).getLatestBlockhash(SOLANA_MAINNET);
+        expect((await latest).blockhash).toBe(blockhash);
+        expect(eps[0]!.calls.some((c) => c.method === "getLatestBlockhash")).toBe(true);
+    });
+});
+
+describe("readLanding over the router", () => {
+    const SIG = getBase58Decoder().decode(new Uint8Array(64).fill(7));
+    const NEW = SIG;
+    const OLD = getBase58Decoder().decode(new Uint8Array(64).fill(8));
+    const statuses = (value: Status[], slot = 5_000n) => statusesAnswer(slot, value);
+
+    // Fakes a, b, c at rpc1, rpc2, rpc3, each on its own domain
+    function routed(n: number): { rpc: SolanaRpc; router: RouterTransport; eps: FakeEndpoint[] } {
+        const eps = ["a", "b", "c"].slice(0, n).map((label) => fakeEndpoint(label));
+        const deps = testDeps(eps);
+        const router = createRouterTransport(testRpcSettings(), deps.urls, deps);
+        passAll(router);
+        // The router serves mainnet only: its boot check refuses any other genesis
+        const rpc = createSolanaRpcFromTransport(router as unknown as RpcTransportMainnet);
+        return { rpc, router, eps };
+    }
+
+    function node(epoch: unknown, answer: unknown): FakeHandler {
+        return (method) => {
+            if (method === "getEpochInfo") return rpcOk(epoch);
+            if (method === "getSignatureStatuses") return answer;
+            throw new Error(`No answer for ${method}`);
+        };
+    }
+
+    it("readLanding gives not_found while the blockhash is valid", async () => {
+        const { rpc, eps } = routed(2);
+        eps[0]!.answer(node(epochAt(900n, 5_000n), statuses([null])));
+        eps[1]!.answer(() => netFail());
+        expect(await readLanding(rpc, SIG, 1_000n, 10_000)).toEqual({ landing: "not_found" });
+    });
+
+    it("readLanding waits on an unproven null past the blockhash", async () => {
+        const { rpc, eps } = routed(2);
+        eps[0]!.answer(node(epochAt(2_000n, 5_000n), statuses([null])));
+        eps[1]!.answer(() => netFail());
+        const e = await readLanding(rpc, SIG, 1_000n, 10_000).catch((err: unknown) => err);
+        expect(e).toBeInstanceOf(RpcRouterError);
+        expect((e as RpcRouterError).reason).toBe("absence_unconfirmed");
+    });
+
+    it("readLanding finds a re-signed transaction landed while an endpoint is down", async () => {
+        const landed = routed(2);
+        const finalized = statuses([signatureStatus(4_990n, "finalized"), null]);
+        landed.eps[0]!.answer(node(epochAt(2_000n, 5_000n), finalized));
+        landed.eps[1]!.answer(() => netFail());
+        expect(await readLanding(landed.rpc, NEW, 1_000n, 10_000, [OLD])).toEqual({
+            landing: "landed",
+            signature: NEW,
+            slot: 4_990n,
+        });
+
+        const processed = routed(2);
+        const seen = statuses([signatureStatus(4_990n, "processed"), null]);
+        processed.eps[0]!.answer(node(epochAt(2_000n, 5_000n), seen));
+        processed.eps[1]!.answer(() => netFail());
+        expect(await readLanding(processed.rpc, NEW, 1_000n, 10_000, [OLD])).toEqual({
+            landing: "processed",
+        });
+    });
+
+    it("readLanding never decides expiry from an inconsistent endpoint's null", async () => {
+        const { rpc, router, eps } = routed(3);
+        setCheckState(router, "rpc1", { consistent: "no" });
+        eps[0]!.answer(node(epochAt(2_000n, 5_000n), statuses([null])));
+        eps[1]!.answer(node(epochAt(2_000n, 5_000n), statuses([null])));
+        eps[2]!.answer(() => netFail());
+        const e = await readLanding(rpc, SIG, 1_000n, 10_000).catch((err: unknown) => err);
+        expect(e).toBeInstanceOf(RpcRouterError);
+        expect((e as RpcRouterError).reason).toBe("absence_unconfirmed");
+    });
+
+    it("readLanding sees landed through a history-less endpoint", async () => {
+        const { rpc, eps } = routed(2);
+        eps[0]!.answer(node(epochAt(2_000n, 5_000n), statuses([null])));
+        const found = statuses([signatureStatus(4_990n, "finalized")], 5_001n);
+        eps[1]!.answer(node(epochAt(2_000n, 5_000n), found));
+        expect(await readLanding(rpc, SIG, 1_000n, 10_000)).toEqual({
+            landing: "landed",
+            signature: SIG,
+            slot: 4_990n,
         });
     });
 });

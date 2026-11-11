@@ -24,6 +24,35 @@ blockhash_cache_ttl = "8s"
 rpc_timeout = "10s"                     # each RPC call of the jobs, from 1s to 60s
 fee_payer_boot_min_lamports = 100000000
 
+[solana.rpc]
+attempt_timeout = "3s"            # one try; with 2+ URLs, times max_attempts at most rpc_timeout
+max_attempts = 3                  # endpoints tried for one read
+max_slot_lag = 50                 # slots (or blocks) behind before an endpoint is skipped; 1 to 80
+probe_every = "60s"               # getEpochInfo to an endpoint with no confirmed slot and height in this time
+history_check_every = "1h"
+# absence_quorum = 2              # default: 2 when the URLs span two domains, else 1 (D-R3)
+# send_fanout = 1                 # default: 1 when the URLs span two domains, else 0 (D-R4)
+breaker_failures = 5
+breaker_open = "30s"              # doubles at each reopening, up to 10m
+all_down_alarm_after = "30s"
+lag_alarm_after = "2m"
+limited_alarm_after = "5m"        # 429s and no success this long alarm (a spent or small plan)
+background_share = 0.6            # most of each learned limit background reads may use (D-R9)
+usage_flush_every = "60s"
+snapshot_every = "15s"
+
+# The first attempt of these methods; later attempts get attempt_timeout
+[solana.rpc.first_attempt_timeouts]
+getAccountInfo = "1s"
+getBalance = "1s"
+getBlockHeight = "1s"
+getEpochInfo = "1s"
+getLatestBlockhash = "1s"
+getMultipleAccounts = "1500ms"
+getSlot = "1s"
+getTokenAccountBalance = "1s"
+simulateTransaction = "1500ms"
+
 [orders]
 unpaid_ttl = "15m"
 unredeemed_refund_after = "30m"

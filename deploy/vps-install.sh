@@ -5,7 +5,10 @@
 #                  [--router-url URL] [--index FILE]
 #   vps-install.sh --mtls <staging dir>   server certificate and key from bugnet-dev mtls init
 #   vps-install.sh --pubkeys              order_token_public_key and the four wallet addresses
-#   vps-install.sh --start                checks the settings, then starts the installed version
+#   vps-install.sh --start                checks the settings, then starts or restarts the installed
+#                                         version
+#   vps-install.sh --rpc-urls             reads one BUGNET_SOLANA_RPC_URLS line on stdin into
+#                                         payments.env; deploy/push-rpc-urls.sh sends it
 #
 # Every step can run again. It prints addresses and variable names, never a secret value.
 set -euo pipefail
@@ -13,7 +16,7 @@ umask 077
 
 ETC=/etc/bugnet
 TOML=$ETC/payments.toml
-ENV_FILE=$ETC/payments.env
+ENV_FILE=${BUGNET_PAYMENTS_ENV:-$ETC/payments.env}
 ROUTER_ENV=$ETC/router.env
 RELEASE_FILE=$ETC/payments.release
 OPT=/opt/bugnet/payments
@@ -29,8 +32,6 @@ die() {
     exit 1
 }
 say() { echo "== $*"; }
-
-[ "$(id -u)" = 0 ] || die "run as root"
 
 installed_version() {
     [ -f "$RELEASE_FILE" ] || die "no installed version yet, run the install step with the tarball first"
@@ -258,7 +259,7 @@ do_install() {
     ensure_index "$index"
     ensure_unit "$v"
     do_pubkeys
-    say "next: fund the wallets, set BUGNET_SOLANA_RPC_URL in $ENV_FILE (sudoedit), run --mtls, then --start"
+    say "next: fund the wallets, copy BUGNET_SOLANA_RPC_URLS with deploy/push-rpc-urls.sh, run --mtls, then --start"
 }
 
 do_mtls() {
@@ -282,6 +283,94 @@ do_mtls() {
     fi
 }
 
+# One line on stdin: BUGNET_SOLANA_RPC_URLS= and comma-separated URLs, with nothing a shell
+# loading the env file would split or run. Messages name the variable only, never a URL.
+rpc_list_ok() {
+    local line="" value
+    IFS= read -r line || true
+    case $line in
+    BUGNET_SOLANA_RPC_URLS=*) ;;
+    *)
+        echo "expected a BUGNET_SOLANA_RPC_URLS line" >&2
+        return 1
+        ;;
+    esac
+    value=${line#BUGNET_SOLANA_RPC_URLS=}
+    case $value in
+    *[[:space:]\&\;\|\<\>\(\)\$\`\'\"\\]*)
+        echo "BUGNET_SOLANA_RPC_URLS holds a space or a shell character; fix the line in the local .env" >&2
+        return 1
+        ;;
+    esac
+    if [ -z "${value//,/}" ]; then
+        echo "BUGNET_SOLANA_RPC_URLS holds no URL" >&2
+        return 1
+    fi
+}
+
+# The list when it is set, else the single URL; the list itself must pass rpc_list_ok. A shell
+# loading the file runs every list line, so a second one is refused rather than left unchecked.
+rpc_env_ok() {
+    local file=$1 n
+    n=$(grep -c '^BUGNET_SOLANA_RPC_URLS=' "$file" 2>/dev/null || true)
+    if [ "${n:-0}" -gt 1 ]; then
+        echo "$file holds $n BUGNET_SOLANA_RPC_URLS lines; copy the list again with deploy/push-rpc-urls.sh" >&2
+        return 1
+    fi
+    if grep -q '^BUGNET_SOLANA_RPC_URLS=.' "$file" 2>/dev/null; then
+        grep '^BUGNET_SOLANA_RPC_URLS=.' "$file" | rpc_list_ok
+        return
+    fi
+    grep -q '^BUGNET_SOLANA_RPC_URL=.' "$file" 2>/dev/null && return 0
+    echo "$file has no BUGNET_SOLANA_RPC_URLS" >&2
+    return 1
+}
+
+# Replaces the list line with the one on stdin; the single URL line stays for a rollback. The env
+# file holds the only copy of the server's keys, so the new file is built and checked beside it
+# and renamed over it: any failure leaves the old file whole. Every step is checked by hand,
+# because a caller's `|| die` turns set -e off inside this function.
+write_rpc_list() {
+    local file=$1 input tmp n kept lines rc=0
+    input=$(cat)
+    if [ -z "$input" ] || [[ $input == *$'\n'* ]]; then
+        echo "expected one BUGNET_SOLANA_RPC_URLS line on stdin" >&2
+        return 1
+    fi
+    printf '%s\n' "$input" | rpc_list_ok || return 1
+    tmp=$(mktemp "$file.XXXXXX" 2>/dev/null) || tmp=""
+    if [ -z "$tmp" ]; then
+        echo "cannot create a temporary file beside $file" >&2
+        return 1
+    fi
+    # grep exits 1 when it keeps no line, which is fine, and 2 when it cannot read the file
+    grep -v '^BUGNET_SOLANA_RPC_URLS=' "$file" >"$tmp" || rc=$?
+    if [ "$rc" -gt 1 ] || ! printf '%s\n' "$input" >>"$tmp" || ! chmod 0600 "$tmp"; then
+        rm -f "$tmp"
+        echo "cannot write the new $file" >&2
+        return 1
+    fi
+    kept=$(grep -vc '^BUGNET_SOLANA_RPC_URLS=' "$file" || true)
+    lines=$(wc -l <"$tmp" | tr -d ' ')
+    if [ "$lines" != "$((kept + 1))" ] || ! mv -f "$tmp" "$file"; then
+        rm -f "$tmp"
+        echo "cannot write the new $file" >&2
+        return 1
+    fi
+    n=$(printf '%s' "${input#BUGNET_SOLANA_RPC_URLS=}" | tr ',' '\n' | grep -c . || true)
+    echo "BUGNET_SOLANA_RPC_URLS set in $file: $n URL$([ "$n" = 1 ] || echo s)"
+}
+
+do_rpc_urls() {
+    [ -f "$ENV_FILE" ] || die "$ENV_FILE does not exist; run the install step first"
+    write_rpc_list "$ENV_FILE" || die "the RPC list was not changed"
+    chown root:root "$ENV_FILE"
+    chmod 0600 "$ENV_FILE"
+    if [ -f "$RELEASE_FILE" ] && systemctl is-active --quiet "bugnet-payments@$(installed_version)"; then
+        say "run pcli rpc probe, then --start to restart with the new list"
+    fi
+}
+
 do_pubkeys() {
     local recipient
     say "public values (no secrets)"
@@ -295,7 +384,8 @@ do_start() {
     local v ok=1 old
     v=$(installed_version)
     grep -q '<' "$TOML" && { echo "fill the <...> values in $TOML" >&2; ok=0; }
-    for name in BUGNET_SOLANA_RPC_URL BUGNET_PAYMENTS_TOKEN BUGNET_PAYMENTS_ROUTER_TOKEN \
+    rpc_env_ok "$ENV_FILE" || ok=0
+    for name in BUGNET_PAYMENTS_TOKEN BUGNET_PAYMENTS_ROUTER_TOKEN \
         BUGNET_ORDER_PRIVATE_KEY BUGNET_CLAIM_KEY BUGNET_FEE_PAYER_KEY BUGNET_REFUND_KEY \
         BUGNET_ALLOWANCE_KEY BUGNET_X402_TLS_KEY; do
         env_has "$name" || { echo "$ENV_FILE has no $name" >&2; ok=0; }
@@ -309,7 +399,10 @@ do_start() {
         systemctl disable --now "$old"
         say "stopped $old"
     done
-    systemctl enable --now "bugnet-payments@$v"
+    # A unit already running keeps the env file it started with, so --start restarts it to load a
+    # changed list or key; restart also starts a stopped unit
+    systemctl enable "bugnet-payments@$v"
+    systemctl restart "bugnet-payments@$v"
     for _ in $(seq 1 60); do
         if curl -fsS http://127.0.0.1:8447/healthz >/dev/null 2>&1 &&
             curl -fsS http://127.0.0.1:8450/healthz >/dev/null 2>&1; then
@@ -325,6 +418,7 @@ do_start() {
 
 main() {
     local tgz="" recipient="" event_key="" router_url="" index="" mode=install mtls=""
+    [ "$(id -u)" = 0 ] || die "run as root"
     [ $# -gt 0 ] || die "usage: see the comment at the top of this file"
     while [ $# -gt 0 ]; do
         case $1 in
@@ -335,6 +429,7 @@ main() {
         --mtls) mode=mtls; mtls=${2:?}; shift 2 ;;
         --pubkeys) mode=pubkeys; shift ;;
         --start) mode=start; shift ;;
+        --rpc-urls) mode=rpc_urls; shift ;;
         -*) die "unknown option $1" ;;
         *) tgz=$1; shift ;;
         esac
@@ -344,7 +439,9 @@ main() {
     mtls) do_mtls "$mtls" ;;
     pubkeys) do_pubkeys ;;
     start) do_start ;;
+    rpc_urls) do_rpc_urls ;;
     esac
 }
 
-main "$@"
+# A test sources the script with VPS_INSTALL_LIB=1 and calls one function, as a non-root user
+[ "${VPS_INSTALL_LIB:-0}" = 1 ] || main "$@"

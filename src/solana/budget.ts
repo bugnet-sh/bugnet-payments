@@ -14,7 +14,8 @@ export interface RpcCounterOptions {
     alarm?: "x402_rpc_budget" | "deposit_rpc_budget";
 }
 
-// One counter may wrap several clients, so the deposit job's two lanes share one hourly count
+// One counter can sit under several clients (both lanes), so the hourly alarm counts each
+// logical call once
 export function rpcCounter(o: RpcCounterOptions): RpcCounter {
     const alarm = o.alarm ?? "x402_rpc_budget";
     const sends: number[] = [];
@@ -40,12 +41,10 @@ export function rpcCounter(o: RpcCounterOptions): RpcCounter {
     };
 }
 
-export function countingRpc(rpc: SolanaRpc, o: RpcCounterOptions | RpcCounter): SolanaRpc {
-    const counter = "record" in o ? o : rpcCounter(o);
-    const record = () => counter.record();
+export function countingRpc(rpc: SolanaRpc, counter: RpcCounter): SolanaRpc {
     const counted = (fn: unknown, self: unknown) => {
         return (...args: unknown[]) => {
-            record();
+            counter.record();
             return (fn as (...a: unknown[]) => unknown).apply(self, args);
         };
     };

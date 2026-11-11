@@ -37,7 +37,11 @@ export type AlarmName =
     | "deposit_capacity"
     | "deposit_create_churn"
     | "deposit_fee_budget"
-    | "deposit_rpc_budget";
+    | "deposit_rpc_budget"
+    | "rpc_endpoint_down"
+    | "rpc_all_endpoints_down"
+    | "rpc_endpoint_lag"
+    | "rpc_absence_unconfirmed";
 
 type Fields = Record<string, unknown>;
 
@@ -62,6 +66,7 @@ export const REDACTED_KEYS: ReadonlySet<string> = new Set([
     "seed",
     "mnemonic",
     "rpcUrl",
+    "rpcUrls",
     "wire",
     "wireTx",
     "transaction",

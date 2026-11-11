@@ -4,7 +4,21 @@ import { join } from "node:path";
 import { getBase58Decoder } from "@solana/kit";
 import { stringify } from "smol-toml";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { type CliOptions, cliMain } from "./cli.ts";
+import { type CliOptions, cliMain, formatRpcStatus } from "./cli.ts";
+import {
+    type FakeEndpoint,
+    type FakeHandler,
+    fakeEndpoint,
+    httpFail,
+    netFail,
+    rpcFail,
+    rpcOk,
+    signatureStatus,
+    statusesAnswer,
+} from "./solana/router/testing.ts";
+import { MAINNET_GENESIS, type RouterSnapshot } from "./solana/router/index.ts";
+import { endpointFingerprint, pgSnapshotStore, pgVerdictStore } from "./solana/rpc-store.ts";
+import type { EndpointSnapshot } from "./solana/router/transport.ts";
 import { silentLog } from "./log.ts";
 import { findOrder } from "./orders/store.ts";
 import type { OrderRow } from "./orders/types.ts";
@@ -519,7 +533,9 @@ describe("cliMain hot-wallet queue", () => {
         });
         const io = captureIo();
         expect(await cli(["manual", "retry", String(id)], io)).toBe(1);
-        expect(io.errText()).toContain("BUGNET_SOLANA_RPC_URL must be set");
+        expect(io.errText()).toContain(
+            "BUGNET_SOLANA_RPC_URLS or BUGNET_SOLANA_RPC_URL must be set",
+        );
     });
 
     it("manual resolve <refundId> --tx on a pending row while refunds are held", async () => {
@@ -1106,7 +1122,546 @@ describe("the x402 operator commands", () => {
             const account = await seedAccount(db.pool, {});
             const io = captureIo();
             expect(await cli(["x402", "ledger-check", account.id], io)).toBe(1);
-            expect(io.errText()).toContain("BUGNET_SOLANA_RPC_URL must be set");
+            expect(io.errText()).toContain(
+                "BUGNET_SOLANA_RPC_URLS or BUGNET_SOLANA_RPC_URL must be set",
+            );
         });
+    });
+});
+
+describe("rpc commands", () => {
+    const NOW = new Date("2026-11-10T14:00:20.000Z");
+    function endpoint(over: Partial<EndpointSnapshot> = {}): EndpointSnapshot {
+        return {
+            name: "rpc1",
+            roles: ["read", "history", "send"],
+            state: "ok",
+            untilMs: null,
+            latencyMs: 84,
+            errorRate: 0,
+            inflight: 0,
+            confirmedSlot: "467621707",
+            lag: 0,
+            consistent: "yes",
+            limits: {},
+            monthRequests: 412334,
+            monthBackground: 127824,
+            hourRequests: 10,
+            laneRequests: { money: 5, background: 5 },
+            outcomes: {},
+            checks: { genesis: "ok", history: "ok", pinnedAccounts: "ok", pinnedSignatures: "ok" },
+            lastError: null,
+            ...over,
+        };
+    }
+    function snapshot(endpoints: EndpointSnapshot[]): RouterSnapshot {
+        return {
+            at: NOW.getTime(),
+            mode: endpoints.length > 1 ? "routed" : "single",
+            serving: "rpc1",
+            domains: 3,
+            absenceQuorum: 2,
+            sendFanout: 1,
+            endpoints,
+        };
+    }
+    const fiveSecondsAgo = new Date(NOW.getTime() - 5_000);
+
+    it("rpc status prints one line per endpoint", () => {
+        expect(formatRpcStatus(snapshot([endpoint()]), fiveSecondsAgo, NOW, false)).toEqual([
+            "snapshot: 2026-11-10T14:00:15.000Z (age 5s)",
+            "serving: rpc1  domains: 3  quorum: 2  copies: 1",
+            "rpc1  state: ok  roles: read history send  latency: 84ms  errors: 0%  slot: 467621707  lag: 0  month: 412334  background: 31%  limits: none  genesis: ok  history: ok  consistent: yes  pinned-accounts: ok  pinned-signatures: ok",
+        ]);
+    });
+
+    it("rpc status shows cooling with its seconds", () => {
+        const e = endpoint({ state: "cooling", untilMs: NOW.getTime() + 7_000 });
+        const [, , line] = formatRpcStatus(snapshot([e]), fiveSecondsAgo, NOW, false);
+        expect(line).toContain("state: cooling 7s");
+    });
+
+    it("rpc status shows an inconsistent endpoint", () => {
+        const e = endpoint({
+            consistent: "no",
+            roles: ["read", "send"],
+            checks: {
+                genesis: "ok",
+                history: "missing",
+                pinnedAccounts: "ok",
+                pinnedSignatures: "ok",
+            },
+        });
+        const [, , line] = formatRpcStatus(snapshot([e]), fiveSecondsAgo, NOW, false);
+        expect(line).toContain("consistent: no");
+        expect(line).toContain("roles: read send");
+        expect(line).toContain("history: missing");
+    });
+
+    it("rpc status shows learned limits", () => {
+        const e = endpoint({ limits: { getTransaction: 8, "*": 80 } });
+        const [, , line] = formatRpcStatus(snapshot([e]), fiveSecondsAgo, NOW, false);
+        expect(line).toContain("limits: all 80/10s, getTransaction 8/10s");
+    });
+
+    it("rpc status marks an old snapshot", () => {
+        const old = new Date(NOW.getTime() - 300_000);
+        const [first] = formatRpcStatus(snapshot([endpoint()]), old, NOW, false);
+        expect(first).toMatch(/\(age 300s, stale\)$/);
+    });
+
+    it("rpc status --outcomes adds one line per method", () => {
+        const e = endpoint({ outcomes: { getSlot: { ok: 2, http_429: 1 } } });
+        expect(formatRpcStatus(snapshot([e]), fiveSecondsAgo, NOW, true).at(-1)).toBe(
+            "  rpc1 getSlot  ok: 2  http_429: 1",
+        );
+    });
+
+    it("rpc status without a snapshot", async () => {
+        await db.pool.query("delete from rpc_health");
+        const io = captureIo();
+        expect(await cli(["rpc", "status"], io)).toBe(1);
+        expect(io.errText()).toContain("no router snapshot: is the service running?");
+    });
+
+    // A healthy mainnet node at slot `at` that knows every signature it is asked about
+    function checkNode(label: string, over: Record<string, FakeHandler> = {}, at = 500n) {
+        return fakeEndpoint(label, (method, params, payload) => {
+            const own = over[method];
+            if (own !== undefined) return own(method, params, payload);
+            const last = params.at(-1);
+            const pin =
+                typeof last === "object" && last !== null
+                    ? (last as { minContextSlot?: unknown }).minContextSlot
+                    : undefined;
+            if (typeof pin === "bigint" && pin > at) {
+                return rpcFail(-32016, "Minimum context slot has not been reached", {
+                    contextSlot: at,
+                });
+            }
+            switch (method) {
+                case "getGenesisHash":
+                    return rpcOk(MAINNET_GENESIS);
+                case "getEpochInfo":
+                    return rpcOk({
+                        absoluteSlot: at,
+                        blockHeight: at - 100n,
+                        epoch: 0n,
+                        slotIndex: at,
+                        slotsInEpoch: 432_000n,
+                        transactionCount: 0n,
+                    });
+                case "getIdentity":
+                    return rpcOk({ identity: `node-${label}` });
+                case "getSignatureStatuses":
+                    return statusesAnswer(
+                        at,
+                        (params[0] as string[]).map(() => signatureStatus(400n, "finalized")),
+                    );
+                case "getTransaction":
+                    return rpcOk({ slot: 400n });
+                case "getSignaturesForAddress":
+                    return rpcOk(Array.from({ length: 1_000 }, (_, i) => ({ signature: `s${i}` })));
+                default:
+                    return rpcOk({ context: { slot: at }, value: null });
+            }
+        });
+    }
+    const TWO = { BUGNET_SOLANA_RPC_URLS: "https://a.example/,https://b.example/" };
+    const FOUR = {
+        BUGNET_SOLANA_RPC_URLS:
+            "https://a.example/,https://b.example/,https://c.example/,https://d.example/",
+    };
+    // Every repeat of the history check answers alike when `same`, else they alternate
+    function statusesRepeats(same: boolean): FakeHandler {
+        let flip = false;
+        return (_m, params) => {
+            flip = !flip;
+            return statusesAnswer(
+                500n,
+                (params[0] as string[]).map(() =>
+                    same || flip ? signatureStatus(400n, "finalized") : null,
+                ),
+            );
+        };
+    }
+    async function probe(
+        env: NodeJS.ProcessEnv,
+        nodes: ReturnType<typeof checkNode>[],
+    ): Promise<{ code: number; out: string[]; text: string }> {
+        const io = captureIo();
+        const code = await cliMain(["-config", config, "rpc", "probe"], env, io, {
+            rpcTransportFor: (name) => nodes[Number(name.slice(3)) - 1]!.transport,
+        });
+        return { code, out: io.outText().split("\n"), text: io.outText() + io.errText() };
+    }
+
+    it("rpc probe prints each check", async () => {
+        const r = await probe(TWO, [checkNode("a"), checkNode("b")]);
+        expect(r.out[0]).toMatch(
+            /^rpc1 {2}genesis: ok {2}pinned-accounts: ok {2}pinned-signatures: ok {2}history: ok {2}consistent: yes {2}slot: 500 {2}latency: \d+ms$/,
+        );
+        expect(r.out.slice(-2)).toEqual(["quorum: 2 of 2 domains ready", "listings: rpc1 rpc2"]);
+        expect(r.code).toBe(0);
+    });
+
+    it("rpc probe prints a wrong genesis and fails", async () => {
+        const devnet = checkNode("a", {
+            getGenesisHash: () => rpcOk("EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"),
+        });
+        const r = await probe(TWO, [devnet, checkNode("b")]);
+        expect(r.out.some((l) => l.startsWith("rpc1  genesis: wrong"))).toBe(true);
+        expect(r.out.find((l) => l.startsWith("rpc2"))).toMatch(
+            /^rpc2 {2}genesis: ok {2}pinned-accounts: ok {2}pinned-signatures: ok {2}history: ok {2}consistent: yes {2}slot: 500 {2}latency: \d+ms$/,
+        );
+        expect(r.code).toBe(1);
+    });
+
+    it("rpc probe fails on an ignored minContextSlot at a consistent endpoint", async () => {
+        const ignoring = checkNode("b", {
+            getAccountInfo: () => rpcOk({ context: { slot: 500n }, value: null }),
+            getSignaturesForAddress: () => rpcOk([]),
+        });
+        const r = await probe(TWO, [checkNode("a"), ignoring]);
+        expect(r.out.find((l) => l.startsWith("rpc2"))).toMatch(
+            /^rpc2 {2}genesis: ok {2}pinned-accounts: ignored {2}pinned-signatures: ignored {2}history: ok {2}consistent: yes /,
+        );
+        expect(r.code).toBe(1);
+    });
+
+    it("rpc probe calls each endpoint's checks once", async () => {
+        const a = checkNode("a");
+        const r = await probe(TWO, [a, checkNode("b")]);
+        expect(r.code).toBe(0);
+        expect(a.calls.filter((c) => c.method === "getGenesisHash")).toHaveLength(1);
+    });
+
+    it("an inconsistent endpoint or one without history does not fail the probe", async () => {
+        const c = checkNode("c", { getSignatureStatuses: statusesRepeats(false) });
+        const d = checkNode("d", {
+            getSignatureStatuses: (_m, params) =>
+                statusesAnswer(
+                    500n,
+                    (params[0] as string[]).map(() => null),
+                ),
+            getTransaction: () => rpcOk(null),
+        });
+        const r = await probe(FOUR, [checkNode("a"), checkNode("b"), c, d]);
+        expect(r.out.find((l) => l.startsWith("rpc3"))).toMatch(
+            / {2}history: ok {2}consistent: no {2}/,
+        );
+        expect(r.out.find((l) => l.startsWith("rpc4"))).toMatch(/ {2}history: missing {2}/);
+        expect(r.out.slice(-2)).toEqual(["quorum: 2 of 2 domains ready", "listings: rpc1 rpc2"]);
+        expect(r.code).toBe(0);
+    });
+
+    it("rpc probe names a genesis error", async () => {
+        const broken = checkNode("a", { getGenesisHash: () => httpFail(400) });
+        const r = await probe(TWO, [broken, checkNode("b")]);
+        expect(r.out[0]).toMatch(/^rpc1 {2}genesis: error http_400/);
+        expect(r.code).toBe(1);
+    });
+
+    it("rpc probe fails when the quorum is short", async () => {
+        let flip = false;
+        const flipping = checkNode("b", {
+            getSignatureStatuses: (_m, params) => {
+                flip = !flip;
+                return statusesAnswer(
+                    500n,
+                    (params[0] as string[]).map(() =>
+                        flip ? signatureStatus(400n, "finalized") : null,
+                    ),
+                );
+            },
+        });
+        const r = await probe(TWO, [checkNode("a"), flipping]);
+        expect(r.out).toContain("quorum: 1 of 2 domains ready");
+        expect(r.code).toBe(1);
+    });
+
+    it("rpc probe in single mode", async () => {
+        const r = await probe({ BUGNET_SOLANA_RPC_URL: "https://a.example/" }, [checkNode("a")]);
+        expect(r.out.slice(-2)).toEqual(["quorum: off (one URL)", "listings: rpc1"]);
+        expect(r.code).toBe(0);
+    });
+
+    it("rpc probe never prints a URL", async () => {
+        const keyed = {
+            BUGNET_SOLANA_RPC_URLS:
+                "https://one.a.example/0123456789abcdef0123456789abcdef?api-key=KEYONE12345678,https://two.b.example/",
+        };
+        const refusing = checkNode("b", { getGenesisHash: () => httpFail(403) });
+        for (const nodes of [
+            [checkNode("a"), checkNode("b")],
+            [checkNode("a"), refusing],
+        ]) {
+            const r = await probe(keyed, nodes);
+            for (const part of [
+                "one.a.example",
+                "a.example",
+                "two.b.example",
+                "b.example",
+                "0123456789abcdef0123456789abcdef",
+                "KEYONE12345678",
+            ]) {
+                expect(r.text).not.toContain(part);
+            }
+        }
+        const failed = await probe(keyed, [checkNode("a"), refusing]);
+        expect(failed.text).toContain("rpc2  genesis: error http_403");
+    });
+
+    describe("a hot-wallet re-sign proof through the router", () => {
+        const CLAIM_KEY = Buffer.alloc(32, 9);
+        const AT = 2_000n;
+        // A hot refund past its expiry, the mirror verified through expiry_seen_slot + 300
+        async function waitingRow(sig: string): Promise<number> {
+            const o = await hotOrder();
+            const id = await row(o.id, {
+                kind: "allowance",
+                fromWallet: "allowance",
+                state: "manual",
+                amountMicros: 300_000,
+                manualReason: "refund_expired_repeatedly",
+                txSignature: sig,
+                expirySeenSlot: 1_000n,
+            });
+            await db.pool.query("update x402_tail set verified_slot = 1300");
+            return id;
+        }
+        // Every signature found but `sig`, which is null unless `knows`
+        const statusesFor =
+            (sig: string, knows: boolean): FakeHandler =>
+            (_m, params) =>
+                statusesAnswer(
+                    AT,
+                    (params[0] as string[]).map((s) =>
+                        s === sig && !knows ? null : signatureStatus(1_100n, "finalized"),
+                    ),
+                );
+        function proofNode(label: string, sig: string, over: Record<string, FakeHandler> = {}) {
+            return checkNode(label, { getSignatureStatuses: statusesFor(sig, false), ...over }, AT);
+        }
+        async function retry(id: number, env: NodeJS.ProcessEnv, nodes: FakeEndpoint[]) {
+            const io = captureIo();
+            const code = await cliMain(
+                ["-config", config, "manual", "retry", String(id)],
+                env,
+                io,
+                {
+                    rpcTransportFor: (name) => nodes[Number(name.slice(3)) - 1]!.transport,
+                },
+            );
+            return { code, io };
+        }
+        beforeEach(async () => {
+            await db.pool.query("delete from rpc_verdicts");
+        });
+
+        it("the CLI reads the list", async () => {
+            const sig = SIG(31);
+            const id = await waitingRow(sig);
+            const dead = fakeEndpoint("a", () => netFail());
+            const b = proofNode("b", sig);
+            const r = await retry(id, TWO, [dead, b]);
+            // Without the claim key the stored verdicts are off, and the command says so
+            expect(r.io.errText()).toContain(
+                "rpc stored verdicts are not used without a valid BUGNET_CLAIM_KEY",
+            );
+            const asked = b.calls.filter(
+                (c) =>
+                    c.method === "getSignatureStatuses" && (c.params[0] as string[]).includes(sig),
+            );
+            expect(asked.length).toBeGreaterThan(0);
+        });
+
+        it("the CLI proof uses the quorum", async () => {
+            const sig = SIG(32);
+            const id = await waitingRow(sig);
+            // a has no history at all; b knows the refund landed
+            const a = checkNode(
+                "a",
+                {
+                    getSignatureStatuses: (_m, params) =>
+                        statusesAnswer(
+                            AT,
+                            (params[0] as string[]).map(() => null),
+                        ),
+                    getTransaction: () => rpcOk(null),
+                },
+                AT,
+            );
+            const knows = proofNode("b", sig, { getSignatureStatuses: statusesFor(sig, true) });
+            const r = await retry(id, TWO, [a, knows]);
+            expect(r.code).toBe(1);
+            expect(r.io.errText()).toContain(
+                `refund ${id}: its last transaction is not yet proven absent`,
+            );
+            expect((await refundOf(id)).state).toBe("manual");
+        });
+
+        it("the CLI never counts a vote the service took away", async () => {
+            const sig = SIG(33);
+            const id = await waitingRow(sig);
+            await pgVerdictStore(db.pool, () => new Date(), 3_600_000).save({
+                fingerprint: endpointFingerprint(CLAIM_KEY)("https://b.example/"),
+                endpoint: "rpc2",
+                noAt: Date.now() - 10 * 60_000,
+                reason: "check_disagreed",
+                historyPassed: true,
+            });
+            const env = { ...TWO, BUGNET_CLAIM_KEY: CLAIM_KEY.toString("base64") };
+            // Both answer null and b's own boot run agrees, but the stored mark is younger than
+            // the hour
+            const r = await retry(id, env, [proofNode("a", sig), proofNode("b", sig)]);
+            expect(r.code).toBe(1);
+            expect(r.io.errText()).toContain(
+                `refund ${id}: its last transaction is not yet proven absent`,
+            );
+            expect((await refundOf(id)).state).toBe("manual");
+
+            // The same two answers without the stored mark prove the absence
+            await db.pool.query("delete from rpc_verdicts");
+            const clean = await retry(id, env, [proofNode("a", sig), proofNode("b", sig)]);
+            expect(clean.code).toBe(0);
+            expect((await refundOf(id)).state).toBe("pending");
+        });
+
+        it("a CLI command reruns an errored check once", async () => {
+            const sig = SIG(34);
+            const id = await waitingRow(sig);
+            let first = true;
+            const answer = statusesFor(sig, false);
+            const b = proofNode("b", sig, {
+                getSignatureStatuses: (m, params, payload) => {
+                    if (!first) return answer(m, params, payload);
+                    first = false;
+                    return httpFail(503);
+                },
+            });
+            const env = { ...TWO, BUGNET_CLAIM_KEY: CLAIM_KEY.toString("base64") };
+            const r = await retry(id, env, [proofNode("a", sig), b]);
+            expect(first).toBe(false);
+            expect(r.code).toBe(0);
+            expect((await refundOf(id)).state).toBe("pending");
+        });
+
+        it("a router refused at start still flushes its usage", async () => {
+            const sig = SIG(35);
+            const id = await waitingRow(sig);
+            await db.pool.query("delete from rpc_usage");
+            const devnet = checkNode("a", {
+                getGenesisHash: () => rpcOk("EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"),
+            });
+            const r = await retry(id, TWO, [devnet, proofNode("b", sig)]);
+            expect(r.code).toBe(1);
+            const rows = await db.pool.query<{ endpoint: string }>(
+                "select endpoint from rpc_usage order by endpoint",
+            );
+            expect(rows.rows.map((x) => x.endpoint)).toEqual(["rpc1", "rpc2"]);
+        });
+    });
+
+    it("rpc probe works before migration 00006", async () => {
+        const old = await testDb();
+        try {
+            await old.pool.query("drop table rpc_usage, rpc_health, rpc_verdicts");
+            const oldConfig = join(dir, "before-00006.toml");
+            const recipient = (await testSigner(1)).address;
+            writeFileSync(
+                oldConfig,
+                stringify({ database: { url: old.url }, solana: { recipient } }),
+            );
+            const io = captureIo();
+            const env = { ...TWO, BUGNET_CLAIM_KEY: Buffer.alloc(32, 9).toString("base64") };
+            const nodes = [checkNode("a"), checkNode("b")];
+            const code = await cliMain(["-config", oldConfig, "rpc", "probe"], env, io, {
+                rpcTransportFor: (name) => nodes[Number(name.slice(3)) - 1]!.transport,
+            });
+            expect(code).toBe(0);
+            const out = io.outText().split("\n");
+            expect(out.filter((l) => /^rpc[12] {2}genesis: ok/.test(l))).toHaveLength(2);
+            expect(out.slice(-2)).toEqual(["quorum: 2 of 2 domains ready", "listings: rpc1 rpc2"]);
+            const warns = io
+                .errText()
+                .split("\n")
+                .filter((l) => l.includes('"level":"warn"'));
+            expect(warns).toHaveLength(1);
+            expect(warns[0]).not.toContain("example");
+        } finally {
+            await old.close();
+        }
+
+        // Nor does a probe write usage where the table exists
+        await db.pool.query("delete from rpc_usage");
+        const nodes = [checkNode("a"), checkNode("b")];
+        expect((await probe(TWO, nodes)).code).toBe(0);
+        expect((await db.pool.query("select 1 from rpc_usage")).rowCount).toBe(0);
+    });
+
+    it("the CLI names list problems by position", async () => {
+        const io = captureIo();
+        const env = {
+            BUGNET_SOLANA_RPC_URLS: "https://a.example/?api-key=SECRETKEY1,http://b.example",
+        };
+        expect(await cliMain(["-config", config, "rpc", "probe"], env, io)).toBe(1);
+        expect(io.errText()).toContain(
+            "BUGNET_SOLANA_RPC_URLS rpc2 must be an https URL (http only on a loopback host)",
+        );
+        const all = io.outText() + io.errText();
+        expect(all).not.toContain("SECRETKEY1");
+        expect(all).not.toContain("b.example");
+    });
+
+    it("the CLI flushes usage before closing the pool", async () => {
+        const chain = await startFakeChain();
+        try {
+            await db.pool.query("delete from rpc_usage");
+            const io = captureIo();
+            const env = { BUGNET_SOLANA_RPC_URL: chain.url };
+            expect(await cliMain(["-config", config, "x402", "status"], env, io)).toBe(0);
+            const rows = await db.pool.query<{ endpoint: string }>(
+                "select endpoint from rpc_usage",
+            );
+            expect(rows.rows.map((r) => r.endpoint)).toContain("rpc1");
+        } finally {
+            await chain.close();
+        }
+    });
+
+    it("the CLI warns when it reads another list than the service", async () => {
+        const chain = await startFakeChain();
+        try {
+            const three = snapshot([
+                endpoint(),
+                endpoint({ name: "rpc2" }),
+                endpoint({ name: "rpc3" }),
+            ]);
+            const env = { BUGNET_SOLANA_RPC_URL: chain.url };
+            await pgSnapshotStore(db.pool, () => new Date(Date.now() - 5_000)).write(three);
+            const fresh = captureIo();
+            await cliMain(["-config", config, "x402", "status"], env, fresh);
+            expect(fresh.errText()).toContain("rpc the CLI reads 1 URL, the service 3");
+
+            await pgSnapshotStore(db.pool, () => new Date(Date.now() - 300_000)).write(three);
+            const old = captureIo();
+            await cliMain(["-config", config, "x402", "status"], env, old);
+            expect(old.errText()).not.toContain("rpc the CLI reads");
+        } finally {
+            await chain.close();
+        }
+    });
+
+    it("keys commands work without a config file", async () => {
+        const chain = await startFakeChain();
+        try {
+            const io = captureIo();
+            const env = { BUGNET_SOLANA_RPC_URL: chain.url };
+            expect(await cliMain(["keys", "show"], env, io)).toBe(0);
+            expect(chain.calls().some((c) => c.method === "getGenesisHash")).toBe(true);
+        } finally {
+            await chain.close();
+        }
     });
 });

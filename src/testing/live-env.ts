@@ -3,7 +3,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const REQUIRED = [
-    "BUGNET_SOLANA_RPC_URL",
     "BUGNET_FEE_PAYER_KEY",
     "BUGNET_REFUND_KEY",
     "BUGNET_RECIPIENT_KEY",
@@ -14,6 +13,8 @@ const REQUIRED = [
 
 const X402_REQUIRED = ["BUGNET_ALLOWANCE_KEY", "BUGNET_SPIKE_SELLER_URL"] as const;
 
+const RPC_LIST = "BUGNET_SOLANA_RPC_URLS";
+const RPC_SINGLE = "BUGNET_SOLANA_RPC_URL";
 const PAYER_KEY = "BUGNET_TEST_PAYER_KEY";
 const PAYER_MNEMONIC = "BUGNET_TEST_PAYER_MNEMONIC";
 
@@ -22,7 +23,11 @@ function empty(env: NodeJS.ProcessEnv, name: string): boolean {
 }
 
 export function missingLiveEnv(env: NodeJS.ProcessEnv): string[] {
-    const missing: string[] = REQUIRED.filter((name) => empty(env, name));
+    const missing: string[] = [];
+    if (empty(env, RPC_LIST) && empty(env, RPC_SINGLE)) {
+        missing.push(`${RPC_LIST} or ${RPC_SINGLE}`);
+    }
+    missing.push(...REQUIRED.filter((name) => empty(env, name)));
     if (empty(env, PAYER_KEY) && empty(env, PAYER_MNEMONIC)) {
         missing.push(`${PAYER_KEY} or ${PAYER_MNEMONIC}`);
     }

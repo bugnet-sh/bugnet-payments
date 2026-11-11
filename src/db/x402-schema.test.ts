@@ -76,7 +76,7 @@ async function account(): Promise<string> {
 }
 
 describe("migration 00003", () => {
-    it("applies 00003 and 00004 after 00001 and 00002", async () => {
+    it("applies 00003 to 00006 after 00001 and 00002", async () => {
         const fresh = await testDb();
         try {
             await fresh.pool.query(RESET);

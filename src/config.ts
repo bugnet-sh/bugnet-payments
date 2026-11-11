@@ -10,11 +10,20 @@ import { isIP } from "node:net";
 import { parse } from "smol-toml";
 import { z } from "zod";
 import { isCanonicalAddress } from "./solana/base58.ts";
+import {
+    checkRpcList,
+    parseRpcUrls,
+    rpcSettingsSchema,
+    urlProblem,
+    urlSecretParts,
+} from "./solana/router/settings.ts";
 
 const MAINNET = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const ONLY_V0 = "only [0] is supported";
 const MIN_TOKEN_LENGTH = 32;
+// solana.rpc_timeout's default, which the keys commands also use without a settings file
+export const DEFAULT_RPC_TIMEOUT = "10s";
 
 const duration = z
     .string()
@@ -139,8 +148,9 @@ const settingsSchema = z
                 blockhash_cache_ttl: duration.prefault("8s"),
                 rpc_timeout: duration
                     .refine((ms) => ms >= 1_000 && ms <= 60_000, "from 1s to 60s")
-                    .prefault("10s"),
+                    .prefault(DEFAULT_RPC_TIMEOUT),
                 fee_payer_boot_min_lamports: amount.default(100_000_000),
+                rpc: rpcSettingsSchema.prefault({}),
             })
             .strict()
             .prefault({}),
@@ -351,7 +361,11 @@ export interface Secrets {
     claimKey: Buffer;
     feePayerKey: string;
     refundKey: string;
-    rpcUrl: string;
+    // In list order, at least one
+    rpcUrls: readonly string[];
+    rpcUrlsFrom: "BUGNET_SOLANA_RPC_URLS" | "BUGNET_SOLANA_RPC_URL";
+    // Both variables were set and the list won
+    rpcSingleIgnored: boolean;
     allowanceKey: string;
     x402TlsKey: string;
     depositSeed: Buffer | null;
@@ -359,6 +373,10 @@ export interface Secrets {
 }
 
 export class ConfigError extends Error {}
+
+const RPC_LIST = "BUGNET_SOLANA_RPC_URLS";
+const RPC_SINGLE = "BUGNET_SOLANA_RPC_URL";
+type RpcUrlsVar = typeof RPC_LIST | typeof RPC_SINGLE;
 
 // Every secret in .env.example, the test payer's account index is a small number and no secret
 export const SECRET_VARS = [
@@ -390,7 +408,9 @@ export function secretsEnv(s: Secrets): Partial<Record<(typeof SECRET_VARS)[numb
         BUGNET_REFUND_KEY: s.refundKey,
         BUGNET_ALLOWANCE_KEY: s.allowanceKey,
         BUGNET_X402_TLS_KEY: Buffer.from(s.x402TlsKey).toString("base64"),
-        BUGNET_SOLANA_RPC_URL: s.rpcUrl,
+        ...(s.rpcUrlsFrom === RPC_LIST
+            ? { BUGNET_SOLANA_RPC_URLS: s.rpcUrls.join(",") }
+            : { BUGNET_SOLANA_RPC_URL: s.rpcUrls[0] }),
         ...(s.depositSeed === null
             ? {}
             : { BUGNET_DEPOSIT_SEED: s.depositSeed.toString("base64") }),
@@ -402,14 +422,69 @@ export function secretsEnv(s: Secrets): Partial<Record<(typeof SECRET_VARS)[numb
 
 // What every log redacts, longest first so a secret inside another is never half scrubbed.
 // The TLS key is also redacted as the PEM text it decodes to, and the RPC list URL by URL, since
-// an error names only the one URL it failed on.
+// an error names only the one URL it failed on, with each URL's key parts and host.
+// This runs before main's try, so it never throws on a value that is no URL.
 export function secretValues(...envs: NodeJS.ProcessEnv[]): string[] {
-    const values = envs.flatMap((env) => [
-        ...SECRET_VARS.map((name) => env[name] ?? ""),
-        decodedPem(env.BUGNET_X402_TLS_KEY ?? ""),
-        ...(env.BUGNET_SOLANA_RPC_URLS ?? "").split(",").map((url) => url.trim()),
-    ]);
+    const values = envs.flatMap((env) => {
+        const urls = [RPC_LIST, RPC_SINGLE].flatMap((name) =>
+            (env[name] ?? "").split(",").map((url) => url.trim()),
+        );
+        return [
+            ...SECRET_VARS.map((name) => env[name] ?? ""),
+            decodedPem(env.BUGNET_X402_TLS_KEY ?? ""),
+            ...urls,
+            ...urls.flatMap(urlSecretParts),
+        ];
+    });
     return [...new Set(values.filter((v) => v.trim() !== ""))].sort((a, b) => b.length - a.length);
+}
+
+interface RpcUrlsRead {
+    urls: string[];
+    from: RpcUrlsVar;
+    singleIgnored: boolean;
+    problem: readonly [RpcUrlsVar, string] | null;
+}
+
+// Spec 4.1: the list when it is set and not blank, else the single URL
+function readRpcUrls(env: NodeJS.ProcessEnv): RpcUrlsRead {
+    const list = env[RPC_LIST] ?? "";
+    const single = env[RPC_SINGLE] ?? "";
+    if (list.trim() !== "") {
+        const { urls, problems } = parseRpcUrls(list);
+        return {
+            urls,
+            from: RPC_LIST,
+            singleIgnored: single.trim() !== "",
+            problem: problems.length > 0 ? [RPC_LIST, problems.join("; ")] : null,
+        };
+    }
+    if (single.trim() === "") {
+        return {
+            urls: [],
+            from: RPC_LIST,
+            singleIgnored: false,
+            problem: [RPC_LIST, `or ${RPC_SINGLE} must be set`],
+        };
+    }
+    // A list pasted into the single variable is refused rather than read as one URL
+    const problem =
+        single.includes(",") && !/\s/.test(single)
+            ? `must hold one URL; put a list in ${RPC_LIST}`
+            : urlProblem(single);
+    return {
+        urls: [single],
+        from: RPC_SINGLE,
+        singleIgnored: false,
+        problem: problem === null ? null : [RPC_SINGLE, problem],
+    };
+}
+
+// The RPC URLs in list order, for callers that have no settings
+export function rpcUrlsOf(env: NodeJS.ProcessEnv): string[] {
+    const { urls, problem } = readRpcUrls(env);
+    if (problem !== null) throw new ConfigError(`${problem[0]} ${problem[1]}`);
+    return urls;
 }
 
 function decodedPem(b64: string): string {
@@ -504,9 +579,9 @@ export function readSecrets(env: NodeJS.ProcessEnv, s: Settings): Secrets {
     const claimKey = key("BUGNET_CLAIM_KEY");
     const feePayerKey = text("BUGNET_FEE_PAYER_KEY");
     const refundKey = text("BUGNET_REFUND_KEY");
-    const rpcUrl = text("BUGNET_SOLANA_RPC_URL");
+    const rpc = readRpcUrls(env);
+    if (rpc.problem !== null) bad.set(...rpc.problem);
     bearer("BUGNET_PAYMENTS_TOKEN", paymentsToken);
-    token("BUGNET_SOLANA_RPC_URL", rpcUrl);
 
     const routerName = "BUGNET_PAYMENTS_ROUTER_TOKEN";
     const routerToken = env[routerName] ?? "";
@@ -559,9 +634,14 @@ export function readSecrets(env: NodeJS.ProcessEnv, s: Settings): Secrets {
         if (same !== undefined) bad.set(name, `must differ from ${same[0]}`);
     }
 
-    if (bad.size > 0) {
+    // The domain count is read from the URLs, so the list check needs a list that parsed
+    const listLines =
+        rpc.problem === null ? checkRpcList(s.solana.rpc, s.solana.rpc_timeout, rpc.urls) : [];
+    if (bad.size > 0 || listLines.length > 0) {
         const lines = [...bad].sort(([a], [b]) => a.localeCompare(b));
-        throw new ConfigError(lines.map(([name, problem]) => `${name} ${problem}`).join("\n"));
+        throw new ConfigError(
+            [...lines.map(([name, problem]) => `${name} ${problem}`), ...listLines].join("\n"),
+        );
     }
     return {
         paymentsToken,
@@ -570,7 +650,9 @@ export function readSecrets(env: NodeJS.ProcessEnv, s: Settings): Secrets {
         claimKey,
         feePayerKey,
         refundKey,
-        rpcUrl,
+        rpcUrls: rpc.urls,
+        rpcUrlsFrom: rpc.from,
+        rpcSingleIgnored: rpc.singleIgnored,
         allowanceKey,
         x402TlsKey,
         depositSeed,
