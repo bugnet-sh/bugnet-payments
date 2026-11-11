@@ -885,15 +885,20 @@ describe("slots and floors", () => {
     it("a dead endpoint never makes the live one lag", async () => {
         const t = setup(2);
         const confirmed = [{ commitment: "confirmed" }];
-        t.a.answer(() => rpcOk(1_000n));
-        expect(resultOf(await call(t.router, "getSlot", confirmed))).toBe(1_000n);
-        t.a.answer(() => netFail());
-        t.b.answer(() => rpcOk(1_000n + BigInt(Math.floor(t.clock.ms / 420))));
-        for (let ms = 5_000; ms <= 30 * 60_000; ms += 5_000) {
+        t.a.answer(() => rpcOk(5_000n));
+        expect(resultOf(await call(t.router, "getBlockHeight", confirmed))).toBe(5_000n);
+        // Silent from now on with its breaker closed, so only the 10 s reference window takes it
+        // out of b's lag, and only the 60 s projection cap keeps its mark under b's floor
+        setCheckState(t.router, "rpc1", { genesis: "error" });
+        // Slower than the 500 ms a block projection, as heights are when slots are skipped
+        const height = (ms: number) => 5_000n + BigInt(Math.floor(ms / 600));
+        t.b.answer(() => rpcOk(height(t.clock.ms)));
+        for (let ms = 15_000; ms <= 30 * 60_000; ms += 5_000) {
             t.clock.ms = ms;
-            const answer = await call(t.router, "getSlot", confirmed);
-            expect(resultOf(answer)).toBe(1_000n + BigInt(Math.floor(ms / 420)));
-            expect(snap(t.router, "rpc2").lag).toBe(0);
+            const answer = await call(t.router, "getBlockHeight", confirmed);
+            expect(resultOf(answer)).toBe(height(ms));
+            // b's own mark projects 2 blocks past it in 5 s; rpc1's mark would add about 95
+            expect(snap(t.router, "rpc2").lag).toBeLessThanOrEqual(2);
         }
     });
 
