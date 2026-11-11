@@ -596,10 +596,10 @@ async function dueDeposits(c: TickContext, watched: readonly DepositRow[]): Prom
     const busy = await busyByLedger(c.d.pool, c.now, c.cfg);
     const { fraction } = c.d.queue.dayUsed();
     return watched.filter((deposit) => {
-        // watchedDeposits returns a closed deposit only once closed_every has passed
-        if (deposit.state === "closed") return true;
         const m = c.job.deposits.get(deposit.orderId);
         if (m !== undefined) m.inReview = deposit.reviewReason !== null;
+        // watchedDeposits returns a closed deposit only once closed_every has passed
+        if (deposit.state === "closed") return true;
         // Reading faster cannot change a plan that waits for an operator, and an unknown debit
         // keeps every read below the ledger for good: it would spend the day's budget (spec 6.4)
         if (deposit.reviewReason !== null) {

@@ -1925,4 +1925,31 @@ describe("flows on FakeChain", () => {
         expect(chain.lamports(owners.B.address) - payerBefore).toBe(2_039_280n);
         expect(chain.lamports(first.address)).toBe(firstBefore);
     });
+
+    it("a closed deposit put in review never keeps the job busy", async () => {
+        const dep = await paidAndClosed();
+        // Late money opens the account again, and a leaked key takes part of it before the job
+        // reads, so every later read stays below the ledger
+        await chain.transfer({
+            authority: owners.B,
+            feePayer: owners.B,
+            source: sources.B,
+            destination: dep.tokenAccount,
+            micros: 2_000n,
+            memo: `t${++memoSeq}`,
+            createDestinationFor: dep.address,
+        });
+        chain.advance(1);
+        chain.debit(dep.tokenAccount, 1_500n);
+        chain.advance(1);
+        await until(
+            async () => (await depositOf()).reviewReason === "unknown_debit",
+            4,
+            cfg.closed_every,
+        );
+        // The next tick that watches the deposit sees the review
+        await ticks(1, cfg.closed_every);
+        expect(await depositOf()).toMatchObject({ state: "closed", reviewReason: "unknown_debit" });
+        expect(await depositsBusy(db.pool, watch, clock, cfg)).toBe(false);
+    });
 });
