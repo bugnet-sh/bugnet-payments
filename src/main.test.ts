@@ -15,6 +15,8 @@ import {
     getCompiledTransactionMessageDecoder,
     getTransactionDecoder,
     type KeyPairSigner,
+    createDefaultRpcTransport,
+    type RpcTransport,
 } from "@solana/kit";
 import { getTransferCheckedInstructionDataDecoder } from "@solana-program/token";
 import { decodePaymentRequiredHeader } from "@x402/core/http";
@@ -38,6 +40,8 @@ import { create, until } from "./testing/app.ts";
 import { testDb, type TestDb } from "./testing/db.ts";
 import { createFakeRpc, epochAt, type FakeRpcScript } from "./testing/fake-rpc.ts";
 import { testSigner } from "./testing/keys.ts";
+import { MAINNET_GENESIS } from "./solana/router/index.ts";
+import { fakeEndpoint, netFail, rpcOk, stall } from "./solana/router/testing.ts";
 import { startFakeChain, type FakeChain } from "./testing/fake-chain.ts";
 import { startFakeRouter, type FakeRouter } from "./testing/fake-router.ts";
 import { seedOrder, seedPayment } from "./testing/orders.ts";
@@ -191,16 +195,18 @@ async function rpcStub(withAccounts: boolean): Promise<{ url: string; close(): P
             const call = JSON.parse(body) as { id: unknown; method: string; params: unknown[] };
             const context = { slot: 1 };
             const answer =
-                call.method === "getBalance"
-                    ? { result: { context, value: 1_000_000_000 } }
-                    : call.method === "getAccountInfo"
-                      ? {
-                            result: {
-                                context,
-                                value: withAccounts ? accountAt(String(call.params[0])) : null,
-                            },
-                        }
-                      : { error: { code: -32601, message: `unexpected ${call.method}` } };
+                call.method === "getGenesisHash"
+                    ? { result: MAINNET_GENESIS }
+                    : call.method === "getBalance"
+                      ? { result: { context, value: 1_000_000_000 } }
+                      : call.method === "getAccountInfo"
+                        ? {
+                              result: {
+                                  context,
+                                  value: withAccounts ? accountAt(String(call.params[0])) : null,
+                              },
+                          }
+                        : { error: { code: -32601, message: `unexpected ${call.method}` } };
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ jsonrpc: "2.0", id: call.id, ...answer }));
         });
@@ -1495,5 +1501,142 @@ describe("deploy notes", () => {
             expect(text, file).toContain("pcli() {");
             expect(text, file).toContain("-config /etc/bugnet/payments.toml");
         }
+    });
+});
+
+describe("router wiring", () => {
+    let chain: FakeChain;
+    beforeEach(async () => {
+        chain = await startFakeChain({ autoFinalize: true });
+        for (const [ata, owner] of owners)
+            chain.setTokenAccount({ address: ata, owner, amount: 0n });
+        chain.fundLamports((await testSigner(5)).address, 1_000_000_000n);
+    });
+    afterEach(() => chain.close());
+    const startLine = (log: ReturnType<typeof memoryLog>) =>
+        log.lines.find((l) => l.msg === "payments started");
+    const listed = (urls: string[]): Secrets => ({
+        ...secrets,
+        rpcUrls: urls,
+        rpcUrlsFrom: "BUGNET_SOLANA_RPC_URLS",
+    });
+    const dead: RpcTransport = (async () => netFail()) as RpcTransport;
+
+    it("startService with only BUGNET_SOLANA_RPC_URL runs single mode as today", async () => {
+        const log = memoryLog();
+        const s = await startService({
+            settings,
+            secrets: { ...secrets, rpcUrls: [chain.url] },
+            log,
+        });
+        try {
+            expect(startLine(log)?.rpc).toMatchObject({ mode: "single", endpoints: ["rpc1"] });
+            expect(chain.calls()[0]?.method).toBe("getGenesisHash");
+        } finally {
+            await s.stop();
+        }
+    });
+
+    it("startService reads the list and routes around a dead endpoint", async () => {
+        const log = memoryLog();
+        const live = createDefaultRpcTransport({ url: chain.url });
+        const s = await startService({
+            settings,
+            log,
+            secrets: listed(["https://a.example/", "https://b.example/"]),
+            rpcTransportFor: (name) => (name === "rpc1" ? dead : live),
+        });
+        try {
+            expect(startLine(log)?.rpc).toEqual({
+                mode: "routed",
+                endpoints: ["rpc1", "rpc2"],
+                domains: 2,
+                absenceQuorum: 2,
+                sendFanout: 1,
+            });
+            expect(chain.calls().some((c) => c.method === "getBalance")).toBe(true);
+            expect(chain.calls().some((c) => c.method === "getAccountInfo")).toBe(true);
+        } finally {
+            await s.stop();
+        }
+    });
+
+    it("startService warns once when both RPC variables are set", async () => {
+        const log = memoryLog();
+        const s = await startService({
+            settings,
+            log,
+            secrets: { ...listed([chain.url]), rpcSingleIgnored: true },
+        });
+        try {
+            const warns = log.lines.filter(
+                (l) =>
+                    l.msg ===
+                    "rpc BUGNET_SOLANA_RPC_URL is ignored while BUGNET_SOLANA_RPC_URLS is set",
+            );
+            expect(warns).toHaveLength(1);
+            expect(JSON.stringify(warns[0])).not.toContain(chain.url);
+        } finally {
+            await s.stop();
+        }
+    });
+
+    it("startService starts while an endpoint stalls its history checks", async () => {
+        const live = createDefaultRpcTransport({ url: chain.url });
+        const stalling = fakeEndpoint("stalls", (method) => {
+            if (method === "getGenesisHash") return rpcOk(MAINNET_GENESIS);
+            if (method === "getEpochInfo") {
+                return rpcOk({
+                    absoluteSlot: chain.slot(),
+                    blockHeight: chain.height(),
+                    epoch: 0n,
+                    slotIndex: chain.slot(),
+                    slotsInEpoch: 432_000n,
+                    transactionCount: 0n,
+                });
+            }
+            return stall();
+        });
+        const started = Date.now();
+        const s = await startService({
+            settings,
+            log: silentLog,
+            secrets: listed(["https://a.example/", "https://b.example/"]),
+            rpcTransportFor: (name) => (name === "rpc1" ? live : stalling.transport),
+        });
+        try {
+            expect(Date.now() - started).toBeLessThan(
+                2 * settings.solana.rpc.attempt_timeout + 5_000,
+            );
+        } finally {
+            await s.stop();
+        }
+    });
+
+    it("startService refuses a devnet endpoint", async () => {
+        const devnet = fakeEndpoint("devnet", (method) =>
+            method === "getGenesisHash"
+                ? rpcOk("EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG")
+                : netFail(),
+        );
+        const started = startService({
+            settings,
+            log: silentLog,
+            secrets: listed(["https://a.example/"]),
+            rpcTransportFor: () => devnet.transport,
+        });
+        await expect(started).rejects.toBeInstanceOf(BootCheckError);
+        await expect(started).rejects.toThrow("RPC endpoint rpc1 is not on Solana mainnet");
+    });
+
+    it("stop flushes router usage", async () => {
+        const s = await startService({
+            settings,
+            log: silentLog,
+            secrets: { ...secrets, rpcUrls: [chain.url] },
+        });
+        await s.stop();
+        const rows = await db.pool.query<{ endpoint: string }>("select endpoint from rpc_usage");
+        expect(rows.rows.map((r) => r.endpoint)).toContain("rpc1");
     });
 });

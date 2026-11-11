@@ -33,6 +33,7 @@ import { isRecord } from "../is-record.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { MEMO_PROGRAM, TOKEN_PROGRAM, USDC_DECIMALS, USDC_MINT } from "../solana/constants.ts";
 import { createRpc, type SolanaRpc } from "../solana/rpc.ts";
+import { MAINNET_GENESIS, MAINNET_HISTORY_PROBE } from "../solana/router/index.ts";
 
 export interface FakeChain {
     url: string;
@@ -68,6 +69,9 @@ export interface FakeChain {
         lifetime?: { blockhash: string; lastValidBlockHeight: bigint };
     }): Promise<string>;
     withholdTransaction(signature: string, times: number): void;
+    // SOL balances getBalance answers, 0 for an unknown address
+    lamports(address: string): bigint;
+    fundLamports(address: string, lamports: bigint): void;
     calls(): { method: string; params: unknown[] }[];
     close(): Promise<void>;
 }
@@ -197,6 +201,9 @@ export async function startFakeChain(
     const hidden = new Map<string, number>();
     const withheld = new Map<string, number>();
     const requests: { method: string; params: unknown[] }[] = [];
+    const lamportsByAddress = new Map<string, bigint>();
+    // The router's history check asks for this old mainnet transaction before any payment exists
+    const probeSlot = GENESIS_SLOT - 1n;
     const heights = new Map<string, bigint>([
         [blockhashOf(GENESIS_SLOT), GENESIS_SLOT - HEIGHT_OFFSET],
     ]);
@@ -597,14 +604,59 @@ export async function startFakeChain(
         };
     }
 
+    // A dry run of apply() on the current state: nothing lands
+    function simulate(wire: string): Record<string, unknown> {
+        let tx: Transaction;
+        let compiled: ReturnType<typeof decodeMessage>;
+        try {
+            tx = getTransactionDecoder().decode(getBase64Encoder().encode(wire));
+            compiled = decodeMessage(tx);
+        } catch {
+            throw new RpcError(-32602, "Invalid param: failed to deserialize transaction");
+        }
+        const result = { logs: [], accounts: null, unitsConsumed: 0, returnData: null };
+        const known = heights.get(compiled.lifetimeToken);
+        if (known === undefined || heightOf(slot) > known + BLOCKHASH_LIFE) {
+            return { err: "BlockhashNotFound", ...result };
+        }
+        const keys = [...compiled.staticAccounts] as string[];
+        const instructions = compiled.instructions.map((ix) => ({
+            program: keys[ix.programAddressIndex]!,
+            accounts: (ix.accountIndices ?? []).map((i) => keys[i]!),
+            data: new Uint8Array(ix.data ?? []),
+        }));
+        const { err } = apply(keys, compiled.header.numSignerAccounts, instructions);
+        return { err, ...result, unitsConsumed: 1_000 };
+    }
+
+    function probeTransaction(): Record<string, unknown> {
+        return {
+            slot: probeSlot,
+            blockTime: null,
+            version: 0,
+            transaction: ["", "base64"],
+            meta: {
+                err: null,
+                fee: 5000,
+                preBalances: [],
+                postBalances: [],
+                preTokenBalances: [],
+                postTokenBalances: [],
+                innerInstructions: [],
+                logMessages: [],
+                loadedAddresses: { writable: [], readonly: [] },
+            },
+        };
+    }
+
     function answer(method: string, params: unknown[]): unknown {
         const last = params[params.length - 1];
         const config = isRecord(last) ? last : {};
         const view = viewSlot(method, config.commitment);
+        // Above the head every node refuses; below it only a lagged view that is set to refuse
         if (
             typeof config.minContextSlot === "number" &&
-            lagRefuses &&
-            view < config.minContextSlot
+            (config.minContextSlot > slot || (lagRefuses && view < config.minContextSlot))
         ) {
             throw new RpcError(
                 MIN_CONTEXT_SLOT_NOT_REACHED,
@@ -616,6 +668,12 @@ export async function startFakeChain(
         }
         const context = { slot: view };
         switch (method) {
+            case "getGenesisHash":
+                return MAINNET_GENESIS;
+            case "getBalance":
+                return { context, value: lamportsByAddress.get(params[0] as string) ?? 0n };
+            case "simulateTransaction":
+                return { context, value: simulate(params[0] as string) };
             case "getSlot":
                 return view;
             case "getBlockHeight":
@@ -661,6 +719,14 @@ export async function startFakeChain(
                 return {
                     context: { slot: viewSlot(method, "confirmed") },
                     value: sigs.map((s) => {
+                        if (s === MAINNET_HISTORY_PROBE.signature) {
+                            return {
+                                slot: probeSlot,
+                                confirmations: null,
+                                err: null,
+                                confirmationStatus: "finalized",
+                            };
+                        }
                         const t = bySignature.get(s);
                         if (t === undefined || t.slot > viewSlot(method, "confirmed")) return null;
                         return {
@@ -702,6 +768,19 @@ export async function startFakeChain(
             case "getTransaction": {
                 const sig = params[0] as string;
                 const t = bySignature.get(sig);
+                const probe = sig === MAINNET_HISTORY_PROBE.signature;
+                // Every transaction here is v0, which Agave refuses to a caller without the field
+                if (
+                    (t !== undefined || probe) &&
+                    config.maxSupportedTransactionVersion === undefined
+                ) {
+                    throw new RpcError(
+                        -32015,
+                        "Transaction version (0) is not supported by the requesting client. " +
+                            'Please try the request again with the following configuration parameter: "maxSupportedTransactionVersion": 0',
+                    );
+                }
+                if (probe) return probeTransaction();
                 const left = withheld.get(sig) ?? 0;
                 if (left > 0) {
                     withheld.set(sig, left - 1);
@@ -868,6 +947,10 @@ export async function startFakeChain(
             );
         },
         hideFromIndex: (sig, ms) => hidden.set(sig, Date.now() + ms),
+        lamports: (address) => lamportsByAddress.get(address) ?? 0n,
+        fundLamports: (address, lamports) => {
+            lamportsByAddress.set(address, lamports);
+        },
         lagNode(slots, opts = {}) {
             lag = slots;
             lagRefuses = opts.refuse ?? true;

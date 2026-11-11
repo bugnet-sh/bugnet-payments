@@ -3,10 +3,12 @@ import type { SolanaRpc } from "./rpc.ts";
 
 const HOUR_MS = 3_600_000;
 
-export function countingRpc(
-    rpc: SolanaRpc,
-    o: { limitPerHour: number; log: Log; now: () => number },
-): SolanaRpc {
+export interface RpcCounter {
+    record(): void;
+}
+
+// One counter can sit under both lanes, so the hourly alarm counts every logical call once
+export function rpcCounter(o: { limitPerHour: number; log: Log; now: () => number }): RpcCounter {
     const sends: number[] = [];
     let head = 0;
     let alarmed = false;
@@ -26,9 +28,13 @@ export function countingRpc(
             o.log.alarm("x402_rpc_budget", { calls, limitPerHour: o.limitPerHour });
         }
     };
+    return { record };
+}
+
+export function countingRpc(rpc: SolanaRpc, counter: RpcCounter): SolanaRpc {
     const counted = (fn: unknown, self: unknown) => {
         return (...args: unknown[]) => {
-            record();
+            counter.record();
             return (fn as (...a: unknown[]) => unknown).apply(self, args);
         };
     };

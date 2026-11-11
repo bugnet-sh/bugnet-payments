@@ -1,16 +1,52 @@
 import {
+    createDefaultRpcTransport,
     createSolanaRpc,
+    createSolanaRpcFromTransport,
     isSolanaError,
     mainnet,
     type RpcMainnet,
+    type RpcTransportMainnet,
     type SolanaRpcApiMainnet,
 } from "@solana/kit";
 import { RpcRouterError } from "./router/errors.ts";
+import {
+    createRouterTransport,
+    type RouterDeps,
+    type RouterTransport,
+    type RpcSettings,
+} from "./router/index.ts";
 
 export type SolanaRpc = RpcMainnet<SolanaRpcApiMainnet>;
 
 export function createRpc(url: string): SolanaRpc {
     return createSolanaRpc(mainnet(url));
+}
+
+export interface RoutedRpc {
+    // The money lane: payments, refunds, transfers, the mirror, boot and the CLI
+    rpc: SolanaRpc;
+    // The background lane: alarms and audits, held to its share of each endpoint
+    backgroundRpc: SolanaRpc;
+    router: RouterTransport;
+}
+
+export function createRouterRpc(
+    settings: RpcSettings,
+    urls: readonly string[],
+    deps: Omit<RouterDeps, "transportFor"> & Partial<Pick<RouterDeps, "transportFor">>,
+): RoutedRpc {
+    const router = createRouterTransport(settings, urls, {
+        ...deps,
+        transportFor:
+            deps.transportFor ?? ((_name, url) => createDefaultRpcTransport({ url: mainnet(url) })),
+    });
+    return {
+        rpc: createSolanaRpcFromTransport(router as unknown as RpcTransportMainnet),
+        backgroundRpc: createSolanaRpcFromTransport(
+            router.background as unknown as RpcTransportMainnet,
+        ),
+        router,
+    };
 }
 
 // A fresh signal per call, so a stalled RPC fails like an unavailable one

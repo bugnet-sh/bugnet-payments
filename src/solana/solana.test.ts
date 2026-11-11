@@ -17,6 +17,7 @@ import {
     signTransactionMessageWithSigners,
 } from "@solana/kit";
 import { getTransferSolInstruction } from "@solana-program/system";
+import { toFacilitatorSvmSigner } from "@x402/svm";
 import { describe, expect, it } from "vitest";
 import {
     createFakeRpc,
@@ -25,13 +26,15 @@ import {
     TEST_LVBH,
     TEST_SLOT,
 } from "../testing/fake-rpc.ts";
+import { memoryLog } from "../log.ts";
 import { testSigner } from "../testing/keys.ts";
 import { BlockhashCache } from "./blockhash.ts";
 import { inspectTokenAccount } from "./accounts.ts";
-import { MEMO_PROGRAM, TOKEN_PROGRAM, USDC_MINT } from "./constants.ts";
+import { MEMO_PROGRAM, SOLANA_MAINNET, TOKEN_PROGRAM, USDC_MINT } from "./constants.ts";
 import { generateExportableKeypair, loadKeypair } from "./keys.ts";
 import { readLanding } from "./landing.ts";
-import { createRpc, rpcErrorFields, type SolanaRpc } from "./rpc.ts";
+import { createRouterRpc, createRpc, rpcErrorFields, type SolanaRpc } from "./rpc.ts";
+import { countingRpc, rpcCounter } from "./budget.ts";
 import type { Status } from "./router/absence.ts";
 import { RpcRouterError } from "./router/errors.ts";
 import {
@@ -340,6 +343,70 @@ describe("readLanding", () => {
             signature: earlier,
             slot: 777n,
         });
+    });
+});
+
+describe("createRouterRpc", () => {
+    function routedRpc() {
+        const eps = ["a", "b"].map((label) => fakeEndpoint(label));
+        const deps = testDeps(eps);
+        const routed = createRouterRpc(testRpcSettings(), deps.urls, deps);
+        passAll(routed.router);
+        return { routed, eps };
+    }
+    const slotOnly =
+        (slot: bigint): FakeHandler =>
+        (method) =>
+            method === "getSlot" ? rpcOk(slot) : netFail();
+
+    it("createRouterRpc gives a SolanaRpc", async () => {
+        const { routed, eps } = routedRpc();
+        eps[0]!.answer(slotOnly(5n));
+        eps[1]!.answer(slotOnly(9n));
+        expect(await routed.rpc.getSlot().send()).toBe(5n);
+        expect(await routed.backgroundRpc.getSlot().send()).toBe(5n);
+    });
+
+    it("countingRpc counts logical calls over both lanes", async () => {
+        const { routed, eps } = routedRpc();
+        eps[0]!.answer(() => netFail());
+        eps[1]!.answer(slotOnly(9n));
+        const log = memoryLog();
+        const counter = rpcCounter({ limitPerHour: 1, log, now: () => 0 });
+        await countingRpc(routed.rpc, counter).getSlot().send();
+        await countingRpc(routed.backgroundRpc, counter).getSlot().send();
+        expect(log.lines.filter((l) => l.alarm === "x402_rpc_budget")).toHaveLength(1);
+        const http = routed.router
+            .snapshot()
+            .endpoints.reduce(
+                (sum, e) => sum + e.laneRequests.money + e.laneRequests.background,
+                0,
+            );
+        expect(http).toBe(4);
+    });
+
+    it("the settler's x402 map still works", async () => {
+        const { routed, eps } = routedRpc();
+        const blockhash = getBase58Decoder().decode(new Uint8Array(32).fill(3));
+        eps[0]!.answer((method) =>
+            method === "getLatestBlockhash"
+                ? rpcOk({
+                      context: { slot: 5_000n },
+                      value: { blockhash, lastValidBlockHeight: 4_000n },
+                  })
+                : netFail(),
+        );
+        eps[1]!.answer(() => netFail());
+        const signer = toFacilitatorSvmSigner(await testSigner(1), {
+            [SOLANA_MAINNET]: routed.rpc,
+        });
+        const latest = (
+            signer as unknown as {
+                getLatestBlockhash(network: string): Promise<{ blockhash: string }>;
+            }
+        ).getLatestBlockhash(SOLANA_MAINNET);
+        expect((await latest).blockhash).toBe(blockhash);
+        expect(eps[0]!.calls.some((c) => c.method === "getLatestBlockhash")).toBe(true);
     });
 });
 

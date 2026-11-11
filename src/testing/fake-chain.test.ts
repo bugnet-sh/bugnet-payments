@@ -16,10 +16,11 @@ import {
     SOLANA_ERROR__JSON_RPC__SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED,
     SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE,
 } from "@solana/kit";
-import { getApproveInstruction } from "@solana-program/token";
+import { getApproveInstruction, getTransferCheckedInstruction } from "@solana-program/token";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { usdcAta } from "../solana/accounts.ts";
-import { USDC_MINT } from "../solana/constants.ts";
+import { USDC_DECIMALS, USDC_MINT } from "../solana/constants.ts";
+import { MAINNET_GENESIS, MAINNET_HISTORY_PROBE } from "../solana/router/index.ts";
 import { buildSellerPayment, randomSellerMemo, signSellerPayment } from "../x402/build.ts";
 import { type FakeChain, startFakeChain } from "./fake-chain.ts";
 import { testSigner } from "./keys.ts";
@@ -54,6 +55,95 @@ describe("fake chain", () => {
                 maxSupportedTransactionVersion: 0,
             })
             .send();
+
+    const transferWire = async (
+        micros: bigint,
+        lifetime?: { blockhash: string; lastValidBlockHeight: bigint },
+    ): Promise<string> => {
+        const life = lifetime ?? (await chain.rpc.getLatestBlockhash().send()).value;
+        const message = pipe(
+            createTransactionMessage({ version: 0 }),
+            (m) => setTransactionMessageFeePayerSigner(payer, m),
+            (m) => setTransactionMessageLifetimeUsingBlockhash(life as never, m),
+            (m) =>
+                appendTransactionMessageInstruction(
+                    getTransferCheckedInstruction({
+                        source: address(a),
+                        mint: address(USDC_MINT),
+                        destination: address(b),
+                        authority: owner,
+                        amount: micros,
+                        decimals: USDC_DECIMALS,
+                    }),
+                    m,
+                ),
+        );
+        return getBase64EncodedWireTransaction(await signTransactionMessageWithSigners(message));
+    };
+    const simulate = async (wire: string) =>
+        (
+            (await chain.rpc.simulateTransaction(wire as never, { encoding: "base64" }).send()) as {
+                value: { err: unknown };
+            }
+        ).value.err;
+
+    it("the fake chain answers getGenesisHash", async () => {
+        expect(await chain.rpc.getGenesisHash().send()).toBe(MAINNET_GENESIS);
+    });
+
+    it("the fake chain answers getBalance", async () => {
+        chain.fundLamports(payer.address, 5n);
+        const funded = await chain.rpc.getBalance(payer.address).send();
+        expect(funded.value).toBe(5n);
+        expect(typeof funded.context.slot).toBe("bigint");
+        expect((await chain.rpc.getBalance(other.address).send()).value).toBe(0n);
+        expect(chain.lamports(other.address)).toBe(0n);
+    });
+
+    it("the fake chain simulates without landing", async () => {
+        const fresh = await transferWire(10n);
+        expect(await simulate(fresh)).toBeNull();
+        expect(chain.submitted()).toHaveLength(0);
+        expect(chain.balance(a)).toBe(1_000_000n);
+        expect(chain.balance(b)).toBe(0n);
+
+        const life = (await chain.rpc.getLatestBlockhash().send()).value;
+        chain.advance(200);
+        expect(await simulate(await transferWire(10n, life))).toBe("BlockhashNotFound");
+        expect(await simulate(await transferWire(2_000_000n))).toEqual({
+            InstructionError: [0n, { Custom: 1n }],
+        });
+    });
+
+    it("the fake chain knows the mainnet probe", async () => {
+        const { value } = await chain.rpc
+            .getSignatureStatuses([signature(MAINNET_HISTORY_PROBE.signature)], {
+                searchTransactionHistory: true,
+            })
+            .send();
+        expect(value[0]?.confirmationStatus).toBe("finalized");
+    });
+
+    it("the fake chain refuses a v0 transaction without the version field", async () => {
+        const s = await send(10n);
+        await expect(
+            chain.rpc.getTransaction(signature(s), { encoding: "base64" }).send(),
+        ).rejects.toSatisfy((e: unknown) => isSolanaError(e) && e.context.__code === -32015);
+        expect(await getTx(s)).not.toBeNull();
+    });
+
+    it("the fake chain refuses a slot above its head", async () => {
+        const far = chain.slot() + 1_000_000n;
+        const ask = () =>
+            chain.rpc
+                .getAccountInfo(address(a), { encoding: "jsonParsed", minContextSlot: far })
+                .send();
+        const refused = (e: unknown) =>
+            isSolanaError(e, SOLANA_ERROR__JSON_RPC__SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED);
+        await expect(ask()).rejects.toSatisfy(refused);
+        chain.lagNode(10, { refuse: false });
+        await expect(ask()).rejects.toSatisfy(refused);
+    });
 
     it("a signed TransferChecked moves balances and is listed newest first", async () => {
         expect(chain.slot()).toBe(1_000n);
