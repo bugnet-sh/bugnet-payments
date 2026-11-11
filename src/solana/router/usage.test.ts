@@ -307,6 +307,34 @@ describe("alarms", () => {
         ]);
     });
 
+    it("a quiet fallback whose probes answer JSON-RPC 429 alarms too", async () => {
+        const t = setup();
+        t.b.answer(() => rpcFail(429, "Too many requests"));
+        // The service's tick, every 5 s
+        for (let ms = 0; ms <= 300_000; ms += 5_000) await tickAt(t, ms);
+        await tickAt(t, 301_000);
+        expect(alarms(t, "rpc_endpoint_down", { reason: "rate_limited" })).toEqual([
+            alarm("rpc_endpoint_down", { endpoint: "rpc2", reason: "rate_limited" }),
+        ]);
+        expect(snap(t, "rpc2").limits["*"]).toBe(1);
+    });
+
+    for (const [status, reason] of [
+        [401, "auth"],
+        [402, "http_402"],
+        [403, "http_403"],
+    ] as const) {
+        it(`a quiet fallback whose probes get ${status} opens and alarms once`, async () => {
+            const t = setup();
+            t.b.answer(() => httpFail(status));
+            for (let ms = 0; ms <= 600_000; ms += 5_000) await tickAt(t, ms);
+            expect(alarms(t, "rpc_endpoint_down", { endpoint: "rpc2" })).toEqual([
+                alarm("rpc_endpoint_down", { endpoint: "rpc2", reason, status }),
+            ]);
+            expect(snap(t, "rpc2").state).toBe("open");
+        });
+    }
+
     it("the lag alarm waits 2 minutes", async () => {
         const t = setup();
         const behind = node(t.clock, "a", {

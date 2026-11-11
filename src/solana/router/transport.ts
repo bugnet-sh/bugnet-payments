@@ -988,8 +988,10 @@ class Router {
         }
     }
 
-    // A check or probe call is counted and observed like traffic, but it never strikes, never
-    // fails over and logs nothing: its result is the check's
+    // A check or probe call is counted and observed like traffic, and a 429 or a 401 to 410
+    // acts as in traffic, so a quiet endpoint that only gets probes still leaves and alarms
+    // (spec 6.3, 6.4). It never strikes, never fails over and logs nothing: its result is the
+    // check's
     private checkTransport(ep: Endpoint): RpcTransport {
         return (async ({ payload, signal }: Config) => {
             const req = readRequest(payload) ?? opaqueRequest(payload);
@@ -1000,8 +1002,10 @@ class Router {
             try {
                 const answer = await ep.transport({ payload, signal });
                 ep.health.sample(this.deps.now() - started);
-                // Any answer, not only a result, says the endpoint is not rate limiting
-                ep.limits.succeeded(req.method);
+                const o = classifyAnswer(req.method, answer);
+                // Any other answer, not only a result, says the endpoint is not rate limiting
+                if (o.kind === "cooldown") this.cool(ep, req.method, o);
+                else ep.limits.succeeded(req.method);
                 this.observe(ep, req, answer);
                 const error = rpcErrorOf(answer);
                 ep.counters.outcome(req.method, error === null ? "ok" : codeLabel(error.code));
@@ -1010,9 +1014,12 @@ class Router {
                 if (signal?.aborted) {
                     ep.counters.outcome(req.method, "timeout");
                 } else {
+                    const error = thrownError(err);
                     ep.counters.outcome(req.method, thrownLabel(err));
-                    ep.lastError = { at: this.deps.now(), ...thrownError(err) };
-                    this.cool(ep, req.method, classifyThrown(err, false, this.deps.now()));
+                    ep.lastError = { at: this.deps.now(), ...error };
+                    const o = classifyThrown(err, false, this.deps.now());
+                    this.cool(ep, req.method, o);
+                    if (o.kind === "auth" || o.kind === "down") this.shutOut(ep, o, codeOf(error));
                 }
                 throw err;
             } finally {
@@ -1238,12 +1245,8 @@ class Router {
                 this.cool(ep, req.method, o);
                 return;
             case "auth":
-                ep.health.authFailed();
-                this.down(ep, "auth", code);
-                return;
             case "down":
-                ep.health.endpointDown();
-                this.down(ep, `http_${o.status}`, code);
+                this.shutOut(ep, o, code);
                 return;
             case "bad_request":
                 run.badRequests.push({ ep, ms: elapsed });
@@ -1673,6 +1676,20 @@ class Router {
         const before = ep.health.breaker();
         ep.health.strike(ms);
         if (before === "closed" && ep.health.breaker() === "open") this.down(ep, "errors", code);
+    }
+
+    // A 401 to 410 is about the URL: open for 10 min (spec 6.4). Like a strike, it alarms only
+    // when it takes a closed endpoint out, so a reopening in probation repeats no alarm (10.2)
+    private shutOut(
+        ep: Endpoint,
+        o: Extract<Outcome, { kind: "auth" | "down" }>,
+        code: ErrorCode,
+    ): void {
+        const before = ep.health.breaker();
+        if (o.kind === "auth") ep.health.authFailed();
+        else ep.health.endpointDown();
+        if (before !== "closed") return;
+        this.down(ep, o.kind === "auth" ? "auth" : `http_${o.status}`, code);
     }
 
     private down(ep: Endpoint, reason: string, code: ErrorCode): void {

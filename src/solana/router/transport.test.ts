@@ -461,6 +461,20 @@ describe("priority and failover", () => {
         expect(snap(t.router, "rpc1").state).toBe("open");
     });
 
+    it("a 401 alarms once per opening", async () => {
+        const t = setup(2);
+        t.a.answer(() => httpFail(401));
+        t.b.answer(() => netFail("ECONNREFUSED"));
+        // b opens through strikes, and the relaxation then sends one request at a time to a
+        for (let i = 0; i < 10; i++) {
+            await call(t.router, "getSlot").catch(() => undefined);
+            t.clock.ms += 1_000;
+        }
+        expect(t.a.calls.length).toBeGreaterThan(2);
+        const reasons = alarms(t).map((l) => `${String(l.endpoint)} ${String(l.reason)}`);
+        expect(reasons).toEqual(["rpc1 auth", "rpc2 errors"]);
+    });
+
     it("a 403 opens the endpoint and alarms", async () => {
         const t = setup(2);
         t.a.answer(() => httpFail(403));
