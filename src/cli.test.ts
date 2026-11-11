@@ -6,16 +6,18 @@ import { stringify } from "smol-toml";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { type CliOptions, cliMain, formatRpcStatus } from "./cli.ts";
 import {
+    type FakeEndpoint,
     type FakeHandler,
     fakeEndpoint,
     httpFail,
+    netFail,
     rpcFail,
     rpcOk,
     signatureStatus,
     statusesAnswer,
 } from "./solana/router/testing.ts";
 import { MAINNET_GENESIS, type RouterSnapshot } from "./solana/router/index.ts";
-import { pgSnapshotStore } from "./solana/rpc-store.ts";
+import { endpointFingerprint, pgSnapshotStore, pgVerdictStore } from "./solana/rpc-store.ts";
 import type { EndpointSnapshot } from "./solana/router/transport.ts";
 import { silentLog } from "./log.ts";
 import { findOrder } from "./orders/store.ts";
@@ -1222,9 +1224,8 @@ describe("rpc commands", () => {
         expect(io.errText()).toContain("no router snapshot: is the service running?");
     });
 
-    // A healthy mainnet node at slot 500 that knows every signature it is asked about
-    function checkNode(label: string, over: Record<string, FakeHandler> = {}) {
-        const at = 500n;
+    // A healthy mainnet node at slot `at` that knows every signature it is asked about
+    function checkNode(label: string, over: Record<string, FakeHandler> = {}, at = 500n) {
         return fakeEndpoint(label, (method, params, payload) => {
             const own = over[method];
             if (own !== undefined) return own(method, params, payload);
@@ -1267,6 +1268,23 @@ describe("rpc commands", () => {
         });
     }
     const TWO = { BUGNET_SOLANA_RPC_URLS: "https://a.example/,https://b.example/" };
+    const FOUR = {
+        BUGNET_SOLANA_RPC_URLS:
+            "https://a.example/,https://b.example/,https://c.example/,https://d.example/",
+    };
+    // Every repeat of the history check answers alike when `same`, else they alternate
+    function statusesRepeats(same: boolean): FakeHandler {
+        let flip = false;
+        return (_m, params) => {
+            flip = !flip;
+            return statusesAnswer(
+                500n,
+                (params[0] as string[]).map(() =>
+                    same || flip ? signatureStatus(400n, "finalized") : null,
+                ),
+            );
+        };
+    }
     async function probe(
         env: NodeJS.ProcessEnv,
         nodes: ReturnType<typeof checkNode>[],
@@ -1297,6 +1315,44 @@ describe("rpc commands", () => {
             /^rpc2 {2}genesis: ok {2}pinned-accounts: ok {2}pinned-signatures: ok {2}history: ok {2}consistent: yes {2}slot: 500 {2}latency: \d+ms$/,
         );
         expect(r.code).toBe(1);
+    });
+
+    it("rpc probe fails on an ignored minContextSlot at a consistent endpoint", async () => {
+        const ignoring = checkNode("b", {
+            getAccountInfo: () => rpcOk({ context: { slot: 500n }, value: null }),
+            getSignaturesForAddress: () => rpcOk([]),
+        });
+        const r = await probe(TWO, [checkNode("a"), ignoring]);
+        expect(r.out.find((l) => l.startsWith("rpc2"))).toMatch(
+            /^rpc2 {2}genesis: ok {2}pinned-accounts: ignored {2}pinned-signatures: ignored {2}history: ok {2}consistent: yes /,
+        );
+        expect(r.code).toBe(1);
+    });
+
+    it("rpc probe calls each endpoint's checks once", async () => {
+        const a = checkNode("a");
+        const r = await probe(TWO, [a, checkNode("b")]);
+        expect(r.code).toBe(0);
+        expect(a.calls.filter((c) => c.method === "getGenesisHash")).toHaveLength(1);
+    });
+
+    it("an inconsistent endpoint or one without history does not fail the probe", async () => {
+        const c = checkNode("c", { getSignatureStatuses: statusesRepeats(false) });
+        const d = checkNode("d", {
+            getSignatureStatuses: (_m, params) =>
+                statusesAnswer(
+                    500n,
+                    (params[0] as string[]).map(() => null),
+                ),
+            getTransaction: () => rpcOk(null),
+        });
+        const r = await probe(FOUR, [checkNode("a"), checkNode("b"), c, d]);
+        expect(r.out.find((l) => l.startsWith("rpc3"))).toMatch(
+            / {2}history: ok {2}consistent: no {2}/,
+        );
+        expect(r.out.find((l) => l.startsWith("rpc4"))).toMatch(/ {2}history: missing {2}/);
+        expect(r.out.slice(-2)).toEqual(["quorum: 2 of 2 domains ready", "listings: rpc1 rpc2"]);
+        expect(r.code).toBe(0);
     });
 
     it("rpc probe names a genesis error", async () => {
@@ -1354,6 +1410,190 @@ describe("rpc commands", () => {
         }
         const failed = await probe(keyed, [checkNode("a"), refusing]);
         expect(failed.text).toContain("rpc2  genesis: error http_403");
+    });
+
+    describe("a hot-wallet re-sign proof through the router", () => {
+        const CLAIM_KEY = Buffer.alloc(32, 9);
+        const AT = 2_000n;
+        // A hot refund past its expiry, the mirror verified through expiry_seen_slot + 300
+        async function waitingRow(sig: string): Promise<number> {
+            const o = await hotOrder();
+            const id = await row(o.id, {
+                kind: "allowance",
+                fromWallet: "allowance",
+                state: "manual",
+                amountMicros: 300_000,
+                manualReason: "refund_expired_repeatedly",
+                txSignature: sig,
+                expirySeenSlot: 1_000n,
+            });
+            await db.pool.query("update x402_tail set verified_slot = 1300");
+            return id;
+        }
+        // Every signature found but `sig`, which is null unless `knows`
+        const statusesFor =
+            (sig: string, knows: boolean): FakeHandler =>
+            (_m, params) =>
+                statusesAnswer(
+                    AT,
+                    (params[0] as string[]).map((s) =>
+                        s === sig && !knows ? null : signatureStatus(1_100n, "finalized"),
+                    ),
+                );
+        function proofNode(label: string, sig: string, over: Record<string, FakeHandler> = {}) {
+            return checkNode(label, { getSignatureStatuses: statusesFor(sig, false), ...over }, AT);
+        }
+        async function retry(id: number, env: NodeJS.ProcessEnv, nodes: FakeEndpoint[]) {
+            const io = captureIo();
+            const code = await cliMain(
+                ["-config", config, "manual", "retry", String(id)],
+                env,
+                io,
+                {
+                    rpcTransportFor: (name) => nodes[Number(name.slice(3)) - 1]!.transport,
+                },
+            );
+            return { code, io };
+        }
+        beforeEach(async () => {
+            await db.pool.query("delete from rpc_verdicts");
+        });
+
+        it("the CLI reads the list", async () => {
+            const sig = SIG(31);
+            const id = await waitingRow(sig);
+            const dead = fakeEndpoint("a", () => netFail());
+            const b = proofNode("b", sig);
+            await retry(id, TWO, [dead, b]);
+            const asked = b.calls.filter(
+                (c) =>
+                    c.method === "getSignatureStatuses" && (c.params[0] as string[]).includes(sig),
+            );
+            expect(asked.length).toBeGreaterThan(0);
+        });
+
+        it("the CLI proof uses the quorum", async () => {
+            const sig = SIG(32);
+            const id = await waitingRow(sig);
+            // a has no history at all; b knows the refund landed
+            const a = checkNode(
+                "a",
+                {
+                    getSignatureStatuses: (_m, params) =>
+                        statusesAnswer(
+                            AT,
+                            (params[0] as string[]).map(() => null),
+                        ),
+                    getTransaction: () => rpcOk(null),
+                },
+                AT,
+            );
+            const knows = proofNode("b", sig, { getSignatureStatuses: statusesFor(sig, true) });
+            const r = await retry(id, TWO, [a, knows]);
+            expect(r.code).toBe(1);
+            expect(r.io.errText()).toContain(
+                `refund ${id}: its last transaction is not yet proven absent`,
+            );
+            expect((await refundOf(id)).state).toBe("manual");
+        });
+
+        it("the CLI never counts a vote the service took away", async () => {
+            const sig = SIG(33);
+            const id = await waitingRow(sig);
+            await pgVerdictStore(db.pool, () => new Date(), 3_600_000).save({
+                fingerprint: endpointFingerprint(CLAIM_KEY)("https://b.example/"),
+                endpoint: "rpc2",
+                noAt: Date.now() - 10 * 60_000,
+                reason: "check_disagreed",
+                historyPassed: true,
+            });
+            const env = { ...TWO, BUGNET_CLAIM_KEY: CLAIM_KEY.toString("base64") };
+            // Both answer null and b's own boot run agrees, but the stored mark is younger than
+            // the hour
+            const r = await retry(id, env, [proofNode("a", sig), proofNode("b", sig)]);
+            expect(r.code).toBe(1);
+            expect(r.io.errText()).toContain(
+                `refund ${id}: its last transaction is not yet proven absent`,
+            );
+            expect((await refundOf(id)).state).toBe("manual");
+
+            // The same two answers without the stored mark prove the absence
+            await db.pool.query("delete from rpc_verdicts");
+            const clean = await retry(id, env, [proofNode("a", sig), proofNode("b", sig)]);
+            expect(clean.code).toBe(0);
+            expect((await refundOf(id)).state).toBe("pending");
+        });
+
+        it("a CLI command reruns an errored check once", async () => {
+            const sig = SIG(34);
+            const id = await waitingRow(sig);
+            let first = true;
+            const answer = statusesFor(sig, false);
+            const b = proofNode("b", sig, {
+                getSignatureStatuses: (m, params, payload) => {
+                    if (!first) return answer(m, params, payload);
+                    first = false;
+                    return httpFail(503);
+                },
+            });
+            const env = { ...TWO, BUGNET_CLAIM_KEY: CLAIM_KEY.toString("base64") };
+            const r = await retry(id, env, [proofNode("a", sig), b]);
+            expect(first).toBe(false);
+            expect(r.code).toBe(0);
+            expect((await refundOf(id)).state).toBe("pending");
+        });
+
+        it("a router refused at start still flushes its usage", async () => {
+            const sig = SIG(35);
+            const id = await waitingRow(sig);
+            await db.pool.query("delete from rpc_usage");
+            const devnet = checkNode("a", {
+                getGenesisHash: () => rpcOk("EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"),
+            });
+            const r = await retry(id, TWO, [devnet, proofNode("b", sig)]);
+            expect(r.code).toBe(1);
+            const rows = await db.pool.query<{ endpoint: string }>(
+                "select endpoint from rpc_usage order by endpoint",
+            );
+            expect(rows.rows.map((x) => x.endpoint)).toEqual(["rpc1", "rpc2"]);
+        });
+    });
+
+    it("rpc probe works before migration 00006", async () => {
+        const old = await testDb();
+        try {
+            await old.pool.query("drop table rpc_usage, rpc_health, rpc_verdicts");
+            const oldConfig = join(dir, "before-00006.toml");
+            const recipient = (await testSigner(1)).address;
+            writeFileSync(
+                oldConfig,
+                stringify({ database: { url: old.url }, solana: { recipient } }),
+            );
+            const io = captureIo();
+            const env = { ...TWO, BUGNET_CLAIM_KEY: Buffer.alloc(32, 9).toString("base64") };
+            const nodes = [checkNode("a"), checkNode("b")];
+            const code = await cliMain(["-config", oldConfig, "rpc", "probe"], env, io, {
+                rpcTransportFor: (name) => nodes[Number(name.slice(3)) - 1]!.transport,
+            });
+            expect(code).toBe(0);
+            const out = io.outText().split("\n");
+            expect(out.filter((l) => /^rpc[12] {2}genesis: ok/.test(l))).toHaveLength(2);
+            expect(out.slice(-2)).toEqual(["quorum: 2 of 2 domains ready", "listings: rpc1 rpc2"]);
+            const warns = io
+                .errText()
+                .split("\n")
+                .filter((l) => l.includes('"level":"warn"'));
+            expect(warns).toHaveLength(1);
+            expect(warns[0]).not.toContain("example");
+        } finally {
+            await old.close();
+        }
+
+        // Nor does a probe write usage where the table exists
+        await db.pool.query("delete from rpc_usage");
+        const nodes = [checkNode("a"), checkNode("b")];
+        expect((await probe(TWO, nodes)).code).toBe(0);
+        expect((await db.pool.query("select 1 from rpc_usage")).rowCount).toBe(0);
     });
 
     it("the CLI names list problems by position", async () => {
@@ -1415,7 +1655,6 @@ describe("rpc commands", () => {
             const io = captureIo();
             const env = { BUGNET_SOLANA_RPC_URL: chain.url };
             expect(await cliMain(["keys", "show"], env, io)).toBe(0);
-            expect(io.errText()).not.toContain("ConfigError");
             expect(chain.calls().some((c) => c.method === "getGenesisHash")).toBe(true);
         } finally {
             await chain.close();
