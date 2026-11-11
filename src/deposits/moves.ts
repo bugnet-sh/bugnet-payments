@@ -118,9 +118,31 @@ type Proof = { kind: "absent" } | { kind: "wait" } | ({ kind: "landed" } & Lande
 // out of attempts; race: a closing move whose account changed before it could be signed again
 type FailCause = "onchain" | "refused" | "expired" | "race";
 
+// One attempt's re-sign proof, kept across ticks as the job keeps its trails: the cursor cannot
+// move while the move is in flight, so a proof that listed from the top on every tick would never
+// reach the cursor once more than scan_max_pages pages sit above it
+interface ProofScan {
+    orderId: string;
+    signature: string | null;
+    trail: ReadTrail;
+    // Only once a scan finished: an unfinished listing goes on from the read it started on
+    readAgain: boolean;
+}
+
 const SIGNATURE_LAMPORTS = 5_000n;
 const IN_FLIGHT: ReadonlySet<MoveState> = new Set(["pending", "signed", "sent"]);
 const SENT: ReadonlySet<MoveState> = new Set(["signed", "sent"]);
+// Per database, by move id
+const proofScans = new WeakMap<pg.Pool, Map<number, ProofScan>>();
+
+function proofScansOf(pool: pg.Pool): Map<number, ProofScan> {
+    let scans = proofScans.get(pool);
+    if (scans === undefined) {
+        scans = new Map();
+        proofScans.set(pool, scans);
+    }
+    return scans;
+}
 
 const takesOut = (m: Pick<MoveRow, "amountMicros" | "keepMicros" | "heldMicros">): bigint =>
     BigInt(m.amountMicros + m.keepMicros + m.heldMicros);
@@ -300,6 +322,14 @@ export async function advanceMoves(d: MoveDeps, orderIds?: readonly string[]): P
          order by id`,
         [orderIds ?? null],
     );
+    // A move no longer in flight drops its proof, however it left
+    const live = new Set(rows.map((r) => Number(r.id)));
+    const scans = proofScansOf(d.pool);
+    for (const [id, p] of scans) {
+        if (!live.has(id) && (orderIds === undefined || orderIds.includes(p.orderId))) {
+            scans.delete(id);
+        }
+    }
     for (const r of rows) {
         const ids = { moveId: Number(r.id), orderId: r.order_id };
         try {
@@ -602,6 +632,7 @@ async function expired(d: MoveDeps, move: MoveRow, slot: bigint, tick: MoveTick)
         tick.waitingProof++;
         return;
     }
+    proofScansOf(d.pool).delete(move.id);
     if (proof.kind === "landed") {
         const landed = { signature: proof.signature, slot: proof.slot };
         if (await confirmMove(d, current, landed)) tick.confirmed++;
@@ -643,23 +674,38 @@ async function viaScan<T>(call: () => Promise<T>): Promise<T> {
  * Spec 11.2: a balance read pinned to expiry_seen_slot that equals the ledger with this move not
  * landed, and a history scan through that slot that finds none of its signatures. A deposit can
  * hold several senders' money, so a node that answers null for a transaction that did land must
- * never be enough to pay twice. A signature the scan finds landed confirms the move instead.
+ * never be enough to pay twice. A signature the scan finds landed confirms the move instead. The
+ * balance is judged at the read the scan was pinned to, the newest moment its listing proves.
  */
 async function proveAbsent(d: MoveDeps, deposit: DepositRow, move: MoveRow): Promise<Proof> {
-    const read = (
-        await viaRpc(() =>
-            readDepositBalances(d.rpc, [address(deposit.tokenAccount)], {
-                timeoutMs: d.rpcTimeoutMs,
-                minContextSlot: move.expirySeenSlot ?? 0n,
-            }),
-        )
-    ).get(deposit.tokenAccount)!;
-    const trail = new ReadTrail(
-        deposit.checkedSlot === null
-            ? null
-            : { slot: deposit.checkedSlot, micros: deposit.balanceMicros },
-    );
-    trail.push(read);
+    const scans = proofScansOf(d.pool);
+    let p = scans.get(move.id);
+    if (p === undefined || p.signature !== move.txSignature) {
+        const anchor =
+            deposit.checkedSlot === null
+                ? null
+                : { slot: deposit.checkedSlot, micros: deposit.balanceMicros };
+        p = {
+            orderId: move.orderId,
+            signature: move.txSignature,
+            trail: new ReadTrail(anchor),
+            readAgain: true,
+        };
+        scans.set(move.id, p);
+    }
+    const { trail } = p;
+    if (p.readAgain) {
+        const read = (
+            await viaRpc(() =>
+                readDepositBalances(d.rpc, [address(deposit.tokenAccount)], {
+                    timeoutMs: d.rpcTimeoutMs,
+                    minContextSlot: move.expirySeenSlot ?? 0n,
+                }),
+            )
+        ).get(deposit.tokenAccount)!;
+        trail.push(read);
+        p.readAgain = trail.latest() === null;
+    }
     if (trail.latest() === null) return { kind: "wait" };
     const scanDeps: ScanDeps = {
         pool: d.pool,
@@ -671,6 +717,7 @@ async function proveAbsent(d: MoveDeps, deposit: DepositRow, move: MoveRow): Pro
         now: d.now,
     };
     const result = await viaScan(() => scanDeposit(scanDeps, deposit, trail));
+    p.readAgain = result.complete;
     const ledger = await loadLedger(d, deposit.orderId);
     const scanned = ledger.moves.find((m) => m.id === move.id);
     if (scanned === undefined) return { kind: "wait" };
@@ -680,6 +727,7 @@ async function proveAbsent(d: MoveDeps, deposit: DepositRow, move: MoveRow): Pro
         return { kind: "landed", signature, slot: scanned.landedSlot };
     }
     if (!result.complete) return { kind: "wait" };
+    const { read } = result;
     const expected = expectedBalanceAt(ledger.transfers, ledger.moves, read.contextSlot);
     return read.micros === expected ? { kind: "absent" } : { kind: "wait" };
 }

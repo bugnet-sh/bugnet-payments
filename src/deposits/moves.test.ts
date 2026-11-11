@@ -30,8 +30,10 @@ import {
     insertMove,
     lockDeposit,
     setTransferOutcomes,
+    updateDeposit,
 } from "./store.ts";
 import type { DepositRow, MoveRow, NewMove, TransferOutcome, TransferReason } from "./types.ts";
+import { depositViewFrom } from "./view.ts";
 
 const ORDER_A = "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa";
 const ORDER_B = "ord_bbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -499,6 +501,39 @@ describe("returns and closes", () => {
         expect((await moveRow(next.id)).state).toBe("sent");
         expect(alarms("deposit_review")).toHaveLength(1);
     });
+
+    it("a paid transfer whose rest cannot go back still counts", async () => {
+        const { sigs } = await funded([{ micros: 60_000n }]);
+        const crossing = sigs[0]!;
+        await withTx(db.pool, (c) =>
+            setTransferOutcomes(c, ORDER_A, [
+                { signature: crossing, outcome: "paid", reason: "extra", appliedMicros: 50_000 },
+            ]),
+        );
+        await pending(returnTo(10_000, { payer: ownC.address }), [crossing]);
+        expect((await run()).dropped).toBe(1);
+
+        const t = (await ledgerOf()).transfers[0]!;
+        expect(t).toMatchObject({
+            outcome: "review",
+            reason: "return_destination_invalid",
+            appliedMicros: 50_000,
+            moveId: null,
+        });
+        await withTx(db.pool, (c) => updateDeposit(c, ORDER_A, { settledAt: clock }));
+        const paid = { state: "paid" as const, amountMicros: 50_000, expiresAt: EXPIRES };
+        const v = depositViewFrom(paid, (await depositLedger(db.pool, ORDER_A))!, clock, cfg);
+        expect(v).toMatchObject({
+            status: "paid",
+            receivedMicros: 60_000,
+            remainingMicros: 0,
+            extraMicros: 0,
+            reviewMicros: 10_000,
+            reason: "return_destination_invalid",
+            reasonMicros: 10_000,
+        });
+        expect(v.transfers[0]!.outcome).toBe("counted");
+    });
 });
 
 describe("the guard", () => {
@@ -765,6 +800,34 @@ describe("expiry", () => {
         expect(resigned.attempts).toBe(2);
         // The new attempt pins its own expiry, so a proof never reads below its landing
         expect(resigned.expirySeenSlot).toBeNull();
+    });
+
+    it("a proof whose listing spans several ticks goes on where it stopped", async () => {
+        const { sigs } = await funded([{ micros: 7_000n }]);
+        const move = await pending(returnTo(7_000), sigs);
+        await run(deps({ rpc: dropFirst() }));
+        const old = (await moveRow(move.id)).txSignature!;
+        for (let i = 0; i < 3; i++) chain.credit(TOKEN_A, 1n);
+        expireAll();
+
+        const d = deps({ cfg: { ...cfg, scan_page_size: 1, scan_max_pages: 1 } });
+        const mark = chain.calls().length;
+        const ticks: MoveTick[] = [];
+        while (ticks.length < 8 && ticks.at(-1)?.resigned !== 1) ticks.push(await run(d));
+        expect(ticks.map((t) => [t.waitingProof, t.resigned])).toEqual([
+            [1, 0],
+            [1, 0],
+            [1, 0],
+            [0, 1],
+        ]);
+        const resigned = await moveRow(move.id);
+        expect(resigned.previousSignatures).toEqual([old]);
+        expect(resigned.attempts).toBe(2);
+        expect((await ledgerOf()).transfers).toHaveLength(4);
+        // Four pages of one entry and the completeness call, never the top again
+        expect(callsOf("getSignaturesForAddress", mark)).toHaveLength(5);
+        // The proof's one read, then the new attempt's guard read
+        expect(callsOf("getMultipleAccounts", mark)).toHaveLength(2);
     });
 
     it("every sweep signing calls the payments hook", async () => {

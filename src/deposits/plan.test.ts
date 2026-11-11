@@ -924,6 +924,39 @@ describe("planDeposit: moving money", () => {
         expect(p.transfers).toEqual(["A2"]);
     });
 
+    it("only the rest of a paid transfer in review rides to the float", () => {
+        const p = moved(
+            planDeposit(
+                input({
+                    order: { state: "paid" },
+                    deposit: {
+                        state: "draining",
+                        settledAt: at("00:04:50"),
+                        stableSince: ago(3_000),
+                    },
+                    transfers: [
+                        A1({ outcome: "paid", appliedMicros: 30_000 }),
+                        A2({
+                            outcome: "review",
+                            reason: "return_destination_invalid",
+                            appliedMicros: 20_000,
+                        }),
+                    ],
+                    moves: [mv(1, "sweep", "confirmed", { amountMicros: 50_000 })],
+                    read: { micros: 10_000n },
+                }),
+            ),
+        );
+        expect(p.move).toMatchObject({
+            kind: "close",
+            amountMicros: 0,
+            keepMicros: 0,
+            heldMicros: 10_000,
+            closes: true,
+        });
+        expect(p.transfers).toEqual(["A2"]);
+    });
+
     it("dust rides in the closing move", () => {
         const first = expired({
             transfers: [

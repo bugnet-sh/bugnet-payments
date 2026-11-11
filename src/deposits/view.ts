@@ -119,6 +119,10 @@ function facts(order: StatusOrder, l: DepositLedger, now: Date, cfg: StatusCfg):
         };
         let outcome: ViewOutcome;
         let returnSignature: string | null = null;
+        // A paid transfer whose rest could not go back goes to review keeping its applied part
+        // (spec 11.2; 10.9 holds amount minus applied), so it still counts toward the order
+        const applied = t.outcome === "paid" || t.appliedMicros > 0;
+        if (applied) paidMicros += t.amountMicros;
         switch (t.outcome) {
             case "open": {
                 if (t.sourceOwner !== null && onTime(t, order.expiresAt)) {
@@ -131,7 +135,6 @@ function facts(order: StatusOrder, l: DepositLedger, now: Date, cfg: StatusCfg):
                 break;
             }
             case "paid":
-                paidMicros += t.amountMicros;
                 outcome = "counted";
                 if (rest(t) === 0) break;
                 if (reasonOf(t) === "below_minimum") {
@@ -169,7 +172,7 @@ function facts(order: StatusOrder, l: DepositLedger, now: Date, cfg: StatusCfg):
                 break;
             }
         }
-        outcomes.set(t.signature, { outcome, returnSignature });
+        outcomes.set(t.signature, { outcome: applied ? "counted" : outcome, returnSignature });
     }
 
     const settled = deposit.settledAt !== null;
