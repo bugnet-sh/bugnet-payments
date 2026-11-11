@@ -712,7 +712,7 @@ do_rotate_seed() {
         say "finishing the rotation to seed version $target"
     else
         if env_has BUGNET_DEPOSIT_SEED_PREVIOUS; then
-            die "BUGNET_DEPOSIT_SEED_PREVIOUS is set: an earlier rotation is still draining; run --retire-deposit-seed first"
+            die "BUGNET_DEPOSIT_SEED_PREVIOUS is set: an earlier rotation is still draining; run deploy/retire-deposit-seed.sh first"
         fi
         env_has BUGNET_DEPOSIT_SEED || die "$ENV_FILE has no BUGNET_DEPOSIT_SEED; run the install step first"
         target=$((version + 1))

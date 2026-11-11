@@ -581,7 +581,9 @@ describe("vps-install.sh deposits", () => {
 
         r = server.run("do_rotate_seed");
         expect(r.code).toBe(1);
-        expect(r.err).toContain("BUGNET_DEPOSIT_SEED_PREVIOUS is set");
+        expect(r.err).toContain(
+            "BUGNET_DEPOSIT_SEED_PREVIOUS is set: an earlier rotation is still draining; run deploy/retire-deposit-seed.sh first",
+        );
         expect(readFileSync(server.toml, "utf8")).toContain("seed_version = 2\n");
         expect(server.calls().filter((c) => c.includes("rotate-deposit-seed"))).toHaveLength(1);
     });
