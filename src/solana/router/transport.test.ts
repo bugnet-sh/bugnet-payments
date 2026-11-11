@@ -514,22 +514,6 @@ describe("priority and failover", () => {
         expect(t.b.calls).toHaveLength(0);
     });
 
-    it("a send is tried once, on the money lane only", async () => {
-        const t = setup(2);
-        const send = ["AAAA", { encoding: "base64", preflightCommitment: "confirmed" }];
-        t.a.answer(() => netFail());
-        expect(await rejection(call(t.router, "sendTransaction", send))).toBeInstanceOf(TypeError);
-        const refusal = rpcFail(-32002, "Transaction simulation failed", {
-            err: "AlreadyProcessed",
-        });
-        t.a.answer(() => refusal);
-        expect(await call(t.router, "sendTransaction", send)).toBe(refusal);
-        const e = await rejection(call(t.router.background, "sendTransaction", send));
-        expect(reasonOf(e)).toBe("no_endpoint");
-        expect(t.a.calls).toHaveLength(2);
-        expect(t.b.calls).toHaveLength(0);
-    });
-
     it("-32601 turns the method off on that endpoint", async () => {
         const t = setup(2);
         t.a.answer(() => rpcFail(-32601, "Method not found"));

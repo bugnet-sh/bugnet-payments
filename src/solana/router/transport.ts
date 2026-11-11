@@ -11,7 +11,7 @@ import {
 } from "@solana/kit";
 import { hasNull, mergeStatuses, statusesOf, type StatusesAnswer } from "./absence.ts";
 import { CursorBook } from "./affinity.ts";
-import { classifyAnswer, classifyThrown, type Outcome } from "./classify.ts";
+import { classifyAnswer, classifyThrown, mayHaveDelivered, type Outcome } from "./classify.ts";
 import { type Consistency, ConsistencyBook, type DisagreeReason } from "./consistency.ts";
 import { RpcRouterError } from "./errors.ts";
 import { EndpointHealth, type Lane, monthOf } from "./health.ts";
@@ -19,6 +19,7 @@ import { LearnedLimits } from "./limits.ts";
 import { UNKNOWN_METHOD } from "./methods.ts";
 import { contextSlotOf, isObject, readRequest, type RouterRequest, rpcErrorOf } from "./payload.ts";
 import { choose, type EndpointView } from "./select.ts";
+import { copyPayload, isMissingBlockhashSimulation } from "./send.ts";
 import {
     checkRpcList,
     domainOf,
@@ -39,6 +40,8 @@ const ENDPOINT_SCOPE = "*";
 const ABSENCE_ALARM_EVERY_MS = 600_000;
 // Transaction history is not available from this node
 const NO_HISTORY = -32011;
+const ATTEMPT_FAILED = "rpc attempt failed";
+const COPY_FAILED = "rpc send copy failed";
 
 export type RouterAlarm =
     "rpc_endpoint_down" | "rpc_all_endpoints_down" | "rpc_endpoint_lag" | "rpc_absence_unconfirmed";
@@ -177,6 +180,12 @@ interface Run {
     stale: string | null;
     // An endpoint was passed over because it could not prove the page's cursor
     unproven: boolean;
+    // An attempt of this send may have delivered it, so no later refusal is a clean one
+    delivered: boolean;
+    // A simulation that missed the payer's blockhash, returned if no other endpoint answers
+    missed: { answer: unknown } | null;
+    // The warn of a failed attempt
+    readonly failure: string;
 }
 
 // A listing's before cursor (spec 8.5)
@@ -325,7 +334,7 @@ function hasStatus(answer: unknown): boolean {
     return value?.length === 1 && value[0] !== null;
 }
 
-function newRun(): Run {
+function newRun(failure = ATTEMPT_FAILED): Run {
     return {
         tried: new Set(),
         attempts: 0,
@@ -336,6 +345,9 @@ function newRun(): Run {
         thrown: null,
         stale: null,
         unproven: false,
+        delivered: false,
+        missed: null,
+        failure,
     };
 }
 
@@ -405,9 +417,8 @@ class Router {
         if (this.mode === "single") return this.single(config, lane);
         const { payload, signal } = config;
         const req = readRequest(payload) ?? opaqueRequest(payload);
-        // A refusal after a send attempt that may have been delivered must never reach the caller
-        // as a clean one (spec 8.6), so a send gets one attempt here
-        const maxAttempts = req.spec.retry && req.spec.kind !== "send" ? this.s.max_attempts : 1;
+        const maxAttempts = req.spec.retry ? this.s.max_attempts : 1;
+        const send = req.spec.kind === "send";
         const run = newRun();
         const cursor = this.cursorOf(req, payload);
         // The checks keep their own 400s and never end the page's first-attempt cut (spec 7.2)
@@ -423,7 +434,7 @@ class Router {
             }
             if (next.kind === "stop") {
                 // The endpoints left are only busy, and the router does not wait longer
-                if (next.blocked) throw new RpcRouterError("no_endpoint");
+                if (next.blocked) return this.end(run, true);
                 break;
             }
             const { ep } = next;
@@ -449,9 +460,21 @@ class Router {
             run.attempts += 1;
             const timeoutMs = cutMs ?? this.s.attempt_timeout;
             const a = await this.attempt(ep, req, payload, signal, lane, timeoutMs);
-            const step = this.settle(ep, req, a, run, cutMs, timeoutMs, signal);
+            let step = this.settle(ep, req, a, run, cutMs, timeoutMs, signal);
+            if (send) step = this.sendStep(req, a, step, run);
             if (step.kind === "throw") throw step.err;
             if (step.kind === "answer") {
+                // Spec 8.6: one more endpoint is asked, and its answer is returned whatever it says
+                if (
+                    step.ok &&
+                    req.method === "simulateTransaction" &&
+                    run.missed === null &&
+                    isMissingBlockhashSimulation(step.answer)
+                ) {
+                    run.missed = { answer: step.answer };
+                    continue;
+                }
+                if (step.ok && send) this.copySend(ep, payload, run);
                 if (step.ok && req.spec.nullRetry && lacksTransaction(step.answer)) {
                     return this.askAgain(ep, step.answer, req, payload, signal, lane, run);
                 }
@@ -464,9 +487,7 @@ class Router {
                 return step.answer;
             }
         }
-        // An unproven cursor's page could read as "history ended", so it is never run elsewhere
-        if (run.unproven) throw new RpcRouterError("cursor_unverified");
-        return this.fail(run);
+        return this.end(run, false);
     }
 
     snapshot(): RouterSnapshot {
@@ -582,7 +603,7 @@ class Router {
                     ep.health.sample(cutMs);
                     run.cut = { ep, ms: cutMs };
                 }
-                this.failed(ep, req.method, "timeout", thrownError(a.err));
+                this.failed(run, ep, req.method, "timeout", thrownError(a.err));
                 return { kind: "next" };
             }
             const o = classifyThrown(a.err, false, this.deps.now());
@@ -592,7 +613,7 @@ class Router {
                 return { kind: "throw", err: a.err };
             }
             this.react(ep, req, o, a.elapsed, codeOf(error), run);
-            this.failed(ep, req.method, thrownLabel(a.err), error);
+            this.failed(run, ep, req.method, thrownLabel(a.err), error);
             return { kind: "next" };
         }
 
@@ -616,7 +637,7 @@ class Router {
             // R2 treats an answer below the request's own pin as -32016
             if (refused === "pin") this.behind(ep, req);
             run.stale = ep.name;
-            this.failed(ep, req.method, "stale", { err: "RpcRouterError", reason: "stale" });
+            this.failed(run, ep, req.method, "stale", { err: "RpcRouterError", reason: "stale" });
             return { kind: "next" };
         }
         if (o.kind === "return" || o.kind === "refused" || o.kind === "processed") {
@@ -627,15 +648,21 @@ class Router {
             run.errorAnswer = { answer };
             const code = Number.isInteger(error.code) ? { code: error.code } : {};
             this.react(ep, req, o, a.elapsed, code, run);
-            this.failed(ep, req.method, codeLabel(error.code), { err: "SolanaError", ...code });
+            this.failed(run, ep, req.method, codeLabel(error.code), {
+                err: "SolanaError",
+                ...code,
+            });
         } else if (isObject(answer) && "result" in answer) {
             // R2: a context method's result without its slot could skip every slot check
             run.stale = ep.name;
             this.react(ep, req, o, a.elapsed, {}, run);
-            this.failed(ep, req.method, "no_context", { err: "RpcRouterError", reason: "stale" });
+            this.failed(run, ep, req.method, "no_context", {
+                err: "RpcRouterError",
+                reason: "stale",
+            });
         } else {
             this.react(ep, req, o, a.elapsed, {}, run);
-            this.failed(ep, req.method, "invalid", { err: "invalid_answer" });
+            this.failed(run, ep, req.method, "invalid", { err: "invalid_answer" });
         }
         return { kind: "next" };
     }
@@ -696,6 +723,57 @@ class Router {
             case "processed":
                 return;
         }
+    }
+
+    // Spec 8.6 step 3: a refusal or error returns as it is only while no attempt of this send may
+    // have delivered it, because a later one can be caused by that delivery
+    private sendStep(req: RouterRequest, a: Attempt, step: Step, run: Run): Step {
+        const o =
+            a.kind === "thrown"
+                ? classifyThrown(a.err, a.callerAborted, this.deps.now())
+                : classifyAnswer(req.method, a.answer);
+        if (mayHaveDelivered(o)) run.delivered = true;
+        if (step.kind === "next" || (step.kind === "answer" && step.ok)) return step;
+        // AlreadyProcessed: a node already holds the transaction
+        if (o.kind !== "processed" && (o.kind === "aborted" || !run.delivered)) return step;
+        return { kind: "throw", err: new RpcRouterError("send_unconfirmed") };
+    }
+
+    // Spec 8.6 step 4: detached copies to send_fanout endpoints on other domains, never to one
+    // this send already tried
+    private copySend(accepted: Endpoint, payload: unknown, run: Run): void {
+        const fanout = this.list.sendFanout;
+        if (fanout === 0) return;
+        // readRequest read this payload as a send, so it holds its params array
+        const copy = copyPayload(payload as { params: readonly unknown[] });
+        const req = readRequest(copy)!;
+        const domains = new Set([accepted.domain]);
+        const now = this.deps.now();
+        for (const v of choose(req, this.views(req, "money"), { now, lane: "money" })) {
+            if (domains.size > fanout) return;
+            const ep = this.endpoint(v.name);
+            if (run.tried.has(ep.name) || v.breaker !== "closed" || domains.has(ep.domain)) {
+                continue;
+            }
+            domains.add(ep.domain);
+            // A detached copy must never become an unhandled rejection
+            this.copy(ep, req, copy).catch(() => undefined);
+        }
+    }
+
+    // A copy's answer is counted and logged by position, and never reaches the caller
+    private async copy(ep: Endpoint, req: RouterRequest, payload: unknown): Promise<void> {
+        const run = newRun(COPY_FAILED);
+        const timeoutMs = this.s.attempt_timeout;
+        const a = await this.attempt(ep, req, payload, undefined, "money", timeoutMs);
+        const step = this.settle(ep, req, a, run, null, timeoutMs, undefined);
+        if (step.kind === "next" || (step.kind === "answer" && step.ok)) return;
+        // An answer settle would hand a caller, so it gave no warn
+        const outcome =
+            step.kind === "throw"
+                ? thrownLabel(step.err)
+                : codeLabel(rpcErrorOf(step.answer)?.code ?? Number.NaN);
+        this.deps.log.warn(run.failure, { endpoint: ep.name, method: req.method, outcome });
     }
 
     // The getTransaction null path of spec 8.3: one more ask on another domain, a consistent
@@ -877,6 +955,16 @@ class Router {
             this.absenceAlarm = { at: now, count: 0 };
         }
         return new RpcRouterError("absence_unconfirmed", undefined, partial);
+    }
+
+    // A request that ends without an answer to return, after the rules of spec 8.5 and 8.6
+    private end(run: Run, blocked: boolean): unknown {
+        if (run.missed !== null) return run.missed.answer;
+        if (run.delivered) throw new RpcRouterError("send_unconfirmed");
+        if (blocked) throw new RpcRouterError("no_endpoint");
+        // An unproven cursor's page could read as "history ended", so it is never run elsewhere
+        if (run.unproven) throw new RpcRouterError("cursor_unverified");
+        return this.fail(run);
     }
 
     // Spec 7.4: the last JSON-RPC error answer, else a refusal for its slot, else the last
@@ -1084,10 +1172,16 @@ class Router {
         }
     }
 
-    private failed(ep: Endpoint, method: string, outcome: string, error: ErrorSnapshot): void {
+    private failed(
+        run: Run,
+        ep: Endpoint,
+        method: string,
+        outcome: string,
+        error: ErrorSnapshot,
+    ): void {
         this.outcome(ep, method, outcome);
         ep.lastError = { at: this.deps.now(), ...error };
-        this.deps.log.warn("rpc attempt failed", { endpoint: ep.name, method, outcome });
+        this.deps.log.warn(run.failure, { endpoint: ep.name, method, outcome });
     }
 
     // Every real HTTP request counts, per position and lane
