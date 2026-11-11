@@ -49,7 +49,7 @@ import { usdcAta } from "./solana/accounts.ts";
 import { countingRpc, rpcCounter } from "./solana/budget.ts";
 import { loadKeypair } from "./solana/keys.ts";
 import { createRouterRpc, type RoutedRpc, type SolanaRpc } from "./solana/rpc.ts";
-import { type RouterDeps, RpcRouterError } from "./solana/router/index.ts";
+import { type RouterDeps, type RouterTransport, RpcRouterError } from "./solana/router/index.ts";
 import {
     endpointFingerprint,
     historyProbe,
@@ -86,6 +86,8 @@ export interface StartOptions {
     now?: () => Date;
     // Tests map each list position to their own endpoint
     rpcTransportFor?: RouterDeps["transportFor"];
+    // Tests read the router's snapshot, which the service only writes on its tick
+    onRouter?: (router: RouterTransport) => void;
 }
 
 export interface RunningService {
@@ -206,6 +208,7 @@ export async function startService(o: StartOptions): Promise<RunningService> {
                 ...(o.rpcTransportFor === undefined ? {} : { transportFor: o.rpcTransportFor }),
             });
             const router = routed.router;
+            o.onRouter?.(router);
             closers.push(() => router.stop());
             try {
                 // Resolves after the genesis and slot reads; the slower checks finish behind it

@@ -40,7 +40,7 @@ import { create, until } from "./testing/app.ts";
 import { testDb, type TestDb } from "./testing/db.ts";
 import { createFakeRpc, epochAt, type FakeRpcScript } from "./testing/fake-rpc.ts";
 import { testSigner } from "./testing/keys.ts";
-import { MAINNET_GENESIS } from "./solana/router/index.ts";
+import { MAINNET_GENESIS, type RouterTransport } from "./solana/router/index.ts";
 import { fakeEndpoint, netFail, rpcOk, stall } from "./solana/router/testing.ts";
 import { startFakeChain, type FakeChain } from "./testing/fake-chain.ts";
 import { startFakeRouter, type FakeRouter } from "./testing/fake-router.ts";
@@ -1582,6 +1582,11 @@ describe("router wiring", () => {
     });
 
     it("startService starts while an endpoint stalls its history checks", async () => {
+        // An attempt far longer than the start may take, so a start that waited for the stalled
+        // run could not pass
+        const slow = testSettings({
+            solana: { rpc_timeout: "15s", rpc: { attempt_timeout: "5s" } },
+        });
         const live = createDefaultRpcTransport({ url: chain.url });
         const stalling = fakeEndpoint("stalls", (method) => {
             if (method === "getGenesisHash") return rpcOk(MAINNET_GENESIS);
@@ -1597,17 +1602,62 @@ describe("router wiring", () => {
             }
             return stall();
         });
+        let router: RouterTransport | undefined;
         const started = Date.now();
         const s = await startService({
-            settings,
+            settings: slow,
             log: silentLog,
             secrets: listed(["https://a.example/", "https://b.example/"]),
             rpcTransportFor: (name) => (name === "rpc1" ? live : stalling.transport),
+            onRouter: (r) => (router = r),
         });
         try {
-            expect(Date.now() - started).toBeLessThan(
-                2 * settings.solana.rpc.attempt_timeout + 5_000,
-            );
+            expect(Date.now() - started).toBeLessThan(slow.solana.rpc.attempt_timeout / 2);
+            expect((await health(s.internalPort)).status).toBe(200);
+            const history = () => router!.snapshot().endpoints[1]!.checks.history;
+            expect(history()).toBe("unchecked");
+            await until(async () => history() === "error", 10_000);
+        } finally {
+            await s.stop();
+        }
+    });
+
+    it("the watch-only jobs use the background lane", async () => {
+        const live = createDefaultRpcTransport({ url: chain.url });
+        let router: RouterTransport | undefined;
+        const log = memoryLog();
+        const s = await startService({
+            settings: testSettings({
+                alarms: { fee_payer_min_lamports: 2_000_000_000 },
+                jobs: { alarms_every: "50ms", reconcile_every: "50ms" },
+            }),
+            log,
+            secrets: listed(["https://a.example/", "https://b.example/"]),
+            rpcTransportFor: () => live,
+            onRouter: (r) => (router = r),
+        });
+        // The router's own checks count as background too, so only the money lane tells the jobs
+        // apart
+        const lanes = () => {
+            const sum = { money: 0, background: 0 };
+            for (const e of router!.snapshot().endpoints) {
+                sum.money += e.laneRequests.money;
+                sum.background += e.laneRequests.background;
+            }
+            return sum;
+        };
+        const balances = () => chain.calls().filter((c) => c.method === "getBalance").length;
+        try {
+            const before = lanes();
+            const booted = balances();
+            await until(async () => balances() >= booted + 3, 5_000);
+            expect(log.lines.some((l) => l.alarm === "fee_payer_sol_low")).toBe(true);
+            const alarmed = lanes();
+            expect(alarmed.money).toBe(before.money);
+            expect(alarmed.background).toBeGreaterThanOrEqual(before.background + 3);
+
+            await seedSettling();
+            await until(async () => lanes().money >= alarmed.money + 2, 5_000);
         } finally {
             await s.stop();
         }
