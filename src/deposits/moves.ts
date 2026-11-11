@@ -400,9 +400,14 @@ async function dropInvalidReturn(d: MoveDeps, move: MoveRow): Promise<boolean> {
         d.pool,
         async (c) => {
             await lockDeposit(c, move.orderId);
+            // The returned group is the money owed back, as the planner counts it: kept dust
+            // and held review money of the same account only rode along
             const carried = await c.query<{ signature: string; source_token_account: string }>(
                 `select signature, source_token_account from deposit_transfers
-                 where order_id = $1 and move_id = $2 order by slot, seq`,
+                 where order_id = $1 and move_id = $2
+                    and (outcome = 'return'
+                        or (outcome = 'paid' and reason is distinct from 'below_minimum'))
+                 order by slot, seq`,
                 [move.orderId, move.id],
             );
             if (!(await deletePendingMove(c, move.id))) return null;

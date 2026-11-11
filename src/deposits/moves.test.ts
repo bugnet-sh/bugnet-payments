@@ -503,6 +503,36 @@ describe("returns and closes", () => {
         expect(alarms("deposit_review")).toHaveLength(1);
     });
 
+    it("an invalid destination leaves kept money from the same account kept", async () => {
+        const { sigs } = await funded([{ micros: 7_000n }, { micros: 500n }]);
+        const [owed, dust] = sigs as [string, string];
+        await outcome(ORDER_A, [
+            { signature: owed, outcome: "return", reason: "unpaid" },
+            { signature: dust, outcome: "keep", reason: "below_minimum" },
+        ]);
+        await pending(
+            returnTo(7_000, {
+                payer: ownC.address,
+                keepMicros: 500,
+                closes: true,
+                closeTo: feePayer.address,
+            }),
+            [owed, dust],
+        );
+        expect((await run()).dropped).toBe(1);
+        const bySig = new Map((await ledgerOf()).transfers.map((t) => [t.signature, t]));
+        expect(bySig.get(owed)).toMatchObject({
+            outcome: "review",
+            reason: "return_destination_invalid",
+            moveId: null,
+        });
+        expect(bySig.get(dust)).toMatchObject({
+            outcome: "keep",
+            reason: "below_minimum",
+            moveId: null,
+        });
+    });
+
     it("a paid transfer whose rest cannot go back still counts", async () => {
         const { sigs } = await funded([{ micros: 60_000n }]);
         const crossing = sigs[0]!;
