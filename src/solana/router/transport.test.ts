@@ -1465,6 +1465,105 @@ describe("cursor affinity", () => {
         expect(befores(t.c)).toEqual(["s2", "s3"]);
         expect(t.a.calls).toHaveLength(0);
     });
+
+    it("a cursor check and its page stay within the background share", async () => {
+        const t = setup(2);
+        await teach(t, t.b, "rpc2", 10);
+        expect(snap(t.router, "rpc2").limits).toEqual({ "*": 8 });
+        t.a.answer(pages(t, { "": ["s1", "s2", "s3"] }));
+        t.b.answer(pages(t, { s2: ["s3"], s3: ["s4", "s5"] }));
+        await call(t.router, LISTING, [ADDRESS, { limit: 3 }]);
+        await open(t, t.a, "rpc1");
+        t.clock.ms = 11_000;
+        const page = [ADDRESS, { before: "s3", limit: 3 }];
+        const results = await Promise.allSettled(
+            [1, 2, 3, 4].map(() => call(t.router.background, LISTING, page)),
+        );
+        expect(snap(t.router, "rpc2").laneRequests.background).toBeLessThanOrEqual(4);
+        for (const r of results) {
+            if (r.status === "fulfilled") expect(signaturesOf(r.value)).toEqual(["s4", "s5"]);
+            else expect(reasonOf(r.reason)).toBe("no_endpoint");
+        }
+        const before = t.b.calls.length;
+        await call(t.router, "getLatestBlockhash");
+        expect(t.b.calls).toHaveLength(before + 1);
+        expect(t.b.calls.at(-1)!.method).toBe("getLatestBlockhash");
+    });
+
+    it("a page waits for its room after the check", async () => {
+        const t = setup(2);
+        await teach(t, t.b, "rpc2", 10);
+        t.a.answer(pages(t, { "": ["s1", "s2", "s3"] }));
+        t.b.answer(pages(t, { s2: ["s3"], s3: ["s4", "s5"] }));
+        await call(t.router, LISTING, [ADDRESS, { limit: 3 }]);
+        await open(t, t.a, "rpc1");
+        t.clock.ms = 11_000;
+        for (let i = 0; i < 3; i++) await call(t.router.background, "getSlot");
+        t.clock.ms = 20_500;
+        const page = [ADDRESS, { before: "s3", limit: 3 }];
+        expect(signaturesOf(await call(t.router.background, LISTING, page))).toEqual(["s4", "s5"]);
+        expect(t.clock.ms).toBe(21_000);
+        expect(befores(t.b).slice(-2)).toEqual(["s2", "s3"]);
+    });
+
+    it("a status check keeps to its own method's cooldown", async () => {
+        const t = setup(2);
+        await teach(t, t.a, "rpc1", 10);
+        t.clock.ms = 11_000;
+        const status = (): unknown => statusesAnswer(slotAt(t.clock.ms), [S(900n, "finalized")]);
+        let statuses = 0;
+        t.a.answer(
+            pages(
+                t,
+                { zzz: ["s9"] },
+                {
+                    getSignatureStatuses: () =>
+                        ++statuses === 3 ? httpFail(429, { "retry-after": "30" }) : status(),
+                },
+            ),
+        );
+        t.b.answer(pages(t, { zzz: ["s9"] }, { getSignatureStatuses: status }));
+        for (let i = 0; i < 3; i++) await call(t.router, "getSignatureStatuses", [["x"]]);
+        expect(snap(t.router, "rpc1").limits).toEqual({ "*": 8, getSignatureStatuses: 2 });
+        const aCalls = t.a.calls.length;
+        const page = [ADDRESS, { before: "zzz", limit: 3 }];
+
+        expect(signaturesOf(await call(t.router, LISTING, page))).toEqual(["s9"]);
+        expect(t.a.calls).toHaveLength(aCalls);
+        expect(methods(t.b).slice(-2)).toEqual(["getSignatureStatuses", LISTING]);
+
+        const bCalls = t.b.calls.length;
+        const e = await rejection(call(t.router.background, LISTING, page));
+        expect(reasonOf(e)).toBe("no_endpoint");
+        expect(t.a.calls).toHaveLength(aCalls);
+        expect(t.b.calls).toHaveLength(bCalls);
+    });
+
+    it("a served cursor check never strikes a 400 to the page", async () => {
+        const t = setup(2);
+        t.a.answer(pages(t, { "": ["s1", "s2", "s3"] }));
+        await call(t.router, LISTING, [ADDRESS, { limit: 3 }]);
+        const failing = throwing(() => httpFail(400));
+        const refusing =
+            (served: FakeHandler): FakeHandler =>
+            (method, params, p) =>
+                method === LISTING && optionsOf(params).before === "s3"
+                    ? failing.handler(method, params, p)
+                    : served(method, params, p);
+        t.a.answer(refusing(pages(t, {})));
+        t.b.answer(refusing(pages(t, { s2: ["s3"] })));
+        for (let i = 0; i < 5; i++) {
+            const e = await rejection(
+                call(t.router, LISTING, [ADDRESS, { before: "s3", limit: 3 }]),
+            );
+            expect(e).toBe(failing.errors.at(-1));
+        }
+        expect(befores(t.a).slice(1)).toEqual(Array(5).fill("s3"));
+        expect(befores(t.b)).toEqual(Array(5).fill(["s2", "s3"]).flat());
+        expect(snap(t.router, "rpc1").state).toBe("ok");
+        expect(snap(t.router, "rpc2").state).toBe("ok");
+        expect(alarms(t)).toEqual([]);
+    });
 });
 
 describe("secrets", () => {
