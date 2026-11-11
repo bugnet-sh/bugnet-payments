@@ -482,6 +482,33 @@ describe("boot checks", () => {
         expect((await rejection(read)).reason).toBe("absence_unconfirmed");
         expect([asked(t.b), asked(t.c)]).toEqual([before[0], before[1]! + 1]);
     });
+
+    // rpc1 and rpc2 report one node; rpc3 is on its own
+    async function sharing(): Promise<Setup> {
+        const t = routed(3);
+        for (const ep of [t.a, t.b]) {
+            tweak(t, ep, (m) =>
+                m === "getIdentity" ? rpcOk({ identity: "node-shared" }) : undefined,
+            );
+        }
+        await t.router.start({ timers: false });
+        return t;
+    }
+
+    it("a null transaction is asked again of another node, not of the one it shares", async () => {
+        const t = await sharing();
+        tweak(t, t.a, (m) => (m === "getTransaction" ? rpcOk(null) : undefined));
+        expect(await reaches(t, "getTransaction", TRANSACTION)).toEqual(["a", "c"]);
+    });
+
+    it("a send copy never goes to an endpoint that shares the node", async () => {
+        const t = await sharing();
+        const sends = (ep: FakeEndpoint) =>
+            ep.calls.filter((c) => c.method === "sendTransaction").length;
+        await call(t, "sendTransaction", ["AQID", { encoding: "base64" }]);
+        await new Promise((r) => setImmediate(r));
+        expect([t.a, t.b, t.c].map(sends)).toEqual([1, 0, 1]);
+    });
 });
 
 describe("pinned checks", () => {
@@ -661,6 +688,25 @@ describe("history checks", () => {
         expect(historyCalls(t.a)).toBe(atStart);
         expect(snap(t, "rpc1").consistent).toBe("no");
         await tickAt(t, HOUR);
+        expect(snap(t, "rpc1").consistent).toBe("yes");
+    });
+
+    it("a run that finds nothing never clears a no", async () => {
+        const t = routed(2);
+        tweak(t, t.a, (m, _p, n) =>
+            m === "getSignatureStatuses" && n === 1 ? notFound(t) : undefined,
+        );
+        await t.router.start({ timers: false });
+        expect(snap(t, "rpc1").consistent).toBe("no");
+        // Every repeat answers and agrees, but the statuses find nothing
+        tweak(t, t.a, (m) => (m === "getSignatureStatuses" ? notFound(t) : undefined));
+        await tickAt(t, HOUR);
+        expect(snap(t, "rpc1")).toMatchObject({
+            consistent: "no",
+            checks: { history: "missing" },
+        });
+        tweak(t, t.a, () => undefined);
+        await tickAt(t, 2 * HOUR);
         expect(snap(t, "rpc1").consistent).toBe("yes");
     });
 

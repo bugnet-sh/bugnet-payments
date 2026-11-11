@@ -793,6 +793,35 @@ describe("slots and floors", () => {
         expect(reasonOf(e)).toBe("stale");
     });
 
+    it("a slot answer below the request's pin is refused too", async () => {
+        const pin = [{ commitment: "confirmed", minContextSlot: 100n }];
+        const t = setup(2);
+        t.a.answer(
+            chain(t.clock, {
+                getSlot: () => rpcOk(90n),
+                getEpochInfo: () => rpcOk(epochAt(0n, 90n)),
+            }),
+        );
+        t.b.answer(
+            chain(t.clock, {
+                getSlot: () => rpcOk(120n),
+                getEpochInfo: () => rpcOk(epochAt(20n, 120n)),
+            }),
+        );
+        expect(resultOf(await call(t.router, "getSlot", pin))).toBe(120n);
+        expect(resultOf(await call(t.router, "getEpochInfo", pin))).toEqual(epochAt(20n, 120n));
+
+        const single = setup(1);
+        single.a.answer(() => rpcOk(99n));
+        expect(reasonOf(await rejection(call(single.router, "getSlot", pin)))).toBe("stale");
+        // A -32016 is returned unchanged, as a node's own answer
+        const behind = rpcFail(-32016, "Minimum context slot has not been reached", {
+            contextSlot: 99n,
+        });
+        single.a.answer(() => behind);
+        expect(await call(single.router, "getSlot", pin)).toBe(behind);
+    });
+
     it("a pinned read reaches an endpoint probed 50 s ago", async () => {
         const t = setup(2);
         const epoch = await via(t, "rpc2", () =>

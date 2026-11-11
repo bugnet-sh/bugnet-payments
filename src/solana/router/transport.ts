@@ -25,7 +25,7 @@ import { RpcRouterError } from "./errors.ts";
 import { EndpointHealth, type Lane } from "./health.ts";
 import { LearnedLimits } from "./limits.ts";
 import { UNKNOWN_METHOD } from "./methods.ts";
-import { contextSlotOf, isObject, readRequest, type RouterRequest, rpcErrorOf } from "./payload.ts";
+import { isObject, readRequest, type RouterRequest, rpcErrorOf } from "./payload.ts";
 import {
     CHECK_PARTS,
     CHECK_TOTAL_MS,
@@ -890,9 +890,11 @@ class Router {
                 ep.passed.history = false;
             }
         }
-        // A run whose repeats did not all answer decides nothing (spec 8.10)
-        if (c.repeatsAgree !== null) {
-            const before = this.book.state(ep.name);
+        // A run whose repeats did not all answer decides nothing, and a "no" clears only after a
+        // run that found the probe every time (spec 8.10)
+        const before = this.book.state(ep.name);
+        const foundNothing = c.repeatsAgree === true && c.history !== "ok";
+        if (c.repeatsAgree !== null && !(before === "no" && foundNothing)) {
             this.book.checkRun(ep.name, c.repeatsAgree, startedAt);
             if (routed) this.marked(ep.name, before, "check_disagreed");
         }
@@ -1100,11 +1102,13 @@ class Router {
         ep.health.sample(this.deps.now() - started);
         const error = rpcErrorOf(answer);
         ep.counters.outcome(method, error === null ? "ok" : codeLabel(error.code));
-        if (req !== null && req.spec.slot === "context" && req.minContextSlot !== null) {
-            const slot = contextSlotOf(answer);
-            if (slot !== null && slot < req.minContextSlot) {
-                throw new RpcRouterError("stale", ep.name);
-            }
+        const pin = req?.minContextSlot ?? null;
+        // A -32016 is the node's own answer, returned unchanged
+        if (req !== null && pin !== null && error === null) {
+            const below = observationsOf(req, answer).some(
+                (o) => o.slot !== undefined && o.slot < pin,
+            );
+            if (below) throw new RpcRouterError("stale", ep.name);
         }
         return answer;
     }
@@ -1348,8 +1352,9 @@ class Router {
         this.deps.log.warn(run.failure, { endpoint: ep.name, method: req.method, outcome });
     }
 
-    // The getTransaction null path of spec 8.3: one more ask on another domain, a consistent
-    // endpoint while one is eligible, and its answer is returned whatever it holds
+    // The getTransaction null path of spec 8.3: one more ask on another domain, never one that
+    // shares the node (4.3), a consistent endpoint while one is eligible, and its answer is
+    // returned whatever it holds
     private async askAgain(
         first: Endpoint,
         firstAnswer: unknown,
@@ -1361,7 +1366,7 @@ class Router {
     ): Promise<unknown> {
         const now = this.deps.now();
         const others = choose(req, this.views(req, lane), { now, lane }).filter(
-            (v) => !run.tried.has(v.name) && this.endpoint(v.name).domain !== first.domain,
+            (v) => !run.tried.has(v.name) && !this.sameSource(first, this.endpoint(v.name)),
         );
         const view = others.find((v) => v.consistent) ?? others[0];
         if (view === undefined) return firstAnswer;
@@ -1638,7 +1643,8 @@ class Router {
         };
     }
 
-    // "pin" below the request's minContextSlot (R2), "floor" below the freshness floor (R3)
+    // "pin" below the request's minContextSlot (R2), "floor" below the freshness floor (R3). The
+    // pin holds for getSlot and getEpochInfo answers too, which are a slot themselves (spec 15)
     private refusalOf(
         req: RouterRequest,
         answer: unknown,
@@ -1646,7 +1652,7 @@ class Router {
     ): "pin" | "floor" | null {
         for (const o of observationsOf(req, answer)) {
             if (o.slot !== undefined) {
-                const pin = req.spec.slot === "context" ? req.minContextSlot : null;
+                const pin = req.minContextSlot;
                 if (pin !== null && o.slot < pin) return "pin";
                 if (floors.slot !== null && o.slot < floors.slot) return "floor";
             }
