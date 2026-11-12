@@ -26,6 +26,7 @@ import { usdcAta } from "../solana/accounts.ts";
 import { RpcRouterError } from "../solana/router/errors.ts";
 import type { SolanaRpc } from "../solana/rpc.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
+import { seedWriteOffPart } from "../testing/deposits.ts";
 import { createFakeRpc, epochAt } from "../testing/fake-rpc.ts";
 import { type FakeChain, startFakeChain } from "../testing/fake-chain.ts";
 import { type FakeRouter, startFakeRouter } from "../testing/fake-router.ts";
@@ -1131,6 +1132,28 @@ describe("a deposit in review", () => {
         expect(await depositsBusy(db.pool, watch, clock, cfg)).toBe(false);
         await ticks(1, cfg.closed_every);
         expect(reads()).toBeGreaterThanOrEqual(1);
+    });
+});
+
+describe("money a write-off took", () => {
+    it("is owed by the float, so it keeps no deposit busy", async () => {
+        await deposit(ORDER_A, { account: false });
+        await db.pool.query("update orders set state = 'expired' where id = $1", [ORDER_A]);
+        await db.pool.query("update deposits set state = 'draining' where order_id = $1", [
+            ORDER_A,
+        ]);
+        await db.pool.query(
+            `insert into deposit_transfers (order_id, signature, slot, seq, block_time, seen_at,
+                amount_micros, source_token_account, source_owner, outcome, reason)
+             values ($1, 'stolen-from', 100, 0, $2, $2, 5000, $3, $4, 'return', 'unpaid')`,
+            [ORDER_A, PAID_AT, sources.A, owners.A.address],
+        );
+        expect(await depositsBusy(db.pool, watch, clock, cfg)).toBe(true);
+        await seedWriteOffPart(db.pool, ORDER_A, {
+            transferSignature: "stolen-from",
+            micros: 5_000,
+        });
+        expect(await depositsBusy(db.pool, watch, clock, cfg)).toBe(false);
     });
 });
 

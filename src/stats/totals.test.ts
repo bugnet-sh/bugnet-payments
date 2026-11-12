@@ -219,6 +219,14 @@ describe("statsTotals", () => {
                 'sig-held', $2, 'held')`,
             [o.id, at("2030-01-10T03:00:00")],
         );
+        // A written-off part paid from the float is no income either (spec 23.1)
+        await db.pool.query(
+            `insert into refunds (order_id, kind, part, reason, amount_micros, destination, payer,
+                state, tx_signature, confirmed_at, deposit_signature)
+             values ($1, 'deposit', 1, 'deposit_write_off', 4000, 'dest', 'payer', 'confirmed',
+                'sig-stolen', $2, 'held')`,
+            [o.id, at("2030-01-10T03:00:00")],
+        );
         const t = await statsTotals(db.pool, settings, NOW);
         expect(t.totals).toEqual({
             earnedMicros: 30_000,

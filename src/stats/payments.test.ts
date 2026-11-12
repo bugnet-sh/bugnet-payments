@@ -257,6 +257,13 @@ describe("statsPayments", () => {
              values ($1, 'deposit', 0, 'deposit_held', 7000, $2, $3, 'confirmed', $4, $5, 'held')`,
             [order!.id, wallet(), wallet(), signature(), ago(1_000)],
         );
+        await db.pool.query(
+            `insert into refunds (order_id, kind, part, reason, amount_micros, destination, payer,
+                state, tx_signature, confirmed_at, deposit_signature)
+             values ($1, 'deposit', 1, 'deposit_write_off', 4000, $2, $3, 'confirmed', $4, $5,
+                'held')`,
+            [order!.id, wallet(), wallet(), signature(), ago(1_000)],
+        );
         const page = await statsPayments(db.pool, null, NOW);
         // Rows at one time come newest id first
         expect(page.items.filter((i) => i.kind === "refund")).toEqual([
