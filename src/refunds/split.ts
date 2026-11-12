@@ -190,7 +190,8 @@ export async function lockRefund(c: pg.PoolClient, refundId: number): Promise<Re
 }
 
 // Held review money goes back once per transfer (spec 10.9, 17): the deposit lock keeps the next
-// free part free, the transfer lock keeps a command typed twice from inserting twice.
+// free part free, the transfer lock keeps a command typed twice from inserting twice. Money a
+// write-off took from it is paid by its own row (spec 23.1).
 export async function insertDepositRefund(
     c: pg.PoolClient,
     o: { orderId: string; signature: string; destination: string; payer: string; at: Date },
@@ -199,13 +200,17 @@ export async function insertDepositRefund(
     const res = await c.query<{
         amount_micros: string;
         applied_micros: string;
+        lost_micros: string;
         outcome: string;
         refund_id: string | null;
         move_state: string | null;
         closes: boolean | null;
     }>(
         `select t.amount_micros, t.applied_micros, t.outcome, t.refund_id,
-            m.state as move_state, m.closes
+            m.state as move_state, m.closes,
+            coalesce((select sum(p.micros) from deposit_write_off_parts p
+                where p.order_id = t.order_id and p.transfer_signature = t.signature), 0)
+                as lost_micros
          from deposit_transfers t left join deposit_moves m on m.id = t.move_id
          where t.order_id = $1 and t.signature = $2
          for no key update of t`,
@@ -214,7 +219,7 @@ export async function insertDepositRefund(
     const t = res.rows[0];
     if (t === undefined || t.outcome !== "review") return "refused";
     if (t.move_state !== "confirmed" || t.closes !== true) return "refused";
-    const held = Number(t.amount_micros) - Number(t.applied_micros);
+    const held = Number(t.amount_micros) - Number(t.applied_micros) - Number(t.lost_micros);
     if (held <= 0) return "refused";
     if (t.refund_id === null) {
         const next = await c.query<{ part: number }>(

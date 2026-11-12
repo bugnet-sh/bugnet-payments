@@ -385,7 +385,9 @@ async function busyByLedger(pool: pg.Pool, now: Date, cfg: Cfg): Promise<Set<str
                 or exists (select 1 from deposit_transfers t where t.order_id = d.order_id
                     and (t.outcome = 'open'
                         or ((t.outcome = 'return' or (t.outcome = 'paid' and t.reason = 'extra'))
-                            and t.applied_micros < t.amount_micros
+                            and t.applied_micros + coalesce((select sum(p.micros)
+                                from deposit_write_off_parts p where p.order_id = t.order_id
+                                    and p.transfer_signature = t.signature), 0) < t.amount_micros
                             and not exists (select 1 from deposit_moves c
                                 where c.id = t.move_id and c.state = 'confirmed'))))
                 or (d.state = 'open' and o.state = 'unpaid'
@@ -510,7 +512,15 @@ export async function runDepositTick(d: DepositJobDeps): Promise<DepositTick> {
                 const ledger = await depositLedger(d.pool, deposit.orderId);
                 if (ledger === null) continue;
                 noteProgress(m, ledger, c.nowMs);
-                if (needsScan(ledger.deposit, read, ledger.transfers, ledger.moves)) {
+                if (
+                    needsScan(
+                        ledger.deposit,
+                        read,
+                        ledger.transfers,
+                        ledger.moves,
+                        ledger.writeOffs,
+                    )
+                ) {
                     m.scanDue = true;
                     continue;
                 }
@@ -815,7 +825,12 @@ async function planInput(
         order,
         deposit,
         read,
-        expectedMicros: expectedBalanceAt(ledger.transfers, ledger.moves, read.contextSlot),
+        expectedMicros: expectedBalanceAt(
+            ledger.transfers,
+            ledger.moves,
+            ledger.writeOffs,
+            read.contextSlot,
+        ),
         transfers: ledger.transfers,
         moves: ledger.moves,
         holds: ledger.holds,
@@ -860,8 +875,10 @@ async function earlyChecks(
                 !d.bugnetOwners.has(t.sourceOwner),
         );
     const sums = new Map<string, number>();
-    for (const t of open)
-        sums.set(t.sourceOwner!, (sums.get(t.sourceOwner!) ?? 0) + t.amountMicros);
+    for (const t of open) {
+        const left = t.amountMicros - t.lostMicros;
+        sums.set(t.sourceOwner!, (sums.get(t.sourceOwner!) ?? 0) + left);
+    }
     let target: Awaited<ReturnType<typeof targetOf>> | undefined;
     for (const [owner, sum] of sums) {
         if (m.early.has(owner) || sum < cfg.refund_min_micros) continue;
@@ -1113,7 +1130,7 @@ function owesMoney(ledger: Ledger): boolean {
     return ledger.transfers.some(
         (t) =>
             (t.outcome === "return" || (t.outcome === "paid" && t.reason === "extra")) &&
-            t.appliedMicros < t.amountMicros &&
+            t.appliedMicros + t.lostMicros < t.amountMicros &&
             (t.moveId === null || !confirmed.has(t.moveId)),
     );
 }
@@ -1155,7 +1172,8 @@ async function pushHardStops(c: TickContext, watched: readonly DepositRow[]): Pr
         const pushed = c.nowMs + cfg.expire_hard_after;
         if (pushed > expiryDueAt.getTime() + cfg.expire_hard_max) continue;
         const unrecorded =
-            latest.micros - expectedBalanceAt(ledger.transfers, ledger.moves, latest.contextSlot);
+            latest.micros -
+            expectedBalanceAt(ledger.transfers, ledger.moves, ledger.writeOffs, latest.contextSlot);
         const cov = coverage(
             order.amountMicros,
             ledger.transfers,

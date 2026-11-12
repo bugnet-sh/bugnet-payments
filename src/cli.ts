@@ -19,7 +19,15 @@ import type pg from "pg";
 import { isBase64Of32, loadSettings, rpcUrlsOf, secretValues, type Settings } from "./config.ts";
 import { createPool, withTx, type Queryable } from "./db/pool.ts";
 import { DepositKeys, depositKeysFrom } from "./deposits/keys.ts";
-import { type CachedTx, classifyTx, createdBy, fetchTx, TxCache } from "./deposits/scan.ts";
+import {
+    balanceBefore,
+    type CachedTx,
+    classifyTx,
+    createdBy,
+    fetchTx,
+    readDepositBalances,
+    TxCache,
+} from "./deposits/scan.ts";
 import {
     depositLedger,
     findDeposit,
@@ -28,6 +36,13 @@ import {
     updateDeposit,
 } from "./deposits/store.ts";
 import type { DepositRow, NewTransfer, TransferRow } from "./deposits/types.ts";
+import {
+    KEPT_TEXT,
+    recheckReview,
+    type ReviewCheck,
+    type WrittenPart,
+    writeOff,
+} from "./deposits/writeoff.ts";
 import { isRecord } from "./is-record.ts";
 import { isKeysCommand, KEYS_USAGE, runKeys, waitForLanding } from "./keys/commands.ts";
 import { parseEnvText } from "./keys/tool.ts";
@@ -70,7 +85,7 @@ import { signV0Transaction, usdcTransferChecked } from "./solana/transfer.ts";
 import { blockPayTo, readControls, setControls, unblockPayTo } from "./x402/controls.ts";
 import { type AllowanceFunding, createAllowanceFunding } from "./x402/funding.ts";
 import { openIncidents, resolveIncident } from "./x402/incidents.ts";
-import { SERVICE_ID } from "./x402/ids.ts";
+import { bugnetAddresses, SERVICE_ID } from "./x402/ids.ts";
 import { type ResignProof, resignProof } from "./x402/resign.ts";
 import { ledgerCheck } from "./x402/ledger-check.ts";
 import { x402Status } from "./x402/status.ts";
@@ -127,6 +142,8 @@ const USAGE = [
     "                                           return a transfer in review to this account",
     "  deposits return-late <orderId> [--signature SIG]... [--archive FILE|-]",
     "                                           list late credits, or return the named ones",
+    "  deposits write-off <orderId> <signature> record a debit Bugnet did not sign, split it",
+    "                                           onto the senders and pay each known one back",
     "  deposits return-sol <orderId> <to> [--archive FILE|-]",
     "                                           send the deposit address's SOL to <to>",
     "                                           --archive of both: - on the server, FILE",
@@ -294,6 +311,7 @@ const DB_COMMANDS = new Map<string, DbCommand>([
         "deposits return-sol",
         { params: ["orderId", "account"], flags: ["--archive"], run: depositsReturnSol },
     ],
+    ["deposits write-off", { params: ["orderId", "signature"], run: depositsWriteOff }],
 ]);
 
 export async function cliMain(
@@ -1275,6 +1293,7 @@ export function probeFails(
 const SEED = "BUGNET_DEPOSIT_SEED";
 const SEED_PREVIOUS = "BUGNET_DEPOSIT_SEED_PREVIOUS";
 const FEE_PAYER_KEY = "BUGNET_FEE_PAYER_KEY";
+const REFUND_KEY = "BUGNET_REFUND_KEY";
 // Each credit return-late sends back carries this memo with the credit's signature, so a later
 // run sees it was returned
 const LATE_MEMO = "bugnet-late ";
@@ -1304,9 +1323,10 @@ async function moveInFlight(c: Queryable, orderId: string): Promise<boolean> {
 // Review money no deposit refund row is returning: none yet, or one that went manual
 const WAITING = `t.outcome = 'review' and (r.id is null
     or (r.state = 'manual' and r.manual_reason is distinct from 'resolved_by_hand'))`;
-const REST = "t.amount_micros - t.applied_micros";
+const REST = "t.amount_micros - t.applied_micros - w.lost";
 
-// review is review money still in the deposit, held the review money at the refund float
+// review is review money still in the deposit, held the review money at the refund float, lost
+// what written-off debits took (spec 23.1)
 async function depositsList(
     ctx: CliContext,
     io: CliIo,
@@ -1322,6 +1342,7 @@ async function depositsList(
         kept: string;
         review: string;
         held: string;
+        lost: string;
         manual_move: boolean;
     }>(
         `select d.order_id, d.state, d.review_reason,
@@ -1337,10 +1358,14 @@ async function depositsList(
                 and m.state is distinct from 'confirmed'), 0)::text as review,
             coalesce(sum(${REST}) filter (where ${WAITING}
                 and m.state = 'confirmed'), 0)::text as held,
+            coalesce(sum(w.lost), 0)::text as lost,
             exists (select 1 from deposit_moves x
                 where x.order_id = d.order_id and x.state = 'manual') as manual_move
          from deposits d
          left join deposit_transfers t on t.order_id = d.order_id
+         left join lateral (select coalesce(sum(p.micros), 0) as lost
+            from deposit_write_off_parts p
+            where p.order_id = t.order_id and p.transfer_signature = t.signature) w on true
          left join deposit_moves m on m.id = t.move_id
          left join refunds r on r.id = t.refund_id
          where ($1::text is null or d.state = $1) and ($2::int is null or d.key_version = $2)
@@ -1367,6 +1392,7 @@ async function depositsList(
                 `kept=${r.kept}`,
                 `review=${r.review}`,
                 `held=${r.held}`,
+                `lost=${r.lost}`,
                 `reason=${orDash(r.review_reason)}`,
             ].join(" "),
         );
@@ -1402,6 +1428,7 @@ async function depositsShow(
                 `transfer ${t.signature} ${t.amountMicros} ${t.outcome}`,
                 `reason=${orDash(t.reason)}`,
                 `applied=${t.appliedMicros}`,
+                `lost=${t.lostMicros}`,
                 `owner=${orDash(t.sourceOwner)}`,
                 `source=${orDash(t.sourceTokenAccount)}`,
                 `move=${orDash(t.moveId)}`,
@@ -1424,6 +1451,19 @@ async function depositsShow(
                 `reason=${orDash(m.manualReason)}`,
             ].join(" "),
         );
+    }
+    const refundState = new Map(ledger.depositRefunds.map((r) => [r.id, r.state]));
+    for (const w of ledger.writeOffs) {
+        io.out(
+            `write-off ${w.signature} ${w.micros} slot=${w.slot} at=${w.writtenAt.toISOString()}`,
+        );
+    }
+    for (const p of ledger.writeOffParts) {
+        let payout = "pay by hand";
+        if (p.refundId !== null) {
+            payout = `refund=${p.refundId} state=${refundState.get(p.refundId) ?? "-"}`;
+        } else if (p.keptReason !== null) payout = `kept: ${KEPT_TEXT[p.keptReason]}`;
+        io.out(`write-off part ${p.signature} ${p.transferSignature} ${p.micros} ${payout}`);
     }
     for (const h of ledger.holds) {
         const owner = h.owner === "" ? "shared" : h.owner;
@@ -1471,6 +1511,10 @@ async function depositsRetry(
         async (c): Promise<string | number> => {
             const deposit = await lockDeposit(c, orderId);
             if (deposit === null) return noDeposit(orderId);
+            // The scan flags the debit again until it is written off (spec 23.1)
+            if (deposit.reviewReason === "unknown_debit") {
+                return `deposit ${orderId} has an unknown debit; use "pcli deposits write-off ${orderId} <signature>"`;
+            }
             if (await moveInFlight(c, orderId)) return inFlight(orderId);
             const requeued = await c.query(
                 `update deposit_moves set state = 'pending', attempts = 0, manual_reason = null,
@@ -1571,6 +1615,7 @@ async function returnHeld(
     if (await moveInFlight(c, o.orderId)) return { refused: inFlight(o.orderId) };
     const { rows } = await c.query<{
         outcome: string;
+        left: string;
         move_id: string | null;
         move_state: string | null;
         refund_id: string | null;
@@ -1578,7 +1623,10 @@ async function returnHeld(
         refund_reason: string | null;
     }>(
         `select t.outcome, t.move_id, m.state as move_state, t.refund_id,
-            r.state as refund_state, r.manual_reason as refund_reason
+            r.state as refund_state, r.manual_reason as refund_reason,
+            t.amount_micros - t.applied_micros - coalesce((select sum(p.micros)
+                from deposit_write_off_parts p
+                where p.order_id = t.order_id and p.transfer_signature = t.signature), 0) as left
          from deposit_transfers t
          left join deposit_moves m on m.id = t.move_id
          left join refunds r on r.id = t.refund_id
@@ -1588,6 +1636,10 @@ async function returnHeld(
     );
     const t = rows[0];
     if (t?.outcome !== "review") return { refused: `transfer ${o.signature} is not in review` };
+    // A write-off pays the part it took by its own refund row (spec 23.1)
+    if (Number(t.left) <= 0) {
+        return { refused: `a write-off took all of transfer ${o.signature}` };
+    }
     // A failed move carried nothing, so that money is still in the deposit too
     if (t.move_id === null || t.move_state === "failed") {
         // The job never reads a done deposit, so no planner would carry out the return
@@ -1723,6 +1775,22 @@ async function feePayerOf(env: NodeJS.ProcessEnv): Promise<KeyPairSigner> {
     const key = (env[FEE_PAYER_KEY] ?? "").trim();
     if (key === "") throw new Error(`${FEE_PAYER_KEY} must be set`);
     return loadKeypair(key, FEE_PAYER_KEY);
+}
+
+// The fee payer and refund wallet are known by their keys, the others by the config
+async function bugnetOwnersOf(ctx: CliContext): Promise<ReadonlySet<string>> {
+    const refundKey = (ctx.env[REFUND_KEY] ?? "").trim();
+    if (refundKey === "") throw new Error(`${REFUND_KEY} must be set`);
+    const [feePayer, refund] = await Promise.all([
+        feePayerOf(ctx.env),
+        loadKeypair(refundKey, REFUND_KEY),
+    ]);
+    return bugnetAddresses({
+        feePayer: feePayer.address,
+        allowanceWallet: ctx.settings.x402.allowance_wallet,
+        refundWallet: refund.address,
+        recipient: ctx.settings.solana.recipient,
+    }).all;
 }
 
 /**
@@ -2012,6 +2080,251 @@ async function depositsReturnSol(
     );
     io.out(`confirmed ${sent}`);
     io.out(`returned ${lamports} lamports to ${to}`);
+    return 0;
+}
+
+type Ledger = NonNullable<Awaited<ReturnType<typeof depositLedger>>>;
+
+// The ledger's own refusals of spec 23.1, before any RPC call; writeOff makes them again under
+// the locks
+function writeOffRefusal(ledger: Ledger, orderId: string, sig: string): string | null {
+    if (ledger.deposit.state === "done") {
+        return `deposit ${orderId} is done, so the job no longer reads it`;
+    }
+    if (ledger.moves.some((m) => m.state === "signed" || m.state === "sent")) {
+        return `deposit ${orderId} has a move in flight; try again shortly`;
+    }
+    if (ledger.moves.some((m) => m.txSignature === sig || m.previousSignatures.includes(sig))) {
+        return `${sig} is a move of ${orderId}`;
+    }
+    if (ledger.transfers.some((t) => t.signature === sig)) {
+        return `${sig} is a transfer of ${orderId}`;
+    }
+    return null;
+}
+
+// The signatures of the debit's slot that the listing puts before it
+async function olderInSlot(
+    rpc: SolanaRpc,
+    deposit: DepositRow,
+    sig: string,
+    slot: bigint,
+    timeoutMs: number,
+): Promise<Set<string>> {
+    const out = new Set<string>();
+    let before = sig;
+    for (;;) {
+        const page = await rpc
+            .getSignaturesForAddress(address(deposit.tokenAccount), {
+                commitment: "confirmed",
+                limit: LISTING_PAGE,
+                before: toSignature(before),
+            })
+            .send(deadline(timeoutMs));
+        for (const e of page) {
+            if (BigInt(e.slot) < slot) return out;
+            out.add(e.signature);
+        }
+        if (page.length < LISTING_PAGE) return out;
+        before = page.at(-1)!.signature;
+    }
+}
+
+// The ledger just before the debit: what came before it in its slot counts, nothing after
+function ledgerBefore(ledger: Ledger, slot: bigint, older: ReadonlySet<string>): bigint {
+    const first = (s: bigint, sigs: readonly (string | null)[]) =>
+        s < slot || (s === slot && sigs.some((x) => x !== null && older.has(x)));
+    let sum = 0n;
+    for (const t of ledger.transfers)
+        if (first(t.slot, [t.signature])) sum += BigInt(t.amountMicros);
+    for (const m of ledger.moves) {
+        if (
+            m.landedSlot === null ||
+            !first(m.landedSlot, [m.txSignature, ...m.previousSignatures])
+        ) {
+            continue;
+        }
+        sum -= BigInt(m.amountMicros + m.keepMicros + m.heldMicros);
+    }
+    for (const w of ledger.writeOffs) if (first(w.slot, [w.signature])) sum -= BigInt(w.micros);
+    return sum;
+}
+
+// A read at or after every slot the ledger knows, so nothing it recorded is missing from it
+async function freshRead(
+    rpc: SolanaRpc,
+    ledger: Ledger,
+    floor: bigint,
+    timeoutMs: number,
+): Promise<{ micros: bigint; contextSlot: bigint }> {
+    let pin = floor;
+    for (const s of [
+        ledger.deposit.checkedSlot,
+        ...ledger.transfers.map((t) => t.slot),
+        ...ledger.moves.map((m) => m.landedSlot),
+        ...ledger.writeOffs.map((w) => w.slot),
+    ]) {
+        if (s !== null && s > pin) pin = s;
+    }
+    const token = ledger.deposit.tokenAccount;
+    const read = (
+        await readDepositBalances(rpc, [address(token)], { timeoutMs, minContextSlot: pin })
+    ).get(token)!;
+    return { micros: read.micros, contextSlot: read.contextSlot };
+}
+
+function reviewLine(r: ReviewCheck, chainMicros: bigint): string | null {
+    if (r.reviewCleared) return "review cleared";
+    if (r.manualSweep !== null) {
+        return `review back to ${r.review}: sweep ${r.manualSweep} is still manual`;
+    }
+    if (r.review === "unknown_debit") {
+        return `review stays unknown_debit: the chain holds ${chainMicros}, the ledger ${orDash(r.expectedMicros)}`;
+    }
+    if (r.review !== null) return `review stays ${r.review}: a write-off clears only unknown_debit`;
+    return null;
+}
+
+/**
+ * Owner's ruling, spec 23.1: run again for a debit already written off, the command records
+ * nothing and checks the review again, so a credit the scan recorded after the first run no
+ * longer keeps unknown_debit for good.
+ */
+async function recheckWriteOff(
+    ctx: CliContext,
+    io: CliIo,
+    ledger: Ledger,
+    sig: string,
+): Promise<number> {
+    const { orderId } = ledger.deposit;
+    const slot = ledger.writeOffs.find((w) => w.signature === sig)!.slot;
+    const read = await freshRead(await ctx.rpc(), ledger, slot, ctx.settings.solana.rpc_timeout);
+    const result = await withTx(
+        ctx.pool,
+        (c) => recheckReview(c, { orderId, signature: sig, read }),
+        ctx.log,
+    );
+    if ("refused" in result) return fail(io, result.refused);
+    ctx.log.info("deposit write-off review check", {
+        orderId,
+        signature: sig,
+        reviewCleared: result.reviewCleared,
+        review: result.review,
+    });
+    io.out(`deposit ${orderId} already wrote off ${sig}; nothing new recorded`);
+    io.out(reviewLine(result, read.micros) ?? "no review to clear");
+    return 0;
+}
+
+const partLine = (p: WrittenPart): string => {
+    const head = `part ${p.transferSignature} ${p.micros}`;
+    if (p.refundId !== null) return `${head} refund=${p.refundId} to=${p.destination}`;
+    if (p.kept !== null) return `${head} refund=- kept: ${KEPT_TEXT[p.kept]}`;
+    const why = p.unpaid ?? "no known sender";
+    return `${head} refund=- pay by hand: ${why}`;
+};
+
+/**
+ * Spec 23.1: a debit Bugnet did not sign is recorded at its slot and split onto the senders'
+ * transfers; each known sender's part is paid from the refund float. The debit is read from the
+ * chain, and the chain's balance just before it must match the ledger, so no credit the scan has
+ * not recorded yet is left out of the split.
+ */
+async function depositsWriteOff(
+    ctx: CliContext,
+    io: CliIo,
+    [orderId = "", sig = ""]: readonly string[],
+): Promise<number> {
+    const ledger = await depositLedger(ctx.pool, orderId);
+    if (ledger === null) return fail(io, noDeposit(orderId));
+    const written = ledger.writeOffs.some((w) => w.signature === sig);
+    if (written && ledger.deposit.state !== "done") return recheckWriteOff(ctx, io, ledger, sig);
+    const refused = writeOffRefusal(ledger, orderId, sig);
+    if (refused !== null) return fail(io, refused);
+    const bugnetOwners = await bugnetOwnersOf(ctx);
+    const { deposit } = ledger;
+    const rpc = await ctx.rpc();
+    const timeoutMs = ctx.settings.solana.rpc_timeout;
+    const { value } = await rpc
+        .getSignatureStatuses([toSignature(sig)], { searchTransactionHistory: true })
+        .send(deadline(timeoutMs));
+    const status = value[0] ?? null;
+    if (status === null || status.confirmationStatus === "processed") {
+        return fail(io, `transaction ${sig} is not found`);
+    }
+    if (status.err !== null) return fail(io, `transaction ${sig} failed`);
+    const slot = BigInt(status.slot);
+    const tx = await fetchTx(rpc, new TxCache(1), sig, slot, timeoutMs);
+    if (tx === null || tx.noMeta) {
+        return fail(io, `transaction ${sig} is not available yet; try again shortly`);
+    }
+    if (tx.failed) return fail(io, `transaction ${sig} failed`);
+    const item = classifyTx(tx, deposit, ctx.now(), 0);
+    if (item.kind !== "unknown_debit")
+        return fail(io, `${sig} took no money from deposit ${orderId}`);
+
+    const sameSlot =
+        ledger.transfers.some((t) => t.slot === slot) ||
+        ledger.moves.some((m) => m.landedSlot === slot) ||
+        ledger.writeOffs.some((w) => w.slot === slot);
+    const older = sameSlot
+        ? await olderInSlot(rpc, deposit, sig, slot, timeoutMs)
+        : new Set<string>();
+    const held = balanceBefore(tx, deposit);
+    const expected = ledgerBefore(ledger, slot, older);
+    if (held > expected) {
+        return fail(
+            io,
+            `a credit at or before slot ${slot} is not recorded yet; run again after the next scan`,
+        );
+    }
+    if (held < expected) {
+        return fail(io, `the ledger expects ${expected} before ${sig} and the chain held ${held}`);
+    }
+
+    const read = await freshRead(rpc, ledger, slot, timeoutMs);
+    const micros = Number(item.micros);
+    const result = await withTx(
+        ctx.pool,
+        (c) =>
+            writeOff(c, {
+                orderId,
+                signature: sig,
+                slot,
+                micros,
+                olderInSlot: older,
+                refundMinMicros: ctx.settings.deposits.refund_min_micros,
+                bugnetOwners,
+                read,
+                at: ctx.now(),
+                x402: ctx.settings.x402,
+                log: ctx.log,
+            }),
+        ctx.log,
+    );
+    if ("refused" in result) return fail(io, result.refused);
+    ctx.log.info("deposit write-off", {
+        orderId,
+        signature: sig,
+        micros,
+        slot: slot.toString(),
+        parts: result.parts.map((p) => ({
+            transfer: p.transferSignature,
+            micros: p.micros,
+            refundId: p.refundId,
+            joined: p.joined,
+            kept: p.kept,
+        })),
+        expired: result.expired,
+        droppedMoves: result.dropped,
+        reviewCleared: result.reviewCleared,
+        review: result.review,
+    });
+    io.out(`deposit ${orderId} wrote off ${sig} micros=${micros} slot=${slot}`);
+    for (const p of result.parts) io.out(partLine(p));
+    if (result.expired) io.out(`order ${orderId} expired: its payment was written off`);
+    const review = reviewLine(result, read.micros);
+    if (review !== null) io.out(review);
     return 0;
 }
 

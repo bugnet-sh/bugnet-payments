@@ -56,3 +56,54 @@ export async function heldRefundId(
     const id = res.rows[0]?.refund_id ?? null;
     return id === null ? null : Number(id);
 }
+
+// A part of a written-off debit taken from one transfer, and the float payout naming it
+export async function seedWriteOffPart(
+    pool: pg.Pool,
+    orderId: string,
+    o: {
+        transferSignature: string;
+        micros: number;
+        refund?: { amountMicros: number; destination: string; payer: string };
+        signature?: string;
+    },
+): Promise<{ signature: string; refundId: number | null }> {
+    const signature = o.signature ?? randomBytes(32).toString("hex");
+    await pool.query(
+        `insert into deposit_write_offs (order_id, signature, slot, micros, written_at)
+         values ($1, $2, 1001, $3, $4)`,
+        [orderId, signature, o.micros, AT],
+    );
+    let refundId: number | null = null;
+    if (o.refund !== undefined) {
+        const part = await pool.query<{ part: number }>(
+            `select coalesce(max(part) + 1, 0)::int as part from refunds
+             where order_id = $1 and kind = 'deposit'`,
+            [orderId],
+        );
+        const res = await pool.query<{ id: string }>(
+            `insert into refunds (order_id, kind, part, reason, amount_micros, destination, payer,
+                state, from_wallet, deposit_signature, created_at)
+             values ($1, 'deposit', $2, 'deposit_write_off', $3, $4, $5, 'pending', 'refund', $6,
+                $7)
+             returning id`,
+            [
+                orderId,
+                part.rows[0]!.part,
+                o.refund.amountMicros,
+                o.refund.destination,
+                o.refund.payer,
+                o.transferSignature,
+                AT,
+            ],
+        );
+        refundId = Number(res.rows[0]!.id);
+    }
+    await pool.query(
+        `insert into deposit_write_off_parts (order_id, signature, transfer_signature, micros,
+            refund_id)
+         values ($1, $2, $3, $4, $5)`,
+        [orderId, signature, o.transferSignature, o.micros, refundId],
+    );
+    return { signature, refundId };
+}

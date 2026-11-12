@@ -23,9 +23,23 @@ import { isRecord } from "../is-record.ts";
 import type { Log } from "../log.ts";
 import { TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
 import { deadline, type SolanaRpc } from "../solana/rpc.ts";
-import { parseChainTx, type TokenAccountChange, usdcDeltaFor } from "../x402/match.ts";
-import { depositLedger, insertTransfers, lockDeposit, moveCursor, updateDeposit } from "./store.ts";
-import type { DepositRow, MoveRow, MoveState, NewTransfer, TransferRow } from "./types.ts";
+import { parseChainTx, type TokenAccountChange, usdcHeldBy } from "../x402/match.ts";
+import {
+    depositLedger,
+    insertTransfers,
+    lockDeposit,
+    moveCursor,
+    updateDeposit,
+    writeOffsOf,
+} from "./store.ts";
+import type {
+    DepositRow,
+    MoveRow,
+    MoveState,
+    NewTransfer,
+    TransferRow,
+    WriteOffRow,
+} from "./types.ts";
 
 export interface AccountRead {
     exists: boolean;
@@ -128,9 +142,10 @@ export interface CachedTx {
     feePayer: string | null;
     signers: readonly string[];
     tokenAccounts: ReadonlyMap<string, TokenAccountChange>;
-    // For an undecodable answer only: each owner's USDC change, from the meta's token balances,
-    // which name owners but need the message to name accounts
+    // For an undecodable answer only: each owner's USDC change and its USDC before, from the meta's
+    // token balances, which name owners but need the message to name accounts
     ownerDeltas: ReadonlyMap<string, bigint>;
+    ownerBefore: ReadonlyMap<string, bigint>;
     undecodable: boolean;
     // meta null, or no token balance arrays (spec 6.1)
     noMeta: boolean;
@@ -201,7 +216,10 @@ function decodable(raw: Record<string, unknown>): boolean {
     }
 }
 
-function ownerDeltasOf(raw: unknown, meta: Record<string, unknown>): Map<string, bigint> {
+function ownerBalancesOf(
+    raw: unknown,
+    meta: Record<string, unknown>,
+): { deltas: Map<string, bigint>; before: Map<string, bigint> } {
     const owners = new Set<string>();
     for (const list of [meta.preTokenBalances, meta.postTokenBalances] as unknown[][]) {
         for (const b of list) {
@@ -210,12 +228,14 @@ function ownerDeltasOf(raw: unknown, meta: Record<string, unknown>): Map<string,
             }
         }
     }
-    const out = new Map<string, bigint>();
+    const deltas = new Map<string, bigint>();
+    const before = new Map<string, bigint>();
     for (const owner of owners) {
-        const delta = usdcDeltaFor(raw, owner) ?? 0n;
-        if (delta !== 0n) out.set(owner, delta);
+        const held = usdcHeldBy(raw, owner) ?? { pre: 0n, post: 0n };
+        if (held.post !== held.pre) deltas.set(owner, held.post - held.pre);
+        before.set(owner, held.pre);
     }
-    return out;
+    return { deltas, before };
 }
 
 function compact(signature: string, slot: bigint, raw: unknown, blockTime: Date): CachedTx {
@@ -228,6 +248,7 @@ function compact(signature: string, slot: bigint, raw: unknown, blockTime: Date)
         signers: [],
         tokenAccounts: NO_TOKEN_ACCOUNTS,
         ownerDeltas: NO_OWNER_DELTAS,
+        ownerBefore: NO_OWNER_DELTAS,
         undecodable: false,
         noMeta: false,
     };
@@ -241,7 +262,14 @@ function compact(signature: string, slot: bigint, raw: unknown, blockTime: Date)
     }
     const failed = meta.err !== null && meta.err !== undefined;
     if (!decodable(raw)) {
-        return { ...base, failed, undecodable: true, ownerDeltas: ownerDeltasOf(raw, meta) };
+        const owners = ownerBalancesOf(raw, meta);
+        return {
+            ...base,
+            failed,
+            undecodable: true,
+            ownerDeltas: owners.deltas,
+            ownerBefore: owners.before,
+        };
     }
     const tx = parseChainTx(signature, slot, raw, "");
     return {
@@ -356,6 +384,16 @@ export function classifyTx(
     };
 }
 
+// The deposit's USDC just before the transaction, from its meta (spec 23.1)
+export function balanceBefore(
+    tx: CachedTx,
+    deposit: Pick<DepositRow, "tokenAccount" | "address">,
+): bigint {
+    if (tx.noMeta) throw new Error(`transaction ${tx.signature} has no usable meta`);
+    if (tx.undecodable) return tx.ownerBefore.get(deposit.address) ?? 0n;
+    return tx.tokenAccounts.get(deposit.tokenAccount)?.pre ?? 0n;
+}
+
 // The fee payer of the transaction that created the account: no pre entry and a post entry
 export function createdBy(tx: CachedTx, tokenAccount: string): string | null {
     if (tx.failed || tx.noMeta || tx.undecodable) return null;
@@ -365,28 +403,37 @@ export function createdBy(tx: CachedTx, tokenAccount: string): string | null {
 
 const moved = (m: MoveRow): bigint => BigInt(m.amountMicros + m.keepMicros + m.heldMicros);
 
+// A written-off debit leaves the account at its slot, as a landed move does (spec 23.1)
+export type WriteOffs = readonly Pick<WriteOffRow, "slot" | "micros">[];
+
 // (b1 - b0) - recorded transfers in (s0, s1] + (amount + keep + held) of moves landed there
+// + write-offs there
 export function unexplainedIn(
     interval: { from: { slot: bigint; micros: bigint }; to: AccountRead },
     transfers: readonly TransferRow[],
     moves: readonly MoveRow[],
+    writeOffs: WriteOffs,
 ): bigint {
     const inside = (s: bigint) => s > interval.from.slot && s <= interval.to.contextSlot;
     let u = interval.to.micros - interval.from.micros;
     for (const t of transfers) if (inside(t.slot)) u -= BigInt(t.amountMicros);
     for (const m of moves) if (m.landedSlot !== null && inside(m.landedSlot)) u += moved(m);
+    for (const w of writeOffs) if (inside(w.slot)) u += BigInt(w.micros);
     return u;
 }
 
-// Transfers with slot <= S minus (amount + keep + held) of moves with landed_slot <= S
+// Transfers with slot <= S minus (amount + keep + held) of moves with landed_slot <= S and
+// write-offs with slot <= S
 export function expectedBalanceAt(
     transfers: readonly TransferRow[],
     moves: readonly MoveRow[],
+    writeOffs: WriteOffs,
     slot: bigint,
 ): bigint {
     let sum = 0n;
     for (const t of transfers) if (t.slot <= slot) sum += BigInt(t.amountMicros);
     for (const m of moves) if (m.landedSlot !== null && m.landedSlot <= slot) sum -= moved(m);
+    for (const w of writeOffs) if (w.slot <= slot) sum -= BigInt(w.micros);
     return sum;
 }
 
@@ -398,8 +445,11 @@ export function needsScan(
     read: AccountRead,
     transfers: readonly TransferRow[],
     moves: readonly MoveRow[],
+    writeOffs: WriteOffs,
 ): boolean {
-    if (read.micros !== expectedBalanceAt(transfers, moves, read.contextSlot)) return true;
+    if (read.micros !== expectedBalanceAt(transfers, moves, writeOffs, read.contextSlot)) {
+        return true;
+    }
     if (read.micros !== deposit.balanceMicros) return true;
     if (deposit.scanTop !== null) return true;
     if (read.exists && deposit.rentPayer === null) return true;
@@ -526,6 +576,7 @@ interface Step {
     deposit: DepositRow;
     transfers: TransferRow[];
     moves: MoveRow[];
+    writeOffs: readonly WriteOffRow[];
     now: Date;
     fetched: number;
 }
@@ -681,6 +732,7 @@ async function record(s: Step, row: NewTransfer, review: boolean): Promise<void>
         blockedUntil: null,
         moveId: null,
         refundId: null,
+        lostMicros: 0,
     });
     if (review && inserted > 0) {
         s.d.log.alarm("deposit_review", {
@@ -697,15 +749,23 @@ async function apply(s: Step, item: ScanItem): Promise<void> {
         return;
     }
     if (item.kind !== "unknown_debit" || s.m.debitsAlarmed.has(item.signature)) return;
+    // The step's ledger may predate a write-off of this debit that has committed since
+    const flagged = await withTx(s.d.pool, async (c) => {
+        await lockDeposit(c, s.deposit.orderId);
+        const { writeOffs } = await writeOffsOf(c, s.deposit.orderId);
+        if (writeOffs.some((w) => w.signature === item.signature)) {
+            s.writeOffs = writeOffs;
+            return false;
+        }
+        await updateDeposit(c, s.deposit.orderId, { reviewReason: "unknown_debit" });
+        return true;
+    });
+    if (!flagged) return;
     // Only the deposit key can debit the account, so a debit that is not ours means a leak
     s.d.log.alarm("deposit_unknown_debit", {
         orderId: s.deposit.orderId,
         signature: item.signature,
         micros: item.micros.toString(),
-    });
-    await withTx(s.d.pool, async (c) => {
-        await lockDeposit(c, s.deposit.orderId);
-        await updateDeposit(c, s.deposit.orderId, { reviewReason: "unknown_debit" });
     });
     // Spec 17: the operator's review alarm names this reason too
     s.d.log.alarm("deposit_review", {
@@ -728,9 +788,13 @@ async function explain(
     seqs: ReadonlyMap<string, number>,
 ): Promise<"explained" | "waiting" | "bound" | Next> {
     for (;;) {
-        let u = unexplainedIn(iv, s.transfers, s.moves);
+        let u = unexplainedIn(iv, s.transfers, s.moves, s.writeOffs);
         if (u === 0n) return "explained";
-        const recorded = new Set(s.transfers.map((t) => t.signature));
+        // A written-off debit is recorded too, so no scan flags it again (spec 23.1)
+        const recorded = new Set([
+            ...s.transfers.map((t) => t.signature),
+            ...s.writeOffs.map((w) => w.signature),
+        ]);
         const candidates = counted.filter(
             (e) =>
                 e.slot > iv.from.slot &&
@@ -749,7 +813,7 @@ async function explain(
                 continue;
             }
             await apply(s, classifyTx(tx, s.deposit, s.now, seqs.get(e.signature) ?? 0));
-            u = unexplainedIn(iv, s.transfers, s.moves);
+            u = unexplainedIn(iv, s.transfers, s.moves, s.writeOffs);
             if (u === 0n) return "explained";
         }
         if (noMeta.length > 0) {
@@ -875,7 +939,7 @@ async function finish(s: Step, next: Extract<Next, { kind: "end" }>): Promise<Sc
         listing.proof === "held" &&
         !inFlight &&
         through !== null &&
-        through.micros === expectedBalanceAt(s.transfers, s.moves, through.contextSlot)
+        through.micros === expectedBalanceAt(s.transfers, s.moves, s.writeOffs, through.contextSlot)
     ) {
         const cursor = listing.entries.find((e) => e.slot <= through.contextSlot);
         await withTx(d.pool, async (c) => {
@@ -917,7 +981,7 @@ async function finish(s: Step, next: Extract<Next, { kind: "end" }>): Promise<Sc
     if (end !== "pages" && end !== "fetches") m.listing = null;
     m.run = null;
 
-    const expected = expectedBalanceAt(s.transfers, s.moves, read.contextSlot);
+    const expected = expectedBalanceAt(s.transfers, s.moves, s.writeOffs, read.contextSlot);
     return {
         invariant: held ? "held" : read.micros < expected ? "below" : "above",
         complete: end === "done",
@@ -972,6 +1036,7 @@ export async function scanStep(
         deposit: current,
         transfers: [...ledger.transfers],
         moves: [...ledger.moves],
+        writeOffs: ledger.writeOffs,
         now: d.now(),
         fetched: 0,
     };

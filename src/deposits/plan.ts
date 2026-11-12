@@ -155,7 +155,9 @@ export function transferTime(t: Pick<TransferRow, "blockTime">): Date {
     return t.blockTime;
 }
 
-const rest = (t: TransferRow) => t.amountMicros - t.appliedMicros;
+// What a written-off debit took from a transfer is no longer in the account (spec 23.1)
+const rest = (t: TransferRow) => t.amountMicros - t.appliedMicros - t.lostMicros;
+const unlost = (t: TransferRow) => t.amountMicros - t.lostMicros;
 const owned = (t: TransferRow) => t.sourceOwner !== null && t.sourceTokenAccount !== null;
 const late = (c: Ctx, t: TransferRow) => transferTime(t).getTime() > c.deadline;
 const row = (t: TransferRow, outcome: TransferOutcome, reason: TransferReason): Assignment => ({
@@ -199,6 +201,11 @@ function takesMoney(c: Ctx): boolean {
     const { order, deposit } = c.i;
     if (order.state === "unpaid") return c.now < c.deadline;
     return order.state === "settling" && deposit.settledAt === null;
+}
+
+// The write-off of a settling payment's money failed its sweep for good (spec 23.1)
+function writtenOff(c: Ctx): boolean {
+    return c.i.moves.some((m) => m.kind === "sweep" && m.manualReason === "written_off");
 }
 
 function finished(c: Ctx): boolean {
@@ -310,7 +317,7 @@ function failingMoves(c: Ctx): Plan | null {
     const failedSweeps = failed.filter(
         (m) => m.kind === "sweep" && (reset === null || m.createdAt.getTime() > reset),
     ).length;
-    if (!sweepsConfirmed && failedSweeps >= cfg.max_attempts) {
+    if (!sweepsConfirmed && !writtenOff(c) && failedSweeps >= cfg.max_attempts) {
         return { kind: "assign", rows: [], review: "moves_failing" };
     }
     const perDestination = new Map<string, number>();
@@ -343,7 +350,7 @@ function sweepCloses(c: Ctx, amountMicros: number): boolean {
 // Rule 8. Settle and CheckPayer never run again: the payments row follows the new sweep.
 function sweepAgain(c: Ctx): Plan | null {
     const { deposit, moves } = c.i;
-    if (deposit.state !== "settling") return null;
+    if (deposit.state !== "settling" || writtenOff(c)) return null;
     const sweeps = moves.filter((m) => m.kind === "sweep");
     if (sweeps.some((m) => m.state === "confirmed")) return null;
     const latest = sweeps.reduce<MoveRow | undefined>(
@@ -375,7 +382,7 @@ function sharedSet(c: Ctx, heldAlone: ReadonlyMap<string, OwnerHoldReason>): Set
     const sums = new Map<string, number>();
     for (const t of c.open) {
         if (late(c, t) || heldAlone.has(t.sourceOwner!)) continue;
-        sums.set(t.sourceOwner!, (sums.get(t.sourceOwner!) ?? 0) + t.amountMicros);
+        sums.set(t.sourceOwner!, (sums.get(t.sourceOwner!) ?? 0) + unlost(t));
     }
     const set = new Set<string>();
     for (const [owner, sum] of sums) {
@@ -441,7 +448,7 @@ function settleOthers(c: Ctx, cov: Coverage): SettleOther[] {
     };
     for (const signature of cov.notApplied) {
         const t = c.bySignature.get(signature)!;
-        add(t, t.amountMicros);
+        add(t, unlost(t));
     }
     for (const [signature, micros] of cov.extra) add(c.bySignature.get(signature)!, micros);
 

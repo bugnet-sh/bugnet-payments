@@ -336,3 +336,130 @@ describe("migration 00005", () => {
         expect(await count("payment_shares", "order_id = $1", [id])).toBe(2);
     });
 });
+
+describe("migration 00007", () => {
+    const THEFT = "6".repeat(88);
+    const SECOND = "7".repeat(88);
+
+    function writeOff(orderId: string, signature = THEFT, micros = 4_000) {
+        return db.pool.query(
+            `insert into deposit_write_offs (order_id, signature, slot, micros, written_at)
+             values ($1, $2, 200, $3, $4)`,
+            [orderId, signature, micros, CREATED],
+        );
+    }
+
+    function part(
+        orderId: string,
+        transferSignature: string,
+        o: {
+            signature?: string;
+            micros?: number;
+            refundId?: number | null;
+            keptReason?: string | null;
+        } = {},
+    ) {
+        return db.pool.query(
+            `insert into deposit_write_off_parts (order_id, signature, transfer_signature, micros,
+                refund_id, kept_reason)
+             values ($1, $2, $3, $4, $5, $6)`,
+            [
+                orderId,
+                o.signature ?? THEFT,
+                transferSignature,
+                o.micros ?? 4_000,
+                o.refundId ?? null,
+                o.keptReason ?? null,
+            ],
+        );
+    }
+
+    it("a write-off row and its parts", async () => {
+        const id = await freshDeposit();
+        const sig = "8".repeat(88);
+        await transfer(id, sig);
+        expect(await code(writeOff(id, THEFT, 0))).toBe("23514");
+        await writeOff(id);
+        expect(await code(writeOff(id))).toBe("23505");
+        // A part names a write-off and a transfer of the same deposit
+        expect(await code(part(id, sig, { signature: SECOND }))).toBe("23503");
+        expect(await code(part(id, "9".repeat(88)))).toBe("23503");
+        expect(await code(part(id, sig, { micros: 0 }))).toBe("23514");
+        await part(id, sig);
+        expect(await code(part(id, sig))).toBe("23505");
+        expect(await code(writeOff("ord_unknownunknownunknownunk"))).toBe("23503");
+    });
+
+    it("a part Bugnet keeps names why, and a kept part has no refund row", async () => {
+        const id = await freshDeposit();
+        const sigs = ["a", "b", "c", "d"].map((x) => x.repeat(88));
+        for (const sig of sigs) await transfer(id, sig);
+        await writeOff(id);
+        await part(id, sigs[0]!, { keptReason: "bugnet_own" });
+        await part(id, sigs[1]!, { keptReason: "below_refund_min" });
+        expect(await failure(part(id, sigs[2]!, { keptReason: "dust" }))).toEqual({
+            code: "23514",
+            constraint: "deposit_write_off_parts_kept_reason_check",
+        });
+        const r = await db.pool.query<{ id: string }>(
+            `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
+                part, deposit_signature, from_wallet)
+             values ($1, 'deposit', 'deposit_write_off', 1000, 'dest', 'payer', 'pending', 0, $2,
+                'refund')
+             returning id`,
+            [id, sigs[3]],
+        );
+        const refundId = Number(r.rows[0]!.id);
+        expect(await failure(part(id, sigs[3]!, { refundId, keptReason: "bugnet_own" }))).toEqual({
+            code: "23514",
+            constraint: "deposit_write_off_parts_kept_check",
+        });
+        await part(id, sigs[3]!, { refundId });
+    });
+
+    it("one theft transaction gives one row per deposit", async () => {
+        const a = await freshDeposit();
+        const b = await freshDeposit();
+        await writeOff(a, SECOND);
+        await writeOff(b, SECOND);
+        expect(await count("deposit_write_offs", "signature = $1", [SECOND])).toBe(2);
+    });
+
+    it("a deposit refund row returns held money or a written-off part", async () => {
+        const id = await order();
+        await refund(id, depositRefund({ part: 0 }));
+        await refund(id, depositRefund({ part: 1, reason: "deposit_write_off" }));
+        expect(
+            await failure(refund(id, depositRefund({ part: 2, reason: "deposit_write_off" }))),
+        ).toEqual({ code: "23505", constraint: "refunds_deposit_once" });
+        expect(await failure(refund(id, { kind: "full", reason: "deposit_write_off" }))).toEqual({
+            code: "23514",
+            constraint: "refunds_deposit_check",
+        });
+        expect(
+            await failure(
+                refund(
+                    id,
+                    depositRefund({
+                        part: 3,
+                        reason: "deposit_write_off",
+                        fromWallet: "allowance",
+                    }),
+                ),
+            ),
+        ).toEqual({ code: "23514", constraint: "refunds_deposit_check" });
+    });
+
+    it("a written-off payment is archived with its reason", async () => {
+        const id = await order();
+        const archive = (reason: string) =>
+            db.pool.query(
+                `insert into failed_payments (order_id, tx_signature, message_hash, payer,
+                    amount_micros, reason)
+                 values ($1, 'sig', 'hash', 'payer', 50000, $2)`,
+                [id, reason],
+            );
+        await archive("written_off");
+        expect(await code(archive("stolen"))).toBe("23514");
+    });
+});

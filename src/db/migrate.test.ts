@@ -58,28 +58,30 @@ describe("schema", () => {
             const r = await fresh.pool.query(
                 "select version from schema_migrations order by version",
             );
-            // Later migrations may follow 00006; these six come first, in this order
-            expect(r.rows.slice(0, 6)).toEqual([
+            // Later migrations may follow 00007; these seven come first, in this order
+            expect(r.rows.slice(0, 7)).toEqual([
                 { version: "00001_init.sql" },
                 { version: "00002_payment_key.sql" },
                 { version: "00003_x402.sql" },
                 { version: "00004_paid_via.sql" },
                 { version: "00005_deposits.sql" },
                 { version: "00006_rpc.sql" },
+                { version: "00007_deposit_write_offs.sql" },
             ]);
         } finally {
             await fresh.close();
         }
     });
 
-    it("migrations include 00006_rpc.sql", async () => {
+    it("migrations include 00007_deposit_write_offs.sql", async () => {
         const r = await db.pool.query<{ version: string }>(
             "select version from schema_migrations order by version",
         );
         const versions = r.rows.map((row) => row.version);
-        expect(versions.at(-1)).toBe("00006_rpc.sql");
+        expect(versions.at(-1)).toBe("00007_deposit_write_offs.sql");
+        expect(versions.at(-2)).toBe("00006_rpc.sql");
         if ((await readdir("migrations")).includes("00005_deposits.sql")) {
-            expect(versions.at(-2)).toBe("00005_deposits.sql");
+            expect(versions.at(-3)).toBe("00005_deposits.sql");
         }
     });
 

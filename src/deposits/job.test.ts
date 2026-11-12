@@ -1,9 +1,14 @@
 import { randomBytes } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { DurationSchema, TimestampSchema } from "@bufbuild/protobuf/wkt";
 import { type Address, getSignatureFromTransaction, getTransactionDecoder } from "@solana/kit";
 import { getBase58Decoder, getBase64Encoder, type KeyPairSigner } from "@solana/kit";
+import { stringify } from "smol-toml";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { cliMain } from "../cli.ts";
 import { parseSettings, type Settings } from "../config.ts";
 import { withTx } from "../db/pool.ts";
 import { PayerVerdict } from "../gen/bugnet/router/v1/payments_pb.ts";
@@ -15,15 +20,17 @@ import { memoryLog, silentLog } from "../log.ts";
 import { newOrderId } from "../orders/ids.ts";
 import { findOrder, findPaymentByOrder } from "../orders/store.ts";
 import type { OrderRow } from "../orders/types.ts";
+import { type RefundDeps, runRefunds } from "../refunds/executor.ts";
 import { createRouterClient, type RouterClient } from "../router/client.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { RpcRouterError } from "../solana/router/errors.ts";
 import type { SolanaRpc } from "../solana/rpc.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
+import { seedWriteOffPart } from "../testing/deposits.ts";
 import { createFakeRpc, epochAt } from "../testing/fake-rpc.ts";
 import { type FakeChain, startFakeChain } from "../testing/fake-chain.ts";
 import { type FakeRouter, startFakeRouter } from "../testing/fake-router.ts";
-import { testSigner } from "../testing/keys.ts";
+import { testSecret, testSigner } from "../testing/keys.ts";
 import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts";
 import { resetLedger, seedAccount, TEST_HANDLE_SHA256 } from "../testing/x402.ts";
 import { createAllowanceFunding } from "../x402/funding.ts";
@@ -52,6 +59,7 @@ import {
     findDeposit,
     holdsOf,
     rentHolding,
+    sharesOf,
     updateDeposit,
 } from "./store.ts";
 import type { DepositRow, MoveRow, TransferRow } from "./types.ts";
@@ -1127,6 +1135,28 @@ describe("a deposit in review", () => {
     });
 });
 
+describe("money a write-off took", () => {
+    it("is owed by the float, so it keeps no deposit busy", async () => {
+        await deposit(ORDER_A, { account: false });
+        await db.pool.query("update orders set state = 'expired' where id = $1", [ORDER_A]);
+        await db.pool.query("update deposits set state = 'draining' where order_id = $1", [
+            ORDER_A,
+        ]);
+        await db.pool.query(
+            `insert into deposit_transfers (order_id, signature, slot, seq, block_time, seen_at,
+                amount_micros, source_token_account, source_owner, outcome, reason)
+             values ($1, 'stolen-from', 100, 0, $2, $2, 5000, $3, $4, 'return', 'unpaid')`,
+            [ORDER_A, PAID_AT, sources.A, owners.A.address],
+        );
+        expect(await depositsBusy(db.pool, watch, clock, cfg)).toBe(true);
+        await seedWriteOffPart(db.pool, ORDER_A, {
+            transferSignature: "stolen-from",
+            micros: 5_000,
+        });
+        expect(await depositsBusy(db.pool, watch, clock, cfg)).toBe(false);
+    });
+});
+
 describe("early blocked check", () => {
     it("a blocked owner's money is returned when it arrives", async () => {
         await deposit();
@@ -1965,5 +1995,343 @@ describe("flows on FakeChain", () => {
         expect(calls("getSignaturesForAddress")).toBeLessThanOrEqual(2);
         await ticks(1, cfg.closed_every);
         expect(calls("getMultipleAccounts")).toBeGreaterThanOrEqual(1);
+    });
+
+    describe("a write-off (spec 23.1)", () => {
+        let dir: string;
+        let config: string;
+
+        beforeAll(() => {
+            dir = mkdtempSync(join(tmpdir(), "bn-pay-write-off-"));
+            config = join(dir, "test.toml");
+            writeFileSync(
+                config,
+                stringify({ database: { url: db.url }, solana: { recipient: recipient.address } }),
+            );
+        });
+        afterAll(() => {
+            rmSync(dir, { recursive: true, force: true });
+        });
+
+        async function writeOff(signature: string, id = ORDER_A) {
+            const out: string[] = [];
+            const err: string[] = [];
+            // Bugnet's fee payer and refund wallet, whose money the write-off keeps
+            const env = {
+                BUGNET_FEE_PAYER_KEY: testSecret(22, feePayer),
+                BUGNET_REFUND_KEY: testSecret(12, refund),
+            };
+            const code = await cliMain(
+                ["-config", config, "deposits", "write-off", id, signature],
+                env,
+                { out: (x) => out.push(x), err: (x) => err.push(x) },
+                { rpc: chain.rpc, now: () => clock },
+            );
+            return { code, out, err: err.join("\n") };
+        }
+
+        // The refund float pays the written-off parts under its own rules
+        async function payRefunds(): Promise<void> {
+            const refundDeps = (at: Date): RefundDeps => ({
+                pool: db.pool,
+                rpc: chain.rpc,
+                feePayer,
+                refundSigner: refund,
+                allowanceSigner: allowanceWallet,
+                x402,
+                hotTokenAccount: hotAta,
+                cfg: settings.refunds,
+                rpcTimeoutMs: TIMEOUT,
+                log,
+                now: () => at,
+            });
+            await runRefunds(refundDeps(clock), "refund");
+            chain.advance(1);
+            later(30_000);
+            await runRefunds(refundDeps(clock), "refund");
+        }
+
+        const writeOffRows = async () =>
+            (
+                await db.pool.query<{ state: string; amount_micros: string; destination: string }>(
+                    `select state, amount_micros, destination from refunds
+                     where order_id = $1 and reason = 'deposit_write_off' order by part`,
+                    [ORDER_A],
+                )
+            ).rows.map((r) => [r.destination, Number(r.amount_micros), r.state]);
+
+        async function expireAndClose(): Promise<void> {
+            chain.setBlockTime(at("00:16:00").getTime() / 1000);
+            clock = at("00:16:01");
+            await tick();
+            await until(async () => (await orderOf()).state === "expired", 5, 2_000);
+            await until(async () => (await depositOf()).state === "closed", 10, cfg.idle_every);
+        }
+
+        async function toDone(): Promise<void> {
+            const closed = await depositOf();
+            clock = new Date(closed.watchUntil!.getTime() + 1_000);
+            await until(async () => (await depositOf()).state === "done", 3, cfg.closed_every);
+        }
+
+        it("a theft from an open deposit of two senders is written off and every sender made whole", async () => {
+            const dep = await deposit();
+            chain.credit(floatAta, 100_000n);
+            const startA = chain.balance(sources.A);
+            const startB = chain.balance(sources.B);
+            await send("A", 20_000n);
+            await send("B", 15_000n);
+            await ticks(2, 3_000, watching());
+            expect((await ledgerOf()).transfers).toHaveLength(2);
+
+            const stolen = chain.debit(dep.tokenAccount, 25_000n);
+            chain.advance(1);
+            later(cfg.idle_every);
+            await tick();
+            expect((await depositOf()).reviewReason).toBe("unknown_debit");
+            expect(alarms("deposit_unknown_debit")).toHaveLength(1);
+
+            const done = await writeOff(stolen);
+            expect(done.err).not.toContain("error:");
+            expect(done.code).toBe(0);
+            expect(done.out.at(-1)).toBe("review cleared");
+            expect(await writeOffRows()).toEqual([
+                [sources.A, 10_000, "pending"],
+                [sources.B, 15_000, "pending"],
+            ]);
+
+            // A new process reads the deposit from the anchor before the debit, and the debit
+            // is explained: no alarm and no review again
+            watch = createDepositWatch(cfg.viewer_ttl, cfg.busy_every);
+            cache = new TxCache(10_000);
+            later(cfg.idle_every);
+            await tick();
+            await ticks(2, cfg.idle_every);
+            expect(alarms("deposit_unknown_debit")).toHaveLength(1);
+            expect(await depositOf()).toMatchObject({ reviewReason: null, balanceMicros: 10_000n });
+
+            await expireAndClose();
+            const returns = (await movesOf()).filter((m) => m.kind === "return");
+            expect(returns).toEqual([
+                expect.objectContaining({
+                    destination: sources.A,
+                    amountMicros: 10_000,
+                    state: "confirmed",
+                    closes: true,
+                }),
+            ]);
+            expect(chain.accountExists(dep.tokenAccount)).toBe(false);
+
+            await payRefunds();
+            expect(await writeOffRows()).toEqual([
+                [sources.A, 10_000, "confirmed"],
+                [sources.B, 15_000, "confirmed"],
+            ]);
+            expect(chain.balance(sources.A)).toBe(startA);
+            expect(chain.balance(sources.B)).toBe(startB);
+            expect(chain.balance(floatAta)).toBe(75_000n);
+
+            await toDone();
+            const view = await depositView(db.pool, await orderOf(), clock, cfg);
+            expect(view).toMatchObject({ status: "refunded", returnedMicros: 35_000 });
+        });
+
+        it("a theft of a settling payment's money expires the order and returns every sender's money", async () => {
+            const dep = await deposit();
+            chain.credit(floatAta, 100_000n);
+            const startA = chain.balance(sources.A);
+            const startB = chain.balance(sources.B);
+            await send("A", 30_000n);
+            await ticks(1, 3_000, watching());
+            await send("B", 25_000n);
+            // The sweep fails on chain, and before it is signed again a leaked key takes money
+            chain.failNext();
+            await ticks(1, 3_000, watching());
+            expect((await orderOf()).state).toBe("settling");
+            expect((await sharesOf(db.pool, ORDER_A)).map((x) => x.owner)).toEqual([
+                owners.A.address,
+                owners.B.address,
+            ]);
+            const stolen = chain.debit(dep.tokenAccount, 20_000n);
+            chain.advance(1);
+            later(cfg.idle_every);
+            await tick();
+            expect((await depositOf()).reviewReason).toBe("unknown_debit");
+            const sweep = (await movesOf()).find((m) => m.kind === "sweep")!;
+            expect(sweep.state).toBe("failed");
+
+            const done = await writeOff(stolen);
+            expect(done.err).not.toContain("error:");
+            expect(done.code).toBe(0);
+            expect(done.out).toContain(`order ${ORDER_A} expired: its payment was written off`);
+            expect(await orderOf()).toMatchObject({ state: "expired" });
+            expect(await findPaymentByOrder(db.pool, ORDER_A)).toBeNull();
+            const failed = await db.pool.query<{ reason: string; tx_signature: string }>(
+                "select reason, tx_signature from failed_payments where order_id = $1",
+                [ORDER_A],
+            );
+            expect(failed.rows).toEqual([
+                { reason: "written_off", tx_signature: sweep.txSignature },
+            ]);
+            expect(await sharesOf(db.pool, ORDER_A)).toEqual([]);
+            expect(await depositOf()).toMatchObject({
+                state: "draining",
+                settledAt: null,
+                reviewReason: null,
+            });
+            expect((await movesOf()).find((m) => m.id === sweep.id)).toMatchObject({
+                state: "failed",
+                manualReason: "written_off",
+            });
+            expect(
+                (await ledgerOf()).transfers.map((t) => [t.outcome, t.reason, t.appliedMicros]),
+            ).toEqual([
+                ["return", "unpaid", 0],
+                ["return", "unpaid", 0],
+            ]);
+            expect(await writeOffRows()).toEqual([[sources.B, 20_000, "pending"]]);
+
+            await until(async () => (await depositOf()).state === "closed", 10, cfg.idle_every);
+            expect((await movesOf()).filter((m) => m.kind === "sweep")).toHaveLength(1);
+            expect(
+                (await movesOf())
+                    .filter((m) => m.kind === "return")
+                    .map((m) => [m.destination, m.amountMicros, m.state]),
+            ).toEqual([
+                [sources.A, 30_000, "confirmed"],
+                [sources.B, 5_000, "confirmed"],
+            ]);
+            expect((await depositOf()).reviewReason).toBeNull();
+
+            await payRefunds();
+            expect(chain.balance(sources.A)).toBe(startA);
+            expect(chain.balance(sources.B)).toBe(startB);
+            await toDone();
+        });
+
+        it("a write-off made before the scan recorded a later credit clears the review when run again", async () => {
+            const dep = await deposit();
+            chain.credit(floatAta, 100_000n);
+            const startA = chain.balance(sources.A);
+            const startB = chain.balance(sources.B);
+            await send("A", 20_000n);
+            await ticks(2, 3_000, watching());
+            expect((await ledgerOf()).transfers).toHaveLength(1);
+
+            const stolen = chain.debit(dep.tokenAccount, 5_000n);
+            chain.advance(1);
+            later(cfg.idle_every);
+            await tick();
+            expect((await depositOf()).reviewReason).toBe("unknown_debit");
+
+            // B's money lands after the theft, before the scan reads it
+            const b1 = await send("B", 3_000n);
+            const first = await writeOff(stolen);
+            expect(first.err).not.toContain("error:");
+            expect(first.code).toBe(0);
+            expect(first.out.at(-1)).toBe(
+                "review stays unknown_debit: the chain holds 18000, the ledger 15000",
+            );
+            expect(await writeOffRows()).toEqual([[sources.A, 5_000, "pending"]]);
+
+            later(cfg.closed_every);
+            await tick();
+            await until(
+                async () => (await ledgerOf()).transfers.some((t) => t.signature === b1),
+                5,
+                cfg.closed_every,
+            );
+            expect((await depositOf()).reviewReason).toBe("unknown_debit");
+            expect(alarms("deposit_unknown_debit")).toHaveLength(1);
+            const second = await writeOff(stolen);
+            expect(second.err).not.toContain("error:");
+            expect(second.code).toBe(0);
+            expect(second.out).toEqual([
+                `deposit ${ORDER_A} already wrote off ${stolen}; nothing new recorded`,
+                "review cleared",
+            ]);
+            const third = await writeOff(stolen);
+            expect(third.out).toEqual([
+                `deposit ${ORDER_A} already wrote off ${stolen}; nothing new recorded`,
+                "no review to clear",
+            ]);
+            expect(await depositOf()).toMatchObject({ reviewReason: null });
+            expect((await ledgerOf()).writeOffs).toHaveLength(1);
+            expect(await writeOffRows()).toEqual([[sources.A, 5_000, "pending"]]);
+
+            await expireAndClose();
+            expect(
+                (await movesOf())
+                    .filter((m) => m.kind === "return")
+                    .map((m) => [m.destination, m.amountMicros, m.state])
+                    .sort(),
+            ).toEqual(
+                [
+                    [sources.A, 15_000, "confirmed"],
+                    [sources.B, 3_000, "confirmed"],
+                ].sort(),
+            );
+            expect(chain.accountExists(dep.tokenAccount)).toBe(false);
+            await payRefunds();
+            expect(await writeOffRows()).toEqual([[sources.A, 5_000, "confirmed"]]);
+            expect(chain.balance(sources.A)).toBe(startA);
+            expect(chain.balance(sources.B)).toBe(startB);
+            expect(chain.balance(floatAta)).toBe(95_000n);
+
+            await toDone();
+            const view = await depositView(db.pool, await orderOf(), clock, cfg);
+            expect(view).toMatchObject({ status: "refunded", returnedMicros: 23_000 });
+        });
+
+        it("parts Bugnet keeps get no payout and keep no deposit from done", async () => {
+            const dep = await deposit();
+            chain.credit(floatAta, 100_000n);
+            const startA = chain.balance(sources.A);
+            const startB = chain.balance(sources.B);
+            await send("A", 20_000n);
+            const own = await chain.transfer({
+                authority: refund,
+                feePayer: refund,
+                source: floatAta,
+                destination: dep.tokenAccount,
+                micros: 5_000n,
+                memo: `t${++memoSeq}`,
+            });
+            chain.advance(1);
+            const dust = await send("B", 600n);
+            await ticks(2, 3_000, watching());
+            expect((await transferOf(own)).reason).toBe("from_bugnet");
+
+            const stolen = chain.debit(dep.tokenAccount, 10_600n);
+            chain.advance(1);
+            later(cfg.idle_every);
+            await tick();
+            expect((await depositOf()).reviewReason).toBe("unknown_debit");
+
+            const done = await writeOff(stolen);
+            expect(done.err).not.toContain("error:");
+            expect(done.code).toBe(0);
+            expect(done.out).toContain(`part ${own} 5000 refund=- kept: Bugnet's own money`);
+            expect(done.out).toContain(`part ${dust} 600 refund=- kept: below refund_min_micros`);
+            expect(done.out.at(-1)).toBe("review cleared");
+            expect(await writeOffRows()).toEqual([[sources.A, 5_000, "pending"]]);
+
+            await expireAndClose();
+            expect(chain.accountExists(dep.tokenAccount)).toBe(false);
+            await payRefunds();
+            expect(await writeOffRows()).toEqual([[sources.A, 5_000, "confirmed"]]);
+            expect(chain.balance(sources.A)).toBe(startA);
+            expect(chain.balance(sources.B)).toBe(startB - 600n);
+            expect(chain.balance(floatAta)).toBe(90_000n);
+
+            await toDone();
+            const view = await depositView(db.pool, await orderOf(), clock, cfg);
+            expect(view).toMatchObject({
+                status: "refunded",
+                returnedMicros: 20_000,
+                keptMicros: 5_600,
+                reviewMicros: 0,
+            });
+        });
     });
 });

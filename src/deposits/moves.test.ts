@@ -29,6 +29,7 @@ import {
     findDeposit,
     findMove,
     insertMove,
+    insertWriteOff,
     lockDeposit,
     setTransferOutcomes,
     updateDeposit,
@@ -346,7 +347,7 @@ function expireAll() {
 
 const ledgerOf = async (id = ORDER_A) => {
     const l = (await depositLedger(db.pool, id))!;
-    return { transfers: l.transfers, moves: l.moves };
+    return { transfers: l.transfers, moves: l.moves, writeOffs: l.writeOffs };
 };
 
 describe("moveFeeLamports", () => {
@@ -624,6 +625,31 @@ describe("the guard", () => {
         expect(callsOf("sendTransaction", mark)).toHaveLength(0);
         expect((await moveRow(move.id)).state).toBe("pending");
         expect((await depositRow()).reviewReason).toBeNull();
+    });
+
+    it("the guard counts a written-off debit and pins to its slot", async () => {
+        const { dep, sigs } = await funded([{ micros: 7_000n }]);
+        const debit = chain.debit(TOKEN_A, 1_000n);
+        const { value } = await chain.rpc
+            .getSignatureStatuses([debit as never], { searchTransactionHistory: true })
+            .send();
+        const slot = BigInt(value[0]!.slot);
+        chain.advance(3);
+        await withTx(db.pool, (c) =>
+            insertWriteOff(
+                c,
+                { orderId: ORDER_A, signature: debit, slot, micros: 1_000, writtenAt: clock },
+                [{ transferSignature: sigs[0]!, micros: 1_000, refundId: null, keptReason: null }],
+            ),
+        );
+        const move = await pending(returnTo(6_000), sigs);
+        const mark = chain.calls().length;
+        const verdict = await guardRead(deps(), dep, move, await ledgerOf());
+        expect(verdict).toMatchObject({ verdict: "sign", micros: 6_000n });
+        const guard = callsOf("getMultipleAccounts", mark);
+        expect(
+            (guard[0]!.params[1] as { minContextSlot: number }).minContextSlot,
+        ).toBeGreaterThanOrEqual(Number(slot));
     });
 
     it("a closing move is never signed against new money", async () => {

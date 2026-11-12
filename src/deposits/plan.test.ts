@@ -91,6 +91,7 @@ function t(
         blockedUntil: null,
         moveId: null,
         refundId: null,
+        lostMicros: 0,
         ...over,
     };
 }
@@ -1451,5 +1452,94 @@ describe("planDeposit: the account", () => {
 
     it("an account a sender created is ready", () => {
         expect(planDeposit(input({ deposit: { readyAt: null } }))).toEqual({ kind: "ready" });
+    });
+});
+
+describe("planDeposit: written-off money (spec 23.1)", () => {
+    it("a settle applies an open transfer at its amount minus what was taken", () => {
+        const p = settled(
+            planDeposit(
+                input({
+                    transfers: [A1({ lostMicros: 5_000 }), A2()],
+                    read: { micros: 55_000n },
+                }),
+            ),
+        );
+        expect(entries(p.applied)).toEqual({ A1: 25_000, A2: 25_000 });
+        expect(entries(p.extra)).toEqual({ A2: 5_000 });
+        expect(p.others).toEqual([{ signature: "A2", outcome: "paid", reason: "extra" }]);
+    });
+
+    it("a return carries only what is left of each transfer", () => {
+        const i = expired({
+            transfers: [
+                A1({ outcome: "return", reason: "unpaid", lostMicros: 10_000 }),
+                B1({ outcome: "return", reason: "unpaid" }),
+            ],
+            read: { micros: 50_000n },
+        });
+        const first = moved(planDeposit(i));
+        expect(first.move).toMatchObject({ kind: "return", amountMicros: 20_000, closes: false });
+        const second = moved(planDeposit(landed(i, first, 1, 30_000n)));
+        expect(second.move).toMatchObject({
+            kind: "return",
+            destination: "SrcB",
+            amountMicros: 30_000,
+            closes: true,
+        });
+    });
+
+    it("a transfer taken whole is owed nothing, and the account closes", () => {
+        const i = expired({
+            transfers: [
+                A1({ outcome: "return", reason: "unpaid", lostMicros: 30_000 }),
+                U1({ outcome: "review", reason: "unattributed", lostMicros: 2_000 }),
+            ],
+            read: { micros: 5_000n },
+            deposit: { stableSince: ago(CFG.busy_every) },
+        });
+        expect(moved(planDeposit(i)).move).toMatchObject({
+            kind: "close",
+            keepMicros: 0,
+            heldMicros: 5_000,
+        });
+    });
+
+    it("kept dust is what is left of it", () => {
+        const i = expired({
+            transfers: [
+                A1({ outcome: "return", reason: "unpaid" }),
+                C1({ outcome: "keep", reason: "below_minimum", lostMicros: 200 }),
+            ],
+            read: { micros: 30_300n },
+        });
+        expect(moved(planDeposit(i)).move).toMatchObject({
+            amountMicros: 30_000,
+            keepMicros: 300,
+            closes: true,
+        });
+    });
+
+    it("a written-off sweep is never planned again and puts nothing in review", () => {
+        const sweeps = [
+            mv(1, "sweep", "failed", { amountMicros: 50_000 }),
+            mv(2, "sweep", "failed", { amountMicros: 50_000 }),
+            mv(3, "sweep", "failed", { amountMicros: 50_000, manualReason: "written_off" }),
+        ];
+        const transfers = [A1({ outcome: "return", reason: "unpaid", lostMicros: 10_000 })];
+        const drained = planDeposit(
+            expired({ moves: sweeps, transfers, read: { micros: 20_000n } }),
+        );
+        expect(moved(drained).move).toMatchObject({ kind: "return", amountMicros: 20_000 });
+        const settling = planDeposit(
+            input({
+                order: { state: "expired" },
+                deposit: { state: "settling", settledAt: NOW },
+                moves: [sweeps[2]!],
+                transfers,
+                read: { micros: 20_000n },
+            }),
+        );
+        expect(moved(settling).move.kind).toBe("return");
     });
 });

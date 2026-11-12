@@ -718,7 +718,8 @@ allowance wallet, money already swept, or review money already carried to the re
    deposits stay off until `deploy/retire-deposit-seed.sh` can run (at most about 25 h), then
    rotate.
 3. Read every `deposit_unknown_debit` alarm: it fires on any debit of a deposit account that is not
-   one of Payments' own moves.
+   one of Payments' own moves. Write each one off with `deposits write-off <orderId> <signature>`
+   (below), oldest first.
 4. `vps-install.sh --deposits on` (section 8).
 
 **Alarms.**
@@ -736,13 +737,16 @@ allowance wallet, money already swept, or review money already carried to the re
 **Operator commands** (all `pcli`, section 8):
 
 - `deposits list [--state S] [--review] [--version N] [--moving]`: one line per deposit,
-  `<orderId> state=<s> received= returned= kept= review= held= reason=`, amounts in micros.
+  `<orderId> state=<s> received= returned= kept= review= held= lost= reason=`, amounts in micros.
   `review` is review money still in the deposit, `held` is review money carried to the refund
-  float. `--moving` lists only deposits with a move in flight.
-- `deposits show <orderId>`: the deposit, its transfers with owner and source, its moves with
-  their signatures, its holds, and for a shared payment its shares and every refund part.
+  float, `lost` what written-off debits took. `--moving` lists only deposits with a move in
+  flight.
+- `deposits show <orderId>`: the deposit, its transfers with owner, source and `lost=`, its moves
+  with their signatures, its write-offs and their parts with each part's refund row, `kept:` and
+  why, or `pay by hand`, its holds, and for a shared payment its shares and every refund part.
 - `deposits retry <orderId>`: clears the review reason and puts the deposit's manual sweep back to
-  pending; refused while a move is in flight.
+  pending; refused while a move is in flight, and for an `unknown_debit`, which only
+  `deposits write-off` clears.
 - `deposits return-to <orderId> <signature> <tokenAccount> [--signed FILE]`: returns a transfer in
   review (below).
 - `deposits return-late <orderId> [--signature SIG]... [--archive -]`: for a `done` deposit.
@@ -753,6 +757,27 @@ allowance wallet, money already swept, or review money already carried to the re
   before running it again.
 - `deposits return-sol <orderId> <to> [--archive -]`: SOL sent to a deposit address, on
   request.
+- `deposits write-off <orderId> <signature>`: records a debit Payments did not sign (an
+  `unknown_debit`) and splits it onto the senders' transfers: money that was in the account at the
+  debit's slot, unapplied money first and newest transfer first, a settling payment's applied
+  money last. Each part whose sender is known gets a `deposit` refund row from the refund float to
+  that sender's source account; the command prints a part with no known sender as
+  `pay by hand`, and support pays it on a signed claim. A part of Bugnet's own money (kept dust, or
+  a transfer from the fee payer, refund wallet, allowance wallet or recipient, named before the job
+  does) or below `refund_min_micros` gets no row: it is printed as `kept`, stays written off, and
+  the reason is stored with the part. When the debit took a settling payment's
+  applied money, its sweep can never land: the payment is archived as failed, the order expires
+  and every sender's money goes back. It clears the `unknown_debit` review once the ledger matches
+  the chain; the job then returns, closes and finishes the deposit. When a sweep is still manual
+  the review goes back to `move_expired_repeatedly` instead, for `deposits retry`. Any other review
+  reason stays. Run again for a debit already written off, it records nothing and only checks the
+  review again the same way: when it printed `review stays unknown_debit` because a credit that
+  came after the debit was not recorded yet, run it again after the next scan. It refuses, changing
+  nothing, while a move is signed or sent, for a transaction not found, failed, or one of the
+  deposit's own moves or transfers, for one that took nothing from the deposit, and while the
+  chain held more before the debit than the ledger (a credit the scan has not recorded yet: run it
+  again after the next scan) or less (write off the earlier debit first). The payouts obey every refund-float rule: `refunds status` shows a pause,
+  `refunds resume` lifts it.
 - `manual list`, `manual retry`, `manual resolve` and `manual refund` take split refund parts and
   `deposit` refund rows, one line or one id per part.
 

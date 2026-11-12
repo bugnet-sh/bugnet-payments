@@ -53,6 +53,7 @@ import {
     findDeposit,
     holdsOf,
     insertMove,
+    insertWriteOff,
     setTransferOutcomes,
     sharesOf,
     updateDeposit,
@@ -308,7 +309,12 @@ async function planFor(id: string, r: ScanResult): Promise<Plan> {
         order,
         deposit: ledger.deposit,
         read: { ...r.read, invariant: r.invariant },
-        expectedMicros: expectedBalanceAt(ledger.transfers, ledger.moves, r.read.contextSlot),
+        expectedMicros: expectedBalanceAt(
+            ledger.transfers,
+            ledger.moves,
+            ledger.writeOffs,
+            r.read.contextSlot,
+        ),
         transfers: ledger.transfers,
         moves: ledger.moves,
         holds: ledger.holds,
@@ -1034,6 +1040,32 @@ describe("changes under the settle", () => {
         expect((await ledgerOf()).moves).toEqual([]);
         expect(await findPaymentByOrder(db.pool, ORDER_A)).toBeNull();
         expect((await ledgerOf()).transfers[0]!.outcome).toBe("open");
+    });
+
+    it("a write-off under the settle stops it", async () => {
+        await deposit();
+        const sent = await send("A", 50_000n);
+        onCheck = async () => {
+            await withTx(db.pool, (c) =>
+                insertWriteOff(
+                    c,
+                    {
+                        orderId: ORDER_A,
+                        signature: "theft".padEnd(88, "1"),
+                        slot: chain.slot(),
+                        micros: 1_000,
+                        writtenAt: clock,
+                    },
+                    [{ transferSignature: sent, micros: 1_000, refundId: null, keptReason: null }],
+                ),
+            );
+        };
+        const mark = chain.calls().length;
+        expect(await settle()).toBe("changed");
+        expect(callsOf("sendTransaction", mark)).toHaveLength(0);
+        expect((await ledgerOf()).moves).toEqual([]);
+        expect(await findPaymentByOrder(db.pool, ORDER_A)).toBeNull();
+        expect((await findOrder(db.pool, ORDER_A))!.state).toBe("unpaid");
     });
 
     it("a failed sweep is replanned and the payment row follows", async () => {

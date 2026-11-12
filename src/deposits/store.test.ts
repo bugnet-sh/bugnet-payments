@@ -18,6 +18,7 @@ import {
     insertMove,
     insertShares,
     insertTransfers,
+    insertWriteOff,
     lockDeposit,
     meteredLamports,
     moveCursor,
@@ -25,6 +26,7 @@ import {
     putHold,
     setTransferOutcomes,
     sharesOf,
+    transfersChanged,
     unpaidCreateLamports,
     updateDeposit,
     watchedDeposits,
@@ -205,6 +207,7 @@ describe("transfers and the cursor", () => {
                 blockedUntil: null,
                 moveId: null,
                 refundId: null,
+                lostMicros: 0,
             },
         ]);
     });
@@ -522,6 +525,55 @@ describe("depositLedger and depositView", () => {
             ["deposit", "zero"],
         ]);
         expect(await depositLedger(db.pool, "ord_nonexistent")).toBeNull();
+    });
+
+    it("the ledger holds each write-off, its parts and each transfer's lost money", async () => {
+        const { order: o } = await fresh();
+        await tx((c) =>
+            insertTransfers(c, o.id, [
+                transfer("A1", { orderId: o.id, slot: 100n }),
+                transfer("B1", { orderId: o.id, slot: 101n }),
+            ]),
+        );
+        const before = (await depositLedger(db.pool, o.id))!;
+        expect(before.writeOffs).toEqual([]);
+        expect(before.writeOffParts).toEqual([]);
+        await tx((c) =>
+            insertWriteOff(
+                c,
+                { orderId: o.id, signature: "theft2", slot: 140n, micros: 5_000, writtenAt: NOW },
+                [{ transferSignature: "B1", micros: 5_000, refundId: null, keptReason: null }],
+            ),
+        );
+        await tx((c) =>
+            insertWriteOff(
+                c,
+                { orderId: o.id, signature: "theft1", slot: 130n, micros: 12_000, writtenAt: NOW },
+                [
+                    { transferSignature: "B1", micros: 10_000, refundId: null, keptReason: null },
+                    { transferSignature: "A1", micros: 2_000, refundId: null, keptReason: null },
+                ],
+            ),
+        );
+        const ledger = (await depositLedger(db.pool, o.id))!;
+        expect(ledger.writeOffs).toEqual([
+            { orderId: o.id, signature: "theft1", slot: 130n, micros: 12_000, writtenAt: NOW },
+            { orderId: o.id, signature: "theft2", slot: 140n, micros: 5_000, writtenAt: NOW },
+        ]);
+        expect(
+            ledger.writeOffParts.map((p) => [p.signature, p.transferSignature, p.micros]),
+        ).toEqual([
+            ["theft1", "A1", 2_000],
+            ["theft1", "B1", 10_000],
+            ["theft2", "B1", 5_000],
+        ]);
+        expect(ledger.transfers.map((t) => [t.signature, t.lostMicros])).toEqual([
+            ["A1", 2_000],
+            ["B1", 15_000],
+        ]);
+        // A plan read before the write-off is stale
+        expect(await tx((c) => transfersChanged(c, o.id, before.transfers))).toBe(true);
+        expect(await tx((c) => transfersChanged(c, o.id, ledger.transfers))).toBe(false);
     });
 
     it("depositView reads the ledger", async () => {

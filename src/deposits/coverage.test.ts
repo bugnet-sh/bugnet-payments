@@ -33,6 +33,7 @@ function t(
         blockedUntil: null,
         moveId: null,
         refundId: null,
+        lostMicros: 0,
         ...over,
     };
 }
@@ -363,5 +364,48 @@ describe("coverage", () => {
             crossing: null,
             heldCovers: null,
         });
+    });
+});
+
+describe("coverage after a write-off (spec 23.1)", () => {
+    it("an open transfer counts at its amount minus what was taken from it", () => {
+        const c = coverage(
+            PRICE,
+            [t("A1", "OwnA", 30_000, 100, { lostMicros: 5_000 }), t("A2", "OwnA", 30_000, 101)],
+            EXPIRES,
+            NONE,
+            CFG,
+        );
+        expect(c.mode).toBe("single");
+        expect(entries(c.applied)).toEqual({ A1: 25_000, A2: 25_000 });
+        expect(entries(c.extra)).toEqual({ A2: 5_000 });
+        expect(c.countedMicros).toBe(55_000);
+    });
+
+    it("money that was taken never reaches the price", () => {
+        const c = coverage(
+            PRICE,
+            [t("A1", "OwnA", 50_000, 100, { lostMicros: 1 })],
+            EXPIRES,
+            NONE,
+            CFG,
+        );
+        expect(c.mode).toBe("short");
+        expect(c.largestMicros).toBe(49_999);
+        expect(c.countedMicros).toBe(49_999);
+    });
+
+    it("a transfer taken whole counts for nothing", () => {
+        const c = coverage(
+            PRICE,
+            [t("A1", "OwnA", 30_000, 100, { lostMicros: 30_000 }), t("B1", "OwnB", 50_000, 101)],
+            EXPIRES,
+            NONE,
+            CFG,
+        );
+        expect(c.mode).toBe("single");
+        expect(owners(c)).toEqual(["OwnB"]);
+        expect(c.notApplied).toEqual([]);
+        expect(c.largestOwner).toBe("OwnB");
     });
 });
