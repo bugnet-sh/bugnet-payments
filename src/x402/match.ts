@@ -14,7 +14,7 @@ import type { Settings } from "../config.ts";
 import { withTx, type Queryable } from "../db/pool.ts";
 import { isRecord } from "../is-record.ts";
 import type { Log } from "../log.ts";
-import { lockPayment, setPaymentLandedSlot } from "../orders/store.ts";
+import { lockOrder, lockPayment, setPaymentLandedSlot } from "../orders/store.ts";
 import type { X402ResolvedInput } from "../router/client.ts";
 import { confirmHotRefund } from "../refunds/hot.ts";
 import { TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
@@ -34,6 +34,13 @@ type TokenInstructionName =
     | "FreezeAccount"
     | "other";
 
+// pre is null for an account created in the transaction, post for one closed in it
+export interface TokenAccountChange {
+    owner: string | null;
+    pre: bigint | null;
+    post: bigint | null;
+}
+
 export interface ChainTx {
     signature: string;
     slot: bigint;
@@ -43,6 +50,9 @@ export interface ChainTx {
     messageHash: string;
     tokenDeltas: ReadonlyMap<string, bigint>;
     tokenInstructions: readonly { name: TokenInstructionName; writable: readonly string[] }[];
+    feePayer: string;
+    signers: readonly string[];
+    tokenAccounts: ReadonlyMap<string, TokenAccountChange>;
 }
 
 const TOKEN_INSTRUCTION_NAMES: Readonly<Record<number, TokenInstructionName>> = {
@@ -57,6 +67,8 @@ const TOKEN_INSTRUCTION_NAMES: Readonly<Record<number, TokenInstructionName>> = 
 interface RawBalance {
     accountIndex: number;
     mint: string;
+    owner?: string;
+    programId?: string;
     uiTokenAmount: { amount: string };
 }
 
@@ -73,6 +85,42 @@ function usdcBalances(list: unknown): Map<number, bigint> {
         if (b.mint === USDC_MINT) out.set(Number(b.accountIndex), BigInt(b.uiTokenAmount.amount));
     }
     return out;
+}
+
+// USDC under the Token program only. An entry without programId comes from a node that predates
+// the field, and the USDC mint is a Token program mint.
+function usdcEntries(list: unknown): Map<number, { owner: string | null; micros: bigint }> {
+    const out = new Map<number, { owner: string | null; micros: bigint }>();
+    if (!Array.isArray(list)) return out;
+    for (const b of list as RawBalance[]) {
+        if (b.mint !== USDC_MINT) continue;
+        if (b.programId !== undefined && b.programId !== TOKEN_PROGRAM) continue;
+        out.set(Number(b.accountIndex), {
+            owner: b.owner ?? null,
+            micros: BigInt(b.uiTokenAmount.amount),
+        });
+    }
+    return out;
+}
+
+// An owner changed inside the transaction names nobody, so its money is attributed to neither
+function ownerOf(pre: string | null = null, post: string | null = null): string | null {
+    if (pre !== null && post !== null && pre !== post) return null;
+    return post ?? pre;
+}
+
+// For an answer whose message cannot be decoded: the meta's token balances alone. Null when the
+// answer has no meta or no token balance lists.
+export function usdcDeltaFor(raw: unknown, owner: string): bigint | null {
+    if (!isRecord(raw) || !isRecord(raw.meta)) return null;
+    const { preTokenBalances, postTokenBalances } = raw.meta;
+    if (!Array.isArray(preTokenBalances) || !Array.isArray(postTokenBalances)) return null;
+    const held = (list: unknown[]): bigint => {
+        let sum = 0n;
+        for (const e of usdcEntries(list).values()) if (e.owner === owner) sum += e.micros;
+        return sum;
+    };
+    return held(postTokenBalances) - held(preTokenBalances);
 }
 
 // getTransaction with encoding base64, so meta carries the token balances and inner instructions
@@ -130,6 +178,21 @@ export function parseChainTx(
         tokenDeltas.set(account, (post.get(index) ?? 0n) - (pre.get(index) ?? 0n));
     }
 
+    const preEntries = usdcEntries(meta.preTokenBalances);
+    const postEntries = usdcEntries(meta.postTokenBalances);
+    const tokenAccounts = new Map<string, TokenAccountChange>();
+    for (const index of new Set([...preEntries.keys(), ...postEntries.keys()])) {
+        const account = accounts[index];
+        if (account === undefined) continue;
+        const before = preEntries.get(index);
+        const after = postEntries.get(index);
+        tokenAccounts.set(account, {
+            owner: ownerOf(before?.owner, after?.owner),
+            pre: before?.micros ?? null,
+            post: after?.micros ?? null,
+        });
+    }
+
     const tokenInstructions: { name: TokenInstructionName; writable: string[] }[] = [];
     const add = (programIndex: number, indices: readonly number[], data: Uint8Array) => {
         if (accounts[programIndex] !== TOKEN_PROGRAM) return;
@@ -162,6 +225,9 @@ export function parseChainTx(
         messageHash: transactionMessageHash(tx),
         tokenDeltas,
         tokenInstructions,
+        feePayer: statics[0]!,
+        signers: statics.slice(0, header.numSignerAccounts),
+        tokenAccounts,
     };
 }
 
@@ -182,6 +248,8 @@ interface Matched {
     id: string | null;
     incidents: IncidentFact[];
     alarms?: Record<string, unknown>[];
+    // deposit_review alarms, fired after commit like the inflow alarms
+    reviews?: Record<string, unknown>[];
 }
 
 const sha256 = (s: string): Buffer =>
@@ -340,12 +408,36 @@ async function matchOrder(c: pg.PoolClient, tx: ChainTx): Promise<Matched | null
         [tx.signatures],
     );
     const orderId = found.rows[0]?.order_id;
-    if (orderId === undefined) return null;
+    if (orderId === undefined) return await matchEarlierSweep(c, tx);
     if (!tx.failed) {
         await lockPayment(c, orderId);
         await setPaymentLandedSlot(c, orderId, tx.slot);
     }
     return { kind: "order", id: orderId, incidents: [] };
+}
+
+// The re-sign proof (spec 11.2) should make this impossible: a deposit sweep's earlier attempt
+// landed, so the deposit may have paid twice and an operator must look (spec 10.7)
+async function matchEarlierSweep(c: pg.PoolClient, tx: ChainTx): Promise<Matched | null> {
+    const found = await c.query<{ order_id: string }>(
+        `select order_id from deposit_moves
+         where kind = 'sweep' and previous_signatures && $1::text[]
+         order by id limit 1`,
+        [tx.signatures],
+    );
+    const orderId = found.rows[0]?.order_id;
+    if (orderId === undefined) return null;
+    const matched: Matched = { kind: "order", id: orderId, incidents: [] };
+    if (tx.failed) return matched;
+    await lockPayment(c, orderId);
+    await lockOrder(c, orderId);
+    await c.query("update deposits set review_reason = 'double_sweep' where order_id = $1", [
+        orderId,
+    ]);
+    return {
+        ...matched,
+        reviews: [{ orderId, signature: tx.signature, reason: "double_sweep" }],
+    };
 }
 
 async function matchLateOrder(c: pg.PoolClient, tx: ChainTx): Promise<Matched | null> {
@@ -508,6 +600,9 @@ export async function storeAndMatch(
     for (const incident of m.incidents) await recordIncident(c, incident, d.log, d.now());
     for (const fields of m.alarms ?? []) {
         afterCommit.push(() => d.log.alarm("inflow_mismatch", fields));
+    }
+    for (const fields of m.reviews ?? []) {
+        afterCommit.push(() => d.log.alarm("deposit_review", fields));
     }
     return m.kind;
 }

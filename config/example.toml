@@ -65,6 +65,10 @@ min_idempotency_key_length = 16
 [limits]
 public_per_ip_per_minute = 60
 status_per_ip_per_minute = 240          # GET /o/{id}/status only; it makes no RPC call
+balance_per_ip_per_minute = 20       # GET /o/{id}/balance, on top of public_per_ip_per_minute
+balance_rpc_per_minute = 30          # RPC reads of the balance route, process-wide
+report_per_ip_per_minute = 10        # POST /o/{id}/report
+ipv6_block_multiple = 4              # a /48 gets this many times a /64's per-IP limits
 
 [router]
 url = "http://127.0.0.1:8080"
@@ -161,3 +165,39 @@ events_batch = 50
 events_max_backoff = "5m"
 events_stuck_alarm_after = "10m"
 cert_expiry_alarm_before = "720h"         # 30 days; the duration grammar has no d
+
+[deposits]
+enabled = true                       # offer an address on new pages; existing deposits finish either way
+seed_version = 1                     # the version of BUGNET_DEPOSIT_SEED (rotation, 4.3)
+busy_every = "2s"                    # while a page watches or money moves
+idle_every = "20s"
+closed_every = "120s"                # late-money reads of closed deposits
+watch_after_close = "24h"            # D3
+settle_grace = "60s"                 # after the deadline, time for a last transfer to show up
+expire_hard_after = "5m"             # past the grace, an unpaid order expires whatever its deposit's state
+expire_hard_max = "30m"              # the hard stop waits at most this long for a scan that is catching up
+viewer_ttl = "30s"
+max_open = 500                       # open and settling deposits holding Bugnet-paid rent (about 1.02 SOL, returned)
+rented_per_ip = 1                    # of those, per IPv4 address or IPv6 /64
+rented_per_block = 2                 # of those, per IPv6 /48
+unpaid_create_lamports_per_hour = 1000000   # fees of created accounts that saw no money (5)
+refund_min_micros = 1000             # D1: smaller leftovers, review money and split parts are kept or merged
+max_late_returns = 2                 # automatic late returns per deposit, then review
+free_moves_lamports_per_hour = 2000000   # fees of metered moves and of every failed move (11.5)
+returns_per_owner_per_hour = 6       # metered returns to one sending owner
+payer_recheck_every = "10s"          # CheckPayer again while a hold lasts
+max_split_owners = 4                 # D5: owners of at least refund_min_micros that may share a payment
+compute_unit_limit = 40000
+compute_unit_price_micro_lamports = 10000
+max_attempts = 3                     # signings per move, failed sweeps, failed returns per destination, failed creates
+close_retry_after = ["2m", "10m", "1h"]  # after a failed separate close; the last repeats until watch_until
+scan_page_size = 1000                # getSignaturesForAddress page
+scan_max_pages = 10                  # listing pages per deposit per tick
+scan_max_transactions = 200          # getTransaction calls per deposit per tick
+scan_time_box = "1500ms"             # scans stop for this tick after this long (6.4)
+move_check_after = "2s"
+resend_after = "10s"
+index_lag_alarm_after = "30s"
+rpc_calls_per_second = 3             # the job's own cap, at most 5 (6.5, R7)
+rpc_calls_per_day = 30000            # moves excluded; past 80 % and 100 % the job falls back (6.4)
+rpc_calls_per_hour_alarm = 6000      # an anomaly alarm, not a plan limit

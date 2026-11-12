@@ -19,14 +19,26 @@ import { testSigner } from "../testing/keys.ts";
 import { buildPaymentTransaction } from "../x402/build.ts";
 import { requirementsFor } from "../x402/challenge.ts";
 import {
-    pageStep,
+    BUILD_FAILED,
     payWithWallet,
-    stateStep,
-    walletError,
-    walletErrorStep,
+    readBalance,
+    reportError,
+    shortReport,
+    WalletError,
     type WalletPort,
     watchOrder,
 } from "./flow.ts";
+import { pageStep as messageStep, stateStep as messageState } from "./messages.ts";
+
+const CTX = {
+    amountMicros: 50_000,
+    deadline: "14:05",
+    refundMinMicros: 1_000,
+    orderId: "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+    wallet: "Phantom",
+};
+const pageStep = (r: Parameters<typeof messageStep>[0]) => messageStep(r, CTX);
+const stateStep = (s: Parameters<typeof messageState>[0]) => messageState(s, CTX);
 
 const id = "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa";
 const orderUrl = `https://pay.bugnet.sh/o/${id}`;
@@ -157,13 +169,13 @@ describe("payWithWallet", () => {
         ]);
     });
 
-    it("names itself with Bugnet-Client: checkout on the payment request only", async () => {
+    it("names itself with Bugnet-Client: checkout on the payment request and the status polls", async () => {
         const { clients, w, f, sleep } = harness({
             submit: () => json(202, { state: "settling" }),
             statuses: [() => json(200, { state: "paid" })],
         });
         expect(await payWithWallet({ fetch: f, wallet: w, orderUrl, sleep })).toBe("paid");
-        expect(clients).toEqual(["order:null", "order:checkout", "status:null"]);
+        expect(clients).toEqual(["order:null", "order:checkout", "status:checkout"]);
     });
 
     it("asks the wallet to sign the payment built from the refetched challenge", async () => {
@@ -250,9 +262,9 @@ describe("payWithWallet", () => {
             submit: () => json(202, { state: "settling", orderId: id }),
             statuses: [() => json(200, { orderId: id, state: "unpaid" })],
         });
-        expect(await payWithWallet({ fetch: f, wallet: w, orderUrl, sleep })).toEqual({
-            refused: "order_unpaid",
-        });
+        expect(await payWithWallet({ fetch: f, wallet: w, orderUrl, sleep })).toBe(
+            "unpaid_after_submit",
+        );
     });
 
     it("answers network_busy without hints and never asks the wallet to sign", async () => {
@@ -378,10 +390,7 @@ describe("payWithWallet", () => {
             });
             const result = await payWithWallet({ fetch: f, wallet: w, orderUrl, sleep });
             expect(result).toEqual({ unavailable: reason, retryAfterSeconds: 5 });
-            expect(pageStep(result)).toEqual({
-                message: "busy, try again in 5 s",
-                payAfterMs: 5_000,
-            });
+            expect(pageStep(result).payAfterMs).toBe(reason === "payer_busy" ? 0 : 5_000);
         },
     );
 
@@ -401,7 +410,7 @@ describe("payWithWallet", () => {
             sleep: zero.sleep,
         });
         expect(result).toEqual({ unavailable: "payer_busy", retryAfterSeconds: 0 });
-        expect(pageStep(result)).toEqual({ message: "busy, try again now", payAfterMs: 0 });
+        expect(pageStep(result).payAfterMs).toBe(0);
 
         const absent = harness({ order: () => json(429, { error: "too_many_requests" }) });
         const refetched = await payWithWallet({
@@ -411,7 +420,7 @@ describe("payWithWallet", () => {
             sleep: absent.sleep,
         });
         expect(refetched).toEqual({ unavailable: "too_many_requests", retryAfterSeconds: 0 });
-        expect(pageStep(refetched)).toEqual({ message: "busy, try again now", payAfterMs: 0 });
+        expect(pageStep(refetched).payAfterMs).toBe(0);
         expect(absent.calls).not.toContain("signTransaction");
     });
 
@@ -431,7 +440,10 @@ describe("payWithWallet", () => {
                 orderUrl,
                 sleep: simulation.sleep,
             }),
-        ).toEqual({ refused: "invalid_exact_svm_transaction_simulation_failed" });
+        ).toEqual({
+            refused: "payment_invalid",
+            code: "invalid_exact_svm_transaction_simulation_failed",
+        });
 
         const blocked = harness({
             submit: () => json(403, { refused: "payer_blocked", orderId: id }),
@@ -444,6 +456,15 @@ describe("payWithWallet", () => {
                 sleep: blocked.sleep,
             }),
         ).toEqual({ refused: "payer_blocked" });
+    });
+
+    it("a transaction that cannot be built never reaches the wallet", async () => {
+        const { calls, w, f, sleep } = harness();
+        (w.account as { address: string }).address = "not-an-address";
+        await expect(payWithWallet({ fetch: f, wallet: w, orderUrl, sleep })).rejects.toThrow(
+            new Error(BUILD_FAILED),
+        );
+        expect(calls).not.toContain("signTransaction");
     });
 
     it("never signs when the refetch shows the order is no longer payable", async () => {
@@ -465,6 +486,220 @@ describe("payWithWallet", () => {
             await payWithWallet({ fetch: paid.f, wallet: paid.w, orderUrl, sleep: paid.sleep }),
         ).toBe("paid");
         expect(paid.calls).not.toContain("signTransaction");
+    });
+});
+
+describe("refusals through payWithWallet", () => {
+    const ctx = { ...CTX, formatDateTime: () => "2 Jan 2030, 00:00" };
+    const RETRY = { "Retry-After": "7" };
+    const W25 =
+        "Bugnet could not accept the transaction Phantom signed. Nothing was charged. Press Pay to try again, or send to the address above.";
+    const W24 = (wait: string) =>
+        `Bugnet cannot take the payment right now. Nothing was charged. Press Pay again${wait}.`;
+    const settlingFor = (n: number) =>
+        Array.from({ length: n }, () => () => json(200, { orderId: id, state: "settling" }));
+    const rows: [string, Script, string][] = [
+        [
+            "W15",
+            {
+                order: () => {
+                    const bare = { ...accepts, extra: { feePayer: accepts.extra.feePayer } };
+                    const pr = challenge(bare as PaymentRequirements);
+                    return json(402, pr, { "PAYMENT-REQUIRED": encodePaymentRequiredHeader(pr) });
+                },
+            },
+            "Bugnet could not get a recent Solana block. Nothing was charged. Press Pay again in a few seconds.",
+        ],
+        [
+            "W16",
+            {
+                submit: () => json(202, { orderId: id, state: "settling" }),
+                statuses: settlingFor(60),
+            },
+            "The payment is still confirming on Solana. This page updates when it lands.",
+        ],
+        [
+            "W17",
+            {
+                submit: () => {
+                    throw new TypeError("network error");
+                },
+            },
+            "The connection dropped after sending. Checking whether the payment landed.",
+        ],
+        [
+            "W18",
+            {
+                submit: () => json(202, { orderId: id, state: "settling" }),
+                statuses: [() => json(200, { orderId: id, state: "unpaid" })],
+            },
+            "The payment did not land on Solana. Nothing was charged. Press Pay to try again.",
+        ],
+        [
+            "W19",
+            {
+                submit: () =>
+                    json(422, {
+                        refused: "payment_invalid",
+                        orderId: id,
+                        code: "invalid_exact_svm_transaction_simulation_failed",
+                    }),
+            },
+            "Solana refused the payment, most often because the account holds less than $0.05 USDC. Nothing was charged. Add USDC, or send to the address above.",
+        ],
+        [
+            "W20",
+            {
+                submit: () =>
+                    json(403, {
+                        refused: "payer_blocked",
+                        orderId: id,
+                        blockedUntil: "2030-01-02T00:00:00.000Z",
+                    }),
+            },
+            "Bugnet blocks this wallet until 2 Jan 2030, 00:00. Nothing was charged. Pay from another wallet.",
+        ],
+        [
+            "W21",
+            { submit: () => json(429, { refused: "payer_busy", orderId: id }, RETRY) },
+            "This wallet already runs as many sandboxes as Bugnet allows at once. Nothing was charged. Stop a sandbox, then press Pay.",
+        ],
+        [
+            "W22 payer_rate_limited",
+            { submit: () => json(429, { refused: "payer_rate_limited", orderId: id }, RETRY) },
+            "Too many tries from this wallet. Nothing was charged. Press Pay again in 7 s.",
+        ],
+        [
+            "W22 too_many_attempts",
+            { submit: () => json(429, { refused: "too_many_attempts", orderId: id }, RETRY) },
+            "Too many tries from this wallet. Nothing was charged. Press Pay again in 7 s.",
+        ],
+        [
+            "W23",
+            { submit: () => json(503, { refused: "x402_disabled", orderId: id }) },
+            "Bugnet is not taking allowance payments right now. Nothing was charged. Ask your agent to try again later.",
+        ],
+        [
+            "W24 with Retry-After",
+            { submit: () => json(503, { refused: "router_unavailable", orderId: id }, RETRY) },
+            W24(" in 7 s"),
+        ],
+        [
+            "W24 without Retry-After",
+            { submit: () => json(503, { refused: "settlement_unavailable", orderId: id }) },
+            W24(""),
+        ],
+        [
+            "W25 payment_invalid",
+            {
+                submit: () =>
+                    json(422, {
+                        refused: "payment_invalid",
+                        orderId: id,
+                        code: "invalid_exact_svm_payload_transaction",
+                    }),
+            },
+            W25,
+        ],
+        [
+            "W25 payment_malformed",
+            { submit: () => json(400, { refused: "payment_malformed", orderId: id }) },
+            W25,
+        ],
+        [
+            "W25 payment_order_mismatch",
+            { submit: () => json(400, { refused: "payment_order_mismatch", orderId: id }) },
+            W25,
+        ],
+        [
+            "W25 payer_invalid",
+            { submit: () => json(400, { refused: "payer_invalid", orderId: id }) },
+            W25,
+        ],
+        [
+            "W26",
+            { submit: () => json(409, { refused: "payment_replayed", orderId: id }) },
+            "This signed payment was already sent once. Nothing was charged again. Press Pay to sign a new one.",
+        ],
+        [
+            "W27",
+            {
+                submit: () =>
+                    json(410, { refused: "order_closed", orderId: id, code: "allowance_ceiling" }),
+            },
+            "Paid, but this sandbox already holds the most allowance Bugnet allows. The $0.05 is being returned to the paying wallet.",
+        ],
+        [
+            "W28",
+            {
+                submit: () =>
+                    json(410, { refused: "order_closed", orderId: id, code: "sandbox_ended" }),
+            },
+            "Paid, but the sandbox has ended. The $0.05 is being returned to the paying wallet.",
+        ],
+        [
+            "W29",
+            {
+                submit: () =>
+                    json(410, {
+                        refused: "order_closed",
+                        orderId: id,
+                        code: "allowance_pool_full",
+                    }),
+            },
+            "Paid, but Bugnet holds as much allowance money as it allows right now. The $0.05 is being returned to the paying wallet.",
+        ],
+        [
+            "W30",
+            {
+                submit: () =>
+                    json(410, { refused: "order_closed", orderId: id, code: "order_expired" }),
+            },
+            "Paid after the order expired. The $0.05 is being returned to the paying wallet.",
+        ],
+        [
+            "W31",
+            { submit: () => json(400, { refused: "something_new", orderId: id }) },
+            "Bugnet refused the payment (something_new). Nothing was charged. Press Pay to try again, or write to support@bugnet.org.",
+        ],
+        [
+            "W32",
+            { submit: () => json(410, { refused: "order_closed", orderId: id }) },
+            "This order is closed and cannot be paid. Ask your agent for a new payment link.",
+        ],
+        [
+            "W33",
+            { order: () => json(404, { error: "order_unknown", orderId: id }) },
+            "Bugnet has no order for this link. Ask your agent for a new payment link.",
+        ],
+    ];
+
+    it.each(rows)("%s", async (_, script, text) => {
+        const { w, f, sleep } = harness(script);
+        const result = await payWithWallet({ fetch: f, wallet: w, orderUrl, sleep });
+        expect(messageStep(result, ctx).message).toBe(text);
+    });
+
+    it("W20 keeps blockedUntil and W21 keeps the wait out of its text", async () => {
+        const blocked = harness({
+            submit: () =>
+                json(403, {
+                    refused: "payer_blocked",
+                    orderId: id,
+                    blockedUntil: "2030-01-02T00:00:00.000Z",
+                }),
+        });
+        expect(await payWithWallet({ fetch: blocked.f, wallet: blocked.w, orderUrl })).toEqual({
+            refused: "payer_blocked",
+            blockedUntil: "2030-01-02T00:00:00.000Z",
+        });
+        const busy = harness({
+            submit: () => json(429, { refused: "payer_busy", orderId: id }, RETRY),
+        });
+        expect(await payWithWallet({ fetch: busy.f, wallet: busy.w, orderUrl })).toEqual({
+            unavailable: "payer_busy",
+            retryAfterSeconds: 7,
+        });
     });
 });
 
@@ -492,7 +727,10 @@ describe("watchOrder", () => {
         const state = await watchOrder({ fetch: f, orderUrl, sleep }, step.watch);
         expect(state).toBe("paid");
         expect(sleeps).toEqual([2000, 2000, 2000, 2000]);
-        expect(stateStep(state)).toEqual({ message: "paid", state: "paid" });
+        expect(stateStep(state)).toEqual({
+            message: "Paid. Go back to your agent; it continues on its own.",
+            state: "paid",
+        });
     });
 
     it("answers unpaid for an unconfirmed payment only after 20 s of unpaid", async () => {
@@ -583,143 +821,133 @@ describe("watchOrder", () => {
     });
 });
 
-describe("pageStep", () => {
-    it("explains each result to the payer", () => {
-        expect(pageStep("network_busy").message).toBe("network busy, try again");
+describe("balance pre-check", () => {
+    const NEED = 50_000;
+
+    it("the balance pre-check stops before signing", async () => {
+        const { calls, w, f, sleep } = harness();
+        const r = await payWithWallet({
+            fetch: f,
+            wallet: w,
+            orderUrl,
+            sleep,
+            balance: async () => ({ usdcMicros: 0, needMicros: NEED }),
+        });
+        expect(r).toEqual({ short: { haveMicros: 0, needMicros: NEED } });
+        expect(calls).toEqual(["connect"]);
+    });
+
+    it("a failing balance check is skipped", async () => {
+        for (const balance of [
+            async () => {
+                throw new TypeError("network error");
+            },
+            async () => null,
+        ]) {
+            const { calls, w, f, sleep } = harness();
+            expect(await payWithWallet({ fetch: f, wallet: w, orderUrl, sleep, balance })).toBe(
+                "paid",
+            );
+            expect(calls).toContain("signTransaction");
+        }
+    });
+
+    it("a wallet error re-checks the balance", async () => {
+        const failing = (answers: number[]) => {
+            const h = harness();
+            h.w.signTransaction = async () => {
+                throw new WalletError("Phantom", -32603, "Unexpected error");
+            };
+            const balance = async () => ({ usdcMicros: answers.shift() ?? 0, needMicros: NEED });
+            return { ...h, balance };
+        };
+        const short = failing([NEED, 0]);
         expect(
-            pageStep({ refused: "invalid_exact_svm_transaction_simulation_failed" }).message,
-        ).toBe("the wallet lacks USDC or the payment expired, try again");
-        expect(pageStep("paid").message).toBe("paid");
-        expect(pageStep("settling_timeout").message).toBe(
-            "the payment is still settling, refresh this page in a minute",
-        );
-        expect(pageStep({ refused: "order_unpaid" }).message).toBe(
-            "the payment did not land, try again",
-        );
-        expect(pageStep({ refused: "payer_blocked" }).message).toBe(
-            "payment refused: payer_blocked",
-        );
+            await payWithWallet({
+                fetch: short.f,
+                wallet: short.w,
+                orderUrl,
+                sleep: short.sleep,
+                balance: short.balance,
+            }),
+        ).toEqual({ short: { haveMicros: 0, needMicros: NEED } });
+
+        const enough = failing([NEED, NEED]);
+        await expect(
+            payWithWallet({
+                fetch: enough.f,
+                wallet: enough.w,
+                orderUrl,
+                sleep: enough.sleep,
+                balance: enough.balance,
+            }),
+        ).rejects.toBeInstanceOf(WalletError);
     });
 
-    it("offers Pay again only while the order can still be paid", () => {
-        expect(pageStep("network_busy").payAfterMs).toBe(0);
-        expect(pageStep({ refused: "payer_blocked" }).payAfterMs).toBe(0);
-        expect(pageStep({ refused: "order_unpaid" })).toEqual({
-            message: "the payment did not land, try again",
-            state: "unpaid",
-            payAfterMs: 0,
-        });
-        expect(pageStep("paid")).toEqual({ message: "paid", state: "paid" });
-        expect(pageStep("settling_timeout")).toEqual({
-            message: "the payment is still settling, refresh this page in a minute",
-            state: "settling",
-        });
-        expect(pageStep({ refused: "order_expired" })).toEqual({
-            message: "this order has expired",
-            state: "expired",
-        });
-        expect(pageStep({ refused: "order_refunded" })).toEqual({
-            message: "this order was refunded",
-            state: "refunded",
-        });
-        expect(pageStep({ refused: "order_review" })).toEqual({
-            message: "this order is under review",
-            state: "review",
-        });
-        expect(pageStep({ refused: "order_unknown" })).toEqual({
-            message: "this order does not exist",
-        });
-    });
-
-    it("checks the order's status when the result leaves it unknown", () => {
-        expect(pageStep("unconfirmed")).toEqual({
-            message: "could not confirm the payment; checking status…",
-            watch: { unpaidForMs: 20_000 },
-        });
-        expect(pageStep({ refused: "order_closed" })).toEqual({
-            message: "this order is closed",
-            watch: {},
-        });
-    });
-
-    it("waits out Retry-After before offering Pay again", () => {
-        expect(pageStep({ unavailable: "rpc_unavailable", retryAfterSeconds: 5 })).toEqual({
-            message: "busy, try again in 5 s",
-            payAfterMs: 5_000,
-        });
-        expect(pageStep({ unavailable: "http_502" })).toEqual({
-            message: "busy, try again",
-            payAfterMs: 0,
-        });
-        expect(pageStep({ unavailable: "http_503", retryAfterSeconds: 0 })).toEqual({
-            message: "busy, try again now",
-            payAfterMs: 0,
-        });
-    });
-});
-
-describe("order_closed_refunding", () => {
-    it("reads a paid order that could not be applied as being refunded", async () => {
-        const h = harness({
-            submit: () =>
-                json(410, { refused: "order_closed", orderId: id, code: "sandbox_ended" }),
-        });
-        expect(await payWithWallet({ fetch: h.f, wallet: h.w, orderUrl, sleep: h.sleep })).toEqual({
-            refused: "order_closed_refunding",
-        });
-        expect(pageStep({ refused: "order_closed_refunding" })).toEqual({
-            message:
-                "paid, but this order could not be applied: the money is being refunded to the paying wallet",
-            watch: {},
-        });
-        const other = harness({
-            submit: () => json(422, { refused: "payment_invalid", orderId: id, code: "x" }),
-        });
+    it("readBalance skips the check on a 503 or a network failure", async () => {
+        const answer = (res: () => Response) =>
+            readBalance(
+                {
+                    fetch: (async (url: string) => {
+                        expect(url).toBe(`${orderUrl}/balance?owner=${payer.address}`);
+                        return res();
+                    }) as unknown as typeof fetch,
+                    orderUrl,
+                },
+                payer.address,
+            );
         expect(
-            await payWithWallet({ fetch: other.f, wallet: other.w, orderUrl, sleep: other.sleep }),
-        ).toEqual({ refused: "x" });
+            await answer(() =>
+                json(200, { owner: payer.address, usdcMicros: 7, needMicros: NEED }),
+            ),
+        ).toEqual({ usdcMicros: 7, needMicros: NEED });
+        expect(await answer(() => json(503, { error: "rpc_unavailable" }))).toBeNull();
+        expect(await answer(() => json(200, { usdcMicros: "7" }))).toBeNull();
+        expect(
+            await answer(() => {
+                throw new TypeError("network error");
+            }),
+        ).toBeNull();
     });
-});
 
-describe("stateStep", () => {
-    it("maps a watched state to the page, telling the payer to refresh when it never settled", () => {
-        expect(stateStep("unpaid")).toEqual(pageStep({ refused: "order_unpaid" }));
-        expect(stateStep("paid")).toEqual(pageStep("paid"));
-        expect(stateStep("settling")).toEqual(pageStep("settling_timeout"));
-        expect(stateStep(undefined)).toEqual({
-            message: "could not confirm the payment, refresh this page in a minute",
+    it("reportError posts the report", async () => {
+        const posted: { url: string; method?: string; body?: string }[] = [];
+        const f = (async (url: string, init?: RequestInit) => {
+            posted.push({ url, method: init?.method, body: init?.body as string });
+            return new Response(null, { status: 204 });
+        }) as unknown as typeof fetch;
+        const report = {
+            stage: "sign",
+            wallet: "Phantom",
+            code: -32603,
+            message: "Unexpected error",
+        };
+        await reportError({ fetch: f, orderUrl }, report);
+        expect(posted).toEqual([
+            { url: `${orderUrl}/report`, method: "POST", body: JSON.stringify(report) },
+        ]);
+
+        // A short balance, and a wallet text cut to the route's limits
+        posted.length = 0;
+        await reportError(
+            { fetch: f, orderUrl },
+            shortReport("Phantom", { haveMicros: 0, needMicros: NEED }),
+        );
+        await reportError(
+            { fetch: f, orderUrl },
+            { stage: "sign", wallet: "W".repeat(50), code: 1, message: "Z".repeat(3_000) },
+        );
+        expect(JSON.parse(posted[0]!.body!)).toEqual({
+            stage: "balance",
+            wallet: "Phantom",
+            code: null,
+            message: "short 0 50000",
         });
-    });
-});
-
-describe("walletErrorStep", () => {
-    it("names the wallet and the likely cause for Phantom's bare Unexpected error", () => {
-        const e = walletError("Phantom", { code: -32603, message: "Unexpected error" });
-        expect(e.code).toBe(-32603);
-        const step = walletErrorStep(e, "$0.05");
-        expect(step.message).toBe(
-            'Phantom stopped the payment ("Unexpected error"). This usually means the account ' +
-                "holds less than $0.05 USDC on Solana. Add USDC or pick another account, then press Pay again",
-        );
-        expect(step.payAfterMs).toBe(0);
-    });
-    it("reads an Error without a code the same way", () => {
-        const step = walletErrorStep(walletError("Solflare", new Error("boom")), "$1.00");
-        expect(step.message).toContain('Solflare stopped the payment ("boom")');
-        expect(step.message).toContain("less than $1.00 USDC on Solana");
-    });
-    it("says the user declined for 4001", () => {
-        const e = Object.assign(new Error("User rejected the request."), { code: 4001 });
-        expect(walletErrorStep(walletError("Phantom", e), "$0.05").message).toBe(
-            "you declined the payment in Phantom. Press Pay to try again",
-        );
-    });
-    it("asks to unlock for 4100 and to close the open request for -32002", () => {
-        expect(walletErrorStep(walletError("Phantom", { code: 4100 }), "$0.05").message).toBe(
-            "Phantom did not share an account. Unlock Phantom, allow this page, then press Pay again",
-        );
-        expect(walletErrorStep(walletError("Phantom", { code: -32002 }), "$0.05").message).toBe(
-            "Phantom already has a request open. Close it in Phantom, then press Pay again",
-        );
+        expect(JSON.parse(posted[1]!.body!)).toEqual({
+            stage: "sign",
+            wallet: "W".repeat(40),
+            code: 1,
+            message: "Z".repeat(200),
+        });
     });
 });

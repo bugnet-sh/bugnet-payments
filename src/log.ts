@@ -31,6 +31,13 @@ export type AlarmName =
     | "x402_close_unverifiable"
     | "x402_resign_waiting"
     | "x402_cold_transfer_failed"
+    | "deposit_review"
+    | "deposit_unknown_debit"
+    | "deposit_index_lag"
+    | "deposit_capacity"
+    | "deposit_create_churn"
+    | "deposit_fee_budget"
+    | "deposit_rpc_budget"
     | "rpc_endpoint_down"
     | "rpc_all_endpoints_down"
     | "rpc_endpoint_lag"
@@ -71,7 +78,7 @@ const REDACTED_LOWER: ReadonlySet<string> = new Set([...REDACTED_KEYS].map((k) =
 
 const REDACTED = "[redacted]";
 
-function makeScrubber(secrets: readonly string[]): (s: string) => string {
+export function makeScrubber(secrets: readonly string[]): (s: string) => string {
     const list = secrets.filter((s) => s.length > 0);
     return (s) => list.reduce((acc, secret) => acc.split(secret).join(REDACTED), s);
 }

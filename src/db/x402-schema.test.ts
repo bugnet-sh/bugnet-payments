@@ -1,4 +1,4 @@
-import { mkdtemp, copyFile, rm } from "node:fs/promises";
+import { mkdtemp, copyFile, readdir, rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -12,6 +12,11 @@ const PAYTO = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi";
 const SERVICE = "xs_w5a4htopmpzmmhos";
 const RESET = "drop schema public cascade; create schema public";
 type Failure = { code?: string; constraint?: string } | null;
+
+// Later migrations run too, so these tests count the files instead of naming a number
+const MIGRATIONS = (await readdir("migrations")).filter((f) =>
+    /^\d{5}_[a-z0-9_]+\.sql$/.test(f),
+).length;
 
 let db: TestDb;
 beforeAll(async () => {
@@ -71,11 +76,11 @@ async function account(): Promise<string> {
 }
 
 describe("migration 00003", () => {
-    it("applies 00003, 00004 and 00006 after 00001 and 00002", async () => {
+    it("applies 00003 to 00006 after 00001 and 00002", async () => {
         const fresh = await testDb();
         try {
             await fresh.pool.query(RESET);
-            expect(await migrate(fresh.pool)).toBe(5);
+            expect(await migrate(fresh.pool)).toBe(MIGRATIONS);
             expect(await migrate(fresh.pool)).toBe(0);
         } finally {
             await fresh.close();
@@ -109,7 +114,7 @@ describe("migration 00003", () => {
                  values ($1, 'full', 'late', 10000, 'dest', 'payer', 'pending')`,
                 [start],
             );
-            expect(await migrate(fresh.pool)).toBe(3);
+            expect(await migrate(fresh.pool)).toBe(MIGRATIONS - 2);
             const o = await fresh.pool.query(
                 `select pay_into, allowance_micros::text, fee_micros::text, x402_setup,
                     hot_router_refund_micros::text from orders where id = $1`,
@@ -216,7 +221,7 @@ describe("migration 00003", () => {
         expect((await refund("allowance", "x402_unspent")).rows[0].from_wallet).toBe("refund");
         expect(await failure(refund("allowance", "x402_unspent"))).toEqual({
             code: "23505",
-            constraint: "refunds_order_id_kind_key",
+            constraint: "refunds_order_kind_part",
         });
     });
 

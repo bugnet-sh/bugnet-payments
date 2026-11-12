@@ -57,7 +57,9 @@ export async function blockedAmong(
     payTos: readonly string[],
 ): Promise<ReadonlySet<string>> {
     const { rows } = await db.query<{ pay_to: string }>(
-        "select pay_to from x402_blocked_payto where pay_to = any($1::text[])",
+        // A deposit address is never a seller: paying one would credit an order, not a seller
+        `select pay_to from x402_blocked_payto where pay_to = any($1::text[])
+         union select address as pay_to from deposits where address = any($1::text[])`,
         [payTos],
     );
     return new Set(rows.map((r) => r.pay_to));

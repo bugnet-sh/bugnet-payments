@@ -45,3 +45,8 @@ export function missingX402Env(
     if (!exists(sellerFile)) missing.push(`${sellerFile} missing`);
     return missing;
 }
+
+// Only the deposit live file needs it; the other live files run with deposits off
+export function missingDepositEnv(env: NodeJS.ProcessEnv): string[] {
+    return empty(env, "BUGNET_DEPOSIT_SEED") ? ["BUGNET_DEPOSIT_SEED"] : [];
+}

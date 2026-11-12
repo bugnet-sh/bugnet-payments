@@ -28,19 +28,25 @@ type MoneyKey = keyof StatsMoney;
 const DAY_MS = 86_400_000;
 const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 
-// The four money kinds by UTC day, a null day for a row without its time
+// The four money kinds by UTC day, a null day for a row without its time. A refund split among
+// owners counts once (its part 0); deposit rows return held review money, never earned.
 const DAILY_SQL = `
     with refunded as (
         select to_char(r.confirmed_at at time zone 'UTC', 'YYYY-MM-DD') as day, r.amount_micros,
-            r.kind <> 'allowance' as counted,
-            -- a full refund gives back the earned part first, the rest is the unspent allowance
+            r.kind <> 'allowance' and r.part = 0 as counted,
+            -- a full refund gives back the earned part first, to its parts in part order, and
+            -- the rest is the unspent allowance
             case r.kind
                 when 'allowance' then 0
                 when 'partial' then r.amount_micros
-                else least(r.amount_micros, o.amount_micros - o.allowance_micros)
+                else greatest(0, least(r.amount_micros,
+                    o.amount_micros - o.allowance_micros
+                        - (select coalesce(sum(e.amount_micros), 0) from refunds e
+                            where e.order_id = r.order_id and e.kind = 'full'
+                              and e.part < r.part)))
             end as earned_part
           from refunds r join orders o on o.id = r.order_id
-         where r.state = 'confirmed'
+         where r.state = 'confirmed' and r.kind <> 'deposit'
     )
     select 'earnedMicros' as what, to_char(p.confirmed_at at time zone 'UTC', 'YYYY-MM-DD') as day,
         count(*)::text as n, sum(o.amount_micros - o.allowance_micros)::text as micros

@@ -6,7 +6,12 @@ import { silentLog } from "../log.ts";
 import { findOrder, lockOrder } from "../orders/store.ts";
 import type { OrderRow, PaymentRow } from "../orders/types.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
-import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts";
+import {
+    seedAllowanceOrder,
+    seedOrder,
+    seedPayment,
+    seedSharedPayment,
+} from "../testing/orders.ts";
 import { testSigner } from "../testing/keys.ts";
 import { agentPin, resetLedger, seedAccount, seedFunding, seedService } from "../testing/x402.ts";
 import { createAllowanceFunding } from "./funding.ts";
@@ -126,7 +131,7 @@ async function fundingOf(orderId: string) {
 async function refundRow(orderId: string) {
     const res = await db.pool.query(
         `select kind, reason, amount_micros::int as "amountMicros", destination, payer, state,
-            from_wallet as "fromWallet" from refunds where order_id = $1`,
+            from_wallet as "fromWallet" from refunds where order_id = $1 order by part`,
         [orderId],
     );
     return res.rows;
@@ -370,6 +375,44 @@ describe("onOrderPaid", () => {
         await Promise.all([paid(o1.order, o1.payment), paid(o2.order, o2.payment)]);
         expect(await isFirstUse(db.pool, PAYER, o1.order.id)).toBe(true);
         expect(await isFirstUse(db.pool, PAYER2, o2.order.id)).toBe(true);
+    });
+});
+
+describe("every insert site splits a shared payment", () => {
+    it("an onOrderPaid refusal of a hot shared order is one full row per owner", async () => {
+        const { order } = await seedAllowanceOrder(db.pool, {
+            state: "paid",
+            handleSha256: "5a".repeat(32),
+            paidAt: AT,
+            expiresAt: new Date(AT.getTime() + 60_000),
+            amountMicros: 50_000,
+            allowanceMicros: 47_000,
+            feeMicros: 3_000,
+        });
+        const payment = await seedSharedPayment(db.pool, order.id);
+        await setPool(0, 47_000);
+        expect(await paid(order, payment)).toEqual({ kind: "refused", refusal: "sandbox_ended" });
+        expect(await refundRow(order.id)).toEqual([
+            {
+                kind: "full",
+                reason: "x402_closed",
+                amountMicros: 30_000,
+                destination: "SrcA",
+                payer: "OwnA",
+                state: "pending",
+                fromWallet: "allowance",
+            },
+            {
+                kind: "full",
+                reason: "x402_closed",
+                amountMicros: 20_000,
+                destination: "SrcB",
+                payer: "OwnB",
+                state: "pending",
+                fromWallet: "allowance",
+            },
+        ]);
+        expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
     });
 });
 

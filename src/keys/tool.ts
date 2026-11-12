@@ -32,7 +32,11 @@ const SERVICE_SECRETS = [
     ["BUGNET_ORDER_PRIVATE_KEY", () => randomBytes(32).toString("base64")],
     ["BUGNET_CLAIM_KEY", () => randomBytes(32).toString("base64")],
     ["BUGNET_PAYMENTS_TOKEN", () => randomBytes(32).toString("base64url")],
+    ["BUGNET_DEPOSIT_SEED", () => randomBytes(32).toString("base64")],
 ] as const;
+
+const DEPOSIT_SEED = "BUGNET_DEPOSIT_SEED";
+const DEPOSIT_SEED_PREVIOUS = "BUGNET_DEPOSIT_SEED_PREVIOUS";
 
 const LINE = /^([A-Z][A-Z0-9_]*)=(.*)$/;
 
@@ -43,6 +47,28 @@ export function parseEnvText(text: string): Record<string, string> {
         if (m) env[m[1]!] = m[2]!.trim().replace(/^(["'])(.*)\1$/, "$2");
     }
     return env;
+}
+
+function linesOf(text: string): string[] {
+    return text === "" ? [] : text.replace(/\n$/, "").split("\n");
+}
+
+function lineOf(lines: readonly string[], variable: string): number {
+    return lines.findIndex((l) => LINE.exec(l)?.[1] === variable);
+}
+
+function setLine(lines: string[], variable: string, value: string): void {
+    const at = lineOf(lines, variable);
+    if (at === -1) lines.push(`${variable}=${value}`);
+    else lines[at] = `${variable}=${value}`;
+}
+
+// A rename keeps a crash from truncating a file that holds the only copy of the keys
+function writeEnvFile(path: string, lines: readonly string[]): void {
+    const temp = `${path}.${process.pid}.tmp`;
+    writeFileSync(temp, lines.length === 0 ? "" : `${lines.join("\n")}\n`, { mode: 0o600 });
+    chmodSync(temp, 0o600);
+    renameSync(temp, path);
 }
 
 export function walletAddresses(
@@ -62,13 +88,11 @@ export async function generateSecrets(
     envPath: string,
 ): Promise<{ added: string[]; addresses: Record<string, string> }> {
     const text = existsSync(envPath) ? readFileSync(envPath, "utf8") : "";
-    const lines = text === "" ? [] : text.replace(/\n$/, "").split("\n");
+    const lines = linesOf(text);
     const current = parseEnvText(text);
     const added: string[] = [];
     const set = (variable: string, value: string) => {
-        const at = lines.findIndex((l) => LINE.exec(l)?.[1] === variable);
-        if (at === -1) lines.push(`${variable}=${value}`);
-        else lines[at] = `${variable}=${value}`;
+        setLine(lines, variable, value);
         current[variable] = value;
         added.push(variable);
     };
@@ -87,15 +111,92 @@ export async function generateSecrets(
     if (testPayer !== null) addresses.test_payer = testPayer.address;
     for (const { name, signer } of await walletAddresses(current)) addresses[name] = signer.address;
     if (added.length > 0) {
-        // A rename keeps a crash from truncating a file that holds the only copy of the keys
-        const temp = `${envPath}.${process.pid}.tmp`;
-        writeFileSync(temp, `${lines.join("\n")}\n`, { mode: 0o600 });
-        chmodSync(temp, 0o600);
-        renameSync(temp, envPath);
+        writeEnvFile(envPath, lines);
     } else if (existsSync(envPath)) {
         chmodSync(envPath, 0o600);
     }
     return { added, addresses };
+}
+
+function readEnvFile(path: string): { lines: string[]; env: Record<string, string> } {
+    if (!existsSync(path)) throw new Error(`${path} does not exist`);
+    const text = readFileSync(path, "utf8");
+    return { lines: linesOf(text), env: parseEnvText(text) };
+}
+
+// Spec 4.3: one rename moves the seed and writes the new one, so a crash leaves either both or
+// neither, and a second rotation cannot drop a seed that live deposits still sign with
+export function rotateDepositSeed(envPath: string): void {
+    const { lines, env } = readEnvFile(envPath);
+    if ((env[DEPOSIT_SEED_PREVIOUS] ?? "") !== "") {
+        throw new Error(`${DEPOSIT_SEED_PREVIOUS} is set: a rotation is still draining`);
+    }
+    const seed = env[DEPOSIT_SEED] ?? "";
+    if (seed === "") throw new Error(`${DEPOSIT_SEED} is empty: run keys generate first`);
+    const at = lineOf(lines, DEPOSIT_SEED);
+    lines[at] = `${DEPOSIT_SEED}=${randomBytes(32).toString("base64")}`;
+    const previous = `${DEPOSIT_SEED_PREVIOUS}=${seed}`;
+    const old = lineOf(lines, DEPOSIT_SEED_PREVIOUS);
+    if (old === -1) lines.splice(at + 1, 0, previous);
+    else lines[old] = previous;
+    writeEnvFile(envPath, lines);
+}
+
+// Spec 4.3: the archive is written before the env file loses the seed, so a run that stops
+// between the two is finished by the next one and the seed is never lost
+export function retireDepositSeed(o: { envPath: string; archivePath: string; version: number }): {
+    archived: boolean;
+    removed: boolean;
+} {
+    if (resolve(o.archivePath) === resolve(o.envPath)) {
+        throw new Error("the archive must be a file of its own");
+    }
+    const { lines, env } = readEnvFile(o.envPath);
+    const previous = env[DEPOSIT_SEED_PREVIOUS] ?? "";
+    if (previous === "") return { archived: false, removed: false };
+    const name = `${DEPOSIT_SEED}_V${o.version}`;
+    const archive = existsSync(o.archivePath)
+        ? readEnvFile(o.archivePath)
+        : { lines: [], env: {} as Record<string, string> };
+    const kept = archive.env[name] ?? "";
+    if (kept !== "" && kept !== previous) {
+        throw new Error(`${name} is already archived with another value`);
+    }
+    if (kept === "") {
+        setLine(archive.lines, name, previous);
+        writeEnvFile(o.archivePath, archive.lines);
+    } else {
+        chmodSync(o.archivePath, 0o600);
+    }
+    writeEnvFile(
+        o.envPath,
+        lines.filter((l) => LINE.exec(l)?.[1] !== DEPOSIT_SEED_PREVIOUS),
+    );
+    return { archived: kept === "", removed: true };
+}
+
+// D8 A, phase 1: the line a Mac-side script appends to the offline archive. The env file keeps
+// the seed until phase 2 sees that line read back, so a seed is never lost in transit.
+export function previousSeedLine(envPath: string, version: number): string | null {
+    const previous = readEnvFile(envPath).env[DEPOSIT_SEED_PREVIOUS] ?? "";
+    return previous === "" ? null : `${DEPOSIT_SEED}_V${version}=${previous}`;
+}
+
+// D8 A, phase 2: the seed leaves the env file only when the archive holds this same value
+export function removeArchivedSeed(
+    envPath: string,
+    version: number,
+    archive: Readonly<Record<string, string>>,
+): "removed" | "nothing" | "mismatch" {
+    const { lines, env } = readEnvFile(envPath);
+    const previous = env[DEPOSIT_SEED_PREVIOUS] ?? "";
+    if (previous === "") return "nothing";
+    if (archive[`${DEPOSIT_SEED}_V${version}`] !== previous) return "mismatch";
+    writeEnvFile(
+        envPath,
+        lines.filter((l) => LINE.exec(l)?.[1] !== DEPOSIT_SEED_PREVIOUS),
+    );
+    return "removed";
 }
 
 export async function fundingPlan(o: {
@@ -302,24 +403,19 @@ export async function writeTestSellerEnv(
     if (basename(path) === ".env" || resolve(path) === PAYMENTS_ENV_FILE) throw refuse();
     const existed = existsSync(path);
     const text = existed ? readFileSync(path, "utf8") : "";
-    const lines = text === "" ? [] : text.replace(/\n$/, "").split("\n");
+    const lines = linesOf(text);
     const current = parseEnvText(text);
     if (Object.keys(current).some((k) => k.startsWith("BUGNET_"))) throw refuse();
     const added: string[] = [];
     for (const variable of TESTSELLER_KEYS) {
         if ((current[variable] ?? "") !== "") continue;
         const value = (await generateExportableKeypair()).secretBase58;
-        const at = lines.findIndex((l) => LINE.exec(l)?.[1] === variable);
-        if (at === -1) lines.push(`${variable}=${value}`);
-        else lines[at] = `${variable}=${value}`;
+        setLine(lines, variable, value);
         current[variable] = value;
         added.push(variable);
     }
     if (added.length > 0) {
-        const temp = `${path}.${process.pid}.tmp`;
-        writeFileSync(temp, `${lines.join("\n")}\n`, { mode: 0o600 });
-        chmodSync(temp, 0o600);
-        renameSync(temp, path);
+        writeEnvFile(path, lines);
     } else {
         chmodSync(path, 0o600);
     }

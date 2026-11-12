@@ -127,6 +127,7 @@ describe("money decisions over the router", () => {
             now: () => new Date(clock.ms),
             paid: null,
             x402: defaults.x402,
+            deposits: defaults.deposits,
         });
 
     const pay = () =>

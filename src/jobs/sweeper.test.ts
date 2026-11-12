@@ -14,6 +14,9 @@ import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts
 import { createAllowanceFunding } from "../x402/funding.ts";
 import { readPool } from "../x402/ledger.ts";
 import { seedAccount, seedFunding } from "../testing/x402.ts";
+import { DepositKeys } from "../deposits/keys.ts";
+import { ensureDeposit, updateDeposit } from "../deposits/store.ts";
+import type { DepositRow } from "../deposits/types.ts";
 import { sweep, type SweepDeps } from "./sweeper.ts";
 
 const MIN = 60_000;
@@ -131,6 +134,83 @@ describe("expiry", () => {
     });
 });
 
+describe("orders with a deposit", () => {
+    const keys = new DepositKeys(new Map([[1, Buffer.alloc(32, 7)]]), 1);
+    const CREATED = new Date("2030-01-01T00:00:00Z");
+    const EXPIRES = new Date("2030-01-01T00:15:00Z");
+    const clock = (hhmmss: string) => new Date(`2030-01-01T${hhmmss}Z`);
+
+    async function withDeposit(
+        over: Partial<DepositRow>,
+        o: { allowance?: boolean } = {},
+    ): Promise<OrderRow> {
+        const fields = {
+            id: "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+            state: "unpaid" as const,
+            createdAt: CREATED,
+            expiresAt: EXPIRES,
+        };
+        const { order } = o.allowance
+            ? await seedAllowanceOrder(db.pool, fields)
+            : await seedOrder(db.pool, { amountMicros: 50_000, ...fields });
+        await ensureDeposit(db.pool, keys, order, CREATED, () => Buffer.alloc(16, 1));
+        await updateDeposit(db.pool, order.id, over);
+        return order;
+    }
+
+    it("the order sweeper leaves an order with an open deposit", async () => {
+        const order = await withDeposit({
+            expiryDueAt: clock("00:16:00"),
+            hardStopAt: clock("00:21:00"),
+        });
+        expect((await sweep(deps(clock("00:20:00")))).expired).toBe(0);
+        expect((await stateOf(order.id)).state).toBe("unpaid");
+
+        await db.pool.query("truncate orders cascade");
+        const { order: plain } = await seedOrder(db.pool, {
+            state: "unpaid",
+            createdAt: CREATED,
+            expiresAt: EXPIRES,
+        });
+        expect((await sweep(deps(clock("00:20:00")))).expired).toBe(1);
+        expect((await stateOf(plain.id)).state).toBe("expired");
+    });
+
+    it("the hard stop expires a stuck deposit's order", async () => {
+        const order = await withDeposit(
+            {
+                reviewReason: "unknown_debit",
+                expiryDueAt: clock("00:16:00"),
+                hardStopAt: clock("00:21:00"),
+            },
+            { allowance: true },
+        );
+        await db.pool.query("update x402_pool set unpaid_micros = 1000000");
+        const log = memoryLog();
+        expect((await sweep(deps(clock("00:20:59"), { log }))).expired).toBe(0);
+
+        const report = await sweep(deps(clock("00:21:01"), { log }));
+        expect(report.expired).toBe(1);
+        expect((await stateOf(order.id)).state).toBe("expired");
+        expect((await readPool(db.pool)).unpaidMicros).toBe(0);
+        expect(log.lines.filter((l) => l.alarm === "deposit_review")).toEqual([
+            expect.objectContaining({ orderId: order.id, reason: "expired_unchecked" }),
+        ]);
+    });
+
+    it("waits without a hard stop and expires a draining deposit's order as before", async () => {
+        const order = await withDeposit({ expiryDueAt: null, hardStopAt: null });
+        expect((await sweep(deps(clock("00:30:00")))).expired).toBe(0);
+        expect((await stateOf(order.id)).state).toBe("unpaid");
+
+        const log = memoryLog();
+        await updateDeposit(db.pool, order.id, { state: "draining" });
+        expect((await sweep(deps(clock("00:30:00"), { log }))).expired).toBe(1);
+        expect((await stateOf(order.id)).state).toBe("expired");
+        expect(log.lines.filter((l) => l.alarm === "deposit_review")).toEqual([]);
+    });
+});
+
 describe("paid orders", () => {
     it("refunds a forced late payment at once and logs it as impossible", async () => {
         const { order } = await seedOrder(db.pool, {
@@ -147,6 +227,20 @@ describe("paid orders", () => {
         ]);
         expect((await stateOf(order.id)).state).toBe("refunding");
         expect((await findOrderRefund(db.pool, order.id))?.reason).toBe("late");
+    });
+
+    it("unredeemed waits for the confirmation clock", async () => {
+        // A transfer's paid_at is its chain time; Payments confirmed it much later
+        const { order } = await seedOrder(db.pool, {
+            state: "paid",
+            expiresAt: at(15 * MIN),
+            paidAt: at(4 * MIN),
+        });
+        await seedPayment(db.pool, order.id, { confirmedAt: at(40 * MIN) });
+        expect((await sweep(deps(at(50 * MIN)))).refunds.unredeemed).toBe(0);
+        expect((await stateOf(order.id)).state).toBe("paid");
+        expect((await sweep(deps(at(70 * MIN)))).refunds.unredeemed).toBe(1);
+        expect((await stateOf(order.id)).state).toBe("refunding");
     });
 
     it("refunds paid orders unredeemed for 30 minutes", async () => {

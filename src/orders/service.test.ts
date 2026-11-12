@@ -12,7 +12,12 @@ import {
     until,
     withHints,
 } from "../testing/app.ts";
-import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts";
+import {
+    seedAllowanceOrder,
+    seedOrder,
+    seedPayment,
+    seedSharedPayment,
+} from "../testing/orders.ts";
 import { signedPayment } from "../testing/payment.ts";
 import { agentPin, seedAccount, seedFunding, seedService, TEST_PAYTO } from "../testing/x402.ts";
 import { setControls } from "../x402/controls.ts";
@@ -22,6 +27,9 @@ import type { StoredX402Setup, X402ServicePin } from "../x402/types.ts";
 import { claimHash, newClaim, sealClaim } from "./claim.ts";
 import { newOrderId } from "./ids.ts";
 import { abandonOrder } from "./service.ts";
+import { DepositKeys } from "../deposits/keys.ts";
+import { ensureDeposit, insertTransfers } from "../deposits/store.ts";
+import { blockedAmong } from "../x402/controls.ts";
 import { findOrder, insertOrder, lockOrder, setOrderState } from "./store.ts";
 import type { OrderRow } from "./types.ts";
 
@@ -1508,6 +1516,39 @@ describe("x402 answers", () => {
             refundPending: false,
         });
     });
+    it("closedAnswer waits for the whole group", async () => {
+        const { order, claim } = await seedAllowanceOrder(app.pool, {
+            handleSha256: newHandle(),
+            state: "manual",
+            manualReason: "refund_destination_invalid",
+            x402Refusal: "allowance_ceiling",
+            payer: app.payer.address,
+            createdAt: app.now.get(),
+            expiresAt: after(300_000),
+            amountMicros: 50_000,
+            allowanceMicros: 47_000,
+            feeMicros: 3_000,
+        });
+        await seedSharedPayment(app.pool, order.id);
+        for (const [part, amount, state] of [
+            [0, 30_000, "confirmed"],
+            [1, 20_000, "manual"],
+        ] as const) {
+            await app.pool.query(
+                `insert into refunds (order_id, kind, part, reason, amount_micros, destination,
+                    payer, state, from_wallet)
+                 values ($1, 'full', $2, 'x402_ceiling', $3, $4, $5, $6, 'allowance')`,
+                [order.id, part, amount, `Src${"AB"[part]}`, `Own${"AB"[part]}`, state],
+            );
+        }
+        const ask = async () => (await post(app, "/v1/orders", { orderId: order.id, claim })).body;
+        expect(await ask()).toMatchObject({ reason: "allowance_ceiling", refundPending: true });
+        await app.pool.query(
+            "update refunds set state = 'confirmed' where order_id = $1 and part = 1",
+            [order.id],
+        );
+        expect(await ask()).toMatchObject({ reason: "allowance_ceiling", refundPending: false });
+    });
     it("a settle refusal answers charged false", async () => {
         const { order, claim } = await seedAllowanceOrder(app.pool, {
             handleSha256: newHandle(),
@@ -1601,5 +1642,163 @@ describe("x402 answers", () => {
             status: "paid",
             orderId: cold.orderId,
         });
+    });
+});
+
+describe("deposit-aware expiry", () => {
+    const keys = new DepositKeys(new Map([[1, Buffer.alloc(32, 7)]]), 1);
+    const MIN = 60_000;
+
+    // An unpaid order whose deposit exists, optionally holding an on-time transfer
+    async function withDeposit(o: { micros?: number; decided?: boolean; settled?: boolean } = {}) {
+        const key = KEY + randomBytes(4).toString("hex");
+        const created = await post(app, "/v1/orders", create({ idempotencyKey: key }));
+        const order = (await findOrder(app.pool, created.body.orderId))!;
+        await ensureDeposit(app.pool, keys, order, app.now.get());
+        if (o.micros !== undefined) {
+            const c = await app.pool.connect();
+            try {
+                await insertTransfers(c, order.id, [
+                    {
+                        orderId: order.id,
+                        signature: getBase58Decoder().decode(randomBytes(64)),
+                        slot: 100n,
+                        seq: 0,
+                        blockTime: after(5 * MIN),
+                        seenAt: after(5 * MIN),
+                        amountMicros: o.micros,
+                        sourceTokenAccount: "SourceAta",
+                        sourceOwner: "SourceOwner",
+                        sourceBalanceMicros: 1_000_000n,
+                    },
+                ]);
+            } finally {
+                c.release();
+            }
+        }
+        if (o.decided === true) {
+            await app.pool.query(
+                `update deposits set checked_at = $2, checked_slot = 500, expiry_min_slot = 400
+                 where order_id = $1`,
+                [order.id, after(20 * MIN)],
+            );
+        }
+        if (o.settled === true) {
+            await app.pool.query("update deposits set settled_at = $2 where order_id = $1", [
+                order.id,
+                after(9 * MIN),
+            ]);
+        }
+        return { orderId: order.id, claim: created.body.claim as string, key };
+    }
+    // By claim (authorized), then by replaying the create (unauthorized)
+    const ask = async (o: { orderId: string; claim: string; key: string }) => [
+        (await post(app, "/v1/orders", { orderId: o.orderId, claim: o.claim })).body.reason,
+        (await post(app, "/v1/orders", create({ idempotencyKey: o.key }))).body.reason,
+    ];
+
+    it("lapsed is deposit-aware, with three branches", async () => {
+        // Decided, so only its on-time money keeps it settling
+        const paidOnTime = await withDeposit({ micros: 30_000, decided: true });
+        const empty = await withDeposit();
+        const decidedEmpty = await withDeposit({ decided: true });
+        const noDeposit = await post(app, "/v1/orders", create({ idempotencyKey: KEY + "nodep" }));
+        const plain = {
+            orderId: noDeposit.body.orderId as string,
+            claim: noDeposit.body.claim as string,
+            key: KEY + "nodep",
+        };
+
+        app.now.set(after(5 * MIN));
+        const before = await post(app, "/v1/orders", {
+            orderId: empty.orderId,
+            claim: empty.claim,
+        });
+        expect(before.body.status).toBe("payment_required");
+        const replay = await post(app, "/v1/orders", create({ idempotencyKey: empty.key }));
+        expect(replay.body.status).toBe("payment_required");
+
+        app.now.set(after(10 * MIN + 30_000));
+        expect(await ask(paidOnTime)).toEqual(["settling", "settling"]);
+        expect(await ask(empty)).toEqual(["settling", "settling"]);
+        expect(await ask(decidedEmpty)).toEqual(["order_expired", "order_expired"]);
+        expect(await ask(plain)).toEqual(["order_expired", "order_expired"]);
+    });
+
+    it("an unpaid row read before its deposit settled answers settling", async () => {
+        // The settle committed between this request's order read and its deposit read, and the
+        // transfers it paid are no longer open on-time money
+        const stale = await withDeposit({ decided: true, settled: true });
+        const decided = await withDeposit({ decided: true });
+        app.now.set(after(15 * MIN + 30_000));
+        expect(await ask(stale)).toEqual(["settling", "settling"]);
+        expect(await ask(decided)).toEqual(["order_expired", "order_expired"]);
+    });
+});
+
+describe("transfer payments", () => {
+    const b58 = (n: number, len: 32 | 64) => getBase58Decoder().decode(Buffer.alloc(len, n));
+    const SENDER = b58(21, 32);
+
+    async function redeemTransfer(payerCounted: boolean) {
+        const flag = app.settings.router;
+        const was = flag.token_payer_claims;
+        const before = app.log.lines.length;
+        const sweep = b58(payerCounted ? 22 : 23, 64);
+        try {
+            flag.token_payer_claims = true;
+            const seeded = await seedPaid({ payer: SENDER });
+            await app.pool.query("update orders set paid_via = 'transfer' where id = $1", [
+                seeded.order.id,
+            ]);
+            await seedPayment(app.pool, seeded.order.id, {
+                payer: SENDER,
+                txSignature: sweep,
+                payerCounted,
+                multiSender: !payerCounted,
+                splitMinMicros: payerCounted ? null : 1_000,
+            });
+            const r = await post(app, "/v1/orders", {
+                orderId: seeded.order.id,
+                claim: seeded.claim,
+            });
+            expect(r.body.status).toBe("paid");
+            return {
+                body: r.body as { orderToken: string; paymentResponse?: { transaction: string } },
+                claims: tokenClaims(r.body.orderToken) as Record<string, unknown>,
+                lines: app.log.lines.slice(before),
+                sweep,
+            };
+        } finally {
+            flag.token_payer_claims = was;
+        }
+    }
+
+    it("transfer order token names the sender, Bugnet's fee payer and the sweep", async () => {
+        const r = await redeemTransfer(true);
+        expect(r.claims).toMatchObject({
+            payer: SENDER,
+            fee_payer: app.feePayer.address,
+            tx: r.sweep,
+        });
+        expect(r.body.paymentResponse?.transaction).toBe(r.sweep);
+    });
+
+    it("several senders: no payer claims and no warning", async () => {
+        const r = await redeemTransfer(false);
+        for (const key of ["payer", "fee_payer", "tx"]) expect(key in r.claims).toBe(false);
+        expect(r.lines.some((l) => l.msg === "order token payer claims dropped")).toBe(false);
+        expect(
+            r.lines.filter((l) => l.msg === "payer claims left out: several sending wallets"),
+        ).toHaveLength(1);
+    });
+
+    it("deposit addresses are blocked payees", async () => {
+        const keys = new DepositKeys(new Map([[1, Buffer.alloc(32, 7)]]), 1);
+        const { order } = await seed();
+        const dep = (await ensureDeposit(app.pool, keys, order, app.now.get()))!;
+        expect(await blockedAmong(app.pool, [dep.address, "Other"])).toEqual(
+            new Set([dep.address]),
+        );
     });
 });

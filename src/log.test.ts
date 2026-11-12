@@ -175,3 +175,21 @@ describe("x402 alarms", () => {
         expect(log.lines.map((l) => l.alarm)).toEqual(names);
     });
 });
+
+describe("deposit alarms", () => {
+    it("knows every deposit alarm of spec 17", () => {
+        // typed AlarmName[], so a missing name fails pnpm typecheck
+        const names: AlarmName[] = [
+            "deposit_review",
+            "deposit_unknown_debit",
+            "deposit_index_lag",
+            "deposit_capacity",
+            "deposit_create_churn",
+            "deposit_fee_budget",
+            "deposit_rpc_budget",
+        ];
+        const log = memoryLog();
+        for (const n of names) log.alarm(n);
+        expect(log.lines.map((l) => l.alarm)).toEqual(names);
+    });
+});

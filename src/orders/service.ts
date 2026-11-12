@@ -15,9 +15,11 @@ import type pg from "pg";
 import { z } from "zod";
 import type { Settings } from "../config.ts";
 import { withTx, type Queryable } from "../db/pool.ts";
+import { depositLedger } from "../deposits/store.ts";
+import { depositLapsed, depositSummary } from "../deposits/view.ts";
 import { isRecord } from "../is-record.ts";
 import type { Log } from "../log.ts";
-import { findOrderRefund } from "../refunds/request.ts";
+import { groupComplete } from "../refunds/split.ts";
 import type { BlockhashCache } from "../solana/blockhash.ts";
 import { SOLANA_MAINNET } from "../solana/constants.ts";
 import { type ChallengeContext, challengeFor, payUrlFor } from "../x402/challenge.ts";
@@ -350,14 +352,25 @@ function termsDiffer(r: OrderRequest, o: OrderRow): boolean {
     );
 }
 
-function lapsed(o: OrderRow, now: Date): boolean {
-    return now.getTime() >= o.expiresAt.getTime();
+// Reads the deposit only for an unpaid order past its deadline
+async function unpaidAnswer(
+    d: OrderServiceDeps,
+    o: OrderRow,
+): Promise<"open" | "expired" | "settling"> {
+    const now = d.now();
+    if (now.getTime() < o.expiresAt.getTime()) return "open";
+    const ledger = await depositLedger(d.pool, o.id);
+    // An unpaid order never has a settled deposit: the settle committed after this request read
+    // the order, and the order is settling now
+    if (ledger !== null && ledger.deposit.settledAt !== null) return "settling";
+    const dep =
+        ledger === null ? null : depositSummary(o, ledger, d.settings.deposits.settle_grace);
+    return depositLapsed(o.expiresAt, now, dep) ? "expired" : "settling";
 }
 
 async function closedAnswer(db: Queryable, o: OrderRow): Promise<Refused> {
     if (o.x402Refusal !== null && ["refunding", "refunded", "manual"].includes(o.state)) {
-        const row = await findOrderRefund(db, o.id);
-        const done = row?.state === "confirmed" || row?.manualReason === "resolved_by_hand";
+        const done = await groupComplete(db, o.id, "full");
         return { ...refused(o.x402Refusal, o.id), refundPending: !done };
     }
     return refused(o.state === "expired" ? "order_expired" : "order_closed", o.id);
@@ -370,7 +383,9 @@ async function answerUnauthorized(
 ): Promise<OrderResult> {
     switch (o.state) {
         case "unpaid": {
-            if (lapsed(o, d.now())) return refused("order_expired", o.id);
+            const at = await unpaidAnswer(d, o);
+            if (at === "expired") return refused("order_expired", o.id);
+            if (at === "settling") return refused("settling", o.id);
             const claim =
                 idempotencyHit && o.claimBox !== null
                     ? openClaim(d.claimKey, o.id, o.claimBox)
@@ -392,8 +407,12 @@ async function answerAuthorized(
     retryStale: boolean,
 ): Promise<OrderResult> {
     switch (o.state) {
-        case "unpaid":
-            return lapsed(o, d.now()) ? refused("order_expired", o.id) : paymentRequired(d, o);
+        case "unpaid": {
+            const at = await unpaidAnswer(d, o);
+            if (at === "expired") return refused("order_expired", o.id);
+            if (at === "settling") return refused("settling", o.id);
+            return paymentRequired(d, o);
+        }
         case "settling":
             return refused("settling", o.id);
         case "paid":
@@ -461,8 +480,15 @@ async function paid(
     if (payer === undefined) throw new Error(`paid order ${o.id} has no payer`);
     let proof: PaymentProof | undefined;
     if (d.settings.router.token_payer_claims) {
-        proof = paymentProof(payment?.payer, d.challenge.feePayer, payment?.txSignature);
-        if (proof === undefined) d.log.warn("order token payer claims dropped", { orderId: o.id });
+        // A payment from several wallets names no one payer, so it carries no payer claims
+        if (payment !== null && !payment.payerCounted) {
+            d.log.info("payer claims left out: several sending wallets", { orderId: o.id });
+        } else {
+            proof = paymentProof(payment?.payer, d.challenge.feePayer, payment?.txSignature);
+            if (proof === undefined) {
+                d.log.warn("order token payer claims dropped", { orderId: o.id });
+            }
+        }
     }
     const out: Paid = {
         status: "paid",

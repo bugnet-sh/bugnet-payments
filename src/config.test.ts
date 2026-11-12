@@ -17,6 +17,7 @@ import { jsonLog } from "./log.ts";
 const ADDR = "11111111111111111111111111111111";
 const ORDER_SEED = Buffer.alloc(32, 1);
 const CLAIM_KEY = Buffer.alloc(32, 2);
+const DEPOSIT_SEED = Buffer.alloc(32, 3);
 const PAYMENTS_TOKEN = "gateway-to-payments-0123456789abcdef";
 const ROUTER_TOKEN = "payments-to-router-0123456789abcdef";
 
@@ -64,6 +65,7 @@ function validEnv(overrides: Record<string, string | undefined> = {}): NodeJS.Pr
         BUGNET_PAYMENTS_ROUTER_TOKEN: ROUTER_TOKEN,
         BUGNET_ORDER_PRIVATE_KEY: ORDER_SEED.toString("base64"),
         BUGNET_CLAIM_KEY: CLAIM_KEY.toString("base64"),
+        BUGNET_DEPOSIT_SEED: DEPOSIT_SEED.toString("base64"),
         BUGNET_FEE_PAYER_KEY: "fee-payer-key",
         BUGNET_REFUND_KEY: "refund-key",
         BUGNET_SOLANA_RPC_URL: "https://rpc.example/?api-key=k",
@@ -459,9 +461,18 @@ describe("secret redaction list", () => {
         });
         for (const env of [single, list]) {
             const secrets = readSecrets(env, settings());
+            expect(secrets.depositSeedPrevious).toBeNull();
             expect(secretsEnv(secrets)).toEqual(env);
             expect(Object.keys(secretsEnv(secrets))).toHaveLength(Object.keys(env).length);
         }
+    });
+
+    it("secretValues redacts the deposit seeds", () => {
+        const a = Buffer.alloc(32, 4).toString("base64");
+        const b = Buffer.alloc(32, 5).toString("base64");
+        const values = secretValues({ BUGNET_DEPOSIT_SEED: a, BUGNET_DEPOSIT_SEED_PREVIOUS: b });
+        expect(values).toContain(a);
+        expect(values).toContain(b);
     });
 
     it("keeps each set secret once, longest first, and nothing else", () => {
@@ -769,5 +780,205 @@ describe("x402 secret redaction", () => {
     });
     it("never adds a decoded value that is not a PEM", () => {
         expect(secretValues({ BUGNET_X402_TLS_KEY: "c2hvcnQ=" })).toEqual(["c2hvcnQ="]);
+    });
+});
+
+const DEPOSITS_DEFAULTS = {
+    enabled: true,
+    seed_version: 1,
+    busy_every: 2_000,
+    idle_every: 20_000,
+    closed_every: 120_000,
+    watch_after_close: 86_400_000,
+    settle_grace: 60_000,
+    expire_hard_after: 300_000,
+    expire_hard_max: 1_800_000,
+    viewer_ttl: 30_000,
+    max_open: 500,
+    rented_per_ip: 1,
+    rented_per_block: 2,
+    unpaid_create_lamports_per_hour: 1_000_000,
+    refund_min_micros: 1_000,
+    max_late_returns: 2,
+    free_moves_lamports_per_hour: 2_000_000,
+    returns_per_owner_per_hour: 6,
+    payer_recheck_every: 10_000,
+    max_split_owners: 4,
+    compute_unit_limit: 40_000,
+    compute_unit_price_micro_lamports: 10_000,
+    max_attempts: 3,
+    close_retry_after: [120_000, 600_000, 3_600_000],
+    scan_page_size: 1_000,
+    scan_max_pages: 10,
+    scan_max_transactions: 200,
+    scan_time_box: 1_500,
+    move_check_after: 2_000,
+    resend_after: 10_000,
+    index_lag_alarm_after: 30_000,
+    rpc_calls_per_second: 3,
+    rpc_calls_per_day: 30_000,
+    rpc_calls_per_hour_alarm: 6_000,
+};
+const deposits = (lines: string) => parseSettings(`${SOLANA}\n[deposits]\n${lines}`, "t");
+
+describe("[deposits] settings", () => {
+    it("deposits defaults", () => {
+        expect(parseSettings(SOLANA, "t").deposits).toEqual(DEPOSITS_DEFAULTS);
+    });
+
+    it("limits defaults", () => {
+        expect(parseSettings(SOLANA, "t").limits).toMatchObject({
+            balance_per_ip_per_minute: 20,
+            balance_rpc_per_minute: 30,
+            report_per_ip_per_minute: 10,
+            ipv6_block_multiple: 4,
+        });
+    });
+
+    it("example.toml parses to the defaults", () => {
+        const text = readFileSync("config/example.toml", "utf8").replace(
+            'recipient = ""',
+            `recipient = "${ADDR}"`,
+        );
+        const example = parseSettings(text, "example.toml");
+        const defaults = parseSettings(SOLANA, "t");
+        expect(example.deposits).toEqual(defaults.deposits);
+        expect(example.limits).toEqual(defaults.limits);
+    });
+
+    it("scan_page_size stays from 1 to 1,000", () => {
+        expect(() => deposits("scan_page_size = 0")).toThrow(ConfigError);
+        expect(() => deposits("scan_page_size = 1001")).toThrow(/deposits.scan_page_size/);
+        expect(deposits("scan_page_size = 1000").deposits.scan_page_size).toBe(1_000);
+    });
+
+    it("close_retry_after refuses an empty list", () => {
+        expect(() => deposits("close_retry_after = []")).toThrow(ConfigError);
+        expect(() => deposits("close_retry_after = []")).toThrow(/deposits.close_retry_after/);
+    });
+
+    it("rpc_calls_per_second stays at most 5", () => {
+        expect(() => deposits("rpc_calls_per_second = 6")).toThrow(ConfigError);
+        expect(deposits("rpc_calls_per_second = 5").deposits.rpc_calls_per_second).toBe(5);
+    });
+
+    it("expire_hard_max is at least expire_hard_after", () => {
+        expect(() => deposits('expire_hard_max = "1m"')).toThrow(ConfigError);
+        expect(() => deposits('expire_hard_max = "1m"')).toThrow(
+            "deposits.expire_hard_max: must be at least expire_hard_after",
+        );
+        expect(deposits('expire_hard_max = "5m"').deposits.expire_hard_max).toBe(300_000);
+    });
+
+    it.each([
+        "max_attempts",
+        "max_late_returns",
+        "rented_per_ip",
+        "rented_per_block",
+        "returns_per_owner_per_hour",
+        "max_split_owners",
+        "scan_max_pages",
+        "scan_max_transactions",
+        "rpc_calls_per_day",
+    ])("deposits.%s is at least 1", (key) => {
+        expect(() => deposits(`${key} = 0`)).toThrow(new RegExp(`deposits.${key}`));
+        expect(deposits(`${key} = 1`).deposits).toHaveProperty(key, 1);
+    });
+
+    it("limits.ipv6_block_multiple is at least 1", () => {
+        const limits = (n: number) =>
+            parseSettings(`${SOLANA}\n[limits]\nipv6_block_multiple = ${n}`, "t").limits;
+        expect(() => limits(0)).toThrow(/limits.ipv6_block_multiple/);
+        expect(limits(1).ipv6_block_multiple).toBe(1);
+    });
+
+    it.each(["busy_every", "idle_every", "closed_every", "payer_recheck_every"])(
+        "bounds deposits.%s from 1ms to 24h",
+        (key) => {
+            expect(() => deposits(`${key} = "0ms"`)).toThrow(new RegExp(`deposits.${key}`));
+            expect(() => deposits(`${key} = "25h"`)).toThrow(new RegExp(`deposits.${key}`));
+            expect(deposits(`${key} = "24h"`).deposits).toHaveProperty(key, 86_400_000);
+        },
+    );
+
+    it("refund_min_micros may be 0", () => {
+        expect(deposits("refund_min_micros = 0").deposits.refund_min_micros).toBe(0);
+        expect(() => deposits("refund_min_micros = -1")).toThrow(/deposits.refund_min_micros/);
+    });
+});
+
+describe("readSecrets for deposits", () => {
+    const disabled = () => parseSettings(`${SOLANA}\n[deposits]\nenabled = false`, "t");
+
+    it("deposit seed required while enabled", () => {
+        const missing = validEnv({ BUGNET_DEPOSIT_SEED: undefined });
+        expect(() => readSecrets(missing, settings())).toThrow(ConfigError);
+        expect(() => readSecrets(missing, settings())).toThrow("BUGNET_DEPOSIT_SEED must be set");
+        expect(() => readSecrets(validEnv({ BUGNET_DEPOSIT_SEED: "abc" }), settings())).toThrow(
+            "BUGNET_DEPOSIT_SEED must be standard base64 of exactly 32 bytes",
+        );
+        expect(readSecrets(validEnv(), settings()).depositSeed?.equals(DEPOSIT_SEED)).toBe(true);
+    });
+
+    it("deposit seed optional while disabled", () => {
+        const s = readSecrets(validEnv({ BUGNET_DEPOSIT_SEED: undefined }), disabled());
+        expect(s.depositSeed).toBeNull();
+        expect(s.depositSeedPrevious).toBeNull();
+        expect(readSecrets(validEnv(), disabled()).depositSeed?.equals(DEPOSIT_SEED)).toBe(true);
+        expect(() => readSecrets(validEnv({ BUGNET_DEPOSIT_SEED: "abc" }), disabled())).toThrow(
+            "BUGNET_DEPOSIT_SEED must be standard base64 of exactly 32 bytes",
+        );
+    });
+
+    it("reads the previous seed only when it is set", () => {
+        const previous = Buffer.alloc(32, 4);
+        const s = readSecrets(
+            validEnv({ BUGNET_DEPOSIT_SEED_PREVIOUS: previous.toString("base64") }),
+            settings(),
+        );
+        expect(s.depositSeedPrevious?.equals(previous)).toBe(true);
+        expect(readSecrets(validEnv({ BUGNET_DEPOSIT_SEED_PREVIOUS: "" }), settings())).toEqual(
+            expect.objectContaining({ depositSeedPrevious: null }),
+        );
+        expect(() =>
+            readSecrets(validEnv({ BUGNET_DEPOSIT_SEED_PREVIOUS: "abc" }), settings()),
+        ).toThrow("BUGNET_DEPOSIT_SEED_PREVIOUS must be standard base64 of exactly 32 bytes");
+    });
+
+    it("deposit seeds must differ", () => {
+        const claim = CLAIM_KEY.toString("base64");
+        const order = ORDER_SEED.toString("base64");
+        const seed = DEPOSIT_SEED.toString("base64");
+        const refused = (over: Record<string, string>, message: string) => {
+            let text = "";
+            try {
+                readSecrets(validEnv(over), settings());
+            } catch (e) {
+                expect(e).toBeInstanceOf(ConfigError);
+                text = (e as Error).message;
+            }
+            expect(text).toBe(message);
+            for (const value of [claim, order, seed]) expect(text).not.toContain(value);
+        };
+        refused(
+            { BUGNET_DEPOSIT_SEED: claim },
+            "BUGNET_DEPOSIT_SEED must differ from BUGNET_CLAIM_KEY",
+        );
+        refused(
+            { BUGNET_DEPOSIT_SEED: order },
+            "BUGNET_DEPOSIT_SEED must differ from BUGNET_ORDER_PRIVATE_KEY",
+        );
+        refused(
+            { BUGNET_DEPOSIT_SEED_PREVIOUS: seed },
+            "BUGNET_DEPOSIT_SEED_PREVIOUS must differ from BUGNET_DEPOSIT_SEED",
+        );
+        refused(
+            { BUGNET_DEPOSIT_SEED_PREVIOUS: order },
+            "BUGNET_DEPOSIT_SEED_PREVIOUS must differ from BUGNET_ORDER_PRIVATE_KEY",
+        );
+        refused(
+            { BUGNET_DEPOSIT_SEED_PREVIOUS: claim },
+            "BUGNET_DEPOSIT_SEED_PREVIOUS must differ from BUGNET_CLAIM_KEY",
+        );
     });
 });

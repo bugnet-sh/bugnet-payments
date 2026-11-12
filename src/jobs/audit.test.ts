@@ -1,4 +1,6 @@
 import { randomBytes } from "node:crypto";
+import { DepositKeys } from "../deposits/keys.ts";
+import { ensureDeposit } from "../deposits/store.ts";
 import { address, getBase58Decoder } from "@solana/kit";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { memoryLog } from "../log.ts";
@@ -125,6 +127,33 @@ beforeEach(async () => {
 const alarms = (name: string) => log.lines.filter((l) => l.alarm === name);
 
 describe("auditInflows", () => {
+    it("audit matches a cold sweep and kept dust", async () => {
+        const keys = new DepositKeys(new Map([[1, Buffer.alloc(32, 7)]]), 1);
+        const { order: other } = await seedOrder(db.pool, {
+            state: "unpaid",
+            createdAt: new Date(),
+            expiresAt: new Date(Date.now() + 3_600_000),
+        });
+        await ensureDeposit(db.pool, keys, other, new Date());
+        await db.pool.query(
+            `insert into deposit_moves (order_id, kind, amount_micros, keep_micros, held_micros,
+                payer, closes, close_to, state, tx_signature, created_at, confirmed_at)
+             values ($1, 'return', 7000, 500, 7000, 'Payer', true, 'FeePayer', 'confirmed', $2,
+                now(), now())`,
+            [other.id, sig("K1")],
+        );
+        const r = await auditInflows(
+            deps(
+                rpcWith([
+                    inflow({ name: "S1", memo: order.id, amount: "10000" }),
+                    inflow({ name: "K1", memo: `bugnet-kept ${other.id}`, amount: "500" }),
+                ]),
+            ),
+        );
+        expect(r.matched).toBe(2);
+        expect(r.mismatches).toEqual([]);
+    });
+
     it("matches an inflow to its paid order by memo and amount", async () => {
         const r = await auditInflows(
             deps(rpcWith([inflow({ name: "S1", memo: order.id, amount: "10000" })])),

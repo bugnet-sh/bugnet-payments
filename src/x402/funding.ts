@@ -2,6 +2,7 @@ import type pg from "pg";
 import type { Settings } from "../config.ts";
 import type { Log } from "../log.ts";
 import type { OrderRow, PaymentRow } from "../orders/types.ts";
+import { insertRefundGroup, refundTargets } from "../refunds/split.ts";
 import {
     creditMicros,
     insertFirstUse,
@@ -195,15 +196,23 @@ export function createAllowanceFunding(d: { x402: Settings["x402"]; log: Log }):
         for (const f of fundings.rows.map(toFunding)) {
             if (left === 0) break;
             const share = Math.min(left, f.allowanceMicros);
-            const row = await c.query<{ id: string }>(
-                `insert into refunds (order_id, kind, reason, amount_micros, destination, payer,
-                    state, from_wallet, created_at)
-                 values ($1, 'allowance', 'x402_unspent', $2, $3, $4, 'pending', 'allowance', $5)
-                 on conflict (order_id, kind) do nothing returning id`,
-                [f.orderId, share, f.sourceTokenAccount, f.payer, at],
+            // A funding order paid by several owners gives each its part of the order's share
+            const targets = await refundTargets(c, f.orderId, share);
+            if (targets === null) throw new Error(`funding order ${f.orderId} has no payment`);
+            const made = await insertRefundGroup(
+                c,
+                {
+                    orderId: f.orderId,
+                    kind: "allowance",
+                    reason: "x402_unspent",
+                    fromWallet: "allowance",
+                    budgetWaived: false,
+                    at,
+                },
+                targets,
             );
-            if (row.rows.length !== 1) throw new Error(`allowance refund of ${f.orderId} exists`);
-            refundIds.push(Number(row.rows[0]!.id));
+            if (made === "exists") throw new Error(`allowance refund of ${f.orderId} exists`);
+            refundIds.push(...made.ids);
             left -= share;
         }
         if (left !== 0) throw new Error(`x402 account ${account.id} has unrefundable money`);

@@ -67,11 +67,12 @@ function freePort(): Promise<number> {
     });
 }
 
-// The public URL names the public port, so that port is picked before the service starts
-async function liveTables(dbUrl: string, eventSeed: Buffer): Promise<Tables> {
+// The public URL names the public port, so that port is picked before the service starts. A
+// section of over replaces those keys of the result.
+async function liveTables(dbUrl: string, eventSeed: Buffer, over: Tables = {}): Promise<Tables> {
     const dev = parse(readFileSync(resolve(REPO, "config/dev.toml"), "utf8")) as Tables;
     const port = await freePort();
-    return {
+    const tables: Tables = {
         ...dev,
         http: {
             ...dev.http,
@@ -81,14 +82,24 @@ async function liveTables(dbUrl: string, eventSeed: Buffer): Promise<Tables> {
         },
         database: { ...dev.database, url: dbUrl },
         router: { ...dev.router, event_public_key: orderPublicKeyBase64(eventSeed) },
+        // These runs pay by wallet and x402, so they need no BUGNET_DEPOSIT_SEED
+        deposits: { ...dev.deposits, enabled: false },
     };
+    for (const [section, keys] of Object.entries(over)) {
+        tables[section] = { ...tables[section], ...keys };
+    }
+    return tables;
 }
 
 // Far above every test amount, so no cold transfer moves the hot balance until the cold step
 export const COLD_OFF_MICROS = 1_000_000_000_000;
 
-export async function liveSettings(dbUrl: string, eventSeed: Buffer): Promise<Settings> {
-    return parseSettings(stringify(await liveTables(dbUrl, eventSeed)), "live");
+export async function liveSettings(
+    dbUrl: string,
+    eventSeed: Buffer,
+    over: Tables = {},
+): Promise<Settings> {
+    return parseSettings(stringify(await liveTables(dbUrl, eventSeed, over)), "live");
 }
 
 // The router settings, recipient and rpc_timeout of config/dev.toml, and the local list in its

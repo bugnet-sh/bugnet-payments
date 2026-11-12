@@ -110,10 +110,13 @@ export async function refundView(
     account: AccountRow,
 ): Promise<X402RefundView | undefined> {
     if (account.state === "open") return undefined;
-    // A voided funding's allowance is what the buyer is owed back, not the full refund's gross
+    // A voided funding's allowance is what the buyer is owed back, not the full refund's gross,
+    // counted once from part 0 however many owners its refund is split among
     const res = await db.query<RefundViewRow>(
         `select r.state, r.manual_reason, r.tx_signature, r.hand_tx,
-            case when r.kind = 'full' then f.allowance_micros else r.amount_micros end as amount
+            case when r.kind <> 'full' then r.amount_micros
+                when r.part = 0 then f.allowance_micros
+                else 0 end as amount
          from refunds r join x402_fundings f on f.order_id = r.order_id
          where f.account_id = $1
             and (r.kind = 'allowance' or (r.kind = 'full' and f.voided_at is not null))

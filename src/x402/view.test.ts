@@ -272,6 +272,52 @@ describe("refund view states", () => {
             txs: [SIG(3)],
         });
     });
+    it("refundView counts a voided allowance once", async () => {
+        const a = await seedAccount(db.pool, { state: "closing" });
+        await seedFunding(db.pool, {
+            accountId: a.id,
+            orderId: a.id,
+            allowanceMicros: 40_000,
+            voidedAt: new Date(),
+        });
+        for (const [part, amount] of [
+            [0, 30_000],
+            [1, 20_000],
+        ] as const) {
+            await db.pool.query(
+                `insert into refunds (order_id, kind, part, reason, amount_micros, destination,
+                    payer, state, from_wallet)
+                 values ($1, 'full', $2, 'unredeemed', $3, 'source-test', $4, 'sent', 'allowance')`,
+                [a.id, part, amount, PAYER],
+            );
+        }
+        expect(await refundView(db.pool, a)).toEqual({
+            state: "sent",
+            amountMicros: 40_000,
+            keptMicros: 0,
+            txs: [],
+        });
+        const confirm = (part: number, tx: string) =>
+            db.pool.query(
+                `update refunds set state = 'confirmed', tx_signature = $3
+                 where order_id = $1 and part = $2`,
+                [a.id, part, tx],
+            );
+        await confirm(0, SIG(3));
+        expect(await refundView(db.pool, a)).toEqual({
+            state: "sent",
+            amountMicros: 40_000,
+            keptMicros: 0,
+            txs: [SIG(3)],
+        });
+        await confirm(1, SIG(4));
+        expect(await refundView(db.pool, a)).toEqual({
+            state: "confirmed",
+            amountMicros: 40_000,
+            keptMicros: 0,
+            txs: [SIG(3), SIG(4)],
+        });
+    });
     it("a full refund of a funding that is not voided is not counted", async () => {
         const a = await seedAccount(db.pool, { state: "closing" });
         await seedFunding(db.pool, { accountId: a.id, orderId: a.id, allowanceMicros: 1_000_000 });

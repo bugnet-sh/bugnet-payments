@@ -1,16 +1,22 @@
 /**
- * The `keys` commands of the operator CLI: generate secrets, fund the service wallets from the test
- * payer, show addresses and balances, drain the wallets back, and print the order public key.
+ * The `keys` commands of the operator CLI: generate secrets, rotate and retire the deposit seed,
+ * fund the service wallets from the test payer, show addresses and balances, drain the wallets
+ * back, and print the order public key.
  *
- * Only `generate`, `testseller` and `drain --testseller` read an env file; every other command reads
- * the process environment. Only `drain --allowance` parses the TOML settings, to check the key
+ * Only `generate`, `rotate-deposit-seed`, `retire-deposit-seed`, `testseller` and
+ * `drain --testseller` read an env file; every other command reads the process environment. The
+ * two seed commands run as root on the server's env file and print variable names only, never a
+ * value, except `retire-deposit-seed --archive -`, whose stdout is the archive line a Mac-side
+ * script carries off the server (D8 A). Only `drain --allowance` parses the TOML settings, to
+ * check the key
  * against the configured allowance wallet and the hot ledger: `fund --create-recipient-ata` takes
  * the recipient address itself, so it never reads a config that names another wallet. The test
  * payer pays every fee and every ATA rent, so no other wallet needs SOL for these commands.
  *
  * The commands that touch Solana read the same RPC list as the service, through the router. Only
  * with -config do they parse the TOML, and then only for [solana] rpc and rpc_timeout; without
- * one they use the router's defaults. pubkey, show --no-balances and generate never read a TOML.
+ * one they use the router's defaults. pubkey, show --no-balances, generate, rotate-deposit-seed
+ * and retire-deposit-seed never read a TOML and never call an RPC.
  */
 import {
     type Address,
@@ -40,6 +46,10 @@ import {
     generateSecrets,
     parseEnvText,
     type PlannedTx,
+    previousSeedLine,
+    removeArchivedSeed,
+    retireDepositSeed,
+    rotateDepositSeed,
     testSellerDrainPlan,
     testSellerPlan,
     walletAddresses,
@@ -50,6 +60,7 @@ import { existsSync, readFileSync } from "node:fs";
 interface Io {
     out: (s: string) => void;
     err: (s: string) => void;
+    stdin?: () => Promise<string>;
 }
 
 interface Flags {
@@ -69,6 +80,11 @@ const POLL_BACKOFF_MS = 250;
 
 const COMMANDS: Record<string, { values: string[]; switches: string[] }> = {
     generate: { values: ["--env"], switches: [] },
+    "rotate-deposit-seed": { values: ["--env"], switches: [] },
+    "retire-deposit-seed": {
+        values: ["--env", "--archive", "--version"],
+        switches: ["--remove-previous"],
+    },
     fund: {
         values: ["--fee-payer-lamports", "--refund-usdc-micros", "--create-recipient-ata"],
         switches: ["--create-refund-ata", "--create-allowance-ata"],
@@ -81,6 +97,13 @@ const COMMANDS: Record<string, { values: string[]; switches: string[] }> = {
 
 export const KEYS_USAGE = [
     "  keys generate [--env FILE]               fill empty secrets in FILE (default .env)",
+    "  keys rotate-deposit-seed --env FILE      move the deposit seed to _PREVIOUS, make a new one",
+    "  keys retire-deposit-seed --env FILE --archive FILE --version N",
+    "                                           archive the previous deposit seed as version N,",
+    "                                           then remove it from the env file",
+    "  keys retire-deposit-seed --env FILE --archive - --version N [--remove-previous]",
+    "                                           print the archive line; --remove-previous removes",
+    "                                           the seed once stdin holds that line",
     "  keys fund [--fee-payer-lamports N] [--refund-usdc-micros M]",
     "            [--create-recipient-ata RECIPIENT_ADDRESS] [--create-refund-ata]",
     "            [--create-allowance-ata]",
@@ -150,16 +173,37 @@ export async function runKeys(
         return 2;
     }
     const envFile = flags.values.get("--env") ?? ".env";
+    const readsEnvFile = ["generate", "rotate-deposit-seed", "retire-deposit-seed"].includes(
+        action ?? "",
+    );
     const source =
-        action === "generate" && existsSync(envFile)
-            ? parseEnvText(readFileSync(envFile, "utf8"))
-            : env;
+        readsEnvFile && existsSync(envFile) ? parseEnvText(readFileSync(envFile, "utf8")) : env;
+    const archive = flags.values.get("--archive");
+    // Phase 2 of D8 A reads the archive back on stdin; phase 1 writes it to stdout
+    let piped: Record<string, string> | null = null;
+    if (archive === "-" && flags.switches.has("--remove-previous")) {
+        if (io.stdin === undefined) {
+            io.err("--archive - needs the archive on stdin");
+            return 2;
+        }
+        piped = parseEnvText(await io.stdin());
+    }
+    const file =
+        archive !== undefined && archive !== "-" && existsSync(archive)
+            ? parseEnvText(readFileSync(archive, "utf8"))
+            : {};
+    const archived = Object.values(piped ?? file);
     const sellerFile =
         (action === "testseller" || flags.switches.has("--testseller")) && flags.values.has("--env")
             ? sellerEnvFile(envFile, existsSync(envFile))
             : {};
     const log = jsonLog("payments-keys", {
-        secrets: [...secretValues(source), ...sellerSecrets(env), ...sellerSecrets(sellerFile)],
+        secrets: [
+            ...secretValues(source),
+            ...archived.filter((v) => v.trim() !== ""),
+            ...sellerSecrets(env),
+            ...sellerSecrets(sellerFile),
+        ],
         write: io.err,
     });
     const rpcs = keysRpc(env, config, log);
@@ -167,6 +211,10 @@ export async function runKeys(
         switch (action) {
             case "generate":
                 return await generate(envFile, io);
+            case "rotate-deposit-seed":
+                return rotateSeed(flags, io);
+            case "retire-deposit-seed":
+                return retireSeed(flags, io, piped);
             case "pubkey":
                 return pubkey(env, io);
             case "show":
@@ -260,6 +308,76 @@ async function generate(envFile: string, io: Io): Promise<number> {
     io.out(added.length === 0 ? "added=none" : `added=${added.join(",")}`);
     for (const [name, addr] of Object.entries(addresses)) io.out(`${name}=${addr}`);
     return 0;
+}
+
+function rotateSeed(flags: Flags, io: Io): number {
+    const file = flags.values.get("--env");
+    if (file === undefined) {
+        io.err("keys rotate-deposit-seed needs --env FILE");
+        return 2;
+    }
+    rotateDepositSeed(file);
+    io.out("moved BUGNET_DEPOSIT_SEED to BUGNET_DEPOSIT_SEED_PREVIOUS and made a new one");
+    return 0;
+}
+
+function retireSeed(flags: Flags, io: Io, piped: Readonly<Record<string, string>> | null): number {
+    const envPath = flags.values.get("--env");
+    const archivePath = flags.values.get("--archive");
+    if (envPath === undefined || archivePath === undefined) {
+        io.err("keys retire-deposit-seed needs --env FILE --archive FILE --version N");
+        return 2;
+    }
+    const version = flags.values.get("--version") ?? "";
+    if (!/^[1-9][0-9]{0,8}$/.test(version)) {
+        io.err("--version needs a whole number of at least 1");
+        return 2;
+    }
+    if (archivePath === "-") return retireThroughStdio(envPath, Number(version), piped, io);
+    if (flags.switches.has("--remove-previous")) {
+        io.err("--remove-previous takes the archive on stdin: --archive -");
+        return 2;
+    }
+    const name = `BUGNET_DEPOSIT_SEED_V${version}`;
+    const { archived, removed } = retireDepositSeed({
+        envPath,
+        archivePath,
+        version: Number(version),
+    });
+    if (!removed) {
+        io.out("nothing to retire");
+        return 0;
+    }
+    io.out(archived ? `archived ${name}` : `${name} was already archived`);
+    io.out("removed BUGNET_DEPOSIT_SEED_PREVIOUS");
+    return 0;
+}
+
+// D8 A: status lines go to stderr in both phases, so stdout carries only the archive line
+function retireThroughStdio(
+    envPath: string,
+    version: number,
+    piped: Readonly<Record<string, string>> | null,
+    io: Io,
+): number {
+    if (piped === null) {
+        const line = previousSeedLine(envPath, version);
+        if (line === null) io.err("nothing to retire");
+        else io.out(line);
+        return 0;
+    }
+    const name = `BUGNET_DEPOSIT_SEED_V${version}`;
+    switch (removeArchivedSeed(envPath, version, piped)) {
+        case "nothing":
+            io.err("nothing to retire");
+            return 0;
+        case "mismatch":
+            io.err(`${name} on stdin does not match BUGNET_DEPOSIT_SEED_PREVIOUS; nothing removed`);
+            return 1;
+        case "removed":
+            io.err("removed BUGNET_DEPOSIT_SEED_PREVIOUS");
+            return 0;
+    }
 }
 
 async function testSeller(
@@ -575,7 +693,7 @@ async function sendAndConfirm(
 
 // Waits by block height, not wall clock: a transaction can land any time before its blockhash
 // expires, so only an expired blockhash with no status proves it never will.
-async function waitForLanding(
+export async function waitForLanding(
     rpc: SolanaRpc,
     txSignature: string,
     lastValidBlockHeight: bigint,

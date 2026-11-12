@@ -12,7 +12,7 @@ afterAll(async () => {
 });
 
 describe("singleRunner", () => {
-    it("keys are the eight fixed values", () => {
+    it("keys are the nine fixed values", () => {
         expect(RUNNER_KEYS).toEqual({
             mirror: 4020001,
             fastPass: 4020002,
@@ -22,6 +22,7 @@ describe("singleRunner", () => {
             hotRefunds: 4020006,
             cold: 4020007,
             outbox: 4020008,
+            deposits: 4020009,
         });
     });
 

@@ -66,6 +66,10 @@ const challenge: ChallengeContext = {
     transactionVersions: [0],
 };
 const X = parseSettings(stringify({ solana: { recipient: challenge.recipient } }), "t").x402;
+const DEPOSITS = parseSettings(
+    stringify({ solana: { recipient: challenge.recipient } }),
+    "t",
+).deposits;
 const paidDeps = {
     funding: createAllowanceFunding({ x402: X, log: silentLog }),
     x402: X,
@@ -1410,6 +1414,7 @@ describe("allowance orders", () => {
                 now: () => new Date(NOW.getTime() + 60_000),
                 paid: paidDeps,
                 x402: paidDeps.x402,
+                deposits: DEPOSITS,
             }).then(() => {}),
         );
         expect(
@@ -1457,6 +1462,7 @@ describe("allowance orders", () => {
                 now: () => new Date(NOW.getTime() + 60_000),
                 paid: paidDeps,
                 x402: paidDeps.x402,
+                deposits: DEPOSITS,
             }).then(() => {}),
         );
         expect(

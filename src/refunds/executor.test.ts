@@ -16,6 +16,7 @@ import { getTransferCheckedInstructionDataDecoder } from "@solana-program/token"
 import { stringify } from "smol-toml";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { parseSettings, type Settings } from "../config.ts";
+import { withTx } from "../db/pool.ts";
 import { memoryLog } from "../log.ts";
 import { findOrder } from "../orders/store.ts";
 import type { RouterClient } from "../router/client.ts";
@@ -33,12 +34,14 @@ import {
     TEST_LVBH,
 } from "../testing/fake-rpc.ts";
 import { testSigner } from "../testing/keys.ts";
-import { seedOrder, seedPayment } from "../testing/orders.ts";
+import { heldRefundId, seedHeldTransfer } from "../testing/deposits.ts";
+import { seedOrder, seedPayment, seedSharedPayment, type TestShare } from "../testing/orders.ts";
 import { seedAccount, seedFunding } from "../testing/x402.ts";
 import { setControls } from "../x402/controls.ts";
 import { runCloseJob } from "../x402/close.ts";
 import { createAllowanceFunding } from "../x402/funding.ts";
 import { findAccount, readPool } from "../x402/ledger.ts";
+import { type ChainTx, type MatchDeps, matchInTx } from "../x402/match.ts";
 import {
     buildRefundTransaction,
     pauseRefunds,
@@ -51,10 +54,12 @@ import {
     findOrderRefund,
     findRefund,
     findRefundById,
+    refundGroup,
     type RefundKind,
     type RefundRow,
     requestRefund,
 } from "./request.ts";
+import { insertDepositRefund } from "./split.ts";
 
 const T0 = new Date("2030-01-01T12:00:00Z");
 const COMPUTE_BUDGET = "ComputeBudget111111111111111111111111111111";
@@ -1642,5 +1647,405 @@ describe("runRefunds allowance", () => {
             landedSlot: 4_321n,
         });
         expect((await readPool(db.pool)).committedMicros).toBe(700_000);
+    });
+});
+
+describe("runRefunds on refund groups", () => {
+    let owners: KeyPairSigner[];
+    let sources: Address[];
+    let OTHER_B: Address;
+    const owner = new Map<string, string>();
+
+    beforeAll(async () => {
+        owners = [payer, await testSigner(12), await testSigner(13), await testSigner(14)];
+        sources = [SOURCE];
+        for (const o of owners.slice(1)) sources.push(await usdcAta(o.address));
+        // A second account of owner B, so a wrong destination still passes the on-chain check
+        OTHER_B = (await testSigner(15)).address;
+        owners.forEach((o, i) => owner.set(sources[i]!, o.address));
+        owner.set(OTHER_B, owners[1]!.address);
+    });
+
+    function shares(...applied: number[]): TestShare[] {
+        return applied.map((appliedMicros, i) => ({
+            owner: owners[i]!.address,
+            sourceTokenAccount: sources[i]!,
+            appliedMicros,
+        }));
+    }
+
+    // Each owner's account answers as its own; a closed one answers nothing
+    function groupRpc(closed: readonly string[] = [], script: Partial<FakeRpcScript> = {}) {
+        return okRpc({
+            getAccountInfo: (addr: string) =>
+                closed.includes(addr) || !owner.has(addr)
+                    ? { value: null }
+                    : tokenAccount({ owner: owner.get(addr)! }),
+            ...script,
+        });
+    }
+
+    async function sharedOrder(
+        applied: number[] = [30_000, 20_000],
+        state: OrderRow["state"] = "paid",
+    ): Promise<OrderRow> {
+        const amountMicros = applied.reduce((sum, a) => sum + a, 0);
+        const { order } = await seedOrder(db.pool, { state, amountMicros });
+        await seedSharedPayment(db.pool, order.id, { shares: shares(...applied) });
+        return order;
+    }
+
+    async function sharedRefund(applied?: number[]): Promise<OrderRow> {
+        const order = await sharedOrder(applied);
+        expect(await requestRefund(db.pool, order.id, "unredeemed")).toBe("created");
+        return order;
+    }
+
+    async function handRow(
+        orderId: string,
+        r: { kind: RefundKind; part: number; amountMicros: number; destination?: string },
+    ): Promise<number> {
+        const res = await db.pool.query<{ id: string }>(
+            `insert into refunds (order_id, kind, part, reason, amount_micros, destination, payer,
+                state, created_at)
+             values ($1, $2, $3, 'operator', $4, $5, $6, 'pending', $7) returning id`,
+            [
+                orderId,
+                r.kind,
+                r.part,
+                r.amountMicros,
+                r.destination ?? sources[r.part]!,
+                owners[r.part]!.address,
+                T0,
+            ],
+        );
+        return Number(res.rows[0]!.id);
+    }
+
+    const states = async (orderId: string, kind: RefundKind = "full") =>
+        (await refundGroup(db.pool, orderId, kind)).map((r) => [r.state, r.manualReason]);
+
+    it("one bad destination stops only its own part", async () => {
+        const order = await sharedRefund();
+        const rpc = groupRpc([sources[1]!]);
+        expect(await runRefunds(deps(rpc), "refund")).toMatchObject({ sent: 1, manual: 1 });
+        expect(await states(order.id)).toEqual([
+            ["sent", null],
+            ["manual", "refund_destination_invalid"],
+        ]);
+        expect(await findOrder(db.pool, order.id)).toMatchObject({
+            state: "manual",
+            manualReason: "refund_destination_invalid",
+        });
+        const [part0] = await refundGroup(db.pool, order.id, "full");
+        expect(transferOf(decodeMessage(rpc.sent[0]!))).toMatchObject({
+            destination: sources[0],
+            amount: 30_000n,
+        });
+        expect((await runRefunds(deps(rpc, later(30_000)), "refund")).confirmed).toBe(1);
+        expect((await findRefundById(db.pool, part0!.id))!.state).toBe("confirmed");
+        expect((await findOrder(db.pool, order.id))!.state).toBe("manual");
+    });
+
+    it("a group above the payment goes to manual", async () => {
+        const over = await sharedOrder([30_000, 20_000], "refunding");
+        await handRow(over.id, { kind: "full", part: 0, amountMicros: 30_000 });
+        await handRow(over.id, { kind: "full", part: 1, amountMicros: 30_000 });
+        const both = await sharedOrder([30_000, 20_000], "refunding");
+        await handRow(both.id, { kind: "full", part: 0, amountMicros: 30_000 });
+        await handRow(both.id, { kind: "full", part: 1, amountMicros: 20_000 });
+        await handRow(both.id, { kind: "partial", part: 0, amountMicros: 12_000 });
+        await handRow(both.id, { kind: "partial", part: 1, amountMicros: 8_000 });
+        const rpc = groupRpc();
+        await runRefunds(deps(rpc), "refund");
+        await runRefunds(deps(rpc), "refund");
+        expect(rpc.calls.sendTransaction).toBe(0);
+        const manual = ["manual", "refund_exceeds_payment"];
+        expect(await states(over.id)).toEqual([manual, manual]);
+        expect(await states(both.id)).toEqual([manual, manual]);
+        expect(await states(both.id, "partial")).toEqual([manual, manual]);
+        expect((await findOrder(db.pool, over.id))!.state).toBe("manual");
+    });
+
+    it("a part to a wrong destination goes to manual", async () => {
+        const order = await sharedOrder([30_000, 20_000], "refunding");
+        await handRow(order.id, { kind: "full", part: 0, amountMicros: 30_000 });
+        await handRow(order.id, {
+            kind: "full",
+            part: 1,
+            amountMicros: 20_000,
+            destination: OTHER_B,
+        });
+        const rpc = groupRpc();
+        expect(await runRefunds(deps(rpc), "refund")).toMatchObject({ sent: 1, manual: 1 });
+        expect(await states(order.id)).toEqual([
+            ["sent", null],
+            ["manual", "refund_destination_invalid"],
+        ]);
+        expect(rpc.sent.map((w) => transferOf(decodeMessage(w)).destination)).toEqual([sources[0]]);
+    });
+
+    it("the order is refunded only when every part landed", async () => {
+        const order = await sharedRefund();
+        expect((await runRefunds(deps(groupRpc()), "refund")).sent).toBe(2);
+        const [p0, p1] = await refundGroup(db.pool, order.id, "full");
+        const landed = new Set<string>([p0!.txSignature!]);
+        const rpc = groupRpc([], {
+            getSignatureStatuses: (sigs: string[]) => ({
+                value: [
+                    landed.has(sigs[0]!)
+                        ? CONFIRMED
+                        : { confirmationStatus: "processed", err: null, slot: 1n },
+                ],
+            }),
+        });
+        expect((await runRefunds(deps(rpc, later(30_000)), "refund")).confirmed).toBe(1);
+        expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
+        landed.add(p1!.txSignature!);
+        expect((await runRefunds(deps(rpc, later(60_000)), "refund")).confirmed).toBe(1);
+        expect((await findOrder(db.pool, order.id))!.state).toBe("refunded");
+    });
+
+    it("a group counts once toward the hourly rate", async () => {
+        // Distinct amounts, so no part is the twin of another group's part
+        const groups = [];
+        for (let i = 0; i < 3; i++) {
+            groups.push(await sharedRefund([20_000 + i, 15_000 + i, 10_000 + i, 5_000 + i]));
+        }
+        const cfg = { max_per_hour: 2 };
+        await runRefunds(deps(groupRpc(), T0, cfg), "refund");
+        const second = await runRefunds(deps(groupRpc(), later(1_000), cfg), "refund");
+        expect(second.paused).toBe("hourly_rate");
+        for (const g of groups.slice(0, 2)) {
+            expect((await states(g.id)).map(([state]) => state)).toEqual(Array(4).fill("sent"));
+        }
+        expect((await states(groups[2]!.id)).map(([state]) => state)).toEqual(
+            Array(4).fill("pending"),
+        );
+        expect(await refundsPaused(db.pool)).toBe("hourly_rate");
+    });
+
+    it("deposit refund rows", async () => {
+        const { order } = await seedOrder(db.pool, { state: "refunding", amountMicros: 50_000 });
+        const first = await seedHeldTransfer(db.pool, order.id, { amountMicros: 7_000 });
+        const second = await seedHeldTransfer(db.pool, order.id, {
+            amountMicros: 9_000,
+            appliedMicros: 1_000,
+        });
+        const returnTo = (signature: string) =>
+            withTx(db.pool, (c) =>
+                insertDepositRefund(c, {
+                    orderId: order.id,
+                    signature,
+                    destination: SOURCE,
+                    payer: payer.address,
+                    at: T0,
+                }),
+            );
+        const a = (await returnTo(first.signature)) as { id: number };
+        expect(await findRefundById(db.pool, a.id)).toMatchObject({
+            kind: "deposit",
+            part: 0,
+            fromWallet: "refund",
+            amountMicros: 7_000,
+            reason: "deposit_held",
+            depositSignature: first.signature,
+            state: "pending",
+        });
+        expect(await heldRefundId(db.pool, order.id, first.signature)).toBe(a.id);
+        const b = (await returnTo(second.signature)) as { id: number };
+        expect(await findRefundById(db.pool, b.id)).toMatchObject({ part: 1, amountMicros: 8_000 });
+        await db.pool.query("update refunds set amount_micros = 8001 where id = $1", [b.id]);
+
+        const rpc = groupRpc();
+        expect(await runRefunds(deps(rpc), "refund")).toMatchObject({ sent: 1, manual: 1 });
+        expect(transferOf(decodeMessage(rpc.sent[0]!))).toMatchObject({
+            source: await usdcAta(refundSigner.address),
+            destination: SOURCE,
+            amount: 7_000n,
+        });
+        expect(await findRefundById(db.pool, b.id)).toMatchObject({
+            state: "manual",
+            manualReason: "refund_exceeds_payment",
+        });
+        expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
+        expect((await runRefunds(deps(rpc, later(30_000)), "refund")).confirmed).toBe(1);
+        expect((await findRefundById(db.pool, a.id))!.state).toBe("confirmed");
+        expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
+
+        // With every deposit row confirmed the order still stays: those rows never move it
+        await db.pool.query(
+            `update refunds set amount_micros = 8000, state = 'pending', manual_reason = null
+             where id = $1`,
+            [b.id],
+        );
+        expect((await runRefunds(deps(rpc, later(60_000)), "refund")).sent).toBe(1);
+        expect((await runRefunds(deps(rpc, later(90_000)), "refund")).confirmed).toBe(1);
+        expect((await findRefundById(db.pool, b.id))!.state).toBe("confirmed");
+        expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
+    });
+});
+
+describe("hot refund groups and the mirror", () => {
+    const SIG = (n: number) => getBase58Decoder().decode(new Uint8Array(64).fill(n));
+    let matchDeps: MatchDeps;
+    let matchLog: ReturnType<typeof memoryLog>;
+    let SRC_B: Address;
+    let COLD: Address;
+
+    beforeAll(async () => {
+        SRC_B = await usdcAta((await testSigner(12)).address);
+        COLD = await usdcAta((await testSigner(23)).address);
+    });
+    beforeEach(() => {
+        matchLog = memoryLog();
+        matchDeps = {
+            x402: x402Defaults,
+            hotTokenAccount: HOT,
+            coldTokenAccount: COLD,
+            log: matchLog,
+            now: () => later(30_000),
+            rpcTimeoutMs,
+        };
+    });
+
+    // An unspent refund of 10,000 from a funding order paid by two owners, both parts sent
+    async function sentAllowanceGroup(sentAt: [Date, Date] = [T0, T0]) {
+        const account = await seedAccount(db.pool, {
+            state: "closing",
+            handleSha256: randomBytes(32).toString("hex"),
+        });
+        const { order } = await seedOrder(db.pool, {
+            kind: "allowance",
+            state: "redeemed",
+            packageId: "x402-allowance",
+            handleSha256: account.handleSha256,
+            amountMicros: 50_000,
+            allowanceMicros: 50_000,
+            payInto: "allowance",
+        });
+        await seedSharedPayment(db.pool, order.id, {
+            shares: [
+                { owner: payer.address, sourceTokenAccount: SOURCE, appliedMicros: 30_000 },
+                {
+                    owner: (await testSigner(12)).address,
+                    sourceTokenAccount: SRC_B,
+                    appliedMicros: 20_000,
+                },
+            ],
+        });
+        await seedFunding(db.pool, {
+            accountId: account.id,
+            orderId: order.id,
+            allowanceMicros: 50_000,
+            payer: payer.address,
+            sourceTokenAccount: SOURCE,
+        });
+        const ids: number[] = [];
+        for (const [part, amount, dest] of [
+            [0, 6_000, SOURCE],
+            [1, 4_000, SRC_B],
+        ] as const) {
+            const res = await db.pool.query<{ id: string }>(
+                `insert into refunds (order_id, kind, part, reason, amount_micros, destination,
+                    payer, state, from_wallet, tx_signature, wire_tx, last_valid_block_height,
+                    signed_at, sent_at, created_at)
+                 values ($1, 'allowance', $2, 'x402_unspent', $3, $4, $5, 'sent', 'allowance', $6,
+                    'wire', 900, $7, $7, $8) returning id`,
+                [
+                    order.id,
+                    part,
+                    amount,
+                    dest,
+                    part === 0 ? payer.address : (await testSigner(12)).address,
+                    SIG(40 + part),
+                    sentAt[part],
+                    T0,
+                ],
+            );
+            ids.push(Number(res.rows[0]!.id));
+        }
+        await db.pool.query("update x402_pool set committed_micros = 10000");
+        return { orderId: order.id, ids };
+    }
+
+    function outgoing(signature: string, destination: string, micros: bigint): ChainTx {
+        return {
+            signature,
+            slot: 4_000n,
+            signatures: [signature],
+            failed: false,
+            deltaMicros: -micros,
+            messageHash: "hash",
+            tokenDeltas: new Map([
+                [HOT, -micros],
+                [destination, micros],
+            ]),
+            tokenInstructions: [],
+            feePayer: feePayer.address,
+            signers: [feePayer.address, allowance.address],
+            tokenAccounts: new Map(),
+        };
+    }
+
+    const refundedEvents = async (orderId: string) =>
+        (
+            await db.pool.query(
+                `select payload from x402_router_events
+                 where order_id = $1 and phase = 'refunded'`,
+                [orderId],
+            )
+        ).rows.map((r) => r.payload as Record<string, unknown>);
+
+    it("the mirror matches a part", async () => {
+        const { orderId, ids } = await sentAllowanceGroup();
+        expect(await matchInTx(db.pool, outgoing(SIG(41), SRC_B, 4_000n), matchDeps)).toBe(
+            "refund",
+        );
+        const stored = await db.pool.query(
+            "select matched, matched_id from x402_chain_txs where signature = $1",
+            [SIG(41)],
+        );
+        expect(stored.rows[0]).toEqual({ matched: "refund", matched_id: String(ids[1]) });
+        expect((await findRefundById(db.pool, ids[1]!))!.state).toBe("confirmed");
+        expect((await findRefundById(db.pool, ids[0]!))!.state).toBe("sent");
+        expect(await refundedEvents(orderId)).toEqual([]);
+    });
+
+    it("two parts confirmed at once send the event once", async () => {
+        // Part 0 was sent too recently for the executor, so the mirror alone confirms it
+        const { orderId } = await sentAllowanceGroup([later(25_000), T0]);
+        let reached = () => {};
+        const inRpc = new Promise<void>((resolve) => (reached = resolve));
+        let release = () => {};
+        const gate = new Promise<void>((resolve) => (release = resolve));
+        const rpc = hotRpc({
+            getSignatureStatuses: async () => {
+                reached();
+                await gate;
+                return { value: [{ ...CONFIRMED, slot: 4_001n }] };
+            },
+        });
+        const executor = runRefunds(deps(rpc, later(30_000)), "allowance");
+        await inRpc;
+        const mirror = matchInTx(db.pool, outgoing(SIG(40), SOURCE, 6_000n), matchDeps);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        release();
+        const [tick, matched] = await Promise.all([executor, mirror]);
+        expect(tick.confirmed).toBe(1);
+        expect(matched).toBe("refund");
+        expect((await refundGroup(db.pool, orderId, "allowance")).map((r) => r.state)).toEqual([
+            "confirmed",
+            "confirmed",
+        ]);
+        expect(await refundedEvents(orderId)).toEqual([
+            expect.objectContaining({ amountMicros: 10_000 }),
+        ]);
+        expect((await readPool(db.pool)).committedMicros).toBe(0);
+        const deadlocks = [...log.lines, ...matchLog.lines].filter((l) =>
+            String(l.msg).includes("deadlock"),
+        );
+        expect(deadlocks).toEqual([]);
+        expect(levels("error")).toEqual([]);
     });
 });

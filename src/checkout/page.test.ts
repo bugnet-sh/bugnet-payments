@@ -22,6 +22,7 @@ import {
     qrSvg,
     renderCheckout,
     renderNotFound,
+    decimalAmount,
     walletLinks,
 } from "./page.ts";
 
@@ -35,6 +36,13 @@ const view: CheckoutView = {
     state: "unpaid",
     pageUrl: `https://pay.bugnet.sh/o/${id}`,
     origin: "https://pay.bugnet.sh",
+    expiresAt: new Date("2030-01-01T00:15:00.000Z"),
+    now: new Date("2030-01-01T00:00:00.000Z"),
+    kind: "start",
+    deposit: null,
+    depositsOffered: false,
+    refundMinMicros: 1_000,
+    settleGraceMs: 60_000,
 };
 
 describe("checkout page", () => {
@@ -138,7 +146,9 @@ describe("checkout page", () => {
 
     it("follows a settling order with the client but offers no way to pay", async () => {
         const html = await renderCheckout({ ...view, state: "settling" });
-        expect(html).toContain('<dd id="state" class="state" data-state="settling">Settling</dd>');
+        expect(html).toContain(
+            '<dd id="state" class="state" data-state="settling">Confirming</dd>',
+        );
         expect(html).toContain('<p id="message" role="status" aria-live="polite"></p>');
         expect(html).toContain('<script type="module" src="/checkout.js"></script>');
         expect(html).not.toContain('id="pay-button"');
@@ -163,6 +173,13 @@ describe("checkout page", () => {
         expect(text).toContain("standard:connect");
         // @x402/core/http and the zod it pulls in would add about 750 KB here
         expect(text.length).toBeLessThan(400_000);
+        // Every message comes from messages.ts, which never passes a raw wallet or error text
+        expect(text).not.toContain("payment refused:");
+        expect(text).not.toContain("did not go through");
+        const flow = await import("./flow.ts");
+        for (const gone of ["pageStep", "stateStep", "walletErrorStep"]) {
+            expect(gone in flow).toBe(false);
+        }
     });
 });
 
@@ -263,7 +280,7 @@ describe("checkout routes", () => {
         const r = await get(app, `/o/${settling.id}`, { accept: "text/html" });
         expect(r.status).toBe(200);
         const html = await r.text();
-        expect(html).toContain("Settling");
+        expect(html).toContain("Confirming");
         expect(html).toContain('<script type="module" src="/checkout.js"></script>');
         expect(html).not.toContain('id="pay-button"');
         expect(totalCalls(app.rpc)).toBe(0);
@@ -363,5 +380,259 @@ describe("checkout routes", () => {
         expect(status).toMatchObject({ orderId: order.id, state: "paid" });
         const via = await app.pool.query("select paid_via from orders where id = $1", [order.id]);
         expect(via.rows).toEqual([{ paid_via: "checkout" }]);
+    });
+});
+
+describe("address-first page", () => {
+    const ADDRESS = "BGx7SpE3VBc356Bhn9Y2GUvkecpfPjSkSM9iRxJ63Ley";
+    const deposit = {
+        address: ADDRESS,
+        ready: true,
+        status: "waiting",
+        receivedMicros: 0,
+        otherMicros: 0,
+        remainingMicros: 50_000,
+        extraMicros: 0,
+        returningMicros: 0,
+        returnedMicros: 0,
+        keptMicros: 0,
+        reviewMicros: 0,
+        reason: null,
+        reasonMicros: 0,
+        blockedUntil: null,
+        hold: null,
+        transfers: [],
+    } as unknown as NonNullable<CheckoutView["deposit"]>;
+    const offered: CheckoutView = { ...view, amountMicros: 50_000, deposit, depositsOffered: true };
+    const section = (html: string, name: string) => {
+        const at = html.indexOf(`<section id="${name}">`);
+        return html.slice(at, html.indexOf("</section>", at));
+    };
+
+    it("decimalAmount", () => {
+        expect(decimalAmount(50_000)).toBe("0.05");
+        expect(decimalAmount(1)).toBe("0.000001");
+        expect(decimalAmount(1_000_000)).toBe("1");
+        expect(decimalAmount(10_000)).toBe("0.01");
+    });
+
+    it("deposit section comes first", async () => {
+        const html = await renderCheckout(offered);
+        const d = html.indexOf('id="deposit"');
+        expect(d).toBeGreaterThan(0);
+        expect(d).toBeLessThan(html.indexOf('id="wallet"'));
+        expect(html.indexOf('id="wallet"')).toBeLessThan(html.indexOf('id="phone"'));
+    });
+
+    it("the address, amount and network are shown with copy buttons", async () => {
+        const html = await renderCheckout(offered);
+        expect(html).toContain(`data-copy="${ADDRESS}"`);
+        expect(html).toContain('data-copy="0.05"');
+        expect(html).toContain(">Solana<");
+        expect(html).toContain("Send only USDC on Solana.");
+    });
+
+    it("both QRs, each with its own caption", async () => {
+        const html = await renderCheckout(offered);
+        expect(html.match(/<figure class="qr">/g)).toHaveLength(2);
+        expect(section(html, "deposit")).toContain(`<img src="/o/${id}/qr.svg?r=50000"`);
+        expect(section(html, "deposit")).toContain(
+            "Scan with a Solana wallet app to send 0.05 USDC",
+        );
+        const phantom = walletLinks(offered.pageUrl, offered.origin).phantom;
+        expect(section(html, "phone")).toContain(await qrSvg(phantom));
+        expect(section(html, "phone")).toContain(
+            "Scan with your phone to open this page in Phantom",
+        );
+    });
+
+    it("the deposit QR names what it asks for, so the first poll fetches it again only when that changed", async () => {
+        const dep = section(await renderCheckout(offered), "deposit");
+        expect(dep).toContain(`<img src="/o/${id}/qr.svg?r=50000" data-remaining="50000"`);
+    });
+
+    it("the deposit QR waits hidden while nothing more is owed", async () => {
+        const shown = section(await renderCheckout(offered), "deposit");
+        expect(shown).toContain('<figure class="qr">');
+        const held = {
+            ...offered,
+            deposit: { ...offered.deposit!, status: "held" as const, remainingMicros: 0 },
+        };
+        const hidden = section(await renderCheckout(held), "deposit");
+        expect(hidden).toContain('<figure class="qr" hidden>');
+        expect(hidden).toContain(
+            `<img src="/o/${id}/qr.svg?r=0" data-remaining="0" loading="lazy"`,
+        );
+    });
+
+    it("once money has arrived, the Amount row, Copy, QR and exchange note ask for the rest", async () => {
+        const partial = {
+            ...offered,
+            deposit: {
+                ...offered.deposit!,
+                status: "partial" as const,
+                receivedMicros: 30_000,
+                remainingMicros: 20_000,
+            },
+        };
+        const html = await renderCheckout(partial);
+        const dep = section(html, "deposit");
+        expect(dep).toContain('<span id="deposit-amount">0.02 USDC</span>');
+        expect(dep).toContain(
+            '<button id="deposit-amount-copy" class="copy" type="button" data-copy="0.02">',
+        );
+        expect(dep).toContain('alt="Solana Pay code for 0.02 USDC"');
+        expect(dep).toContain(
+            "<figcaption>Scan with a Solana wallet app to send 0.02 USDC</figcaption>",
+        );
+        expect(dep).toContain("From an exchange, send exactly 0.02 USDC.");
+        expect(dep).not.toContain("0.05");
+        // The price and the wallet payment stay whole
+        expect(html).toContain('<span class="amount-value">$0.05</span>');
+        expect(html).toContain(">Pay $0.05</button>");
+    });
+
+    it("the ask sits in one block the client hides, apart from the deposit line", async () => {
+        const dep = section(await renderCheckout(offered), "deposit");
+        const ask = dep.slice(dep.indexOf('<div id="deposit-ask">'), dep.indexOf("</div>\n<p id"));
+        expect(ask).toContain("<h2>Send USDC to this address</h2>");
+        expect(ask).toContain('<dl class="facts">');
+        expect(ask).toContain('<figure class="qr">');
+        expect(ask).toContain("Send only USDC on Solana.");
+        expect(ask).toContain('id="exchange-note"');
+        expect(ask).not.toContain('id="deposit-message"');
+        expect(dep).toContain('</div>\n<p id="deposit-message"');
+        const review = {
+            ...offered,
+            deposit: { ...offered.deposit!, status: "review" as const, remainingMicros: 30_000 },
+        };
+        expect(section(await renderCheckout(review), "deposit")).toContain(
+            '<div id="deposit-ask" hidden>',
+        );
+    });
+
+    it("phone links stay", async () => {
+        const phone = section(await renderCheckout(offered), "phone");
+        expect(phone).toContain("Open in Phantom");
+        expect(phone).toContain("Open in Solflare");
+    });
+
+    it("the USDC icon sits in the payment details", async () => {
+        const dep = section(await renderCheckout(offered), "deposit");
+        expect(dep).toContain('class="usdc"');
+        expect(dep.toLowerCase()).toContain("#2775ca");
+    });
+
+    it("the deadline is shown", async () => {
+        const html = await renderCheckout(offered);
+        expect(html).toContain('<time id="time-left" datetime="2030-01-01T00:15:00.000Z"');
+        expect(html).toContain('data-expires-at="2030-01-01T00:15:00.000Z"');
+        expect(html).toContain('data-refund-min-micros="1000"');
+        expect(html).toContain('data-settle-grace-ms="60000"');
+        expect(html).toContain(">15:00</time>");
+    });
+
+    it("time left shows only while the order takes money", async () => {
+        expect(await renderCheckout({ ...offered, state: "paid" })).not.toContain('id="time-left"');
+        expect(await renderCheckout(offered)).toContain('id="time-left"');
+        // The client hides the Time left row, a .facts div that is otherwise display: flex
+        expect(await renderCheckout(offered)).toContain("[hidden] { display: none !important; }");
+    });
+
+    it("the card is centered", async () => {
+        const html = await renderCheckout(offered);
+        expect(html).toContain("min-height: 100dvh");
+        expect(html).toContain("margin-block: auto");
+        expect(html).not.toContain("::first-letter");
+        // On a phone too: a short card is centered, a long one starts at the top
+        expect(html).not.toContain(".box { margin-top: 0;");
+    });
+
+    it("the deposit QR image is sized like the phone QR", async () => {
+        expect(await renderCheckout(offered)).toContain(
+            ".qr img { display: block; width: var(--qr); height: var(--qr);",
+        );
+    });
+
+    it("the wallet note is there and hidden", async () => {
+        const wallet = section(await renderCheckout(offered), "wallet");
+        const note = wallet.indexOf('<p id="wallet-note"');
+        expect(note).toBeGreaterThan(0);
+        expect(wallet.slice(note, wallet.indexOf(">", note))).toContain("hidden");
+        expect(note).toBeLessThan(wallet.indexOf('id="message"'));
+    });
+
+    it("a disabled Pay button looks disabled, outline or not", async () => {
+        const html = await renderCheckout(offered);
+        // Equal specificity, so the later rule wins
+        expect(html.indexOf(".button:disabled {")).toBeGreaterThan(
+            html.indexOf(".button.outline {"),
+        );
+        expect(html).toContain(".button.outline:not(:disabled):hover {");
+        expect(html).not.toContain(".button.outline:hover");
+    });
+
+    it("wallet section is secondary", async () => {
+        const html = await renderCheckout(offered);
+        expect(html).toContain("Or pay with a browser wallet");
+        expect(section(html, "wallet")).toContain(
+            '<button id="pay-button" class="button outline" type="button" disabled>',
+        );
+    });
+
+    it("no deposit offered", async () => {
+        const html = await renderCheckout({ ...offered, depositsOffered: false });
+        expect(html).not.toContain('id="deposit"');
+        expect(html).toContain("Pay with a browser wallet");
+        expect(html).not.toContain("Or pay with a browser wallet");
+        expect(html).toContain(
+            "Paying by address is off right now. Pay with a browser wallet below, or reload this page later.",
+        );
+    });
+
+    it("page-level messages", async () => {
+        expect(await renderCheckout({ ...view, state: "settling" })).toContain(
+            "The payment is confirming on Solana. This page updates when it lands.",
+        );
+        expect(await renderCheckout({ ...view, state: "refunded" })).toContain(
+            "This order's payment was returned to the wallet that paid.",
+        );
+        const P4 =
+            "<noscript><p>This page needs JavaScript to show live status. You can still send to the address above.</p></noscript>";
+        expect(await renderCheckout(offered)).toContain(P4);
+        // Only a page that shows the address
+        for (const state of ["settling", "paid", "expired", "refunded", "review"] as const) {
+            expect(await renderCheckout({ ...offered, state })).not.toContain("<noscript>");
+        }
+        expect(await renderCheckout({ ...offered, depositsOffered: false })).not.toContain(
+            "<noscript>",
+        );
+    });
+
+    it("not found tells what to do", () => {
+        const html = renderNotFound();
+        expect(html).toContain("Order not found.");
+        expect(html).toContain("Check the link, or ask your agent for a new payment link.");
+    });
+
+    it("no middle dot, no raw error text", async () => {
+        const pages = [
+            renderNotFound(),
+            ...(await Promise.all(
+                (["unpaid", "settling", "paid", "expired", "refunded", "review"] as const).map(
+                    (state) => renderCheckout({ ...offered, state }),
+                ),
+            )),
+        ];
+        for (const html of pages) {
+            for (const bad of [
+                "\u00b7",
+                "Unexpected error",
+                "payment refused:",
+                "did not go through",
+            ]) {
+                expect(html).not.toContain(bad);
+            }
+        }
     });
 });

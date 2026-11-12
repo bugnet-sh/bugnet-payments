@@ -170,8 +170,57 @@ const settingsSchema = z
             .object({
                 public_per_ip_per_minute: count.default(60),
                 status_per_ip_per_minute: count.default(240),
+                balance_per_ip_per_minute: count.default(20),
+                balance_rpc_per_minute: count.default(30),
+                report_per_ip_per_minute: count.default(10),
+                ipv6_block_multiple: count.default(4),
             })
             .strict()
+            .prefault({}),
+        deposits: z
+            .object({
+                // Gates only new deposits; existing ones finish whenever a seed is loaded
+                enabled: z.boolean().default(true),
+                seed_version: count.default(1),
+                busy_every: jobEvery.prefault("2s"),
+                idle_every: jobEvery.prefault("20s"),
+                closed_every: jobEvery.prefault("120s"),
+                watch_after_close: duration.prefault("24h"),
+                settle_grace: duration.prefault("60s"),
+                expire_hard_after: duration.prefault("5m"),
+                expire_hard_max: duration.prefault("30m"),
+                viewer_ttl: duration.prefault("30s"),
+                max_open: count.default(500),
+                rented_per_ip: count.default(1),
+                rented_per_block: count.default(2),
+                unpaid_create_lamports_per_hour: amount.default(1_000_000),
+                refund_min_micros: amount.default(1_000),
+                max_late_returns: count.default(2),
+                free_moves_lamports_per_hour: amount.default(2_000_000),
+                returns_per_owner_per_hour: count.default(6),
+                payer_recheck_every: jobEvery.prefault("10s"),
+                max_split_owners: count.default(4),
+                compute_unit_limit: count.default(40_000),
+                compute_unit_price_micro_lamports: amount.default(10_000),
+                max_attempts: count.default(3),
+                close_retry_after: z.array(duration).min(1).prefault(["2m", "10m", "1h"]),
+                scan_page_size: z.int().min(1).max(1_000).default(1_000),
+                scan_max_pages: count.default(10),
+                scan_max_transactions: count.default(200),
+                scan_time_box: duration.prefault("1500ms"),
+                move_check_after: duration.prefault("2s"),
+                resend_after: duration.prefault("10s"),
+                index_lag_alarm_after: duration.prefault("30s"),
+                // Spec 6.5 R7: the job's own cap keeps room for settlement and refunds
+                rpc_calls_per_second: z.int().min(1).max(5).default(3),
+                rpc_calls_per_day: count.default(30_000),
+                rpc_calls_per_hour_alarm: count.default(6_000),
+            })
+            .strict()
+            .refine((d) => d.expire_hard_max >= d.expire_hard_after, {
+                path: ["expire_hard_max"],
+                message: "must be at least expire_hard_after",
+            })
             .prefault({}),
         router: z
             .object({
@@ -319,6 +368,8 @@ export interface Secrets {
     rpcSingleIgnored: boolean;
     allowanceKey: string;
     x402TlsKey: string;
+    depositSeed: Buffer | null;
+    depositSeedPrevious: Buffer | null;
 }
 
 export class ConfigError extends Error {}
@@ -333,6 +384,8 @@ export const SECRET_VARS = [
     "BUGNET_PAYMENTS_ROUTER_TOKEN",
     "BUGNET_ORDER_PRIVATE_KEY",
     "BUGNET_CLAIM_KEY",
+    "BUGNET_DEPOSIT_SEED",
+    "BUGNET_DEPOSIT_SEED_PREVIOUS",
     "BUGNET_FEE_PAYER_KEY",
     "BUGNET_REFUND_KEY",
     "BUGNET_ALLOWANCE_KEY",
@@ -358,6 +411,12 @@ export function secretsEnv(s: Secrets): Partial<Record<(typeof SECRET_VARS)[numb
         ...(s.rpcUrlsFrom === RPC_LIST
             ? { BUGNET_SOLANA_RPC_URLS: s.rpcUrls.join(",") }
             : { BUGNET_SOLANA_RPC_URL: s.rpcUrls[0] }),
+        ...(s.depositSeed === null
+            ? {}
+            : { BUGNET_DEPOSIT_SEED: s.depositSeed.toString("base64") }),
+        ...(s.depositSeedPrevious === null
+            ? {}
+            : { BUGNET_DEPOSIT_SEED_PREVIOUS: s.depositSeedPrevious.toString("base64") }),
     };
 }
 
@@ -454,7 +513,7 @@ function httpsOrLoopback(url: string): boolean {
 }
 
 // The round trip refuses padding errors and stray characters that Buffer.from skips silently
-function isBase64Of32(s: string): boolean {
+export function isBase64Of32(s: string): boolean {
     const b = Buffer.from(s, "base64");
     return b.length === 32 && b.toString("base64") === s;
 }
@@ -554,6 +613,27 @@ export function readSecrets(env: NodeJS.ProcessEnv, s: Settings): Secrets {
         }
     }
 
+    // Needed only while new deposits are on, but a seed that is set is checked either way:
+    // existing deposits keep signing with it after enabled is turned off (spec 16)
+    const seedName = "BUGNET_DEPOSIT_SEED";
+    const previousName = "BUGNET_DEPOSIT_SEED_PREVIOUS";
+    const optionalKey = (name: string): Buffer | null =>
+        (env[name] ?? "") === "" ? null : key(name);
+    const depositSeed = s.deposits.enabled ? key(seedName) : optionalKey(seedName);
+    const depositSeedPrevious = optionalKey(previousName);
+    // Spec 4.2: a seed shared with another key would tie the deposit keys to it
+    const others: [string, string][] = [
+        [seedName, env[seedName] ?? ""],
+        ["BUGNET_ORDER_PRIVATE_KEY", env.BUGNET_ORDER_PRIVATE_KEY ?? ""],
+        ["BUGNET_CLAIM_KEY", env.BUGNET_CLAIM_KEY ?? ""],
+    ];
+    for (const name of [seedName, previousName]) {
+        const v = env[name] ?? "";
+        if (v === "" || bad.has(name)) continue;
+        const same = others.find(([other, value]) => other !== name && value === v);
+        if (same !== undefined) bad.set(name, `must differ from ${same[0]}`);
+    }
+
     // The domain count is read from the URLs, so the list check needs a list that parsed
     const listLines =
         rpc.problem === null ? checkRpcList(s.solana.rpc, s.solana.rpc_timeout, rpc.urls) : [];
@@ -575,5 +655,7 @@ export function readSecrets(env: NodeJS.ProcessEnv, s: Settings): Secrets {
         rpcSingleIgnored: rpc.singleIgnored,
         allowanceKey,
         x402TlsKey,
+        depositSeed,
+        depositSeedPrevious,
     };
 }

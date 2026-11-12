@@ -29,7 +29,7 @@ import {
 import { memoryLog } from "../log.ts";
 import { testSigner } from "../testing/keys.ts";
 import { BlockhashCache } from "./blockhash.ts";
-import { inspectTokenAccount } from "./accounts.ts";
+import { inspectTokenAccount, ownedUsdcAccount } from "./accounts.ts";
 import { MEMO_PROGRAM, SOLANA_MAINNET, TOKEN_PROGRAM, USDC_MINT } from "./constants.ts";
 import { generateExportableKeypair, loadKeypair } from "./keys.ts";
 import { readLanding } from "./landing.ts";
@@ -284,6 +284,17 @@ describe("readLanding", () => {
         expect((await readLanding(rpc, sig, 1_000n, 10_000)).landing).toBe(want);
     });
 
+    it("an expired blockhash carries the status answer's context slot", async () => {
+        const rpc = createFakeRpc({
+            getEpochInfo: () => epochAt(1_001n, TEST_SLOT),
+            getSignatureStatuses: () => ({ context: { slot: TEST_SLOT + 7n }, value: [null] }),
+        });
+        expect(await readLanding(rpc, sig, 1_000n, 10_000)).toEqual({
+            landing: "blockhash_expired",
+            slot: TEST_SLOT + 7n,
+        });
+    });
+
     it.each([
         ["landed", [null, entry("confirmed")], { landing: "landed", signature: earlier, slot: 1n }],
         [
@@ -292,8 +303,12 @@ describe("readLanding", () => {
             { landing: "landed", signature: earlier, slot: 1n },
         ],
         ["processed only", [null, entry("processed")], { landing: "processed" }],
-        ["failed", [null, entry("confirmed", failed)], { landing: "blockhash_expired" }],
-        ["missing", [null, null], { landing: "blockhash_expired" }],
+        [
+            "failed",
+            [null, entry("confirmed", failed)],
+            { landing: "blockhash_expired", slot: TEST_SLOT },
+        ],
+        ["missing", [null, null], { landing: "blockhash_expired", slot: TEST_SLOT }],
     ])("counts an earlier attempt that is %s", async (_n, value, want) => {
         const reads: unknown[] = [];
         const rpc = createFakeRpc({
@@ -586,5 +601,26 @@ describe("inspectTokenAccount", () => {
     it("reads the default context slot from the fake RPC", async () => {
         const rpc = createFakeRpc({ getAccountInfo: () => ({ value: parsed({})().value }) });
         expect((await inspectTokenAccount(rpc, ACCOUNT))!.contextSlot).toBe(TEST_SLOT);
+    });
+});
+
+describe("ownedUsdcAccount", () => {
+    it.each([
+        ["an initialized USDC account of the owner", {}, "O", true],
+        ["another owner", {}, "P", false],
+        ["a frozen account", { state: "frozen" }, "O", false],
+        ["another mint", { mint: "So11111111111111111111111111111111111111112" }, "O", false],
+    ])("accepts only %s", async (_n, info, owner, want) => {
+        const rpc = createFakeRpc({ getAccountInfo: parsed(info) });
+        expect(await ownedUsdcAccount(rpc, ACCOUNT, owner, 10_000)).toBe(want);
+    });
+
+    it("refuses an account under another program and a missing account", async () => {
+        const other = () => ({ ...parsed({})(), value: { ...parsed({})().value, owner: "X" } });
+        expect(
+            await ownedUsdcAccount(createFakeRpc({ getAccountInfo: other }), ACCOUNT, "O", 1),
+        ).toBe(false);
+        const missing = createFakeRpc({ getAccountInfo: () => ({ value: null }) });
+        expect(await ownedUsdcAccount(missing, ACCOUNT, "O", 10_000)).toBe(false);
     });
 });

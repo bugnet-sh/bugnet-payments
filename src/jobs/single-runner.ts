@@ -9,6 +9,7 @@ export const RUNNER_KEYS = {
     hotRefunds: 4020006,
     cold: 4020007,
     outbox: 4020008,
+    deposits: 4020009,
 } as const;
 
 // A session-level advisory lock on a dedicated client: another process running the same job

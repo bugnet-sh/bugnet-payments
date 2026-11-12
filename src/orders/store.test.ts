@@ -15,6 +15,7 @@ import {
     lockOrders,
     lockPayment,
     markEventSeen,
+    replacePaymentTx,
     setOrderState,
     setPaymentLandedSlot,
     StaleStateError,
@@ -243,7 +244,67 @@ describe("order store", () => {
             confirmedAt: null,
             lastValidBlockHeight: 2n ** 40n,
             createdAt: new Date("2026-11-06T12:00:00Z"),
+            payerCounted: true,
+            multiSender: false,
+            splitMinMicros: null,
         });
+    });
+
+    it("insertPayment stores a payment shared by several senders", async () => {
+        const { order } = await seedOrder(db.pool, { state: "settling" });
+        await insertPayment(db.pool, {
+            orderId: order.id,
+            txSignature: "shared-sig",
+            messageHash: "shared-hash",
+            payer: "owner-a",
+            sourceTokenAccount: "source-a",
+            amountMicros: 10_000,
+            blockhash: "b",
+            lastValidBlockHeight: 7n,
+            createdAt: new Date("2030-01-01T00:04:00Z"),
+            payerCounted: false,
+            multiSender: true,
+            splitMinMicros: 1_000,
+        });
+        expect(await findPaymentByOrder(db.pool, order.id)).toMatchObject({
+            payerCounted: false,
+            multiSender: true,
+            splitMinMicros: 1_000,
+        });
+    });
+
+    it("replacePaymentTx", async () => {
+        const { order } = await seedOrder(db.pool, { state: "settling" });
+        const other = await seedOrder(db.pool, { state: "settling" });
+        const before = await seedPayment(db.pool, order.id, { txSignature: "first-sweep" });
+        const untouched = await seedPayment(db.pool, other.order.id, { txSignature: "other" });
+        await withTx(db.pool, (c) =>
+            replacePaymentTx(c, order.id, {
+                txSignature: "second-sweep",
+                messageHash: "second-hash",
+                blockhash: "second-blockhash",
+                lastValidBlockHeight: 9_876n,
+            }),
+        );
+        expect(await findPaymentByOrder(db.pool, order.id)).toEqual({
+            ...before,
+            txSignature: "second-sweep",
+            messageHash: "second-hash",
+            blockhash: "second-blockhash",
+            lastValidBlockHeight: 9_876n,
+        });
+        expect(await findPaymentByOrder(db.pool, other.order.id)).toEqual(untouched);
+        const none = (await seedOrder(db.pool, { state: "settling" })).order;
+        await expect(
+            withTx(db.pool, (c) =>
+                replacePaymentTx(c, none.id, {
+                    txSignature: "x",
+                    messageHash: "y",
+                    blockhash: "z",
+                    lastValidBlockHeight: 1n,
+                }),
+            ),
+        ).rejects.toThrow(/no payment/);
     });
 });
 

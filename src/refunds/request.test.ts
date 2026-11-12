@@ -4,8 +4,8 @@ import type { OrderRow, PaymentRow } from "../orders/types.ts";
 import { usdcAta } from "../solana/accounts.ts";
 import { testDb, type TestDb } from "../testing/db.ts";
 import { testSigner } from "../testing/keys.ts";
-import { seedOrder, seedPayment } from "../testing/orders.ts";
-import { findOrderRefund, requestRefund, returnManualToRedeemed } from "./request.ts";
+import { seedOrder, seedPayment, seedSharedPayment } from "../testing/orders.ts";
+import { findOrderRefund, refundGroup, requestRefund, returnManualToRedeemed } from "./request.ts";
 
 let db: TestDb;
 beforeAll(async () => {
@@ -41,6 +41,7 @@ describe("requestRefund", () => {
         expect(await requestRefund(db.pool, paid.id, "unredeemed")).toBe("created");
         expect(await findOrderRefund(db.pool, paid.id)).toMatchObject({
             kind: "full",
+            part: 0,
             reason: "unredeemed",
             amountMicros: 10_000,
             destination: payment.sourceTokenAccount,
@@ -155,6 +156,36 @@ describe("requestRefund", () => {
         expect(
             await requestRefund(db.pool, order.id, "router_refundable", { amountMicros: 10_000 }),
         ).toBe("created");
+    });
+});
+
+describe("every insert site splits a shared payment", () => {
+    it("cold requestRefund inserts one full row per owner", async () => {
+        const { order } = await seedOrder(db.pool, { state: "paid", amountMicros: 50_000 });
+        await seedSharedPayment(db.pool, order.id);
+        expect(await requestRefund(db.pool, order.id, "unredeemed")).toBe("created");
+        expect(await refundGroup(db.pool, order.id, "full")).toEqual([
+            expect.objectContaining({
+                part: 0,
+                destination: "SrcA",
+                payer: "OwnA",
+                amountMicros: 30_000,
+                state: "pending",
+                fromWallet: "refund",
+            }),
+            expect.objectContaining({
+                part: 1,
+                destination: "SrcB",
+                payer: "OwnB",
+                amountMicros: 20_000,
+                state: "pending",
+                fromWallet: "refund",
+            }),
+        ]);
+        expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
+        expect(await findOrderRefund(db.pool, order.id)).toMatchObject({ part: 0 });
+        expect(await requestRefund(db.pool, order.id, "operator")).toBe("exists");
+        expect(await countRefunds(order.id)).toBe(2);
     });
 });
 

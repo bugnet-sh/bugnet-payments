@@ -31,6 +31,8 @@ import {
     X402SignerService,
 } from "./gen/bugnet/payments/v1/x402_pb.ts";
 import { indexHolder, installReload, main, routeConsole, startService } from "./main.ts";
+import { depositKeysFrom } from "./deposits/keys.ts";
+import { ensureDeposit, findDeposit } from "./deposits/store.ts";
 import { findOrder } from "./orders/store.ts";
 import { orderPublicKeyBase64 } from "./orders/token.ts";
 import { usdcAta } from "./solana/accounts.ts";
@@ -54,6 +56,20 @@ import { parseIndex } from "./x402/index-file.ts";
 import { readTail } from "./x402/tail.ts";
 
 const slowListener = vi.hoisted(() => ({ ms: 0 }));
+const pacedJobs = vi.hoisted(() => [] as string[]);
+vi.mock("./jobs/every.ts", async (importOriginal) => {
+    const real = await importOriginal<typeof import("./jobs/every.ts")>();
+    return {
+        ...real,
+        paced: (
+            name: string,
+            ...rest: Parameters<typeof real.paced> extends [string, ...infer R] ? R : never
+        ) => {
+            pacedJobs.push(name);
+            return real.paced(name, ...rest);
+        },
+    };
+});
 vi.mock("./x402/listener.ts", async (importOriginal) => {
     const real = await importOriginal<typeof import("./x402/listener.ts")>();
     return {
@@ -271,6 +287,7 @@ function envFor(rpcUrl: string, over: Record<string, string | undefined> = {}): 
         BUGNET_PAYMENTS_TOKEN: secrets.paymentsToken,
         BUGNET_ORDER_PRIVATE_KEY: secrets.orderSeed.toString("base64"),
         BUGNET_CLAIM_KEY: secrets.claimKey.toString("base64"),
+        BUGNET_DEPOSIT_SEED: Buffer.alloc(32, 9).toString("base64"),
         BUGNET_FEE_PAYER_KEY: secrets.feePayerKey,
         BUGNET_REFUND_KEY: secrets.refundKey,
         BUGNET_SOLANA_RPC_URL: rpcUrl,
@@ -343,6 +360,8 @@ beforeAll(async () => {
         rpcSingleIgnored: false,
         allowanceKey: "",
         x402TlsKey: "",
+        depositSeed: Buffer.alloc(32, 9),
+        depositSeedPrevious: null,
     };
 });
 afterAll(async () => {
@@ -412,6 +431,24 @@ describe("startService", () => {
         await expect(
             startService({ settings: failing, secrets, rpc: okRpc(), log: silentLog }),
         ).rejects.toThrow(/allowance_wallet is empty while 1 allowance order/);
+        await expect(fetch(`http://${failing.http.internal_listen}/healthz`)).rejects.toThrow();
+    });
+
+    it("refuses to start while an open deposit's seed version is not loaded", async () => {
+        const { order } = await seedOrder(db.pool, { amountMicros: 50_000 });
+        await db.pool.query(
+            `insert into deposits (order_id, address, token_account, key_version, salt, created_at)
+             values ($1, 'deposit-address', 'deposit-token-account', 2, $2, now())`,
+            [order.id, Buffer.alloc(16, 1)],
+        );
+        const internal = await freePort();
+        const pub = await freePort();
+        const failing = testSettings({
+            http: { internal_listen: `127.0.0.1:${internal}`, public_listen: `127.0.0.1:${pub}` },
+        });
+        await expect(
+            startService({ settings: failing, secrets, rpc: okRpc(), log: silentLog }),
+        ).rejects.toThrow(/BUGNET_DEPOSIT_SEED for version 2 is missing while 1 deposits use it/);
         await expect(fetch(`http://${failing.http.internal_listen}/healthz`)).rejects.toThrow();
     });
 
@@ -635,6 +672,52 @@ describe("startService", () => {
         }
     });
 
+    it("startService wires the deposit job whenever a seed is loaded", async () => {
+        const cases = [
+            { enabled: true, seed: Buffer.alloc(32, 9), wired: true },
+            { enabled: false, seed: Buffer.alloc(32, 9), wired: true },
+            { enabled: false, seed: null, wired: false },
+        ];
+        for (const c of cases) {
+            pacedJobs.length = 0;
+            const s = await startService({
+                settings: testSettings({ deposits: { enabled: c.enabled } }),
+                secrets: { ...secrets, depositSeed: c.seed },
+                rpc: okRpc(),
+                log: silentLog,
+            });
+            try {
+                expect(pacedJobs.includes("deposits")).toBe(c.wired);
+            } finally {
+                await s.stop();
+            }
+        }
+    });
+
+    it("the deposit job marks a deposit past its grace with allowance_wallet empty", async () => {
+        const now = Date.now();
+        const { order } = await seedOrder(db.pool, {
+            createdAt: new Date(now - 20 * MIN),
+            expiresAt: new Date(now - 5 * MIN),
+        });
+        const keys = depositKeysFrom(secrets, 1)!;
+        await ensureDeposit(db.pool, keys, order, new Date(now - 20 * MIN));
+        const s = await startService({
+            settings: testSettings({ deposits: { enabled: false, busy_every: "50ms" } }),
+            secrets,
+            rpc: okRpc(),
+            log: silentLog,
+        });
+        try {
+            await until(
+                async () => (await findDeposit(db.pool, order.id))?.expiryDueAt != null,
+                5_000,
+            );
+        } finally {
+            await s.stop();
+        }
+    });
+
     it("redacts every loaded secret and every set test secret in its default log", async () => {
         await seedSettling();
         const all: Secrets = {
@@ -643,6 +726,7 @@ describe("startService", () => {
             rpcUrls: ["https://rpc.example/?api-key=start-test"],
             allowanceKey: "allowance-key-start-test",
             x402TlsKey: PEM_MAIN_TEST,
+            depositSeedPrevious: Buffer.alloc(32, 14),
         };
         vi.stubEnv("BUGNET_TEST_PAYER_MNEMONIC", "abandon ability able, about above absent");
         const values = [
@@ -671,6 +755,92 @@ describe("startService", () => {
         });
         for (const value of values) expect(lines.join("")).not.toContain(value);
     });
+});
+
+describe("deposits over HTTP", () => {
+    let chain: FakeChain;
+    beforeAll(async () => {
+        chain = await startFakeChain({ autoFinalize: true });
+        for (const w of [recipient, refundWallet]) {
+            chain.setTokenAccount({
+                address: await usdcAta(w.address),
+                owner: w.address,
+                amount: 0n,
+            });
+        }
+    });
+    afterAll(async () => {
+        await chain.close();
+    });
+
+    it("HTTP end to end on FakeChain", async () => {
+        chain.fundLamports((await testSigner(5)).address, 1_000_000_000n);
+        const payer = await testSigner(41);
+        const source = await usdcAta(payer.address);
+        chain.setTokenAccount({ address: source, owner: payer.address, amount: 1_000_000n });
+        const now = Date.now();
+        const { order } = await seedOrder(db.pool, {
+            amountMicros: 50_000,
+            createdAt: new Date(now),
+            expiresAt: new Date(now + 15 * MIN),
+        });
+        const s = await startService({
+            settings: testSettings({
+                deposits: { busy_every: "50ms", idle_every: "50ms", rpc_calls_per_second: 5 },
+            }),
+            secrets,
+            rpc: chain.rpc,
+            log: silentLog,
+        });
+        try {
+            const url = `http://127.0.0.1:${s.publicPort}/o/${order.id}`;
+            const page = await fetch(url, { headers: { accept: "text/html" } });
+            expect(page.status).toBe(200);
+            const dep = (await findDeposit(db.pool, order.id))!;
+            expect(await page.text()).toContain(dep.address);
+
+            // A page polls every 2 s; this test polls faster, within the status route's limit,
+            // and the chain moves on a slot between polls as a real one does
+            const seen: string[] = [];
+            const status = async () => {
+                await new Promise((r) => setTimeout(r, 300));
+                chain.advance(1);
+                const res = await fetch(`${url}/status`, {
+                    headers: { accept: "application/json", "bugnet-client": "checkout" },
+                });
+                expect(res.status).toBe(200);
+                const body = (await res.json()) as {
+                    state: string;
+                    deposit: { status: string; ready: boolean } | null;
+                };
+                const at = body.deposit?.status ?? "none";
+                if (seen.at(-1) !== at) seen.push(at);
+                return body;
+            };
+            // The poll notes a viewer, which wakes the job to create the account
+            await until(async () => (await status()).deposit?.ready === true, 30_000);
+            expect((await status()).deposit?.status).toBe("waiting");
+
+            await chain.transfer({
+                authority: payer,
+                feePayer: payer,
+                source,
+                destination: dep.tokenAccount,
+                micros: 50_000n,
+            });
+            await until(async () => {
+                const d = (await status()).deposit?.status;
+                return d === "confirming" || d === "paid";
+            }, 30_000);
+            await until(async () => (await status()).deposit?.status === "paid", 30_000);
+            expect((await status()).state).toBe("paid");
+            // Confirming lasts one or two ticks, which a poll may fall between
+            expect(seen.filter((x) => x !== "confirming")).toEqual(["waiting", "paid"]);
+            expect(chain.balance(await usdcAta(recipient.address))).toBe(50_000n);
+        } finally {
+            await s.stop();
+        }
+    }, 120_000);
 });
 
 describe("routeConsole", () => {
@@ -802,6 +972,8 @@ describe("main", () => {
             // The list wins, so the stub is the list of one and the single URL is only redacted
             BUGNET_SOLANA_RPC_URLS: rpc.url,
             BUGNET_SOLANA_RPC_URL: "https://rpc-b.example/b",
+            BUGNET_DEPOSIT_SEED: Buffer.alloc(32, 12).toString("base64"),
+            BUGNET_DEPOSIT_SEED_PREVIOUS: Buffer.alloc(32, 13).toString("base64"),
         });
         const values = SECRET_VARS.map((name) => env[name] ?? "");
         expect(values).not.toContain("");
@@ -1728,6 +1900,51 @@ describe("router wiring", () => {
 
             await seedSettling();
             await until(async () => lanes().money >= alarmed.money + 2, 5_000);
+        } finally {
+            await s.stop();
+        }
+    });
+
+    it("the deposit job's reads and the balance route use the background lane", async () => {
+        const live = createDefaultRpcTransport({ url: chain.url });
+        let router: RouterTransport | undefined;
+        const now = Date.now();
+        const { order } = await seedOrder(db.pool, {
+            createdAt: new Date(now - MIN),
+            expiresAt: new Date(now + 10 * MIN),
+        });
+        await ensureDeposit(db.pool, depositKeysFrom(secrets, 1)!, order, new Date(now - MIN));
+        const s = await startService({
+            settings: testSettings({ deposits: { busy_every: "50ms", idle_every: "50ms" } }),
+            log: memoryLog(),
+            secrets: listed(["https://a.example/", "https://b.example/"]),
+            rpcTransportFor: () => live,
+            onRouter: (r) => (router = r),
+        });
+        const lanes = () => {
+            const sum = { money: 0, background: 0 };
+            for (const e of router!.snapshot().endpoints) {
+                sum.money += e.laneRequests.money;
+                sum.background += e.laneRequests.background;
+            }
+            return sum;
+        };
+        const reads = () => chain.calls().filter((c) => c.method === "getMultipleAccounts").length;
+        try {
+            // Taken together, so the reads waited for all come after the lane counts
+            const before = lanes();
+            const booted = reads();
+            await until(async () => reads() >= booted + 2, 5_000);
+            const read = lanes();
+            expect(read.money).toBe(before.money);
+            expect(read.background).toBeGreaterThanOrEqual(before.background + 2);
+            const owner = (await testSigner(31)).address;
+            const res = await fetch(
+                `http://127.0.0.1:${s.publicPort}/o/${order.id}/balance?owner=${owner}`,
+            );
+            expect(res.status).toBe(200);
+            expect(chain.calls().some((c) => c.method === "getAccountInfo")).toBe(true);
+            expect(lanes().money).toBe(before.money);
         } finally {
             await s.stop();
         }

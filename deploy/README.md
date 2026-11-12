@@ -74,6 +74,36 @@ The listeners keep their defaults, `127.0.0.1:8447` and `127.0.0.1:8450`, and `p
 `bugnet-payments`, is not a role name. `router.url` must be https unless its host is loopback,
 since every router call carries `BUGNET_PAYMENTS_ROUTER_TOKEN`.
 
+**Deposits** (paying by sending USDC to a per-order address; design
+`docs/superpowers/specs/2026-11-10-direct-transfer-design.md`). The install step adds, once:
+
+```toml
+[deposits]
+enabled = false
+```
+
+`vps-install.sh --deposits on|off` changes `enabled` (section 8) and `--rotate-deposit-seed`
+changes `seed_version` (section 12); nobody edits either by hand. `enabled` only decides whether
+new pages get an address: deposits that exist are watched and finish either way. Every other
+`[deposits]` key keeps its default from `config/example.toml`, which lists each with its meaning:
+
+- pacing: `busy_every` 2 s, `idle_every` 20 s, `closed_every` 120 s;
+- deadlines: `settle_grace` 60 s after the order's deadline, then the hard stop
+  `expire_hard_after` 5 min, waiting at most `expire_hard_max` 30 min for a scan that is catching
+  up; `watch_after_close` 24 h for late money;
+- Bugnet-paid rent: `max_open` 500 open accounts (about 1.02 SOL, returned at the closes),
+  `rented_per_ip` 1 per IPv4 address or IPv6 /64, `rented_per_block` 2 per /48;
+- budgets: `unpaid_create_lamports_per_hour` 1,000,000, `free_moves_lamports_per_hour`
+  2,000,000, `returns_per_owner_per_hour` 6, `max_late_returns` 2;
+- `refund_min_micros` 1,000: smaller leftovers, review money and split parts are kept, not sent;
+- the job's own RPC caps: `rpc_calls_per_second` 3 (at most 5), `rpc_calls_per_day` 30,000,
+  `rpc_calls_per_hour_alarm` 6,000.
+
+`[limits]` gains `balance_per_ip_per_minute` (20, the page's balance route),
+`balance_rpc_per_minute` (30, that route's RPC reads across all clients),
+`report_per_ip_per_minute` (10, the page's error report) and `ipv6_block_multiple` (4). Every
+per-IP limit keys an IPv6 client by its /64, and the /48 around it gets 4 times that limit.
+
 Boot logs a warn line while `orders.max_amount_micros` (100 USDC by default) is above
 `refunds.daily_cap_micros` (20 USDC by default): a refund above the cap always goes to the manual
 queue as `refund_exceeds_cap`. Set the cap at or above the largest package price to refund every
@@ -88,13 +118,13 @@ systemd keeps a `# comment` written after a value as part of that value, so ever
 on its own line:
 
 ```sh
-# Shared with the gateway, which sends it as a bearer token, at least 32 characters
+# Shared with the gateway, which sends it as a bearer token: copied by deploy/push-payments-token.sh
 BUGNET_PAYMENTS_TOKEN=
 # Shared with the router (section 5), at least 32 characters
 BUGNET_PAYMENTS_ROUTER_TOKEN=
-# openssl rand -base64 32
+# Made by the install step; never pasted
 BUGNET_ORDER_PRIVATE_KEY=
-# openssl rand -base64 32
+# Made by the install step; never pasted
 BUGNET_CLAIM_KEY=
 # base58 of the fee payer's 64-byte secret key
 BUGNET_FEE_PAYER_KEY=
@@ -102,21 +132,37 @@ BUGNET_FEE_PAYER_KEY=
 BUGNET_REFUND_KEY=
 # Section 6: copied by deploy/push-rpc-urls.sh, never edited here
 BUGNET_SOLANA_RPC_URLS=
-# Section 6: read only while the list is unset; kept for a rollback
+# Section 6: read only while the list is unset; kept for a rollback (section 8)
 BUGNET_SOLANA_RPC_URL=
 BUGNET_ALLOWANCE_KEY=
 BUGNET_X402_TLS_KEY=
+# Made by the install step; never pasted
+BUGNET_DEPOSIT_SEED=
+# Set only while a seed rotation drains (section 12)
+BUGNET_DEPOSIT_SEED_PREVIOUS=
 ```
+
+Nobody edits this file by hand. The install step (`vps-install.sh <tarball>`) makes it and runs
+the new release's `keys generate` on it, which adds `BUGNET_ORDER_PRIVATE_KEY`,
+`BUGNET_CLAIM_KEY` and `BUGNET_DEPOSIT_SEED` (32 random bytes each, base64) when they are missing,
+as it does for the wallet keys, and never replaces one that is set. With each deposit's salt in the
+database, `BUGNET_DEPOSIT_SEED` derives every deposit address (section 12).
+
+`BUGNET_PAYMENTS_TOKEN` is the one value the gateway shares, so the install step's random one is
+replaced by the line in the local `bugnet-payments/.env`. On the Mac, in `bugnet-payments`:
 
 ```sh
-sudo install -o root -g root -m 0600 /dev/null /etc/bugnet/payments.env
-sudoedit /etc/bugnet/payments.env
+deploy/push-payments-token.sh [ssh options] HOST
 ```
 
-Boot refuses a `BUGNET_PAYMENTS_TOKEN` shorter than 32 characters, and a shorter
-`BUGNET_PAYMENTS_ROUTER_TOKEN` whenever it is set (it is required while `router.get_order` or
-`router.check_payer` is on, or `[x402] allowance_wallet` is set); `openssl rand -base64 32` makes
-one of 44.
+It sends only that line, through a pipe, to `vps-install.sh --payments-token`, which replaces the
+line by an atomic rename and prints only `BUGNET_PAYMENTS_TOKEN set in /etc/bugnet/payments.env`.
+Both ends refuse a value shorter than 32 characters or holding anything but letters, digits and
+`+ / = _ . -`, and the server refuses one equal to `BUGNET_PAYMENTS_ROUTER_TOKEN`.
+`openssl rand -base64 32` makes one of 44. A running version loads it at the next `--start`. Boot
+refuses a `BUGNET_PAYMENTS_ROUTER_TOKEN` shorter than 32 characters whenever it is set (it is
+required while `router.get_order` or `router.check_payer` is on, or `[x402] allowance_wallet` is
+set).
 
 ## 4. Postgres
 
@@ -214,7 +260,8 @@ Copy it to the server with `deploy/push-rpc-urls.sh [ssh options] HOST`. It send
 through a pipe, to `vps-install.sh --rpc-urls`.
 Nobody edits `/etc/bugnet/payments.env` by hand. `rpc1` is the first URL in every log, alarm and
 `pcli` line. The single `BUGNET_SOLANA_RPC_URL` is read only while the list is unset or blank,
-and stays for a rollback to a release without the router.
+and stays for a rollback to a release without the router; from the deposits release on, such a
+rollback first needs `vps-install.sh --deposits remove` (section 8).
 
 - No spaces, quotes, comment or shell character on the line: `pcli` and the install script load
   the file with the shell, which would split the line and print part of it. A comma inside a URL
@@ -237,10 +284,10 @@ and stays for a rollback to a release without the router.
 
 **After changing the list:** copy it, run `pcli rpc probe`, then `vps-install.sh --start`, which
 restarts a running service so it loads the new list. The probe must exit 0 with
-`quorum: 2 of 2 domains ready`. Before `[deposits] enabled = true` it must
-also name two endpoints on `listings:`. After the first day, post the day's failed attempts per
-position, method and outcome; `pcli rpc status --outcomes` shows the current UTC hour only, so the
-day comes from the journal:
+`quorum: 2 of 2 domains ready`. For deposits it must also name two endpoints on `listings:`, which
+`vps-install.sh --deposits on` checks (section 8). After the first day, post the day's failed
+attempts per position, method and outcome; `pcli rpc status --outcomes` shows the current UTC hour
+only, so the day comes from the journal:
 
 ```sh
 journalctl -u "bugnet-payments@$v" --since -24h -o cat | grep '"msg":"rpc attempt failed"' \
@@ -251,6 +298,21 @@ The mainnet smoke test checks a list without moving money, and runs only with th
 `set -a; . ./.env; set +a; pnpm test:live test/live/rpc-router.live.test.ts` on the Mac. It prints
 the probe's lines, each URL's 2021 history note and its `minContextSlot` with `until` answer, by
 position, passes by the probe's exit rule, and spends at most 10 + 30 calls per URL.
+
+**Deposits.** The deposit job reaches Solana only through the router, on its two lanes:
+
+- the money lane: its moves (create, sweep, return, close), the settle step and the proof before a
+  move is signed again;
+- the background lane: everything else, that is its balance reads, the reads pinned past a
+  deadline, the history scans, and the page's balance route.
+
+Its scans are pinned listings, which go only to the endpoints on the probe's `listings:` line. On
+top of the router's own limits, the job counts its calls: at most `[deposits]
+rpc_calls_per_second` (3) a second and `rpc_calls_per_day` (30,000) a day, moves left out. Past
+80 % of the day a page that is only watched no longer speeds the job up; past 100 % scans run only
+for unpaid orders still within their deadline and for the proofs moves need, and reads keep the
+idle pace. Moves and settles are never held back. `deposit_rpc_budget` fires at 80 % and 100 % and
+when an hour passes `rpc_calls_per_hour_alarm` (section 12).
 
 ## 7. Wallets
 
@@ -301,6 +363,58 @@ Every `pcli` command in these notes and in `x402-mainnet-tests.md` means this fu
 install directory has no `src/` for it to run. `PCLI_ENV=<absolute path>` sources one more env
 file after the secrets file, for `keys drain --allowance`, which also needs `BUGNET_TEST_PAYER_KEY`
 (a `0600` file, deleted afterwards).
+
+**Deposits.** `vps-install.sh` here is the installed release's `deploy/vps-install.sh`, run as
+root. No step comes before the install: the install step generates `BUGNET_DEPOSIT_SEED` and, once,
+adds `[deposits] enabled = false` to `payments.toml`, and `--start` checks the seed like the other
+keys.
+
+Releases without deposits decode `payments.toml` strictly: with `[deposits]` in it, their boot
+check fails with a `reason` ending `unknown key deposits`, and every restart fails the same way. So
+from this release's install step on:
+
+- run `--start` right after the install step. Until then the older version still runs, but a
+  crash or a reboot leaves it unable to start. `--start` stops it and starts this release;
+- a rollback to a release without deposits first needs `vps-install.sh --deposits remove`
+  (below).
+
+**Rollback below the deposits release.** Run `vps-install.sh --deposits off` first, then:
+
+1. `vps-install.sh --deposits remove`. It asks the database through `pcli deposits list` and
+   refuses while deposits are on, any deposit is `open`, `settling` or `draining`, or any deposit
+   has a move in flight (`pcli deposits list --moving`), since the older release watches none of
+   them. Otherwise it removes `[deposits]` from `payments.toml` by an atomic rename and restarts
+   nothing. When it refuses, wait for those deposits to finish and run it again. The section's
+   `seed_version` waits in `/etc/bugnet/payments.seed_version`, and the step that adds
+   `[deposits]` back (the install step or `--deposits`) writes it back, so the current seed keeps
+   its version.
+2. At once, the older release's own `deploy/vps-install.sh` with its tarball, then its `--start`
+   (this release's install step would add `[deposits]` back). Until then this release must not
+   restart: it reads the missing section as deposits on. Its `--start` refuses with
+   `payments.toml has no [deposits]`; `--deposits off` adds the section back.
+
+`closed` deposits may stay: late money sent to them waits for a roll forward, then goes back with
+`pcli deposits return-late` (section 12).
+
+To turn deposits on:
+
+1. With the founder's go, the router's mainnet smoke test passes, its test
+   `minContextSlot with until is accepted` included, on the endpoints that `pcli rpc probe` names
+   on its `listings:` line. It moves no money.
+2. `vps-install.sh --deposits on` sets `enabled = true` and restarts the running version. On a
+   release without `pcli rpc probe` it refuses with
+   `deposits need the RPC router release; install it first`. Otherwise it checks the list line as
+   `--start` does, runs the probe as the service user, and refuses unless the probe exits 0, shows
+   `quorum: 2 of 2 domains ready` and names at least two endpoints on `listings:`. Deposit scans
+   are pinned listings, which go only to those endpoints. It prints counts, never an endpoint:
+
+    ```text
+    rpc probe: exit 0, quorum 2 of 2 domains ready, 2 listing endpoints
+    ```
+
+`vps-install.sh --deposits off` stops new addresses and restarts the running version; deposits
+that exist are watched and finish. When the installed version is not the one running, both leave
+the restart to the next `--start`.
 
 ## 9. Open decision 11 (founder, question 14): TLS for `pay.bugnet.sh`
 
@@ -483,3 +597,215 @@ accounts, `signed` rows past `unresolved_alarm_after` with `signed_at`, `signing
 
 Hot refunds that go manual fire the existing `manual_queue`; unmatched inflows of $0.01 or more
 and late order inflows fire the existing `inflow_mismatch`.
+
+## 12. Deposits
+
+Each unpaid order's page shows its own address. The deposit job watches it, sweeps a full payment
+to the recipient (or to the allowance wallet, for an allowance top-up), returns anything else to
+the account that sent it, and closes the token account to get the rent back. Design:
+`docs/superpowers/specs/2026-11-10-direct-transfer-design.md`.
+
+**The seed and key recovery.** A deposit's key is derived from `BUGNET_DEPOSIT_SEED` and that
+deposit's random 16-byte salt in `deposits.salt`. Order ids are public, so the salt keeps the seed
+alone from giving any key. The key itself is never stored. Recovery needs both the env file and
+the database. No backup step exists yet: the current seed and `BUGNET_DEPOSIT_SEED_PREVIOUS` live
+only in `/etc/bugnet/payments.env`, the archive holds retired seeds only, and the database has no
+scripted backup. Without the database and those two seed lines, money still in a deposit, and
+late money sent to a closed address, cannot be moved.
+
+**Boot checks on the seeds.** A failed one stops the whole service, not only deposits. The journal
+shows `"msg":"boot check failed"` with one of these `reason` texts, and `--start` ends with
+`did not answer healthz within 60 s`.
+
+- **A version is missing.** `BUGNET_DEPOSIT_SEED for version N is missing while M deposits use it`.
+  A deposit that is not `done` uses a seed version that is not loaded.
+- **A seed does not derive an address.**
+  `BUGNET_DEPOSIT_SEED does not derive the stored deposit address of <orderId>`. The seed loaded
+  for that deposit's version did not make it. Only deposits that are not `done` count.
+- **The seed version.** This one counts `done` deposits too. It has two texts:
+    - `M deposits use seed version N, above [deposits] seed_version K`. Deposits carry a version
+      above the one boot read from `payments.toml`.
+    - `BUGNET_DEPOSIT_SEED loaded as version N does not derive <orderId>`, the newest deposit of
+      that version. The seed loaded under number N is not the one that made version N's deposits.
+
+When one of them fires:
+
+1. If `/etc/bugnet/payments.rotating` exists, a rotation stopped halfway and a restart loaded the
+   new seed under the old number. Run `vps-install.sh --rotate-deposit-seed` again. It raises
+   `seed_version` to the version in the marker and restarts the running version. If it prints
+   `bugnet-payments@<version> is not running`, run `vps-install.sh --start`.
+2. Otherwise no script fixes it. The seed lines and `seed_version` are never edited by hand.
+   `pcli deposits list --version N` lists the deposits of version N, and `[deposits] seed_version`
+   in `/etc/bugnet/payments.toml` shows the number boot read. Payments stays down until the founder
+   picks a fix.
+
+**Rotation.** `vps-install.sh --rotate-deposit-seed`:
+
+- refuses while `BUGNET_DEPOSIT_SEED_PREVIOUS` is set: an earlier rotation is still draining;
+- writes its target version to `/etc/bugnet/payments.rotating`, runs `keys rotate-deposit-seed`
+  as root (the seed moves to `BUGNET_DEPOSIT_SEED_PREVIOUS` and a new one is written, in one
+  atomic `0600` write), raises `[deposits] seed_version` by 1, restarts the running version, and
+  removes the marker last. A run that stopped halfway is finished by the next run and never
+  rotates twice. While the marker exists, `--start`, `--deposits` and retirement refuse, since a
+  restart then would load the new seed under the old version.
+
+New deposits use the new version. Each deposit keeps signing with the seed of its own version. The
+per-IP rented counts hash the viewer's IP key under the current seed, so a rotation starts them
+again for the deposits open at that moment (at most 15 minutes of them).
+
+**Retirement, with the archive on the Mac.** Once `pcli deposits list --version <old>` prints only
+`state=done` lines (at most `watch_after_close`, 24 h, after the last one closed), on the Mac, in
+`bugnet-payments`:
+
+```sh
+deploy/retire-deposit-seed.sh [ssh options] HOST
+```
+
+1. Over ssh it runs `vps-install.sh --retire-deposit-seed -`. The server refuses while a deposit
+   of the old version is not `done` or a rotation is unfinished; otherwise it prints only the line
+   `BUGNET_DEPOSIT_SEED_V<old>=<value>` and removes nothing.
+2. The script appends that line to the archive, `BUGNET_DEPOSIT_ARCHIVE` (by default
+   `~/.bugnet/deposit-seeds.env`, mode `0600`, refused inside a git checkout), and reads it back.
+3. Only then does it send the line back with `--remove-previous`. The server removes
+   `BUGNET_DEPOSIT_SEED_PREVIOUS` only when the value matches, in one atomic write, and restarts
+   the running version.
+
+Every step can run again: a line already archived with the same value is not appended twice, and
+one with another value stops the run. The seed moves only through pipes: never an argument, never
+printed, and no seed file is left on the server. Keep the archive offline with the database
+backups, and never delete a line from it: a user who saved a closed address and sends to it again
+can still get the money back.
+
+**Returning money with a retired seed.** `deposits return-late` and `deposits return-sol` take
+`--archive -` and read the archive on stdin, so it never touches the server's disk. On the Mac:
+
+```sh
+# Runs one pcli command on the server, fed this shell's stdin
+spcli() {
+    ssh -T -p PORT -i KEY_FILE USER@HOST "cd /opt/bugnet/payments/\$(cat /etc/bugnet/payments.release) &&
+        sudo -n sh -c 'set -a; . /etc/bugnet/payments.env; set +a
+            exec setpriv --reuid=bugnet-payments --regid=bugnet-payments --init-groups \
+                node dist/cli.js -config /etc/bugnet/payments.toml \"\$@\"' sh $(printf '%q ' "$@")"
+}
+spcli deposits return-late <orderId> --signature <sig> --archive - \
+    <"${BUGNET_DEPOSIT_ARCHIVE:-$HOME/.bugnet/deposit-seeds.env}"
+```
+
+**If the seed leaks.** The seed alone gives no key; someone holding both the env file and the
+database (or a backup of each) can derive any deposit's key. They could take USDC sitting in a
+deposit (a partial payment for at most 15 min, a full payment for the seconds before its sweep
+lands, money held while the router is busy, late money before its return lands) and close empty
+deposit accounts to themselves (about 0.00204 SOL each, at most `max_open`, about 1 SOL). They
+could not touch the recipient (no key on the server), the fee payer, the refund float, the
+allowance wallet, money already swept, or review money already carried to the refund float.
+
+1. `vps-install.sh --deposits off`. Deposits that exist keep being watched and finish. If it
+   prints `bugnet-payments@<version> is not running`, the change is not loaded yet: run
+   `vps-install.sh --start`.
+2. `vps-install.sh --rotate-deposit-seed`. If an earlier rotation is still draining it refuses:
+   deposits stay off until `deploy/retire-deposit-seed.sh` can run (at most about 25 h), then
+   rotate.
+3. Read every `deposit_unknown_debit` alarm: it fires on any debit of a deposit account that is not
+   one of Payments' own moves.
+4. `vps-install.sh --deposits on` (section 8).
+
+**Alarms.**
+
+| Alarm                   | When                                                                                                                                                                                                                                                                  | Operator's action                                                                                                                                                                                   |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `deposit_review`        | A deposit or a transfer needs a person; `reason` is one of `unattributed`, `unreadable`, `from_bugnet`, `late_limit`, `return_destination_invalid`, `return_failed`, `unknown_debit`, `move_expired_repeatedly`, `moves_failing`, `expired_unchecked`, `double_sweep` | `pcli deposits list --review`, `pcli deposits show <orderId>`; a transfer in review goes back with `deposits return-to`, a deposit whose moves failed with `deposits retry` once the cause is fixed |
+| `deposit_unknown_debit` | A deposit account lost USDC in a transaction that is not Payments' own                                                                                                                                                                                                | The leak response above                                                                                                                                                                             |
+| `deposit_index_lag`     | The balance has not matched the recorded transfers for over 30 s, a listing could not be proven complete, an interval stayed unexplained after every entry was fetched, a transaction stayed missing, or the hard stop waited for a scan                              | `pcli rpc status`; move the lagging URL down the local list or remove it, copy it again and restart (section 6)                                                                                     |
+| `deposit_capacity`      | `max_open` deposits hold Bugnet-paid rent (once an hour)                                                                                                                                                                                                              | None needed: senders pay their own rent meanwhile and get it back at the close. Look for a flood of page views                                                                                      |
+| `deposit_create_churn`  | The unpaid-create budget of the last hour is spent (once an hour)                                                                                                                                                                                                     | None needed: senders pay their own rent for the rest of the hour. Look for one client behind many addresses                                                                                         |
+| `deposit_fee_budget`    | The free-move budget of the last hour is spent (once an hour)                                                                                                                                                                                                         | None needed: metered returns wait, the money stays in the deposit. Look for a dust flood                                                                                                            |
+| `deposit_rpc_budget`    | The job passed 80 % or 100 % of `rpc_calls_per_day`, or an hour passed `rpc_calls_per_hour_alarm`                                                                                                                                                                     | Look for a scan that is stuck or a padding flood; section 6 says what slows down                                                                                                                    |
+
+**Operator commands** (all `pcli`, section 8):
+
+- `deposits list [--state S] [--review] [--version N] [--moving]`: one line per deposit,
+  `<orderId> state=<s> received= returned= kept= review= held= reason=`, amounts in micros.
+  `review` is review money still in the deposit, `held` is review money carried to the refund
+  float. `--moving` lists only deposits with a move in flight.
+- `deposits show <orderId>`: the deposit, its transfers with owner and source, its moves with
+  their signatures, its holds, and for a shared payment its shares and every refund part.
+- `deposits retry <orderId>`: clears the review reason and puts the deposit's manual sweep back to
+  pending; refused while a move is in flight.
+- `deposits return-to <orderId> <signature> <tokenAccount> [--signed FILE]`: returns a transfer in
+  review (below).
+- `deposits return-late <orderId> [--signature SIG]... [--archive -]`: for a `done` deposit.
+  Without `--signature` it lists the credits sent after the close, each with its source, owner and
+  whether the owner signed; with it, it returns exactly those credits, each to its own
+  signer-owned source, and closes the account only when it is empty afterwards. It prints
+  `sending <signature>` before it sends; if the command is cut off, check that signature on chain
+  before running it again.
+- `deposits return-sol <orderId> <to> [--archive -]`: SOL sent to a deposit address, on
+  request.
+- `manual list`, `manual retry`, `manual resolve` and `manual refund` take split refund parts and
+  `deposit` refund rows, one line or one id per part.
+
+**Fee payer cost per order** (lamports; 5,000 per signature, 400 priority, rent returned at the
+close):
+
+| Order outcome                                                     | Moves                              | Cost                                      |
+| ----------------------------------------------------------------- | ---------------------------------- | ----------------------------------------- |
+| Paid with the exact amount                                        | create + sweep with close          | 15,800 (about $0.003 at $200/SOL)         |
+| Paid with extra, one sender                                       | create + sweep + return with close | 26,200                                    |
+| Underpaid, then expired                                           | create + return with close         | 15,800                                    |
+| Page viewed, never paid                                           | create + close                     | 15,800                                    |
+| Each further sending account to return                            |                                    | + 10,400                                  |
+| A move that fails on chain                                        |                                    | + about 10,400                            |
+| A closing move that loses the race to new money                   |                                    | + 10,400, + 10,400 for the separate close |
+| A move refused at preflight                                       |                                    | 0                                         |
+| Each later refund of a shared payment, per owner beyond the first |                                    | + about 10,200                            |
+
+The rent, 2,039,280 lamports per open account, is locked while it is open and returned at the
+close. The fee-per-order alarms subtract deposit moves, so normal use keeps them quiet.
+
+**Budgets against strangers.** Deposit addresses are public once their account exists, and one
+transaction can credit many of them, so a stranger could make Bugnet pay many times what it pays.
+
+- **Free-move budget**, `free_moves_lamports_per_hour` (2,000,000, about 190 moves): caps the fees
+  of metered moves (returns that do not close to the fee payer, closes to a stranger who opened
+  the account again) and of every failed move. Past it, metered moves wait and
+  `deposit_fee_budget` fires. Creates, sweeps and rent-returning closes are never metered, so
+  every deposit still gets its account and closes.
+- **Per sender**, `returns_per_owner_per_hour` (6): one sending owner cannot spend everyone's
+  share; its later returns wait for the next hour.
+- **Unpaid-create budget**, `unpaid_create_lamports_per_hour` (1,000,000, about 63 accounts):
+  caps the fees of accounts that never see money. Past it no account is created for new pages for
+  the rest of the hour and `deposit_create_churn` fires; senders pay their own rent meanwhile.
+- **Rent caps:** `max_open` (500), `rented_per_ip` (1 per IPv4 address or IPv6 /64) and
+  `rented_per_block` (2 per /48).
+- Leftovers, review money and split parts below `refund_min_micros` ($0.001) never get a
+  transaction of their own.
+
+**Held review money.** Money that needs a person never blocks a close: below $0.001 it is kept,
+above it rides in the closing move to the refund float and stays there as money Bugnet owes.
+`deposits return-to` sends it back, and only to:
+
+- an account owned by the wallet that sent it, with no proof; or
+- another account, with `--signed FILE`: a JSON file `{message, signature}` where `message` is
+  exactly `bugnet return-to <orderId> <transfer signature> <tokenAccount>`, signed by the sending
+  wallet. Ask the sender for that signed message.
+
+Never pay a destination on the word of whoever writes: the order id and the amount are public on
+chain (the sweep's memo), so knowing them proves nothing. Anything else is refused with
+`destination is not the sender's; pass --signed`. A transfer with no source whose transaction
+cannot be decoded has no signer to check, and stays in the float until handled by hand.
+
+**Shared payments.** An order is paid by the first single sending wallet whose own money covers
+the price; only when none does may up to 4 wallets, each with at least $0.001, share it. Every
+later refund of a shared payment (unredeemed, abandoned, router refunds, a refused funding, unspent
+allowance, an operator refund) is split by share, one refund row per wallet, each paid on its own.
+One wallet's closed account sends only its own part to the manual queue. `deposits show` prints
+the shares and every part.
+
+**Who the router sees.** Every single sending wallet is named as the router's payer and checked
+with CheckPayer, under the router's own per-wallet limits and blocks, an exchange's hot wallet
+included: all customers of one exchange share its limits. A shared payment names no payer and
+falls in the router's anonymous pool; each wallet's block still applies. Money the router refuses
+goes back to its sender.
+
+**RPC.** The job's own caps, 3 calls a second and 30,000 a day, sit on top of the router's limits
+(section 6).

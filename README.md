@@ -44,3 +44,5 @@ a test payer (key or mnemonic). Run it as `set -a; . ./.env; set +a; pnpm test:l
 list line free of spaces, quotes and shell characters, as above. `test/live/rpc-router.live.test.ts`
 checks every URL of the list without moving money;
 `pnpm test:live test/live/rpc-router.live.test.ts` runs it alone.
+`test/live/deposit.live.test.ts` pays by sending to an order's address and also needs
+`BUGNET_DEPOSIT_SEED`; `pnpm test:live test/live/deposit.live.test.ts` runs it alone.

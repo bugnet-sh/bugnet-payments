@@ -21,6 +21,8 @@ import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts
 import { createAllowanceFunding } from "../x402/funding.ts";
 import { readPool } from "../x402/ledger.ts";
 import { seedAccount } from "../testing/x402.ts";
+import { DepositKeys } from "../deposits/keys.ts";
+import { ensureDeposit, findDeposit, updateDeposit } from "../deposits/store.ts";
 import { reconcileSettling, type ReconcileDeps, type ReconcileReport } from "./reconciler.ts";
 import { sweep } from "./sweeper.ts";
 
@@ -62,6 +64,7 @@ function deps(rpc: FakeRpc, now: Date, log: ReconcileDeps["log"] = silentLog): R
         now: () => now,
         paid: null,
         x402: defaults.x402,
+        deposits: defaults.deposits,
     };
 }
 
@@ -740,5 +743,76 @@ describe("a settling hot order and the pool", () => {
         const cold = await settling(at(-MIN));
         await reconcileSettling(deps(slotRpc(556n), t0));
         expect((await findPaymentByOrder(db.pool, cold.order.id))!.landedSlot).toBeNull();
+    });
+});
+
+describe("orders with a deposit", () => {
+    const keys = new DepositKeys(new Map([[1, Buffer.alloc(32, 7)]]), 1);
+    const clock = (hhmmss: string) => new Date(`2030-01-01T${hhmmss}Z`);
+    const EXPIRES = clock("00:15:00");
+
+    afterEach(async () => {
+        await db.pool.query("update x402_pool set committed_micros = 0, unpaid_micros = 0");
+    });
+
+    // An order created at 00:00 with its deposit, then settling through a payment recorded then
+    async function settlingWithDeposit(recordedAt: Date, o: { allowance?: boolean } = {}) {
+        const fields = {
+            state: "unpaid" as const,
+            payer: PAYER,
+            createdAt: t0,
+            expiresAt: EXPIRES,
+        };
+        const { order } = o.allowance
+            ? await seedAllowanceOrder(db.pool, fields)
+            : await seedOrder(db.pool, { amountMicros: 50_000, ...fields });
+        await ensureDeposit(db.pool, keys, order, t0, () => Buffer.alloc(16, 1));
+        await db.pool.query("update orders set state = 'settling' where id = $1", [order.id]);
+        const payment = await seedPayment(db.pool, order.id, {
+            txSignature: newSignature(),
+            payer: PAYER,
+            createdAt: recordedAt,
+            lastValidBlockHeight: 1_000n,
+        });
+        return { order, payment };
+    }
+
+    const expiredRpc = () =>
+        createFakeRpc({ getEpochInfo: () => epochAt(1_001n), getSignatureStatuses: notFound });
+
+    it("an x402 failure after the deadline reverts to unpaid when a deposit is live", async () => {
+        const { order } = await settlingWithDeposit(clock("00:14:50"), { allowance: true });
+        await db.pool.query("update x402_pool set unpaid_micros = 1000000 where id = 1");
+
+        expect((await reconcileSettling(deps(expiredRpc(), clock("00:16:30")))).reverted).toBe(1);
+        expect((await orderOf(order.id)).state).toBe("unpaid");
+        expect((await findDeposit(db.pool, order.id))!.hardStopAt).toEqual(clock("00:21:30"));
+        expect((await readPool(db.pool)).unpaidMicros).toBe(1_000_000);
+    });
+
+    it("without a live deposit the order expires as before", async () => {
+        const { order } = await settlingWithDeposit(clock("00:14:50"), { allowance: true });
+        await updateDeposit(db.pool, order.id, { state: "done" });
+        await db.pool.query("update x402_pool set unpaid_micros = 1000000 where id = 1");
+
+        expect((await reconcileSettling(deps(expiredRpc(), clock("00:16:30")))).reverted).toBe(1);
+        expect((await orderOf(order.id)).state).toBe("expired");
+        expect((await findDeposit(db.pool, order.id))!.hardStopAt).toBeNull();
+        expect((await readPool(db.pool)).unpaidMicros).toBe(0);
+    });
+
+    it("the reconciler leaves transfer orders", async () => {
+        const { order } = await settlingWithDeposit(clock("00:05:00"));
+        await db.pool.query("update orders set paid_via = 'transfer' where id = $1", [order.id]);
+        const rpc = expiredRpc();
+
+        expect(await reconcileSettling(deps(rpc, clock("00:06:00")))).toEqual({
+            paid: 0,
+            reverted: 0,
+            waiting: 0,
+            changed: 0,
+        });
+        expect(rpc.calls.getSignatureStatuses ?? 0).toBe(0);
+        expect((await orderOf(order.id)).state).toBe("settling");
     });
 });

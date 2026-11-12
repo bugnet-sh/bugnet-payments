@@ -3,6 +3,7 @@ import type { Settings } from "../config.ts";
 import type { Log } from "../log.ts";
 import { setOrderState } from "../orders/store.ts";
 import type { OrderRow, PaymentRow } from "../orders/types.ts";
+import { insertRefundGroup, refundTargets } from "../refunds/split.ts";
 import type { AllowanceFunding } from "./funding.ts";
 import {
     ceilingUsedMicros,
@@ -63,19 +64,19 @@ export async function onOrderPaid(
 
     const refusal = await refusalFor(c, d, order, account);
     if (refusal !== null) {
-        await c.query(
-            `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
-                from_wallet, created_at)
-             values ($1, 'full', $2, $3, $4, $5, 'pending', 'allowance', $6)
-             on conflict do nothing`,
-            [
-                order.id,
-                REFUND_REASON[refusal],
-                payment.amountMicros,
-                payment.sourceTokenAccount,
-                payment.payer,
+        const targets = await refundTargets(c, order.id, payment.amountMicros);
+        if (targets === null) throw new Error(`paid order ${order.id} has no payments row`);
+        await insertRefundGroup(
+            c,
+            {
+                orderId: order.id,
+                kind: "full",
+                reason: REFUND_REASON[refusal],
+                fromWallet: "allowance",
+                budgetWaived: false,
                 at,
-            ],
+            },
+            targets,
         );
         await setOrderState(c, order.id, "paid", "refunding", { x402Refusal: refusal });
         await movePool(c, { unpaid: -order.allowanceMicros }, d.x402, d.log);

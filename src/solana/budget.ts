@@ -7,28 +7,38 @@ export interface RpcCounter {
     record(): void;
 }
 
-// One counter can sit under both lanes, so the hourly alarm counts every logical call once
-export function rpcCounter(o: { limitPerHour: number; log: Log; now: () => number }): RpcCounter {
+export interface RpcCounterOptions {
+    limitPerHour: number;
+    log: Log;
+    now: () => number;
+    alarm?: "x402_rpc_budget" | "deposit_rpc_budget";
+}
+
+// One counter can sit under several clients (both lanes), so the hourly alarm counts each
+// logical call once
+export function rpcCounter(o: RpcCounterOptions): RpcCounter {
+    const alarm = o.alarm ?? "x402_rpc_budget";
     const sends: number[] = [];
     let head = 0;
     let alarmed = false;
-    const record = () => {
-        const now = o.now();
-        while (head < sends.length && now - sends[head]! > HOUR_MS) head++;
-        if (head > 1024) {
-            sends.splice(0, head);
-            head = 0;
-        }
-        sends.push(now);
-        const calls = sends.length - head;
-        if (calls <= o.limitPerHour) {
-            alarmed = false;
-        } else if (!alarmed) {
-            alarmed = true;
-            o.log.alarm("x402_rpc_budget", { calls, limitPerHour: o.limitPerHour });
-        }
+    return {
+        record() {
+            const now = o.now();
+            while (head < sends.length && now - sends[head]! > HOUR_MS) head++;
+            if (head > 1024) {
+                sends.splice(0, head);
+                head = 0;
+            }
+            sends.push(now);
+            const calls = sends.length - head;
+            if (calls <= o.limitPerHour) {
+                alarmed = false;
+            } else if (!alarmed) {
+                alarmed = true;
+                o.log.alarm(alarm, { calls, limitPerHour: o.limitPerHour });
+            }
+        },
     };
-    return { record };
 }
 
 export function countingRpc(rpc: SolanaRpc, counter: RpcCounter): SolanaRpc {

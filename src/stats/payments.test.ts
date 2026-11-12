@@ -233,6 +233,49 @@ describe("statsPayments", () => {
         ]);
     });
 
+    it("stats show each part with its wallet", async () => {
+        const [order] = await paid([{ at: ago(9_000), amountMicros: 50_000 }]);
+        const ownA = wallet();
+        const ownB = wallet();
+        const parts: { payer: string; tx: string }[] = [];
+        for (const [part, payer, amount] of [
+            [0, ownA, 30_000],
+            [1, ownB, 20_000],
+        ] as const) {
+            const tx = signature();
+            await db.pool.query(
+                `insert into refunds (order_id, kind, part, reason, amount_micros, destination,
+                    payer, state, tx_signature, confirmed_at)
+                 values ($1, 'full', $2, 'late', $3, $4, $5, 'confirmed', $6, $7)`,
+                [order!.id, part, amount, wallet(), payer, tx, ago(2_000)],
+            );
+            parts.push({ payer, tx });
+        }
+        await db.pool.query(
+            `insert into refunds (order_id, kind, part, reason, amount_micros, destination, payer,
+                state, tx_signature, confirmed_at, deposit_signature)
+             values ($1, 'deposit', 0, 'deposit_held', 7000, $2, $3, 'confirmed', $4, $5, 'held')`,
+            [order!.id, wallet(), wallet(), signature(), ago(1_000)],
+        );
+        const page = await statsPayments(db.pool, null, NOW);
+        // Rows at one time come newest id first
+        expect(page.items.filter((i) => i.kind === "refund")).toEqual([
+            {
+                at: ago(2_000).toISOString(),
+                kind: "refund",
+                amountMicros: 20_000,
+                ...shown(parts[1]!),
+            },
+            {
+                at: ago(2_000).toISOString(),
+                kind: "refund",
+                amountMicros: 30_000,
+                ...shown(parts[0]!),
+            },
+        ]);
+        expect(page.items).toHaveLength(3);
+    });
+
     it("pages 51 rows into 50 with a cursor, then 1 with next null", async () => {
         await paid(Array.from({ length: 51 }, (_, i) => ({ at: ago((i + 1) * 60_000) })));
         const { pages, nexts } = await allPages();

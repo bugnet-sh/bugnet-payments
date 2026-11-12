@@ -49,10 +49,7 @@ export function createRouterRpc(
     };
 }
 
-// A fresh signal per call, so a stalled RPC fails like an unavailable one
-export function deadline(timeoutMs: number): { abortSignal: AbortSignal } {
-    return { abortSignal: AbortSignal.timeout(timeoutMs) };
-}
+export { deadline } from "./deadline.ts";
 
 export interface RpcErrorFields {
     err: string;

@@ -33,6 +33,18 @@ import {
 } from "./config.ts";
 import { migrate } from "./db/migrate.ts";
 import { createPool } from "./db/pool.ts";
+import {
+    countedLanes,
+    createDepositWatch,
+    type DepositWatch,
+    depositInterval,
+    depositRpcQueue,
+    depositsBusy,
+    runDepositTick,
+} from "./deposits/job.ts";
+import { checkDepositKeys, type DepositKeys, depositKeysFrom } from "./deposits/keys.ts";
+import { TxCache } from "./deposits/scan.ts";
+import { sweepHooks } from "./deposits/settle.ts";
 import { createHttpApp, type HttpX402Parts } from "./http/app.ts";
 import { startServer } from "./http/server.ts";
 import { type AlarmSnapshot, checkAlarms } from "./jobs/alarms.ts";
@@ -63,6 +75,8 @@ import { advanceColdTransfers, runColdTransfer } from "./x402/cold.ts";
 import { fastPassNeeded, runFastPass } from "./x402/fastpass.ts";
 import { createAllowanceFunding, type AllowanceFunding } from "./x402/funding.ts";
 import { bugnetAddresses } from "./x402/ids.ts";
+import type { PaidDeps } from "./x402/paid.ts";
+import type { BugnetAddresses } from "./x402/types.ts";
 import { type IndexCopy, loadIndex, parseIndex } from "./x402/index-file.ts";
 import {
     certExpiryAlarm,
@@ -141,6 +155,19 @@ function readOrEmpty(path: string): string {
     }
 }
 
+// What the deposit job needs beyond the shared jobs, present whenever a deposit seed is loaded
+interface DepositWiring {
+    keys: DepositKeys;
+    seed: Buffer;
+    watch: DepositWatch;
+    recipientTokenAccount: Address;
+    floatTokenAccount: Address;
+    addresses: BugnetAddresses;
+}
+
+// The deposit job's own transaction cache holds the 10,000 newest answers (spec 6.1)
+const DEPOSIT_TX_CACHE = 10_000;
+
 // What the x402 jobs and the signer listener share once the boot checks have passed
 interface X402Wiring {
     allowance: KeyPairSigner;
@@ -179,6 +206,8 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             else reload();
         });
         if (s.x402.allowance_wallet === "") await refuseUnfinishedAllowanceOrders(pool);
+        const depositKeys = depositKeysFrom(secrets, s.deposits.seed_version);
+        await checkDepositKeys(pool, depositKeys);
 
         const feePayer = await loadKeypair(secrets.feePayerKey, "BUGNET_FEE_PAYER_KEY");
         const refundSigner = await loadKeypair(secrets.refundKey, "BUGNET_REFUND_KEY");
@@ -332,6 +361,17 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             };
             parts = { index: index.current, signer: gate, addresses, funding };
         }
+        const deposits: DepositWiring | null =
+            depositKeys === null || secrets.depositSeed === null
+                ? null
+                : {
+                      keys: depositKeys,
+                      seed: secrets.depositSeed,
+                      watch: createDepositWatch(s.deposits.viewer_ttl, s.deposits.busy_every),
+                      recipientTokenAccount: await usdcAta(recipient),
+                      floatTokenAccount: await usdcAta(refundSigner.address),
+                      addresses,
+                  };
         const http = createHttpApp({
             settings: s,
             secrets,
@@ -339,6 +379,12 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             rpc,
             feePayer,
             x402: parts,
+            // The router's background lane, outside x402's counter: the route caps its own reads
+            backgroundRpc: bg0,
+            deposits:
+                deposits === null
+                    ? null
+                    : { keys: deposits.keys, watch: deposits.watch, enabled: s.deposits.enabled },
             log,
             now,
         });
@@ -417,7 +463,10 @@ export async function startService(o: StartOptions): Promise<RunningService> {
             s,
             pool,
             rpc,
+            rpc0,
+            bg0,
             backgroundRpc,
+            deposits,
             router: http.router,
             feePayer,
             refundSigner,
@@ -478,8 +527,13 @@ interface JobDeps {
     s: Settings;
     pool: pg.Pool;
     rpc: SolanaRpc;
+    // The router's two lanes before the x402 counter wraps them: the deposit job counts its calls
+    // on its own
+    rpc0: SolanaRpc;
+    bg0: SolanaRpc;
     // Watch-only jobs: alarms and audits
     backgroundRpc: SolanaRpc;
+    deposits: DepositWiring | null;
     router: RouterClient;
     feePayer: KeyPairSigner;
     refundSigner: KeyPairSigner;
@@ -509,7 +563,16 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
     const funding = x === null ? null : d.funding;
     const paid = funding === null ? null : { funding, x402: s.x402, log };
     const reconcile = tracked(() =>
-        reconcileSettling({ pool, rpc, rpcTimeoutMs, log, now, paid, x402: s.x402 }),
+        reconcileSettling({
+            pool,
+            rpc,
+            rpcTimeoutMs,
+            log,
+            now,
+            paid,
+            x402: s.x402,
+            deposits: s.deposits,
+        }),
     );
     const first = reconcile().catch((err: unknown) =>
         log.error("job failed", { job: "reconcile", err }),
@@ -548,6 +611,7 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
                         refundWallet: d.refundSigner.address,
                         alarms: s.alarms,
                         refunds: s.refunds,
+                        deposits: s.deposits,
                         rpcTimeoutMs,
                         log,
                         now,
@@ -632,12 +696,105 @@ function startJobs(d: JobDeps): { stop(): Promise<void> } {
         );
     }
     if (x !== null) stops.push(...startX402Jobs(d, x, tracked, track, refundDeps));
+    // Whatever [deposits] enabled says: it gates only new deposits, and existing ones must finish
+    if (d.deposits !== null) stops.push(startDepositJob(d, d.deposits, paid, tracked, track));
     return {
         async stop() {
             stopped = true;
             for (const stop of stops) stop();
             await Promise.allSettled([...running]);
         },
+    };
+}
+
+/**
+ * The deposit job (spec 6.4, 6.5): one tick at a time under its database lock, paced busy or idle,
+ * woken by a new viewer that needs an account. Moves and settles go on the router's money lane,
+ * balance reads and scans on its background lane, and the job's queue keeps its own caps. Both
+ * lanes count into one hourly counter of their own, never x402_rpc_budget's.
+ */
+function startDepositJob(
+    d: JobDeps,
+    w: DepositWiring,
+    paid: PaidDeps | null,
+    tracked: (fn: () => Promise<unknown>) => () => Promise<unknown>,
+    track: <T>(run: Promise<T>) => Promise<T>,
+): () => void {
+    const { s, pool, log, now } = d;
+    const cfg = s.deposits;
+    const nowMs = () => now().getTime();
+    const lanes = countedLanes(
+        { rpc: d.rpc0, backgroundRpc: d.bg0 },
+        { limitPerHour: cfg.rpc_calls_per_hour_alarm, log, now: nowMs },
+    );
+    const queue = depositRpcQueue(lanes, {
+        perSecond: cfg.rpc_calls_per_second,
+        perDay: cfg.rpc_calls_per_day,
+        now: nowMs,
+        log,
+    });
+    const base = {
+        pool,
+        rpc: queue.rpc("deposits.move"),
+        feePayer: d.feePayer,
+        keys: w.keys,
+        cfg,
+        recipientTokenAccount: w.recipientTokenAccount,
+        floatTokenAccount: w.floatTokenAccount,
+        hotTokenAccount: d.x402?.hotTokenAccount ?? null,
+        paid,
+        rpcTimeoutMs: s.solana.rpc_timeout,
+        log,
+        now,
+        cache: new TxCache(DEPOSIT_TX_CACHE),
+        router: d.router,
+        // The order token's fee payer is always Payments' own (spec 10.5)
+        challengeFeePayer: d.feePayer.address,
+        x402: { x402: s.x402, signer: d.x402?.gate ?? { open: () => false } },
+        watch: w.watch,
+        bugnetOwners: w.addresses.all,
+        seed: w.seed,
+        queue,
+    };
+    const deps = { ...base, ...sweepHooks(base) };
+    // A count, not a flag: a run the lock skips ends while the tick it overlapped goes on
+    let running = 0;
+    // A wake while a tick runs would find the lock taken and be skipped, so the paced loop runs
+    // again as soon as that tick ends instead of after busy_every
+    let wokenMeanwhile = false;
+    const run = tracked(async () => {
+        running++;
+        try {
+            return await singleRunner(pool, RUNNER_KEYS.deposits, () => runDepositTick(deps));
+        } finally {
+            running--;
+        }
+    });
+    w.watch.wake.run = () => {
+        if (running > 0) {
+            wokenMeanwhile = true;
+            return;
+        }
+        run().catch((err: unknown) => log.error("job failed", { job: "deposits", err }));
+    };
+    const stop = paced(
+        "deposits",
+        run,
+        () => {
+            if (wokenMeanwhile) {
+                wokenMeanwhile = false;
+                return Promise.resolve(0);
+            }
+            return track(depositsBusy(pool, w.watch, now(), cfg, queue.dayUsed().fraction)).then(
+                (busy) => depositInterval(busy, cfg),
+                () => cfg.idle_every,
+            );
+        },
+        log,
+    );
+    return () => {
+        w.watch.wake.run = null;
+        stop();
     };
 }
 

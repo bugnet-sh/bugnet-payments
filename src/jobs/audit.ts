@@ -194,6 +194,11 @@ async function matches(
          union all
          select true from x402_cold_transfers
          where state <> 'failed' and amount_micros = $2
+           and ($1 = tx_signature or $1 = any(previous_signatures))
+         union all
+         -- Dust a closing deposit move kept for Bugnet lands in the recipient wallet
+         select true from deposit_moves
+         where state = 'confirmed' and closes and keep_micros = $2
            and ($1 = tx_signature or $1 = any(previous_signatures))`,
         [sig, amount.toString(), memos],
     );

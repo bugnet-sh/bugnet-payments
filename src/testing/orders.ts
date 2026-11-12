@@ -127,13 +127,16 @@ export async function seedPayment(
         createdAt: new Date(),
         confirmedAt: null,
         landedSlot: null,
+        payerCounted: true,
+        multiSender: false,
+        splitMinMicros: null,
         ...over,
     };
     await pool.query(
         `insert into payments (order_id, tx_signature, message_hash, payer, source_token_account,
             amount_micros, blockhash, last_valid_block_height, status, created_at, confirmed_at,
-            landed_slot)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+            landed_slot, payer_counted, multi_sender, split_min_micros)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
         [
             p.orderId,
             p.txSignature,
@@ -147,7 +150,50 @@ export async function seedPayment(
             p.createdAt,
             p.confirmedAt,
             p.landedSlot === null ? null : p.landedSlot.toString(),
+            p.payerCounted,
+            p.multiSender,
+            p.splitMinMicros,
         ],
     );
     return (await findPaymentByOrder(pool, orderId))!;
+}
+
+export interface TestShare {
+    owner: string;
+    sourceTokenAccount: string;
+    appliedMicros: number;
+}
+
+// The default shares of a 50,000 order (spec 10.9's example)
+export const TEST_SHARES: readonly TestShare[] = [
+    { owner: "OwnA", sourceTokenAccount: "SrcA", appliedMicros: 30_000 },
+    { owner: "OwnB", sourceTokenAccount: "SrcB", appliedMicros: 20_000 },
+];
+
+// A payment shared by several owners as settle writes it: share part 0 is the payments row's
+// payer and source.
+export async function seedSharedPayment(
+    pool: pg.Pool,
+    orderId: string,
+    o: { shares?: readonly TestShare[]; splitMinMicros?: number; over?: Partial<PaymentRow> } = {},
+): Promise<PaymentRow> {
+    const shares = o.shares ?? TEST_SHARES;
+    const payment = await seedPayment(pool, orderId, {
+        status: "confirmed",
+        payer: shares[0]!.owner,
+        sourceTokenAccount: shares[0]!.sourceTokenAccount,
+        multiSender: true,
+        payerCounted: false,
+        splitMinMicros: o.splitMinMicros ?? 1_000,
+        ...o.over,
+    });
+    for (const [part, s] of shares.entries()) {
+        await pool.query(
+            `insert into payment_shares (order_id, part, owner, source_token_account,
+                applied_micros)
+             values ($1, $2, $3, $4, $5)`,
+            [orderId, part, s.owner, s.sourceTokenAccount, s.appliedMicros],
+        );
+    }
+    return payment;
 }
