@@ -47,7 +47,7 @@ import {
 import { insertRefundGroup, refundTargets } from "./refunds/split.ts";
 import { generateExportableKeypair } from "./solana/keys.ts";
 import { testDb, type TestDb } from "./testing/db.ts";
-import { heldRefundId } from "./testing/deposits.ts";
+import { heldRefundId, seedWriteOffPart } from "./testing/deposits.ts";
 import { type FakeChain, startFakeChain } from "./testing/fake-chain.ts";
 import { createFakeRpc } from "./testing/fake-rpc.ts";
 import { testSigner } from "./testing/keys.ts";
@@ -2468,6 +2468,27 @@ describe("deposits commands", () => {
         expect(io.errText()).toContain(
             `deposit ${ORDER_A} is done, so no move returns money left in its account`,
         );
+        expect(await depositLedger(db.pool, ORDER_A)).toEqual(before);
+    });
+
+    it("return-to refuses a transfer a write-off took whole", async () => {
+        const ownA = await testSigner(73);
+        const first = await usdcAta(ownA.address);
+        await seedDeposit(ORDER_A, { order: { state: "expired" }, deposit: { state: "draining" } });
+        await seedTransfer(ORDER_A, {
+            signature: SIG(64),
+            amountMicros: 7_000,
+            outcome: "review",
+            reason: "late_limit",
+            owner: ownA.address,
+            source: first,
+        });
+        await seedWriteOffPart(db.pool, ORDER_A, { transferSignature: SIG(64), micros: 7_000 });
+        const before = await depositLedger(db.pool, ORDER_A);
+        const io = captureIo();
+        const rpc = accountsRpc({ [first]: ownA.address });
+        expect(await cli(["deposits", "return-to", ORDER_A, SIG(64), first], io, { rpc })).toBe(1);
+        expect(io.errText()).toContain(`a write-off took all of transfer ${SIG(64)}`);
         expect(await depositLedger(db.pool, ORDER_A)).toEqual(before);
     });
 

@@ -1604,6 +1604,7 @@ async function returnHeld(
     if (await moveInFlight(c, o.orderId)) return { refused: inFlight(o.orderId) };
     const { rows } = await c.query<{
         outcome: string;
+        left: string;
         move_id: string | null;
         move_state: string | null;
         refund_id: string | null;
@@ -1611,7 +1612,10 @@ async function returnHeld(
         refund_reason: string | null;
     }>(
         `select t.outcome, t.move_id, m.state as move_state, t.refund_id,
-            r.state as refund_state, r.manual_reason as refund_reason
+            r.state as refund_state, r.manual_reason as refund_reason,
+            t.amount_micros - t.applied_micros - coalesce((select sum(p.micros)
+                from deposit_write_off_parts p
+                where p.order_id = t.order_id and p.transfer_signature = t.signature), 0) as left
          from deposit_transfers t
          left join deposit_moves m on m.id = t.move_id
          left join refunds r on r.id = t.refund_id
@@ -1621,6 +1625,10 @@ async function returnHeld(
     );
     const t = rows[0];
     if (t?.outcome !== "review") return { refused: `transfer ${o.signature} is not in review` };
+    // A write-off pays the part it took by its own refund row (spec 23.1)
+    if (Number(t.left) <= 0) {
+        return { refused: `a write-off took all of transfer ${o.signature}` };
+    }
     // A failed move carried nothing, so that money is still in the deposit too
     if (t.move_id === null || t.move_state === "failed") {
         // The job never reads a done deposit, so no planner would carry out the return
