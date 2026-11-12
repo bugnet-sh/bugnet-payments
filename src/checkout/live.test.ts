@@ -142,7 +142,7 @@ describe("live status", () => {
         expect(showWalletOptions(view("paid"))).toBe(false);
         expect(walletNote(view("unpaid", {}), C)).toBeNull();
         const w35 =
-            "Money already arrived at the address above. Paying by wallet charges the full $0.05 and sends that money back.";
+            "Paying by wallet charges the full $0.05 and returns the money already sent to the address.";
         expect(walletNote(view("unpaid", { receivedMicros: 1 }), C)).toBe(w35);
         expect(walletNote(view("unpaid", { otherMicros: 1 }), C)).toBe(w35);
     });
@@ -161,49 +161,54 @@ describe("which ways to pay show", () => {
     const at = (o: Partial<Parameters<typeof arrangement>[0]>) =>
         arrangement({ takesMoney: true, walletsFound: 0, address: true, phone: false, ...o });
 
+    const none = { wallet: false, phone: false, phoneLinks: false, phoneQr: false, or: false };
+
     it("a found wallet always shows, under the address after an or", () => {
         for (const phone of [false, true]) {
-            expect(at({ walletsFound: 1, phone })).toEqual({
-                wallet: true,
-                phone: false,
-                phoneQr: false,
-                or: true,
-            });
+            expect(at({ walletsFound: 1, phone })).toEqual({ ...none, wallet: true, or: true });
         }
+    });
+
+    it("without an address, a found wallet keeps the Phantom code beside it off a phone", () => {
+        // The extension may hold no USDC while the phone does
         expect(at({ walletsFound: 2, address: false })).toEqual({
+            ...none,
             wallet: true,
-            phone: false,
+            phone: true,
             phoneQr: true,
-            or: false,
+        });
+        // A phone with a wallet is inside that wallet: neither links nor a code it cannot scan
+        expect(at({ walletsFound: 1, address: false, phone: true })).toEqual({
+            ...none,
+            wallet: true,
         });
     });
 
     it("with no wallet and an address, a desktop shows the address alone and a phone adds the app links", () => {
-        expect(at({})).toEqual({ wallet: false, phone: false, phoneQr: false, or: false });
-        expect(at({ phone: true })).toEqual({
-            wallet: false,
-            phone: true,
-            phoneQr: false,
-            or: true,
-        });
+        expect(at({})).toEqual(none);
+        expect(at({ phone: true })).toEqual({ ...none, phone: true, phoneLinks: true, or: true });
     });
 
-    it("with no wallet and no address, the page says so and offers the phone, its code included", () => {
-        for (const phone of [false, true]) {
-            expect(at({ address: false, phone })).toEqual({
-                wallet: true,
-                phone: true,
-                phoneQr: true,
-                or: false,
-            });
-        }
+    it("with no wallet and no address, the page says so and offers the phone, its code off a phone", () => {
+        expect(at({ address: false })).toEqual({
+            ...none,
+            wallet: true,
+            phone: true,
+            phoneLinks: true,
+            phoneQr: true,
+        });
+        expect(at({ address: false, phone: true })).toEqual({
+            ...none,
+            wallet: true,
+            phone: true,
+            phoneLinks: true,
+        });
     });
 
     it("an order that no longer takes money offers nothing", () => {
         for (const walletsFound of [0, 1, 2]) {
             for (const address of [false, true]) {
-                const a = at({ takesMoney: false, walletsFound, address });
-                expect([a.wallet, a.phone, a.or]).toEqual([false, false, false]);
+                expect(at({ takesMoney: false, walletsFound, address })).toEqual(none);
             }
         }
     });

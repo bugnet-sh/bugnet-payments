@@ -170,7 +170,8 @@ function keptLine(v: NonNullable<StatusView["deposit"]>, c: MessageContext): str
     return `${amountLabel(v.keptMicros)} arrived, which is below the ${amountLabel(c.refundMinMicros)} Bugnet returns, so it was kept.`;
 }
 
-const P2 = "The payment is confirming on Solana. This page updates when it lands.";
+// The status label above already says Confirming
+const P2 = "This page updates when the payment lands.";
 const P3 = "This order's payment was returned to the wallet that paid.";
 
 // The deposit section's Amount row, its Copy value, the QR's alt and the exchange note. Once part of the price has arrived they name what is left, as the QR does (spec 14.2):
@@ -210,7 +211,7 @@ export function depositLine(
             message = `Received ${amountLabel(d.receivedMicros)} of ${amountLabel(c.amountMicros)}.`;
             break;
         case "confirming":
-            message = `Received ${amountLabel(d.receivedMicros)}. Confirming the payment on Solana.`;
+            message = `Received ${amountLabel(d.receivedMicros)}.`;
             break;
         case "held":
             message = heldLine(d, c, v.serverNow >= v.expiresAt);
@@ -276,7 +277,7 @@ export function depositLine(
     }
     if ((d.status === "partial" || d.status === "waiting") && d.otherMicros > 0) {
         extra.push(
-            `${amountLabel(d.otherMicros)} also arrived from other wallets. It is not counted in the amount above.`,
+            `${amountLabel(d.otherMicros)} also arrived from other wallets. It does not lower the amount below.`,
         );
     }
     if (d.reviewMicros > 0 && d.status !== "review") {
@@ -296,7 +297,7 @@ export function depositLine(
 
 // W35, while money already sits at the address and the order still takes a wallet payment
 export function walletNoteText(c: MessageContext): string {
-    return `Money already arrived at the address above. Paying by wallet charges the full ${amountLabel(c.amountMicros)} and sends that money back.`;
+    return `Paying by wallet charges the full ${amountLabel(c.amountMicros)} and returns the money already sent to the address.`;
 }
 
 // W35 while the deposit is in review: the address is hidden and that money waits for a person

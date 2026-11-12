@@ -536,7 +536,7 @@ describe("address-first page", () => {
         expect(html).toContain('<p id="copy-message" role="status" aria-live="polite"></p>');
         // Empty live regions stay in the page, so their first line is announced
         expect(html).toContain(
-            "#deposit-message:empty, #message:empty, #copy-message:empty { margin: 0; }",
+            "#deposit-message:empty, #message:empty, #copy-message:empty, #wallet-note:empty { margin: 0; }",
         );
         expect(html).not.toMatch(/:empty \{ display: none/);
     });
@@ -584,12 +584,10 @@ describe("address-first page", () => {
         );
     });
 
-    it("the wallet note is there and hidden", async () => {
+    it("the wallet note is an empty live region in the page, before the wallet's line", async () => {
         const wallet = section(await renderCheckout(offered), "wallet");
-        const note = wallet.indexOf('<p id="wallet-note"');
-        expect(note).toBeGreaterThan(0);
-        expect(wallet.slice(note, wallet.indexOf(">", note))).toContain("hidden");
-        expect(note).toBeLessThan(wallet.indexOf('id="message"'));
+        expect(wallet).toContain('<p id="wallet-note" role="status" aria-live="polite"></p>');
+        expect(wallet.indexOf('id="wallet-note"')).toBeLessThan(wallet.indexOf('id="message"'));
     });
 
     it("a disabled Pay button looks disabled, outline or not", async () => {
@@ -627,7 +625,7 @@ describe("address-first page", () => {
 
     it("page-level messages", async () => {
         expect(await renderCheckout({ ...view, state: "settling" })).toContain(
-            "The payment is confirming on Solana. This page updates when it lands.",
+            "This page updates when the payment lands.",
         );
         expect(await renderCheckout({ ...view, state: "refunded" })).toContain(
             "This order's payment was returned to the wallet that paid.",
@@ -641,6 +639,20 @@ describe("address-first page", () => {
         }
         expect(await renderCheckout({ ...offered, depositsOffered: false })).not.toContain(
             "<noscript>",
+        );
+        // A deposit in review hides the address, so P4 would point at nothing
+        const review = {
+            ...offered,
+            deposit: { ...offered.deposit!, status: "review" as const },
+        };
+        const html = await renderCheckout(review);
+        expect(html).not.toContain("<noscript>");
+        // Without the script the page still says it is in review, and why
+        expect(html).toContain(
+            `data-state="unpaid" role="status" aria-live="polite">Under review</span>`,
+        );
+        expect(html).toContain(
+            `<p id="deposit-message" role="status" aria-live="polite">This payment needs a check by hand. The money is safe. Write to support@bugnet.org with order ${id}.</p>`,
         );
     });
 

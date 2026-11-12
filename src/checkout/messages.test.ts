@@ -79,7 +79,7 @@ describe("deposit lines", () => {
             extra: [],
         });
         expect(line({ status: "confirming", receivedMicros: 50_000 }).message).toBe(
-            "Received $0.05. Confirming the payment on Solana.",
+            "Received $0.05.",
         );
     });
 
@@ -149,7 +149,7 @@ describe("deposit lines", () => {
         });
         expect(r.message).toBe("Received $0.03 of $0.05.");
         expect(r.extra).toEqual([
-            "$0.01 also arrived from other wallets. It is not counted in the amount above.",
+            "$0.01 also arrived from other wallets. It does not lower the amount below.",
         ]);
     });
 
@@ -401,7 +401,7 @@ describe("wallet messages", () => {
             depositLine({ ...view({}, state), deposit: null }, C);
         expect(bare("settling")).toEqual({
             label: "Confirming",
-            message: "The payment is confirming on Solana. This page updates when it lands.",
+            message: "This page updates when the payment lands.",
             extra: [],
         });
         expect(bare("refunded").message).toBe(

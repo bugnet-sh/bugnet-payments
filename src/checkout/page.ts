@@ -2,7 +2,14 @@ import QRCode from "qrcode";
 import type { DepositView } from "../deposits/types.ts";
 import type { PublicState } from "../http/public.ts";
 import type { OrderKind } from "../orders/types.ts";
-import { amountLabel, decimalAmount, depositAsk, PAGE_TEXT, STATE_LABELS } from "./messages.ts";
+import {
+    amountLabel,
+    decimalAmount,
+    depositAsk,
+    PAGE_TEXT,
+    STATE_LABELS,
+    stateStep,
+} from "./messages.ts";
 import { USDC_ICON } from "./usdc.ts";
 
 export { amountLabel, decimalAmount };
@@ -240,7 +247,7 @@ p { margin: 0; }
 .time time { color: var(--text); }
 #deposit-message { margin-top: var(--space-4); }
 /* An empty live region stays in the page, so its first line is announced */
-#deposit-message:empty, #message:empty, #copy-message:empty { margin: 0; }
+#deposit-message:empty, #message:empty, #copy-message:empty, #wallet-note:empty { margin: 0; }
 
 #wallet, #phone { margin-top: var(--space-5); }
 #wallets {
@@ -481,7 +488,7 @@ async function walletSections(v: CheckoutView, address: boolean): Promise<string
     return `<section id="wallet" hidden>
 <ul id="wallets" hidden></ul>
 <button id="pay-button" class="button" type="button" disabled>Pay</button>
-<p id="wallet-note" role="status" hidden></p>
+<p id="wallet-note" role="status" aria-live="polite"></p>
 ${MESSAGE}
 </section>
 <section id="phone"${hidden}>
@@ -517,12 +524,24 @@ function depositSection(v: CheckoutView, deposit: DepositView): string {
 </section>`;
 }
 
-// The page-level line under the status (spec 15.6, M20, P2 and P3)
+// A deposit in review reads as review before the script runs, and without it
+const inReview = (dep: DepositView | null) => dep?.status === "review";
+
+// The page-level line under the status (spec 15.6, M18, M20, P2 and P3)
 function firstLine(v: CheckoutView, dep: DepositView | null): string {
-    if (v.state === "unpaid") return dep === null ? PAGE_TEXT.addressOff : "";
+    if (v.state === "unpaid") {
+        if (dep === null) return PAGE_TEXT.addressOff;
+        if (!inReview(dep)) return "";
+        const ctx = {
+            amountMicros: v.amountMicros,
+            deadline: "",
+            refundMinMicros: v.refundMinMicros,
+            orderId: v.orderId,
+        };
+        return escapeHtml(stateStep("review", ctx).message);
+    }
     if (v.deposit !== null) return "";
-    if (v.state === "settling")
-        return "The payment is confirming on Solana. This page updates when it lands.";
+    if (v.state === "settling") return "This page updates when the payment lands.";
     if (v.state === "refunded") return "This order's payment was returned to the wallet that paid.";
     return "";
 }
@@ -542,8 +561,7 @@ export async function renderCheckout(v: CheckoutView): Promise<string> {
 ${depositSection(v, dep)}
 <p id="or" class="or" hidden>or</p>
 </div>
-${await walletSections(v, askHidden === "")}
-${NOSCRIPT}`;
+${await walletSections(v, askHidden === "")}${askHidden === "" ? `\n${NOSCRIPT}` : ""}`;
     } else if (unpaid) {
         methods = await walletSections(v, false);
     } else if (v.state === "settling") {
@@ -560,7 +578,7 @@ ${NOSCRIPT}`;
 <span class="amount-value">${amount}</span>
 <span class="amount-unit with-usdc">${USDC_ICON}USDC</span>
 </p>
-<p class="status"><span id="state" class="state" data-state="${v.state}" role="status" aria-live="polite">${STATE_LABELS[v.state]}</span>${time}</p>
+<p class="status"><span id="state" class="state" data-state="${v.state}" role="status" aria-live="polite">${inReview(dep) ? STATE_LABELS.review : STATE_LABELS[v.state]}</span>${time}</p>
 <p id="deposit-message" role="status" aria-live="polite">${firstLine(v, dep)}</p>
 ${methods}
 <p class="order"><span>Order <code>${id}</code></span>${copyButton(v.orderId)}</p>

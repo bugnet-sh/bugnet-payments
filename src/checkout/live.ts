@@ -156,13 +156,15 @@ export function walletNote(v: StatusView, c: MessageContext): string | null {
     return showDepositAsk(v) ? walletNoteText(c) : walletNoteReviewText(c);
 }
 
-// Which ways to pay the page shows. A found browser wallet always shows. Without one, the wallet
-// part says so only on a page with no address, and the phone part shows on a phone or on a page
-// with no address; its code, which opens the page in Phantom, only when no address shows, so a
-// page never draws two codes.
+// Which ways to pay the page shows. A found browser wallet always shows; without one, the wallet
+// part says so only on a page with no address. The wallet app links show when this browser has
+// no wallet, on a phone or on a page with no address. The code that opens the page in Phantom
+// shows whenever no address shows, off a phone, even beside a found wallet, which may hold no
+// USDC; so a page never draws two codes.
 export interface Arrangement {
     wallet: boolean;
     phone: boolean;
+    phoneLinks: boolean;
     phoneQr: boolean;
     or: boolean;
 }
@@ -174,8 +176,10 @@ export function arrangement(o: {
     phone: boolean;
 }): Arrangement {
     const wallet = o.takesMoney && (o.walletsFound > 0 || !o.address);
-    const phone = o.takesMoney && o.walletsFound === 0 && (o.phone || !o.address);
-    return { wallet, phone, phoneQr: !o.address, or: o.address && (wallet || phone) };
+    const phoneLinks = o.takesMoney && o.walletsFound === 0 && (o.phone || !o.address);
+    const phoneQr = o.takesMoney && !o.address && !o.phone;
+    const phone = phoneLinks || phoneQr;
+    return { wallet, phone, phoneLinks, phoneQr, or: o.address && (wallet || phone) };
 }
 
 export function walletNoteShown(a: Arrangement, walletsFound: number, note: string): boolean {

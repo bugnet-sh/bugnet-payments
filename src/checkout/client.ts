@@ -64,6 +64,8 @@ interface Page {
     status: StatusDeps;
     ctx: MessageContext;
     copyMessage: HTMLElement | null;
+    // W35 as the last status answer had it, shown only beside a Pay button
+    noteText: string;
     // While the order takes money, and how many usable browser wallets the page found
     takesMoney: boolean;
     walletsFound: number;
@@ -90,11 +92,15 @@ function arrange(p: Page): void {
     };
     show("#wallet", a.wallet);
     show("#phone", a.phone);
+    show("#phone .mobile-links", a.phoneLinks);
     show("#phone figure", a.phoneQr);
     show("#or", a.or);
-    // W35 speaks to a payment by wallet, so it shows only beside a Pay button
-    const note = p.walletNote;
-    if (note !== null) note.hidden = !walletNoteShown(a, p.walletsFound, note.textContent ?? "");
+    // A live region, so it stays in the page and only its text comes and goes
+    if (p.walletNote !== null) {
+        const shown = walletNoteShown(a, p.walletsFound, p.noteText);
+        const text = shown ? p.noteText : "";
+        if (p.walletNote.textContent !== text) p.walletNote.textContent = text;
+    }
 }
 
 function usable(w: Wallet): boolean {
@@ -393,10 +399,11 @@ function follow(p: Page, wallet: WalletSection | null): void {
             remaining = d.remainingMicros;
             qr.src = `/o/${p.ctx.orderId}/qr.svg?r=${remaining}`;
         }
-        wallet?.seen(v);
-        if (p.walletNote !== null) p.walletNote.textContent = walletNote(v, p.ctx) ?? "";
+        p.noteText = walletNote(v, p.ctx) ?? "";
         p.takesMoney = showWalletOptions(v);
         arrange(p);
+        // After arrange, so a line W18 writes lands in a shown wallet part
+        wallet?.seen(v);
     };
 
     let failures = 0;
@@ -484,6 +491,7 @@ if (root !== null) {
             orderId: root.dataset.orderId ?? "",
             hasAddress: root.querySelector("#deposit-ask:not([hidden])") !== null,
         },
+        noteText: "",
         takesMoney: root.dataset.state === "unpaid",
         walletsFound: 0,
     };
