@@ -2229,8 +2229,10 @@ async function depositsWriteOff(
             transfer: p.transferSignature,
             micros: p.micros,
             refundId: p.refundId,
+            joined: p.joined,
         })),
         expired: result.expired,
+        droppedMoves: result.dropped,
         reviewCleared: result.reviewCleared,
     });
     io.out(`deposit ${orderId} wrote off ${sig} micros=${micros} slot=${slot}`);

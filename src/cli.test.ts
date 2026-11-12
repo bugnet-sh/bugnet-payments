@@ -3190,6 +3190,36 @@ describe("deposits commands", () => {
             expect(await writeOffRefunds()).toEqual([]);
         });
 
+        it("a later part of one transfer joins its pending payout, or is left for support", async () => {
+            await seedDeposit(ORDER_A);
+            await credit(a, srcA, 20_000);
+            const b1 = await credit(b, srcB, 15_000);
+            const first = theft(5_000);
+            const second = theft(3_000);
+            const third = theft(2_000);
+            expect((await writeOff(first)).code).toBe(0);
+            const [row] = await writeOffRefunds();
+            const joined = await writeOff(second);
+            expect(joined.code).toBe(0);
+            expect(joined.io.outText()).toContain(`part ${b1} 3000 refund=${row!.id} to=${srcB}`);
+            expect(await writeOffRefunds()).toMatchObject([{ id: row!.id, amountMicros: 8_000 }]);
+
+            await db.pool.query("update refunds set state = 'sent' where id = $1", [row!.id]);
+            const left = await writeOff(third);
+            expect(left.code).toBe(0);
+            expect(left.io.outText()).toContain(
+                `part ${b1} 2000 refund=- pay by hand: refund ${row!.id} is sent`,
+            );
+            const parts = (await depositLedger(db.pool, ORDER_A))!.writeOffParts;
+            expect(
+                Object.fromEntries(parts.map((p) => [p.signature, [p.micros, p.refundId]])),
+            ).toEqual({
+                [first]: [5_000, row!.id],
+                [second]: [3_000, row!.id],
+                [third]: [2_000, null],
+            });
+        });
+
         it("refuses while a move is signed or sent", async () => {
             await seedDeposit(ORDER_A);
             await credit(a, srcA, 20_000);
