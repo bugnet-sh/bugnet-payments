@@ -404,8 +404,8 @@ pg_drop_database() {
     pg_sql postgres -c "set client_min_messages = warning" -c "drop database if exists $1"
 }
 
-# Every version, running or only enabled, so none runs on the database while it is replaced or
-# starts on the restored one before --start
+# Every version systemd has loaded, and the installed one, so none runs on the database while it is
+# replaced or starts on the restored one before --start
 stop_every_version() {
     local v=$1 unit
     for unit in $({
@@ -491,7 +491,7 @@ do_restore() {
     stop_every_version "$v" ||
         restore_abort "$new" "a version did not stop; $DB was not changed, run --restore again"
     if pg_has_database "$DB"; then
-        differences=$(money_differences "$new" "$DB" "$kept")
+        differences=$(money_differences "$new" "$DB" "$kept" || echo "the rows could not be compared")
         pg_sql postgres -1 -c "alter database $DB rename to $kept" -c "alter database $new rename to $DB" ||
             restore_abort "$new" "cannot rename the databases (pg_stat_activity shows who holds $DB); $DB was not changed and every version is stopped: run --restore again, or --start"
         say "$DB is now the dump; the database it replaced is $kept, which only postgres opens"
