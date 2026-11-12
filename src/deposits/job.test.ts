@@ -2329,7 +2329,7 @@ describe("flows on FakeChain", () => {
             expect(view).toMatchObject({
                 status: "refunded",
                 returnedMicros: 20_000,
-                keptMicros: 5_600,
+                keptMicros: 0,
                 reviewMicros: 0,
             });
         });

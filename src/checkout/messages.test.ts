@@ -310,6 +310,54 @@ describe("deposit lines", () => {
             expect(text).not.toContain("$0.05");
         }
     });
+
+    it("a payment a write-off failed says it did not go through, never that time ran out", () => {
+        const failed = { reason: "written_off" as const, reasonMicros: 80_000 };
+        expect(
+            line({ status: "refunding", ...failed, returningMicros: 80_000 }, "refunded"),
+        ).toEqual({
+            label: "Refunding",
+            message: "The payment did not go through. The $0.08 you sent is being returned.",
+            extra: [],
+        });
+        expect(
+            line({ status: "refunded", ...failed, returnedMicros: 80_000 }, "refunded").message,
+        ).toBe(
+            "The payment did not go through. The $0.08 you sent was returned. Ask your agent for a new payment link.",
+        );
+    });
+
+    it("money a theft took before the price arrived is said to go back", () => {
+        expect(line({ returningMicros: 50_000 })).toEqual({
+            label: "Awaiting payment",
+            message: "",
+            extra: ["The $0.05 you sent is being returned."],
+        });
+        const partial = {
+            status: "partial" as const,
+            receivedMicros: 20_000,
+            remainingMicros: 30_000,
+        };
+        expect(line({ ...partial, returningMicros: 10_000 })).toEqual({
+            label: "Partly paid",
+            message: "Received $0.02 of $0.05.",
+            extra: ["The $0.01 you sent is being returned."],
+        });
+        expect(line({ ...partial, returnedMicros: 10_000 }).extra).toEqual([
+            "The $0.01 you sent was returned.",
+        ]);
+        // A blocked sender's money going back is M13's alone
+        expect(
+            line({
+                ...partial,
+                reason: "payer_blocked",
+                reasonMicros: 20_000,
+                returningMicros: 20_000,
+            }).extra,
+        ).toEqual([
+            "Bugnet blocks the wallet that sent $0.02, so that money is being returned to it.",
+        ]);
+    });
 });
 
 describe("wallet messages", () => {

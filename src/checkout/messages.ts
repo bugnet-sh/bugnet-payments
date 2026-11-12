@@ -173,6 +173,8 @@ function keptLine(v: NonNullable<StatusView["deposit"]>, c: MessageContext): str
 // The status label above already says Confirming
 const P2 = "This page updates when the payment lands.";
 const P3 = "This order's payment was returned to the wallet that paid.";
+// A settling payment a write-off failed; the whole price had arrived (spec 23.1)
+const NOT_THROUGH = "The payment did not go through.";
 
 // The deposit section's Amount field, its copy value and the QR's alt. Once part of the price
 // has arrived they name what is left, as the QR does (spec 14.2):
@@ -244,25 +246,36 @@ export function depositLine(
                 } else message = "Go back to your agent. It continues on its own.";
             }
             break;
-        case "refunding":
-            message =
-                d.reason === "unpaid"
-                    ? `Time ran out before the full amount arrived. The ${amountLabel(d.returningMicros > 0 ? d.returningMicros : d.reasonMicros)} you sent is being returned to the address that sent it.`
-                    : (returnLine(d, c, false) ??
-                      "Money is being returned to the address that sent it.");
+        case "refunding": {
+            const sent = amountLabel(d.returningMicros > 0 ? d.returningMicros : d.reasonMicros);
+            if (d.reason === "unpaid") {
+                message = `Time ran out before the full amount arrived. The ${sent} you sent is being returned to the address that sent it.`;
+            } else if (d.reason === "written_off") {
+                message = `${NOT_THROUGH} The ${sent} you sent is being returned.`;
+            } else {
+                message =
+                    returnLine(d, c, false) ??
+                    "Money is being returned to the address that sent it.";
+            }
             break;
-        case "refunded":
+        }
+        case "refunded": {
             // An expired order whose only money was kept reads refunded too (spec 8.3)
             if (kept && d.returnedMicros === 0) {
                 message = keptLine(d, c);
                 break;
             }
-            message =
-                d.reason === "unpaid"
-                    ? `Time ran out before the full amount arrived. The ${amountLabel(d.returnedMicros > 0 ? d.returnedMicros : d.reasonMicros)} you sent was returned. ${ASK_NEW_LINK}`
-                    : (returnLine(d, c, true) ??
-                      "The money was returned to the address that sent it.");
+            const sent = amountLabel(d.returnedMicros > 0 ? d.returnedMicros : d.reasonMicros);
+            if (d.reason === "unpaid") {
+                message = `Time ran out before the full amount arrived. The ${sent} you sent was returned. ${ASK_NEW_LINK}`;
+            } else if (d.reason === "written_off") {
+                message = `${NOT_THROUGH} The ${sent} you sent was returned. ${ASK_NEW_LINK}`;
+            } else {
+                message =
+                    returnLine(d, c, true) ?? "The money was returned to the address that sent it.";
+            }
             break;
+        }
         case "review":
             message = `This payment needs a check by hand. The money is safe. Write to ${SUPPORT} with order ${c.orderId}.`;
             break;
@@ -275,10 +288,17 @@ export function depositLine(
     }
     const extra: string[] = [];
     if (d.keptMicros > 0 && message !== keptLine(d, c)) extra.push(keptLine(d, c));
-    if ((d.status === "partial" || d.status === "waiting") && d.reason === "payer_blocked") {
+    const waits = d.status === "partial" || d.status === "waiting";
+    if (waits && d.reason === "payer_blocked") {
         extra.push(blockedLine(d.reasonMicros, d.blockedUntil, c));
+    } else if (waits && d.returningMicros > 0) {
+        // Money going back that M13 does not name, such as what a theft took and the float pays
+        // back (spec 23.1)
+        extra.push(`The ${amountLabel(d.returningMicros)} you sent is being returned.`);
+    } else if (waits && d.returnedMicros > 0) {
+        extra.push(`The ${amountLabel(d.returnedMicros)} you sent was returned.`);
     }
-    if ((d.status === "partial" || d.status === "waiting") && d.otherMicros > 0) {
+    if (waits && d.otherMicros > 0) {
         extra.push(
             `${amountLabel(d.otherMicros)} also arrived from other wallets. It does not lower the amount below.`,
         );

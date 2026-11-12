@@ -622,6 +622,7 @@ describe("depositSummary", () => {
                 deposit: deposit(),
                 transfers: [A1, t("L1", "OwnA", 5_000, 101, { blockTime: at("00:15:01") })],
                 moves: [],
+                writeOffParts: [],
             },
             60_000,
         );
@@ -633,7 +634,12 @@ describe("depositSummary", () => {
         const decided = (over: Partial<DepositRow>) =>
             depositSummary(
                 order(),
-                { deposit: deposit({ ...pinned, ...over }), transfers: [], moves: [] },
+                {
+                    deposit: deposit({ ...pinned, ...over }),
+                    transfers: [],
+                    moves: [],
+                    writeOffParts: [],
+                },
                 60_000,
             ).decided;
         expect(decided({})).toBe(true);
@@ -658,6 +664,7 @@ describe("depositSummary", () => {
                     t("R1", null, 7_000, 102, { outcome: "review", reason: "unattributed" }),
                 ],
                 moves: [move(1, "return", "confirmed")],
+                writeOffParts: [],
             },
             60_000,
         );
@@ -712,25 +719,22 @@ describe("publicState with deposits", () => {
     });
 });
 
+// The page's line for the server's own view
+function line(o: Order, l: Ledger, state: PublicState, now = at("00:20:00")) {
+    return depositLine(
+        {
+            state,
+            expiresAt: EXPIRES.getTime(),
+            serverNow: now.getTime(),
+            amountMicros: 50_000,
+            kind: "start",
+            deposit: view(o, l, now),
+        },
+        { amountMicros: 50_000, deadline: "00:15", refundMinMicros: 1_000, orderId: ORDER_ID },
+    );
+}
+
 describe("the page's line for the server's own view", () => {
-    const C = {
-        amountMicros: 50_000,
-        deadline: "00:15",
-        refundMinMicros: 1_000,
-        orderId: ORDER_ID,
-    };
-    const line = (o: Order, l: Ledger, state: PublicState) =>
-        depositLine(
-            {
-                state,
-                expiresAt: EXPIRES.getTime(),
-                serverNow: at("00:20:00").getTime(),
-                amountMicros: 50_000,
-                kind: "start",
-                deposit: view(o, l, at("00:20:00")),
-            },
-            C,
-        );
     const K1 = t("K1", "OwnK", 500, 101, { outcome: "keep", reason: "below_minimum" });
     const kept = "$0.0005 arrived, which is below the $0.001 Bugnet returns, so it was kept.";
 
@@ -827,7 +831,7 @@ describe("written-off money on the page (spec 23.1)", () => {
         ]);
     });
 
-    it("a part Bugnet keeps shows as kept, not as review", () => {
+    it("a part Bugnet keeps is not shown to the payer, as kept or as review", () => {
         const a1 = t("A1", "OwnA", 30_000, 100, {
             outcome: "return",
             reason: "unpaid",
@@ -844,25 +848,31 @@ describe("written-off money on the page (spec 23.1)", () => {
             reason: "unattributed",
             lostMicros: 7_000,
         });
-        const v = view(
-            order("expired"),
-            ledger({
-                deposit: deposit({ state: "closed" }),
-                transfers: [a1, k1, u1],
-                moves: [move(1, "return", "confirmed")],
-                writeOffParts: [
-                    part("A1", 500, null, "below_refund_min"),
-                    part("K1", 600, null, "bugnet_own"),
-                    part("U1", 7_000, null),
-                ],
-            }),
-        );
-        expect(v).toMatchObject({ returnedMicros: 29_500, keptMicros: 1_100, reviewMicros: 7_000 });
+        const l = ledger({
+            deposit: deposit({ state: "closed" }),
+            transfers: [a1, k1, u1],
+            moves: [move(1, "return", "confirmed")],
+            writeOffParts: [
+                part("A1", 500, null, "below_refund_min"),
+                part("K1", 600, null, "bugnet_own"),
+                part("U1", 7_000, null),
+            ],
+        });
+        const v = view(order("expired"), l);
+        expect(v).toMatchObject({ returnedMicros: 29_500, keptMicros: 0, reviewMicros: 7_000 });
         expect(v.transfers.map((x) => [x.signature, x.outcome])).toEqual([
             ["U1", "review"],
             ["K1", "kept"],
             ["A1", "returned"],
         ]);
+        expect(line(order("expired"), l, "refunded")).toEqual({
+            label: "Refunded",
+            message:
+                "Time ran out before the full amount arrived. The $0.0295 you sent was returned. Ask your agent for a new payment link.",
+            extra: [
+                `$0.007 arrived in a way Bugnet cannot return on its own. It is safe. To get it back, write to support@bugnet.org with order ${ORDER_ID} and a message signed by the sending wallet.`,
+            ],
+        });
     });
 
     it("a part is kept by the reason stored when it was written off, not by its transfer now", () => {
@@ -882,11 +892,157 @@ describe("written-off money on the page (spec 23.1)", () => {
                 writeOffParts: [part("B1", 5_000, null), part("F1", 4_000, null, "bugnet_own")],
             }),
         );
-        expect(v).toMatchObject({ keptMicros: 4_000, reviewMicros: 5_000 });
+        expect(v).toMatchObject({ keptMicros: 0, reviewMicros: 5_000 });
         expect(v.transfers.map((x) => [x.signature, x.outcome])).toEqual([
             ["F1", "kept"],
             ["B1", "review"],
         ]);
+    });
+
+    it("money Bugnet keeps of a write-off never reads as returned or kept", () => {
+        const f1 = t("F1", "OwnF", 4_000, 101, { outcome: "open", lostMicros: 4_000 });
+        const l = ledger({
+            deposit: deposit({ state: "closed" }),
+            transfers: [f1],
+            writeOffParts: [part("F1", 4_000, null, "bugnet_own")],
+        });
+        expect(depositSummary(order("expired"), l, CFG.settle_grace)).toMatchObject({
+            returnedOrReturningMicros: 0,
+            keptMicros: 0,
+        });
+        expect(line(order("expired"), l, "expired")).toEqual({
+            label: "Expired",
+            message:
+                "This order expired at 00:15 and nothing was charged. Ask your agent for a new payment link.",
+            extra: [],
+        });
+        // A transfer taken whole, partly kept and partly paid back, reads by its payout
+        const a1 = t("A1", "OwnA", 30_000, 100, {
+            outcome: "return",
+            reason: "unpaid",
+            lostMicros: 30_000,
+        });
+        const both = view(
+            order("expired"),
+            ledger({
+                transfers: [a1],
+                depositRefunds: [writeOffRefund(10, "confirmed", "A1")],
+                writeOffParts: [
+                    part("A1", 500, null, "below_refund_min"),
+                    { ...part("A1", 29_500, 10), signature: "theft2" },
+                ],
+            }),
+        );
+        expect(both).toMatchObject({ status: "refunded", returnedMicros: 29_500, keptMicros: 0 });
+        expect(both.transfers.map((x) => x.outcome)).toEqual(["returned"]);
+    });
+
+    it("a payment a write-off failed is returned with its own line", () => {
+        const a1 = t("A1", "OwnA", 80_000, 100, {
+            outcome: "return",
+            reason: "written_off",
+            lostMicros: 30_000,
+        });
+        const returning = ledger({
+            deposit: deposit({ state: "draining" }),
+            transfers: [a1],
+            depositRefunds: [writeOffRefund(10, "pending", "A1")],
+            writeOffParts: [part("A1", 30_000, 10)],
+        });
+        expect(line(order("expired"), returning, "refunded")).toEqual({
+            label: "Refunding",
+            message: "The payment did not go through. The $0.08 you sent is being returned.",
+            extra: [],
+        });
+        const returned = ledger({
+            deposit: deposit({ state: "closed" }),
+            transfers: [{ ...a1, moveId: 1 }],
+            moves: [move(1, "return", "confirmed")],
+            depositRefunds: [writeOffRefund(10, "confirmed", "A1")],
+            writeOffParts: [part("A1", 30_000, 10)],
+        });
+        expect(line(order("expired"), returned, "refunded").message).toBe(
+            "The payment did not go through. The $0.08 you sent was returned. Ask your agent for a new payment link.",
+        );
+    });
+
+    it("the extra names the part a theft took that the float pays back", () => {
+        const settled = deposit({ state: "closed", settledAt: NOW });
+        const a1 = (lostMicros: number, over: Partial<TransferRow> = {}) =>
+            t("A1", "OwnA", 80_000, 100, {
+                outcome: "paid",
+                appliedMicros: 50_000,
+                reason: "extra",
+                lostMicros,
+                ...over,
+            });
+        const whole = ledger({
+            deposit: settled,
+            transfers: [a1(30_000)],
+            depositRefunds: [writeOffRefund(10, "pending", "A1")],
+            writeOffParts: [part("A1", 30_000, 10)],
+        });
+        expect(view(order("paid"), whole)).toMatchObject({
+            status: "paid",
+            extraMicros: 30_000,
+            returningMicros: 30_000,
+            reasonMicros: 30_000,
+        });
+        expect(line(order("paid"), whole, "paid").message).toBe(
+            "The extra $0.03 is being returned to the address that sent it.",
+        );
+        const some = ledger({
+            deposit: settled,
+            transfers: [a1(10_000, { moveId: 2 })],
+            moves: [move(2, "return", "confirmed")],
+            depositRefunds: [writeOffRefund(10, "confirmed", "A1")],
+            writeOffParts: [part("A1", 10_000, 10)],
+        });
+        expect(view(order("paid"), some)).toMatchObject({
+            extraMicros: 30_000,
+            returnedMicros: 30_000,
+        });
+        expect(line(order("paid"), some, "paid").message).toBe(
+            "The extra $0.03 was returned to the address that sent it.",
+        );
+        // The same source's whole transfer after the price is extra too
+        const a2 = t("A2", "OwnA", 20_000, 101, {
+            outcome: "return",
+            reason: "extra",
+            lostMicros: 5_000,
+        });
+        const later = view(
+            order("paid"),
+            ledger({
+                deposit: settled,
+                transfers: [
+                    t("A1", "OwnA", 50_000, 100, { outcome: "paid", appliedMicros: 50_000 }),
+                    a2,
+                ],
+                depositRefunds: [writeOffRefund(10, "sent", "A2")],
+                writeOffParts: [part("A2", 5_000, 10)],
+            }),
+        );
+        expect(later).toMatchObject({ extraMicros: 20_000, returningMicros: 20_000 });
+    });
+
+    it("money a theft took before the price arrived is said to go back", () => {
+        const before = (lostMicros: number, state: RefundRow["state"]) =>
+            ledger({
+                transfers: [t("A1", "OwnA", 30_000, 100, { lostMicros })],
+                depositRefunds: [writeOffRefund(10, state, "A1")],
+                writeOffParts: [part("A1", lostMicros, 10)],
+            });
+        expect(line(order(), before(30_000, "pending"), "unpaid", NOW)).toEqual({
+            label: "Awaiting payment",
+            message: "",
+            extra: ["The $0.03 you sent is being returned."],
+        });
+        expect(line(order(), before(10_000, "confirmed"), "unpaid", NOW)).toEqual({
+            label: "Partly paid",
+            message: "Received $0.02 of $0.05.",
+            extra: ["The $0.01 you sent was returned."],
+        });
     });
 
     it("a held return and a write-off payout of one transfer are told apart", () => {

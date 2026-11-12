@@ -26,7 +26,9 @@ export type TransferReason =
     | "from_bugnet"
     | "late_limit"
     | "return_destination_invalid"
-    | "return_failed";
+    | "return_failed"
+    // a settling payment whose applied money a write-off took (spec 23.1)
+    | "written_off";
 export type MoveKind = "create" | "sweep" | "return" | "close";
 export type MoveState = "pending" | "signed" | "sent" | "confirmed" | "failed" | "manual";
 
