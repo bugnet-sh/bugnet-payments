@@ -475,6 +475,17 @@ compared_rows() {
         for c in $ORDER_TIMES; do query+=", coalesce(extract(epoch from $c)::text, '-')"; done
         query+=" from orders"
         ;;
+    # A deposit's moves and transfers as one digest each: after the dump, its later moves read as
+    # debits that are not Payments' own
+    deposits)
+        query="select d.order_id, d.state,
+            coalesce((select md5(string_agg(format('%s %s %s', m.id, m.state, m.tx_signature),
+                ',' order by m.id)) from deposit_moves m where m.order_id = d.order_id), '-'),
+            coalesce((select md5(string_agg(format('%s %s %s %s %s', t.signature, t.outcome,
+                t.applied_micros, t.move_id, t.refund_id), ',' order by t.signature))
+                from deposit_transfers t where t.order_id = d.order_id), '-')
+            from deposits d"
+        ;;
     *) query="select id, state, coalesce(tx_signature, '-') from $table" ;;
     esac
     pg_sql "$db" -At -F ' ' -c "$query order by 1" 2>/dev/null
@@ -485,8 +496,8 @@ compared_rows() {
 # shows, and the names of the rest.
 money_differences() {
     local new=$1 old=$2 kept=$3 spec table shown names here before
-    for spec in "orders 1 $ORDER_TIMES" "refunds 2" "deposit_moves 2" "x402_payments 2" \
-        "x402_cold_transfers 2"; do
+    for spec in "orders 1 $ORDER_TIMES" "refunds 2" "deposits 1 moves transfers" "deposit_moves 2" \
+        "x402_payments 2" "x402_cold_transfers 2"; do
         read -r table shown names <<<"$spec"
         if ! here=$(compared_rows "$new" "$table") ||
             ! before=$(compared_rows "$old" "$table"); then
@@ -557,7 +568,7 @@ do_restore() {
             say "rows that differ from $kept:"
             printf '%s\n' "$differences"
         else
-            say "no order, refund, deposit move or x402 payment differs from $kept"
+            say "no order, refund, deposit or x402 payment differs from $kept"
         fi
     else
         pg_sql postgres -c "alter database $new rename to $DB" ||

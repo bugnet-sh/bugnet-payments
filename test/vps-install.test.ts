@@ -1348,6 +1348,7 @@ describe("vps-install.sh restore", () => {
                 "== set by the restore: x402 refunds held\n" +
                 `== rows that differ from ${kept}:\n` +
                 `refunds 1: pending - here, confirmed SigAfterDump in ${kept}\n` +
+                "deposits: not compared, missing from one of the two databases\n" +
                 "deposit_moves: not compared, missing from one of the two databases\n",
         );
     });
@@ -1427,13 +1428,90 @@ describe("vps-install.sh restore", () => {
         expect(r.out).not.toContain(SAME);
     });
 
+    it("--restore lists each deposit with moves or transfers after the dump", () => {
+        const [MOVED, CREDITED, SAME, LATER_DEPOSIT] = ["e", "f", "g", "h"].map(
+            (c) => `ord_${c.repeat(26)}`,
+        );
+        const orders = (ids: string[]) =>
+            sql(
+                db,
+                `insert into orders (id, kind, package_id, amount_micros, description,
+                    claim_sha256, state, expires_at) values ` +
+                    ids
+                        .map((id) => `('${id}', 'start', 'p', 1, 'd', '\\x00', 'unpaid', now())`)
+                        .join(", "),
+            );
+        const deposit = (id: string, state: string) =>
+            sql(
+                db,
+                `insert into deposits (order_id, address, token_account, key_version, salt, state,
+                    created_at) values ('${id}', 'A${id}', 'T${id}', 1, '\\x${"00".repeat(16)}',
+                    '${state}', now())`,
+            );
+        const move = (id: string, kind: string, state: string, sig: string | null) =>
+            sql(
+                db,
+                `insert into deposit_moves (order_id, kind, amount_micros, state, tx_signature,
+                    created_at) values ('${id}', '${kind}', ${kind === "sweep" ? 1 : 0},
+                    '${state}', ${sig === null ? "null" : `'${sig}'`}, now())`,
+            );
+        const transfer = (id: string, sig: string) =>
+            sql(
+                db,
+                `insert into deposit_transfers (order_id, signature, slot, seq, block_time,
+                    seen_at, amount_micros) values ('${id}', '${sig}', 1, 0, now(), now(), 1)`,
+            );
+        const { restore } = scene({
+            dumpedAt: 5,
+            before: () => {
+                orders([MOVED, CREDITED, SAME]);
+                deposit(MOVED, "open");
+                deposit(CREDITED, "settling");
+                deposit(SAME, "open");
+                move(MOVED, "create", "confirmed", "CreateE");
+                move(CREDITED, "create", "confirmed", "CreateF");
+                move(SAME, "create", "confirmed", "CreateG");
+                transfer(CREDITED, "CreditF");
+            },
+            // A credit swept, a transfer sent to review, and a new deposit, all after the dump
+            after: () => {
+                transfer(MOVED, "CreditE");
+                move(MOVED, "sweep", "confirmed", "SweepE");
+                sql(db, `update deposits set state = 'done' where order_id = '${MOVED}'`);
+                sql(
+                    db,
+                    `update deposit_transfers set outcome = 'review', reason = 'operator'
+                        where order_id = '${CREDITED}'`,
+                );
+                orders([LATER_DEPOSIT]);
+                deposit(LATER_DEPOSIT, "open");
+                move(LATER_DEPOSIT, "create", "pending", null);
+            },
+        });
+        const r = restore();
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        const kept = databasesLike(`${db}_before_`)[0]!;
+        expect(r.out).toContain(
+            `== rows that differ from ${kept}:\n` +
+                `orders ${LATER_DEPOSIT}: none here, unpaid in ${kept}\n` +
+                `deposits ${MOVED}: open here, done in ${kept}; differ: moves, transfers\n` +
+                `deposits ${CREDITED}: settling here, settling in ${kept}; differ: transfers\n` +
+                `deposits ${LATER_DEPOSIT}: none here, open in ${kept}\n` +
+                `deposit_moves 4: none here, confirmed SweepE in ${kept}\n` +
+                `deposit_moves 5: none here, pending - in ${kept}\n` +
+                "== bugnet-payments@v9",
+        );
+        expect(r.out).not.toContain(SAME);
+    });
+
     it("--restore says so when no row that moves money differs", () => {
         const { restore } = scene({ dumpedAt: 5 });
         const r = restore();
         expect(r.code).toBe(0);
         const kept = databasesLike(`${db}_before_`)[0]!;
         expect(r.out).toContain(
-            `== no order, refund, deposit move or x402 payment differs from ${kept}\n`,
+            `== no order, refund, deposit or x402 payment differs from ${kept}\n`,
         );
         expect(r.out).not.toContain("not compared");
     });
