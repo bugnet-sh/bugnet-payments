@@ -295,7 +295,7 @@ async function checkHotPending(
 // lock of every kind but allowance.
 async function groupBreach(c: pg.PoolClient, r: RefundRow): Promise<ManualReason | null> {
     if (r.kind === "deposit") {
-        return r.amountMicros <= (await heldFor(c, r)) ? null : "refund_exceeds_payment";
+        return r.amountMicros <= (await depositBound(c, r)) ? null : "refund_exceeds_payment";
     }
     const payment = await findPaymentByOrder(c, r.orderId);
     if (payment === null) return "refund_exceeds_payment";
@@ -351,11 +351,24 @@ async function ownerOfPart(
         : { destination: share.source_token_account, payer: share.owner };
 }
 
-// A deposit row returns held review money: the rest of the one transfer in review that names it
-async function heldFor(c: pg.PoolClient, r: RefundRow): Promise<number> {
+// A deposit row returns held review money, the rest of the one transfer in review that names it,
+// or pays the written-off parts of its transfer that name it (spec 10.9, 23.1)
+async function depositBound(c: pg.PoolClient, r: RefundRow): Promise<number> {
+    if (r.reason === "deposit_write_off") {
+        const res = await c.query<{ bound: string }>(
+            `select coalesce(sum(micros), 0)::text as bound from deposit_write_off_parts
+             where order_id = $1 and transfer_signature = $2 and refund_id = $3`,
+            [r.orderId, r.depositSignature, r.id],
+        );
+        return Number(res.rows[0]!.bound);
+    }
     const res = await c.query<{ held: string }>(
-        `select (amount_micros - applied_micros)::text as held from deposit_transfers
-         where order_id = $1 and signature = $2 and outcome = 'review' and refund_id = $3`,
+        `select (t.amount_micros - t.applied_micros - coalesce((select sum(p.micros)
+                from deposit_write_off_parts p
+                where p.order_id = t.order_id and p.transfer_signature = t.signature), 0))::text
+                as held
+         from deposit_transfers t
+         where t.order_id = $1 and t.signature = $2 and t.outcome = 'review' and t.refund_id = $3`,
         [r.orderId, r.depositSignature, r.id],
     );
     return Number(res.rows[0]?.held ?? 0);

@@ -34,7 +34,7 @@ import {
     TEST_LVBH,
 } from "../testing/fake-rpc.ts";
 import { testSigner } from "../testing/keys.ts";
-import { heldRefundId, seedHeldTransfer } from "../testing/deposits.ts";
+import { heldRefundId, seedHeldTransfer, seedWriteOffPart } from "../testing/deposits.ts";
 import { seedOrder, seedPayment, seedSharedPayment, type TestShare } from "../testing/orders.ts";
 import { seedAccount, seedFunding } from "../testing/x402.ts";
 import { setControls } from "../x402/controls.ts";
@@ -1883,6 +1883,74 @@ describe("runRefunds on refund groups", () => {
         expect((await runRefunds(deps(rpc, later(90_000)), "refund")).confirmed).toBe(1);
         expect((await findRefundById(db.pool, b.id))!.state).toBe("confirmed");
         expect((await findOrder(db.pool, order.id))!.state).toBe("refunding");
+    });
+
+    it("a write-off row pays at most its part", async () => {
+        const { order } = await seedOrder(db.pool, { state: "expired", amountMicros: 50_000 });
+        const held = await seedHeldTransfer(db.pool, order.id, { amountMicros: 9_000 });
+        const fits = await seedWriteOffPart(db.pool, order.id, {
+            transferSignature: held.signature,
+            micros: 4_000,
+            refund: { amountMicros: 4_000, destination: SOURCE, payer: payer.address },
+        });
+        const rpc = groupRpc();
+        expect(await runRefunds(deps(rpc), "refund")).toMatchObject({ sent: 1, manual: 0 });
+        expect(transferOf(decodeMessage(rpc.sent[0]!))).toMatchObject({
+            destination: SOURCE,
+            amount: 4_000n,
+        });
+        expect(await findRefundById(db.pool, fits.refundId!)).toMatchObject({
+            kind: "deposit",
+            reason: "deposit_write_off",
+            state: "sent",
+        });
+
+        // A row above its part, or whose part names another row, goes to the manual queue
+        const second = await seedHeldTransfer(db.pool, order.id, { amountMicros: 5_000 });
+        const over = await seedWriteOffPart(db.pool, order.id, {
+            transferSignature: second.signature,
+            micros: 2_000,
+            refund: { amountMicros: 2_001, destination: SOURCE, payer: payer.address },
+        });
+        expect(await runRefunds(deps(rpc, later(1_000)), "refund")).toMatchObject({ manual: 1 });
+        expect(await findRefundById(db.pool, over.refundId!)).toMatchObject({
+            state: "manual",
+            manualReason: "refund_exceeds_payment",
+        });
+        expect((await findOrder(db.pool, order.id))!.state).toBe("expired");
+    });
+
+    it("held money is what a write-off left of the transfer", async () => {
+        const { order } = await seedOrder(db.pool, { state: "expired", amountMicros: 50_000 });
+        const held = await seedHeldTransfer(db.pool, order.id, { amountMicros: 9_000 });
+        await seedWriteOffPart(db.pool, order.id, {
+            transferSignature: held.signature,
+            micros: 4_000,
+            refund: { amountMicros: 4_000, destination: SOURCE, payer: payer.address },
+        });
+        const r = (await withTx(db.pool, (c) =>
+            insertDepositRefund(c, {
+                orderId: order.id,
+                signature: held.signature,
+                destination: SOURCE,
+                payer: payer.address,
+                at: T0,
+            }),
+        )) as { id: number };
+        expect(await findRefundById(db.pool, r.id)).toMatchObject({
+            reason: "deposit_held",
+            part: 1,
+            amountMicros: 5_000,
+        });
+        await db.pool.query("update refunds set amount_micros = 5001 where id = $1", [r.id]);
+        await db.pool.query(
+            "update refunds set state = 'confirmed' where order_id = $1 and part = 0",
+            [order.id],
+        );
+        expect(await runRefunds(deps(groupRpc()), "refund")).toMatchObject({ manual: 1 });
+        expect(await findRefundById(db.pool, r.id)).toMatchObject({
+            manualReason: "refund_exceeds_payment",
+        });
     });
 });
 
