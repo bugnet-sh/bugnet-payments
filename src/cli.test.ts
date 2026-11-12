@@ -3220,6 +3220,36 @@ describe("deposits commands", () => {
             });
         });
 
+        it("keeps the review while the chain holds money the ledger does not", async () => {
+            await seedDeposit(ORDER_A, { deposit: { review_reason: "unknown_debit" } });
+            await credit(a, srcA, 20_000);
+            const stolen = theft(5_000);
+            await credit(b, srcB, 3_000, { record: false });
+            const { code, io } = await writeOff(stolen);
+            expect(io.errText()).not.toContain("error:");
+            expect(code).toBe(0);
+            expect(io.outText().split("\n").at(-1)).toBe(
+                "review stays unknown_debit: the chain holds 18000, the ledger 15000",
+            );
+            expect((await findDeposit(db.pool, ORDER_A))!.reviewReason).toBe("unknown_debit");
+        });
+
+        it("keeps a review other than unknown_debit", async () => {
+            await seedDeposit(ORDER_A);
+            await credit(a, srcA, 20_000);
+            for (const reason of ["double_sweep", "moves_failing"]) {
+                await db.pool.query("update deposits set review_reason = $2 where order_id = $1", [
+                    ORDER_A,
+                    reason,
+                ]);
+                const { code, io } = await writeOff(theft(1_000));
+                expect(io.errText()).not.toContain("error:");
+                expect(code).toBe(0);
+                expect(io.outText()).not.toContain("review cleared");
+                expect((await findDeposit(db.pool, ORDER_A))!.reviewReason).toBe(reason);
+            }
+        });
+
         it("puts the review back to the sweep that is still manual", async () => {
             await seedDeposit(ORDER_A, {
                 order: { state: "settling", amountMicros: 30_000 },
