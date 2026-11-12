@@ -95,14 +95,19 @@ describe("checkout page", () => {
         );
         expect(html).toContain('data-amount="$0.05"');
     });
-    it("wears the brand: title, header, fonts, copy button and footer", async () => {
+    it("wears the brand: title, header with Terms and Privacy at its right, fonts and copy button", async () => {
         const html = await renderCheckout({ ...view, amountMicros: 50_000 });
         expect(html).toContain("<title>Pay $0.05 to Bugnet</title>");
-        expect(html).toContain('<a class="brand" href="https://bugnet.sh/">');
         expect(html).toContain('<span class="amount-value">$0.05</span>');
         expect(html).toContain(`data-copy="${id}"`);
-        expect(html).toContain('href="https://bugnet.sh/terms/"');
-        expect(html).toContain('href="https://bugnet.sh/privacy/"');
+        const header = html.slice(html.indexOf('<header class="top">'), html.indexOf("</header>"));
+        expect(header).toContain('<a class="brand" href="https://bugnet.sh/">');
+        expect(header).toContain(`<nav class="legal" aria-label="Legal">
+<a href="https://bugnet.sh/terms/">Terms</a>
+<a href="https://bugnet.sh/privacy/">Privacy</a>
+</nav>`);
+        expect(html).toContain(".legal { display: flex; gap: var(--space-5); margin-left: auto;");
+        expect(html).not.toContain("<footer");
         for (const name of ["manrope-400.woff2", "lexend-deca-200.woff2"]) {
             expect(html).toContain(
                 `<link rel="preload" href="/fonts/${name}" as="font" type="font/woff2" crossorigin>`,
@@ -614,7 +619,7 @@ describe("address-first page", () => {
     it("the card is centered", async () => {
         const html = await renderCheckout(offered);
         expect(html).toContain("min-height: 100dvh");
-        expect(html).toContain("margin-block: auto");
+        expect(html).toMatch(/\.box \{[^}]*margin: auto;/);
         expect(html).not.toContain("::first-letter");
         // On a phone too: a short card is centered, a long one starts at the top
         expect(html).not.toContain(".box { margin-top: 0;");
@@ -679,22 +684,23 @@ describe("address-first page", () => {
 `);
     });
 
-    it("a disabled Pay button looks disabled, outline or not", async () => {
+    it("every pay button wears one plain style, none green", async () => {
         const html = await renderCheckout(offered);
-        // Equal specificity, so the later rule wins
-        expect(html.indexOf(".button:disabled {")).toBeGreaterThan(
-            html.indexOf(".button.outline {"),
+        const rule = html.slice(
+            html.indexOf(".button {"),
+            html.indexOf("}", html.indexOf(".button {")),
         );
-        expect(html).toContain(".button.outline:not(:disabled):hover {");
-        expect(html).not.toContain(".button.outline:hover");
-    });
-
-    it("Pay is the page's one green button, named by the script once it finds a wallet", async () => {
-        const html = await renderCheckout(offered);
-        expect(section(html, "wallet")).toContain(
-            '<button id="pay-button" class="button" type="button" disabled>Pay</button>',
-        );
-        expect(html.match(/class="button"/g)).toHaveLength(1);
+        expect(rule).toContain("border: var(--hairline) solid var(--line);");
+        expect(rule).toContain("background: var(--bg);");
+        expect(rule).not.toContain("accent");
+        expect(html).not.toContain('outline"');
+        expect(html).not.toContain(".button.");
+        expect(html).toContain(".button:not(:disabled):hover {");
+        expect(html.match(/class="button[^"]*"/g)).toEqual([
+            'class="button"',
+            'class="button"',
+            'class="button"',
+        ]);
     });
 
     it("no deposit offered", async () => {
