@@ -22,7 +22,7 @@ const RETIRE = join(import.meta.dirname, "../deploy/retire-deposit-seed.sh");
 const PUSH_TOKEN = join(import.meta.dirname, "../deploy/push-payments-token.sh");
 const BACKUP = join(import.meta.dirname, "../deploy/payments-backup.sh");
 const DEPLOY = join(import.meta.dirname, "../deploy");
-const BACKUP_UNITS = ["bugnet-payments-backup.service", "bugnet-payments-backup.timer"];
+const BACKUP_UNITS = ["bugnet-payments-backup.service", "bugnet-payments-backup.timer"] as const;
 
 const KEYS = [
     "BUGNET_PAYMENTS_TOKEN",
@@ -938,7 +938,7 @@ describe("vps-install.sh backups", () => {
         expect(r.code).toBe(0);
         const dumps = dumpsIn(server.backups);
         expect(dumps).toHaveLength(1);
-        const dump = join(server.backups, dumps[0]);
+        const dump = join(server.backups, dumps[0]!);
         expect(r.out).toBe(`== wrote ${dump} (${statSync(dump).size} bytes)\n`);
         expect(server.calls()[0]).toBe("postgres pg_dump --format=custom bugnet_payments");
         expect(server.calls().some((c) => c.startsWith("systemctl"))).toBe(false);
@@ -1066,7 +1066,7 @@ describe("vps-install.sh backups", () => {
         const stubs = steps.map((step) => `${step}() { echo "${step} $*"; }`).join("; ");
         const r = server.run(`${stubs}; do_install "${tgz}" "" "" "" ""`);
         expect(r.code).toBe(0);
-        const ran = r.out.split("\n").filter((l) => steps.includes(l.split(" ")[0]));
+        const ran = r.out.split("\n").filter((l) => steps.includes(l.split(" ")[0]!));
         expect(ran.map((l) => l.split(" ")[0])).toEqual(steps);
         expect(ran).toContain("ensure_backup v9");
     });
@@ -1118,20 +1118,19 @@ describe("payments-backup.sh", () => {
             expect(r.code).toBe(0);
             const files = readdirSync(server.backups);
             expect(files).toHaveLength(1);
-            const m = DUMP_NAME.exec(files[0]);
-            expect(m).not.toBeNull();
+            const name = files[0]!;
+            expect(name).toMatch(DUMP_NAME);
             // The stamp is UTC and the time of the run
-            const [, y, mo, d, h, mi, s] = (m ?? []).map(Number);
-            const at = Date.UTC(y, mo - 1, d, h, mi, s);
+            const at = Date.parse(name.replace(DUMP_NAME, "$1-$2-$3T$4:$5:$6Z"));
             expect(Math.abs(Date.now() - at)).toBeLessThan(60_000);
-            const dump = join(server.backups, files[0]);
+            const dump = join(server.backups, name);
             expect(statSync(server.backups).mode & 0o777).toBe(0o700);
             expect(statSync(dump).mode & 0o777).toBe(0o600);
             expect(readFileSync(dump, "utf8")).toMatch(/^PGDMP\n/);
             const calls = server.calls();
             expect(calls).toHaveLength(2);
             expect(calls[0]).toBe("postgres pg_dump --format=custom bugnet_payments");
-            expect(calls[1]).toBe(`root pg_restore --list ${dump}.${calls[1].slice(-6)}`);
+            expect(calls[1]).toBe(`root pg_restore --list ${dump}.${calls[1]!.slice(-6)}`);
             expect(r.out).toBe(`== wrote ${dump} (${statSync(dump).size} bytes)\n`);
             rmSync(dump);
         }
