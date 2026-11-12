@@ -21,6 +21,7 @@ import type {
     OwnerHoldReason,
     TransferReason,
     TransferRow,
+    WriteOffPartRow,
 } from "./types.ts";
 
 export interface DepositSummary {
@@ -47,6 +48,7 @@ export interface DepositLedger {
     moves: readonly MoveRow[];
     holds: readonly HoldRow[];
     depositRefunds: readonly RefundRow[];
+    writeOffParts: readonly WriteOffPartRow[];
 }
 
 type StatusOrder = Pick<OrderRow, "state" | "amountMicros" | "expiresAt">;
@@ -64,7 +66,10 @@ function takesMoney(state: OrderState): boolean {
 }
 
 const onTime = (t: TransferRow, expiresAt: Date) => t.blockTime.getTime() <= expiresAt.getTime();
-const rest = (t: TransferRow) => t.amountMicros - t.appliedMicros;
+// What is still in the deposit; a written-off debit took the rest (spec 23.1)
+const rest = (t: TransferRow) => t.amountMicros - t.appliedMicros - t.lostMicros;
+// What goes back to the sender, from the deposit or, for a written-off part, from the float
+const owedBack = (t: TransferRow) => t.amountMicros - t.appliedMicros;
 
 // A paid transfer's rest is extra unless it was kept as dust
 function reasonOf(t: TransferRow): TransferReason | null {
@@ -95,7 +100,12 @@ interface Facts {
 function facts(order: StatusOrder, l: DepositLedger, now: Date, cfg: StatusCfg): Facts {
     const { deposit } = l;
     const moves = new Map(l.moves.map((m) => [m.id, m]));
-    const refunds = new Map(l.depositRefunds.map((r) => [r.depositSignature, r]));
+    const refunds = new Map(
+        l.depositRefunds
+            .filter((r) => r.reason === "deposit_held")
+            .map((r) => [r.depositSignature, r]),
+    );
+    const byId = new Map(l.depositRefunds.map((r) => [r.id, r]));
     const heldOwners = new Map<string, OwnerHoldReason>();
     let sharedHeld = false;
     for (const h of l.holds) {
@@ -121,6 +131,26 @@ function facts(order: StatusOrder, l: DepositLedger, now: Date, cfg: StatusCfg):
     const outcomes = new Map<string, { outcome: ViewOutcome; returnSignature: string | null }>();
     const takes = takesMoney(order.state);
     for (const t of l.transfers) {
+        // A written-off part comes back through its own payout; no known sender, by hand
+        let lost: { outcome: ViewOutcome; returnSignature: string | null } | null = null;
+        for (const p of l.writeOffParts) {
+            if (p.transferSignature !== t.signature) continue;
+            const payout = p.refundId === null ? undefined : byId.get(p.refundId);
+            let outcome: ViewOutcome;
+            if (payout?.state === "confirmed") {
+                returned += p.micros;
+                outcome = "returned";
+            } else if (payout !== undefined && RETURNING_REFUND.has(payout.state)) {
+                returning += p.micros;
+                outcome = "returning";
+            } else {
+                review += p.micros;
+                outcome = "review";
+            }
+            if (lost === null || lost.outcome === "returned" || outcome === "review") {
+                lost = { outcome, returnSignature: payout?.txSignature ?? null };
+            }
+        }
         const move = t.moveId === null ? undefined : moves.get(t.moveId);
         const moved = move?.state === "confirmed";
         const back = (amount: number) => {
@@ -136,12 +166,12 @@ function facts(order: StatusOrder, l: DepositLedger, now: Date, cfg: StatusCfg):
         switch (t.outcome) {
             case "open": {
                 if (t.sourceOwner !== null && onTime(t, order.expiresAt)) {
-                    openOnTime += t.amountMicros;
+                    openOnTime += rest(t);
                 }
                 // Late money, and any money once the order stops taking it, can only go back
                 const counted = takes && onTime(t, order.expiresAt);
                 outcome = counted ? "counted" : "returning";
-                if (!counted) returning += t.amountMicros;
+                if (!counted) returning += rest(t);
                 break;
             }
             case "paid":
@@ -181,6 +211,10 @@ function facts(order: StatusOrder, l: DepositLedger, now: Date, cfg: StatusCfg):
                 returnSignature = refund?.txSignature ?? null;
                 break;
             }
+        }
+        if (lost !== null && rest(t) === 0) {
+            outcome = lost.outcome;
+            returnSignature = lost.returnSignature;
         }
         outcomes.set(t.signature, { outcome: applied ? "counted" : outcome, returnSignature });
     }
@@ -254,14 +288,14 @@ export function depositViewFrom(
             t.outcome === "return" ||
             t.outcome === "keep" ||
             t.outcome === "review" ||
-            (t.outcome === "paid" && rest(t) > 0),
+            (t.outcome === "paid" && owedBack(t) > 0),
     );
     const latest = newest(told);
     const reason = latest === undefined ? null : reasonOf(latest);
     const reasonMicros =
         reason === null
             ? 0
-            : told.filter((t) => reasonOf(t) === reason).reduce((a, t) => a + rest(t), 0);
+            : told.filter((t) => reasonOf(t) === reason).reduce((a, t) => a + owedBack(t), 0);
     const blocked = newest(ledger.transfers.filter((t) => t.reason === "payer_blocked"));
 
     const listed = [...ledger.transfers]
@@ -303,11 +337,12 @@ export function depositSummary(
     let back = 0;
     let kept = 0;
     for (const t of ledger.transfers) {
-        if (t.outcome === "open" && onTime(t, order.expiresAt)) onTimeMicros += t.amountMicros;
+        if (t.outcome === "open" && onTime(t, order.expiresAt)) onTimeMicros += rest(t);
         if (t.outcome === "keep" || reasonOf(t) === "below_minimum") kept += rest(t);
         // Money neither applied nor kept goes back to its sender, by the job or, for review money,
         // by an operator, so an expired order holding any of it did take money
         else back += rest(t);
+        back += t.lostMicros;
     }
     const d = ledger.deposit;
     const graceEnd = order.expiresAt.getTime() + settleGraceMs;
