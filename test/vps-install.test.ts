@@ -1118,9 +1118,10 @@ describe("vps-install.sh backups", () => {
             `BACKUP_DIR=\${BUGNET_PAYMENTS_BACKUP_DIR:-${folder}}\n`,
         );
         const service = readFileSync(join(DEPLOY, BACKUP_UNITS[0]), "utf8");
+        // Root by default: an explicit User=root with NoNewPrivileges=yes stops runuser on the VPS
+        expect(service).not.toMatch(/^User=/m);
         for (const line of [
             "Type=oneshot",
-            "User=root",
             `ExecStart=${script}`,
             "ProtectSystem=strict",
             `ReadWritePaths=${folder}`,
