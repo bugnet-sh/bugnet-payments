@@ -430,11 +430,35 @@ pending_migrations() {
 
 # A restore brings back an older point of a money ledger: a refund signed after the dump reads as
 # pending again, and an x402 account as not having spent what it spent. Nothing pays from it until
-# a person has compared it with the database it replaced.
+# a person has compared it with the database it replaced. Prints each pause or hold it sets, and
+# each one the dump already had, which keeps its reason as pauseRefunds and engageControl do.
 hold_money() {
-    pg_sql "$1" -1 \
-        -c "update refund_controls set paused = true, reason = 'restore', paused_at = now() where id = 1 and not paused" \
-        -c "update x402_controls set paused = true, refunds_held = true, reason = coalesce(reason, 'restore'), changed_at = now() where id = 1"
+    pg_sql "$1" -1 -At -f - <<'SQL'
+select case when engaged
+        then format('in the dump already, left as it was: %s (%s)', what,
+            coalesce('reason: ' || reason, 'no reason'))
+        else 'set by the restore: ' || what end
+from (
+    select 1, 'refunds paused', paused, reason from refund_controls where id = 1
+    union all
+    select 2, 'x402 payments paused', paused, reason from x402_controls where id = 1
+    union all
+    select 3, 'x402 refunds held', refunds_held, reason from x402_controls where id = 1
+    union all
+    select 4, 'x402 killed', disabled, reason from x402_controls where id = 1 and disabled
+) as c (n, what, engaged, reason)
+order by n;
+update refund_controls set paused = true, reason = 'restore', paused_at = now()
+where id = 1 and not paused;
+update x402_controls set paused = true, refunds_held = true, reason = coalesce(reason, 'restore'),
+    changed_at = now()
+where id = 1;
+SQL
+}
+
+say_each() {
+    local line
+    while IFS= read -r line; do say "$line"; done <<<"$1"
 }
 
 # The order columns that change and that the refund sweeps read besides state
@@ -508,7 +532,7 @@ restore_abort() {
 # one fails as soon as a later migration's table has a foreign key into a table in the dump, and
 # the database it replaces stays whole beside it with everything after the dump.
 do_restore() {
-    local dump=$1 v new kept pending differences=""
+    local dump=$1 v new kept held pending differences=""
     [ -f "$dump" ] || die "no such file: $dump"
     pg_restore --list "$dump" >/dev/null 2>&1 || die "pg_restore --list cannot read $dump; nothing was changed"
     v=$(installed_version)
@@ -519,7 +543,7 @@ do_restore() {
     if ! as_postgres pg_restore --clean --if-exists --single-transaction -d "$new" <"$dump"; then
         restore_abort "$new" "the restore failed, so nothing was stopped and $DB was not changed"
     fi
-    hold_money "$new" ||
+    held=$(hold_money "$new") ||
         restore_abort "$new" "cannot pause refunds and x402 in the restored database, so nothing was stopped and $DB was not changed"
     stop_every_version "$v" ||
         restore_abort "$new" "a version did not stop; $DB was not changed, run --restore again"
@@ -528,7 +552,7 @@ do_restore() {
         pg_sql postgres -1 -c "alter database $DB rename to $kept" -c "alter database $new rename to $DB" ||
             restore_abort "$new" "cannot rename the databases (pg_stat_activity shows who holds $DB); $DB was not changed and every version is stopped: run --restore again, or --start"
         say "$DB is now the dump; the database it replaced is $kept, which only postgres opens"
-        say "refunds and x402 payments are paused and x402 refunds held in $DB"
+        say_each "$held"
         if [ -n "$differences" ]; then
             say "rows that differ from $kept:"
             printf '%s\n' "$differences"
@@ -539,7 +563,7 @@ do_restore() {
         pg_sql postgres -c "alter database $new rename to $DB" ||
             restore_abort "$new" "cannot rename $new to $DB; every version is stopped: run --restore again"
         say "$DB is now the dump; there was no $DB to keep"
-        say "refunds and x402 payments are paused and x402 refunds held in $DB"
+        say_each "$held"
     fi
     pending=$(pending_migrations "$v" | tr '\n' ' ')
     pending=${pending% }

@@ -1343,10 +1343,41 @@ describe("vps-install.sh restore", () => {
         expect(sql(kept, "select paused from refund_controls")).toBe("f");
         expect(sql(kept, "select paused, refunds_held from x402_controls")).toBe("f|f");
         expect(r.out).toContain(
-            `== refunds and x402 payments are paused and x402 refunds held in ${db}\n` +
+            "== set by the restore: refunds paused\n" +
+                "== set by the restore: x402 payments paused\n" +
+                "== set by the restore: x402 refunds held\n" +
                 `== rows that differ from ${kept}:\n` +
                 `refunds 1: pending - here, confirmed SigAfterDump in ${kept}\n` +
                 "deposit_moves: not compared, missing from one of the two databases\n",
+        );
+    });
+
+    it("--restore keeps and names each pause or hold the dump already had", () => {
+        const { restore } = scene({
+            before: () => {
+                sql(
+                    db,
+                    "update refund_controls set paused = true, reason = 'operator check', paused_at = now()",
+                );
+                sql(
+                    db,
+                    "update x402_controls set disabled = true, refunds_held = true, reason = 'x402 kill'",
+                );
+            },
+        });
+        const r = restore();
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        expect(sql(db, "select paused, reason from refund_controls")).toBe("t|operator check");
+        expect(sql(db, "select disabled, paused, refunds_held, reason from x402_controls")).toBe(
+            "t|t|t|x402 kill",
+        );
+        expect(r.out).toContain(
+            "== in the dump already, left as it was: refunds paused (reason: operator check)\n" +
+                "== set by the restore: x402 payments paused\n" +
+                "== in the dump already, left as it was: x402 refunds held (reason: x402 kill)\n" +
+                "== in the dump already, left as it was: x402 killed (reason: x402 kill)\n" +
+                "== rows that differ from ",
         );
     });
 
