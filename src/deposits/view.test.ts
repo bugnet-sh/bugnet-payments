@@ -814,6 +814,44 @@ describe("written-off money on the page (spec 23.1)", () => {
         ]);
     });
 
+    it("a part Bugnet keeps shows as kept, not as review", () => {
+        const a1 = t("A1", "OwnA", 30_000, 100, {
+            outcome: "return",
+            reason: "unpaid",
+            lostMicros: 500,
+            moveId: 1,
+        });
+        const k1 = t("K1", "OwnK", 600, 101, {
+            outcome: "keep",
+            reason: "below_minimum",
+            lostMicros: 600,
+        });
+        const u1 = t("U1", null, 7_000, 102, {
+            outcome: "review",
+            reason: "unattributed",
+            lostMicros: 7_000,
+        });
+        const v = view(
+            order("expired"),
+            ledger({
+                deposit: deposit({ state: "closed" }),
+                transfers: [a1, k1, u1],
+                moves: [move(1, "return", "confirmed")],
+                writeOffParts: [
+                    part("A1", 500, null),
+                    part("K1", 600, null),
+                    part("U1", 7_000, null),
+                ],
+            }),
+        );
+        expect(v).toMatchObject({ returnedMicros: 29_500, keptMicros: 1_100, reviewMicros: 7_000 });
+        expect(v.transfers.map((x) => [x.signature, x.outcome])).toEqual([
+            ["U1", "review"],
+            ["K1", "kept"],
+            ["A1", "returned"],
+        ]);
+    });
+
     it("a held return and a write-off payout of one transfer are told apart", () => {
         const u1 = t("U1", "OwnU", 7_000, 101, {
             outcome: "review",
