@@ -12,8 +12,11 @@ import { seedOrder } from "../testing/orders.ts";
 import { DepositKeys } from "./keys.ts";
 import {
     type AccountRead,
+    balanceBefore,
     type CachedTx,
+    classifyTx,
     expectedBalanceAt,
+    fetchTx,
     needsScan,
     readDepositBalances,
     ReadTrail,
@@ -921,6 +924,23 @@ describe("scanDeposit", () => {
             expect.objectContaining({ orderId: ORDER_A, signature: sig, reason: "unreadable" }),
         ]);
         expect(l.deposit.lastSignature).toBe(sig);
+    });
+
+    it("the balance before a debit is read from its meta, decodable or not", async () => {
+        const { dep } = await deposit();
+        await send(5_000n);
+        const debits = [chain.debit(TOKEN_A, 1_000n), chain.debit(TOKEN_A, 2_000n)];
+        chain.undecodable(debits[1]!);
+        const before = [];
+        for (const sig of debits) {
+            const { value } = await chain.rpc
+                .getSignatureStatuses([sig as never], { searchTransactionHistory: true })
+                .send();
+            const tx = (await fetchTx(chain.rpc, cache, sig, BigInt(value[0]!.slot), TIMEOUT))!;
+            expect(classifyTx(tx, dep, clock, 0)).toMatchObject({ kind: "unknown_debit" });
+            before.push(balanceBefore(tx, dep));
+        }
+        expect(before).toEqual([5_000n, 4_000n]);
     });
 
     it("an answer with no meta is never cached and is recorded only after two fetches 30 s apart", async () => {
