@@ -733,7 +733,8 @@ allowance wallet, money already swept, or review money already carried to the re
   with their signatures, its write-offs and their parts with each part's refund row, its holds, and
   for a shared payment its shares and every refund part.
 - `deposits retry <orderId>`: clears the review reason and puts the deposit's manual sweep back to
-  pending; refused while a move is in flight.
+  pending; refused while a move is in flight, and for an `unknown_debit`, which only
+  `deposits write-off` clears.
 - `deposits return-to <orderId> <signature> <tokenAccount> [--signed FILE]`: returns a transfer in
   review (below).
 - `deposits return-late <orderId> [--signature SIG]... [--archive -]`: for a `done` deposit.

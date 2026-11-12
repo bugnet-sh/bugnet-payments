@@ -1504,6 +1504,10 @@ async function depositsRetry(
         async (c): Promise<string | number> => {
             const deposit = await lockDeposit(c, orderId);
             if (deposit === null) return noDeposit(orderId);
+            // The scan flags the debit again until it is written off (spec 23.1)
+            if (deposit.reviewReason === "unknown_debit") {
+                return `deposit ${orderId} has an unknown debit; use "pcli deposits write-off ${orderId} <signature>"`;
+            }
             if (await moveInFlight(c, orderId)) return inFlight(orderId);
             const requeued = await c.query(
                 `update deposit_moves set state = 'pending', attempts = 0, manual_reason = null,

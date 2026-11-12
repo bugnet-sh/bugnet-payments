@@ -2285,6 +2285,32 @@ describe("deposits commands", () => {
         expect((await findMove(db.pool, failed))!.state).toBe("failed");
     });
 
+    it("retry refuses an unknown debit and points to write-off", async () => {
+        await seedDeposit(ORDER_A, {
+            order: { state: "settling" },
+            deposit: { state: "settling", review_reason: "unknown_debit" },
+        });
+        const sweep = await seedMove(ORDER_A, {
+            kind: "sweep",
+            state: "manual",
+            amountMicros: 50_000,
+            destination: "Recipient",
+            attempts: 3,
+            manualReason: "move_expired_repeatedly",
+            txSignature: SIG(66),
+        });
+        const io = captureIo();
+        expect(await cli(["deposits", "retry", ORDER_A], io, { now: () => LATER })).toBe(1);
+        expect(io.errText()).toContain(
+            `deposit ${ORDER_A} has an unknown debit; use "pcli deposits write-off ${ORDER_A} <signature>"`,
+        );
+        expect(await findDeposit(db.pool, ORDER_A)).toMatchObject({
+            reviewReason: "unknown_debit",
+            movesFailingResetAt: null,
+        });
+        expect(await findMove(db.pool, sweep)).toMatchObject({ state: "manual", attempts: 3 });
+    });
+
     it("return-to returns review money still in the deposit", async () => {
         const chain = await startFakeChain();
         try {
