@@ -18,6 +18,7 @@ const SCRIPT = join(import.meta.dirname, "../deploy/vps-install.sh");
 const PUSH = join(import.meta.dirname, "../deploy/push-rpc-urls.sh");
 const RETIRE = join(import.meta.dirname, "../deploy/retire-deposit-seed.sh");
 const PUSH_TOKEN = join(import.meta.dirname, "../deploy/push-payments-token.sh");
+const BACKUP = join(import.meta.dirname, "../deploy/payments-backup.sh");
 
 const KEYS = [
     "BUGNET_PAYMENTS_TOKEN",
@@ -76,9 +77,10 @@ function keysEnv(extra = ""): string {
     return `${lines.join("\n")}\nBUGNET_SOLANA_RPC_URLS=https://rpc1.example,https://rpc2.example\n${extra}`;
 }
 
-// A server with release v9 installed. systemctl, curl, journalctl, chown, setpriv, id and node are
-// fakes; id makes main run as root, and node stands in for dist/cli.js, logs who ran it with which
-// arguments, and answers from files the test can change.
+// A server with release v9 installed. systemctl, curl, journalctl, chown, setpriv, id, node,
+// runuser, pg_dump and pg_restore are fakes; id makes main run as root, node stands in for
+// dist/cli.js, and node and the Postgres tools log who ran them with which arguments and answer
+// from files the test can change.
 function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) {
     const root = join(dir, "server");
     const etc = join(root, "etc");
@@ -102,6 +104,8 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
     writeFileSync(join(root, "list.out"), "");
     writeFileSync(join(root, "all.out"), "");
     writeFileSync(join(root, "moving.out"), "");
+    writeFileSync(join(root, "pg_dump.exit"), "0");
+    writeFileSync(join(root, "pg_restore.exit"), "0");
     writeFileSync(log, "");
     const env = envFile(o.env ?? keysEnv());
     const fakes: Record<string, string> = {
@@ -134,15 +138,35 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
             '*) echo "unexpected: $*" >&2; exit 9 ;;',
             "esac",
         ].join("\n"),
+        runuser: [
+            'while [ $# -gt 0 ] && [ "$1" != -- ]; do',
+            "    case $1 in -u) export FAKE_AS=$2; shift 2 ;; *) shift ;; esac",
+            "done",
+            'shift; exec "$@"',
+        ].join("\n"),
+        // The dump holds its own environment, so a test can see no secret reached it
+        pg_dump: [
+            `echo "\${FAKE_AS:-root} pg_dump $*" >> "${log}"`,
+            "echo PGDMP; env",
+            `exit "$(cat "${root}/pg_dump.exit")"`,
+        ].join("\n"),
+        pg_restore: [
+            `echo "\${FAKE_AS:-root} pg_restore $*" >> "${log}"`,
+            'for last in "$@"; do :; done',
+            '[ "$(head -c 5 "$last")" = PGDMP ] || { echo "pg_restore: error: not an archive" >&2; exit 1; }',
+            `exit "$(cat "${root}/pg_restore.exit")"`,
+        ].join("\n"),
     };
     for (const [name, body] of Object.entries(fakes)) {
         writeFileSync(join(bin, name), `#!/usr/bin/env bash\n${body}\n`);
         chmodSync(join(bin, name), 0o755);
     }
+    const backups = join(root, "backups");
     return {
         root,
         toml,
         env,
+        backups,
         rotating: join(etc, "payments.rotating"),
         calls: () =>
             readFileSync(log, "utf8")
@@ -171,6 +195,20 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
                     },
                 },
             );
+            return { code: r.status, out: r.stdout, err: r.stderr, all: r.stdout + r.stderr };
+        },
+        // Runs deploy/payments-backup.sh itself, as the timer does
+        backup(extra: Record<string, string> = {}) {
+            const r = spawnSync("bash", [BACKUP], {
+                encoding: "utf8",
+                cwd: dir,
+                env: {
+                    ...process.env,
+                    PATH: `${bin}:${process.env.PATH ?? ""}`,
+                    BUGNET_PAYMENTS_BACKUP_DIR: backups,
+                    ...extra,
+                },
+            });
             return { code: r.status, out: r.stdout, err: r.stderr, all: r.stdout + r.stderr };
         },
     };
@@ -863,6 +901,42 @@ describe("vps-install.sh payments token", () => {
     });
 });
 
+const DUMP_NAME = /^bugnet_payments-(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z\.dump$/;
+
+describe("payments-backup.sh", () => {
+    it("dumps the database as postgres into a 0700 folder as a checked 0600 file", () => {
+        const server = fakeServer();
+        for (const made of [false, true]) {
+            if (made) {
+                rmSync(server.backups, { recursive: true });
+                mkdirSync(server.backups, { mode: 0o755 });
+                writeFileSync(join(server.root, "calls.log"), "");
+            }
+            const r = server.backup();
+            expect(r.err).toBe("");
+            expect(r.code).toBe(0);
+            const files = readdirSync(server.backups);
+            expect(files).toHaveLength(1);
+            const m = DUMP_NAME.exec(files[0]);
+            expect(m).not.toBeNull();
+            // The stamp is UTC and the time of the run
+            const [, y, mo, d, h, mi, s] = (m ?? []).map(Number);
+            const at = Date.UTC(y, mo - 1, d, h, mi, s);
+            expect(Math.abs(Date.now() - at)).toBeLessThan(60_000);
+            const dump = join(server.backups, files[0]);
+            expect(statSync(server.backups).mode & 0o777).toBe(0o700);
+            expect(statSync(dump).mode & 0o777).toBe(0o600);
+            expect(readFileSync(dump, "utf8")).toMatch(/^PGDMP\n/);
+            const calls = server.calls();
+            expect(calls).toHaveLength(2);
+            expect(calls[0]).toBe("postgres pg_dump --format=custom bugnet_payments");
+            expect(calls[1]).toBe(`root pg_restore --list ${dump}.${calls[1].slice(-6)}`);
+            expect(r.out).toBe(`== wrote ${dump} (${statSync(dump).size} bytes)\n`);
+            rmSync(dump);
+        }
+    });
+});
+
 describe("retire-deposit-seed.sh", () => {
     const LINE = `BUGNET_DEPOSIT_SEED_V1=${OLD_SEED}`;
 
@@ -1095,7 +1169,7 @@ describe("push-rpc-urls.sh", () => {
     });
 
     it("the deploy scripts parse", () => {
-        for (const file of [SCRIPT, PUSH, RETIRE, PUSH_TOKEN]) {
+        for (const file of [SCRIPT, PUSH, RETIRE, PUSH_TOKEN, BACKUP]) {
             expect(spawnSync("bash", ["-n", file]).status).toBe(0);
         }
     });
