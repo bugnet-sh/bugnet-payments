@@ -716,7 +716,7 @@ allowance wallet, money already swept, or review money already carried to the re
 | Alarm                   | When                                                                                                                                                                                                                                                                  | Operator's action                                                                                                                                                                                   |
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `deposit_review`        | A deposit or a transfer needs a person; `reason` is one of `unattributed`, `unreadable`, `from_bugnet`, `late_limit`, `return_destination_invalid`, `return_failed`, `unknown_debit`, `move_expired_repeatedly`, `moves_failing`, `expired_unchecked`, `double_sweep` | `pcli deposits list --review`, `pcli deposits show <orderId>`; a transfer in review goes back with `deposits return-to`, a deposit whose moves failed with `deposits retry` once the cause is fixed |
-| `deposit_unknown_debit` | A deposit account lost USDC in a transaction that is not Payments' own                                                                                                                                                                                                | The leak response above, except on a deposit a restore listed (section 13)                                                                                                                          |
+| `deposit_unknown_debit` | A deposit account lost USDC in a transaction that is not Payments' own                                                                                                                                                                                                | The leak response above, unless a restore printed its signature for that deposit (section 13)                                                                                                       |
 | `deposit_index_lag`     | The balance has not matched the recorded transfers for over 30 s, a listing could not be proven complete, an interval stayed unexplained after every entry was fetched, a transaction stayed missing, or the hard stop waited for a scan                              | `pcli rpc status`; move the lagging URL down the local list or remove it, copy it again and restart (section 6)                                                                                     |
 | `deposit_capacity`      | `max_open` deposits hold Bugnet-paid rent (once an hour)                                                                                                                                                                                                              | None needed: senders pay their own rent meanwhile and get it back at the close. Look for a flood of page views                                                                                      |
 | `deposit_create_churn`  | The unpaid-create budget of the last hour is spent (once an hour)                                                                                                                                                                                                     | None needed: senders pay their own rent for the rest of the hour. Look for one client behind many addresses                                                                                         |
@@ -894,17 +894,21 @@ It starts nothing. Then:
       does not show.
     - `deposits`, `deposit_moves`: Payments' moves, and the transfers it recorded, after the dump.
       A deposit `none here` was made after the dump; its salt, and so its key, is only in the kept
-      database.
+      database. A `deposits` line ends with `signed after the dump:` and the signatures of its
+      moves that the kept database has signed, sent or landed and the restored one lacks, or
+      `none`.
 4. **Pauses and holds.** Refunds and x402 stay paused until the founder has settled every listed
    row by hand. Then lift only what printed `set by the restore`: refunds paused with
    `pcli refunds resume`, x402 payments paused with `pcli x402 resume`, x402 refunds held with
    `pcli x402 refunds release`. Leave what printed `in the dump already` as it was. With nothing
    listed, lift them at once. Read the kept database with
    `sudo runuser -u postgres -- psql -d bugnet_payments_before_<UTC time>`.
-5. **`deposit_unknown_debit` on a listed deposit.** After `--start` the deposit job reads a move
+5. **`deposit_unknown_debit` after a restore.** After `--start` the deposit job reads a move
    made after the dump as a debit that is not Payments' own, raises `deposit_unknown_debit` and
-   puts the deposit in review. On a listed deposit it is Payments' own move, **not a leak**: no
-   leak response (section 12), and **never write it off**, which would pay the senders twice. The
-   deposit stays in review until the founder decides how to bring its rows back.
+   puts the deposit in review. It is Payments' own move only when the alarm's `signature` is one
+   the restore printed after `signed after the dump:` on its `orderId`'s line. Then it is
+   **not a leak**: no leak response (section 12), and **never write it off**, which would pay the
+   senders twice; the deposit stays in review until the founder decides how to bring its rows
+   back. Any other unknown debit gets the leak response.
 6. Once every row is settled, drop the kept database:
    `sudo runuser -u postgres -- dropdb bugnet_payments_before_<UTC time>`.
