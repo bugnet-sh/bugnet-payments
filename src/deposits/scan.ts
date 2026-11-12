@@ -23,7 +23,7 @@ import { isRecord } from "../is-record.ts";
 import type { Log } from "../log.ts";
 import { TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
 import { deadline, type SolanaRpc } from "../solana/rpc.ts";
-import { parseChainTx, type TokenAccountChange, usdcDeltaFor } from "../x402/match.ts";
+import { parseChainTx, type TokenAccountChange, usdcHeldBy } from "../x402/match.ts";
 import { depositLedger, insertTransfers, lockDeposit, moveCursor, updateDeposit } from "./store.ts";
 import type {
     DepositRow,
@@ -135,9 +135,10 @@ export interface CachedTx {
     feePayer: string | null;
     signers: readonly string[];
     tokenAccounts: ReadonlyMap<string, TokenAccountChange>;
-    // For an undecodable answer only: each owner's USDC change, from the meta's token balances,
-    // which name owners but need the message to name accounts
+    // For an undecodable answer only: each owner's USDC change and its USDC before, from the meta's
+    // token balances, which name owners but need the message to name accounts
     ownerDeltas: ReadonlyMap<string, bigint>;
+    ownerBefore: ReadonlyMap<string, bigint>;
     undecodable: boolean;
     // meta null, or no token balance arrays (spec 6.1)
     noMeta: boolean;
@@ -208,7 +209,10 @@ function decodable(raw: Record<string, unknown>): boolean {
     }
 }
 
-function ownerDeltasOf(raw: unknown, meta: Record<string, unknown>): Map<string, bigint> {
+function ownerBalancesOf(
+    raw: unknown,
+    meta: Record<string, unknown>,
+): { deltas: Map<string, bigint>; before: Map<string, bigint> } {
     const owners = new Set<string>();
     for (const list of [meta.preTokenBalances, meta.postTokenBalances] as unknown[][]) {
         for (const b of list) {
@@ -217,12 +221,14 @@ function ownerDeltasOf(raw: unknown, meta: Record<string, unknown>): Map<string,
             }
         }
     }
-    const out = new Map<string, bigint>();
+    const deltas = new Map<string, bigint>();
+    const before = new Map<string, bigint>();
     for (const owner of owners) {
-        const delta = usdcDeltaFor(raw, owner) ?? 0n;
-        if (delta !== 0n) out.set(owner, delta);
+        const held = usdcHeldBy(raw, owner) ?? { pre: 0n, post: 0n };
+        if (held.post !== held.pre) deltas.set(owner, held.post - held.pre);
+        before.set(owner, held.pre);
     }
-    return out;
+    return { deltas, before };
 }
 
 function compact(signature: string, slot: bigint, raw: unknown, blockTime: Date): CachedTx {
@@ -235,6 +241,7 @@ function compact(signature: string, slot: bigint, raw: unknown, blockTime: Date)
         signers: [],
         tokenAccounts: NO_TOKEN_ACCOUNTS,
         ownerDeltas: NO_OWNER_DELTAS,
+        ownerBefore: NO_OWNER_DELTAS,
         undecodable: false,
         noMeta: false,
     };
@@ -248,7 +255,14 @@ function compact(signature: string, slot: bigint, raw: unknown, blockTime: Date)
     }
     const failed = meta.err !== null && meta.err !== undefined;
     if (!decodable(raw)) {
-        return { ...base, failed, undecodable: true, ownerDeltas: ownerDeltasOf(raw, meta) };
+        const owners = ownerBalancesOf(raw, meta);
+        return {
+            ...base,
+            failed,
+            undecodable: true,
+            ownerDeltas: owners.deltas,
+            ownerBefore: owners.before,
+        };
     }
     const tx = parseChainTx(signature, slot, raw, "");
     return {
@@ -361,6 +375,16 @@ export function classifyTx(
             sourceBalanceMicros: source.post,
         },
     };
+}
+
+// The deposit's USDC just before the transaction, from its meta (spec 23.1)
+export function balanceBefore(
+    tx: CachedTx,
+    deposit: Pick<DepositRow, "tokenAccount" | "address">,
+): bigint {
+    if (tx.noMeta) throw new Error(`transaction ${tx.signature} has no usable meta`);
+    if (tx.undecodable) return tx.ownerBefore.get(deposit.address) ?? 0n;
+    return tx.tokenAccounts.get(deposit.tokenAccount)?.pre ?? 0n;
 }
 
 // The fee payer of the transaction that created the account: no pre entry and a post entry

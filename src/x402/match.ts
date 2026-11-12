@@ -112,6 +112,12 @@ function ownerOf(pre: string | null = null, post: string | null = null): string 
 // For an answer whose message cannot be decoded: the meta's token balances alone. Null when the
 // answer has no meta or no token balance lists.
 export function usdcDeltaFor(raw: unknown, owner: string): bigint | null {
+    const held = usdcHeldBy(raw, owner);
+    return held === null ? null : held.post - held.pre;
+}
+
+// One owner's USDC before and after the transaction, from the meta alone
+export function usdcHeldBy(raw: unknown, owner: string): { pre: bigint; post: bigint } | null {
     if (!isRecord(raw) || !isRecord(raw.meta)) return null;
     const { preTokenBalances, postTokenBalances } = raw.meta;
     if (!Array.isArray(preTokenBalances) || !Array.isArray(postTokenBalances)) return null;
@@ -120,7 +126,7 @@ export function usdcDeltaFor(raw: unknown, owner: string): bigint | null {
         for (const e of usdcEntries(list).values()) if (e.owner === owner) sum += e.micros;
         return sum;
     };
-    return held(postTokenBalances) - held(preTokenBalances);
+    return { pre: held(preTokenBalances), post: held(postTokenBalances) };
 }
 
 // getTransaction with encoding base64, so meta carries the token balances and inner instructions

@@ -1069,6 +1069,7 @@ describe("pure parts", () => {
             signers: [],
             tokenAccounts: new Map(),
             ownerDeltas: new Map(),
+            ownerBefore: new Map(),
             undecodable: false,
             noMeta: false,
         });
