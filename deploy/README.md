@@ -378,6 +378,12 @@ from this release's install step on:
 - a rollback to a release without deposits first needs `vps-install.sh --deposits remove`
   (below).
 
+**Rollback below a `[router]` key.** The same strict decode holds for the router switches. Before
+a rollback to a release older than the one that added the key, remove the key from
+`payments.toml`: `fee_claim` (added with `feat/fee-claim`) and `token_issued_at` (added in
+1b97f3a). Otherwise the older release fails its boot check with `unknown key router.<name>`, after
+`--start` has already stopped the running one.
+
 **Rollback below the deposits release.** Run `vps-install.sh --deposits off` first, then:
 
 1. `vps-install.sh --deposits remove`. It asks the database through `pcli deposits list` and
