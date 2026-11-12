@@ -11,6 +11,7 @@ import {
 } from "./flow.ts";
 import type { StatusView } from "./live.ts";
 import {
+    arrivedNote,
     depositAsk,
     depositLine,
     errorStep,
@@ -384,7 +385,14 @@ describe("wallet messages", () => {
 
     it("page-made messages", () => {
         expect(PAGE_TEXT.addressOff).toBe("Paying by address is off right now.");
-        expect(PAGE_TEXT.arrived(30_000)).toBe("The $0.03 already sent is then returned.");
+        expect(arrivedNote({ micros: 0, review: false })).toBe("");
+        expect(arrivedNote({ micros: 30_000, review: false })).toBe(
+            "The $0.03 already sent is then returned.",
+        );
+        // The support line above already says what to do; this only promises nothing
+        expect(arrivedNote({ micros: 30_000, review: true })).toBe(
+            "The $0.03 in review is not returned on its own.",
+        );
         expect(PAGE_TEXT.connecting("Phantom")).toBe("Approve the connection in Phantom.");
         expect(PAGE_TEXT.signing("Phantom")).toBe("Approve the payment in Phantom.");
         expect(PAGE_TEXT.copyFailed).toBe("Copy failed. Select the text and copy it by hand.");

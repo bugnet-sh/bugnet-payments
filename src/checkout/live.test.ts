@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { DepositView } from "../deposits/types.ts";
 import {
     arrangement,
-    arrivedMicros,
+    arrivedMoney,
+    initialState,
     confirmingInFull,
     fetchStatus,
     keepPolling,
@@ -233,14 +234,39 @@ describe("which ways to pay show", () => {
         expect(payLabel("Phantom", "$0.08")).toBe("Pay $0.08 with Phantom");
     });
 
-    it("money at the address counts only while the address shows", () => {
-        expect(arrivedMicros(view("unpaid", {}))).toBe(0);
-        expect(arrivedMicros(view("unpaid", { receivedMicros: 20_000, otherMicros: 5_000 }))).toBe(
-            25_000,
-        );
-        // In review that money waits for a person, and is not returned on its own
-        expect(arrivedMicros(view("unpaid", { status: "review", receivedMicros: 20_000 }))).toBe(0);
-        expect(arrivedMicros(view("paid", { receivedMicros: 50_000 }))).toBe(0);
+    it("money at the address counts while a wallet payment is still offered, review included", () => {
+        const of = (v: StatusView) => arrivedMoney(v.state, v.deposit);
+        expect(of(view("unpaid", {}))).toEqual({ micros: 0, review: false });
+        expect(of(view("unpaid", { receivedMicros: 20_000, otherMicros: 5_000 }))).toEqual({
+            micros: 25_000,
+            review: false,
+        });
+        // In review a wallet payment still charges the whole price; that money waits for a person
+        expect(of(view("unpaid", { status: "review", receivedMicros: 20_000 }))).toEqual({
+            micros: 20_000,
+            review: true,
+        });
+        expect(of(view("paid", { receivedMicros: 50_000 })).micros).toBe(0);
+        expect(of(view("unpaid", null)).micros).toBe(0);
+        const full = { status: "confirming" as const, receivedMicros: 50_000, remainingMicros: 0 };
+        expect(of(view("unpaid", full)).micros).toBe(0);
+    });
+
+    it("the script starts from what the server drew", () => {
+        expect(initialState({})).toEqual({
+            takesMoney: false,
+            arrived: { micros: 0, review: false },
+        });
+        expect(
+            initialState({ takesMoney: "true", arrivedMicros: "30000", arrivedReview: "false" }),
+        ).toEqual({ takesMoney: true, arrived: { micros: 30_000, review: false } });
+        expect(
+            initialState({ takesMoney: "true", arrivedMicros: "20000", arrivedReview: "true" }),
+        ).toEqual({ takesMoney: true, arrived: { micros: 20_000, review: true } });
+        // A bad number reads as nothing arrived
+        for (const bad of ["x", "-5", "1.5", "1e30"]) {
+            expect(initialState({ arrivedMicros: bad }).arrived.micros).toBe(0);
+        }
     });
 });
 

@@ -22,7 +22,9 @@ import {
     keepPolling,
     needsReload,
     payLabel,
-    arrivedMicros,
+    type Arrived,
+    arrivedMoney,
+    initialState,
     parseStatus,
     pollDelay,
     showDepositAsk,
@@ -35,6 +37,7 @@ import {
     watchWallet,
 } from "./live.ts";
 import {
+    arrivedNote,
     depositAsk,
     depositLine,
     errorStep,
@@ -150,7 +153,7 @@ interface WalletSection {
     seen(v: StatusView): void;
 }
 
-function startPayment(p: Page): WalletSection {
+function startPayment(p: Page, seed: Arrived): WalletSection {
     const others = element<HTMLElement>(p.root, "#wallets");
     const button = element<HTMLButtonElement>(p.root, "#pay-button");
     const wallets = getWallets();
@@ -175,8 +178,8 @@ function startPayment(p: Page): WalletSection {
         }, ms);
     };
 
-    // Money that already reached the address, which a wallet payment sends back
-    let arrived = 0;
+    // Money that already reached the address, as the server drew it until a status answer comes
+    let arrived = seed;
     const note = p.root.querySelector<HTMLElement>("#wallet-note");
 
     const label = (b: HTMLButtonElement, w: Wallet | undefined) => {
@@ -187,7 +190,7 @@ function startPayment(p: Page): WalletSection {
         const icon = document.createElement("img");
         icon.src = w.icon;
         icon.alt = "";
-        const price = arrived > 0 ? (p.root.dataset.amount ?? undefined) : undefined;
+        const price = arrived.micros > 0 ? (p.root.dataset.amount ?? undefined) : undefined;
         b.replaceChildren(icon, payLabel(w.name, price));
     };
 
@@ -196,27 +199,26 @@ function startPayment(p: Page): WalletSection {
         others.querySelectorAll<HTMLButtonElement>("button").forEach((b, i) => {
             label(b, found[i + 1]);
         });
-        const text = arrived > 0 ? PAGE_TEXT.arrived(arrived) : "";
+        const text = arrivedNote(arrived);
         if (note !== null && note.textContent !== text) note.textContent = text;
     };
 
     // The first wallet found pays from the green button, every other from one of its own
     const render = () => {
         found = wallets.get().filter(usable);
-        label(button, found[0]);
         button.hidden = found.length === 0;
         others.replaceChildren(
             ...found.slice(1).map((w) => {
                 const b = document.createElement("button");
                 b.type = "button";
                 b.className = "button outline";
-                label(b, w);
                 b.addEventListener("click", () => {
                     if (!busy && payable) void pay(w);
                 });
                 return b;
             }),
         );
+        relabel();
         p.walletsFound = found.length;
         arrange(p);
         refresh();
@@ -284,8 +286,8 @@ function startPayment(p: Page): WalletSection {
     render();
     return {
         seen(v) {
-            const now = arrivedMicros(v);
-            if (now !== arrived) {
+            const now = arrivedMoney(v.state, v.deposit);
+            if (now.micros !== arrived.micros || now.review !== arrived.review) {
                 arrived = now;
                 relabel();
             }
@@ -497,6 +499,7 @@ function localTime(ms: number): string {
 
 const root = document.getElementById("checkout");
 if (root !== null) {
+    const start = initialState(root.dataset);
     const expiresAt = Date.parse(root.dataset.expiresAt ?? "");
     const p: Page = {
         root,
@@ -516,7 +519,7 @@ if (root !== null) {
             hasAddress: root.querySelector("#deposit-ask:not([hidden])") !== null,
         },
         // Never offers a way to pay the server left out, until a status answer says so
-        takesMoney: root.dataset.takesMoney === "true",
+        takesMoney: start.takesMoney,
         walletsFound: 0,
     };
     for (const button of root.querySelectorAll<HTMLButtonElement>("button[data-copy]")) {
@@ -546,7 +549,7 @@ if (root !== null) {
     }
     const wallet =
         root.dataset.state === "unpaid" && root.querySelector("#pay-button") !== null
-            ? startPayment(p)
+            ? startPayment(p, start.arrived)
             : null;
     follow(p, wallet);
 }

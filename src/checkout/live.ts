@@ -185,8 +185,35 @@ export function payLabel(wallet: string | undefined, price?: string): string {
     return price === undefined ? `Pay with ${wallet}` : `Pay ${price} with ${wallet}`;
 }
 
-// Money that already reached the address, which a wallet payment sends back (W35)
-export function arrivedMicros(v: StatusView): number {
-    if (!showDepositAsk(v) || v.deposit === null) return 0;
-    return v.deposit.receivedMicros + v.deposit.otherMicros;
+// Money that already reached the address while the order still takes a wallet payment, which
+// charges the whole price whatever arrived (W35). It goes back after, unless the deposit is in
+// review, where it waits for a person.
+export interface Arrived {
+    micros: number;
+    review: boolean;
+}
+
+export function arrivedMoney(
+    state: PublicState,
+    d: Pick<DepositView, "status" | "receivedMicros" | "otherMicros" | "remainingMicros"> | null,
+): Arrived {
+    if (state !== "unpaid" || d === null || confirmingInFull(d))
+        return { micros: 0, review: false };
+    return { micros: d.receivedMicros + d.otherMicros, review: d.status === "review" };
+}
+
+// What the server drew the page with, so before its first status answer the script never offers
+// more, or warns less, than that page
+export function initialState(data: Readonly<Record<string, string | undefined>>): {
+    takesMoney: boolean;
+    arrived: Arrived;
+} {
+    const micros = Number(data.arrivedMicros ?? "0");
+    return {
+        takesMoney: data.takesMoney === "true",
+        arrived: {
+            micros: Number.isSafeInteger(micros) && micros > 0 ? micros : 0,
+            review: data.arrivedReview === "true",
+        },
+    };
 }

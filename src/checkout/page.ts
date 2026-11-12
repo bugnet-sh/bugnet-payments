@@ -10,7 +10,7 @@ import {
     STATE_LABELS,
     stateStep,
 } from "./messages.ts";
-import { confirmingInFull } from "./live.ts";
+import { arrivedMoney, confirmingInFull } from "./live.ts";
 import { USDC_ICON } from "./usdc.ts";
 
 export { amountLabel, decimalAmount };
@@ -111,7 +111,8 @@ const STYLE = `
     --font-head: "Lexend Deca", "Manrope", ui-sans-serif, system-ui, sans-serif;
     --font-mono: "Obel Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
-    --column: 480px;
+    /* Wide enough that a Solana address wraps on two lines at most beside the code */
+    --column: 520px;
     --box-pad: var(--space-6);
     --amount-size: 40px;
     --amount-line: 48px;
@@ -542,6 +543,8 @@ export async function renderCheckout(v: CheckoutView): Promise<string> {
     const dep = unpaid && v.depositsOffered ? v.deposit : null;
     // With the whole price in and confirming, the page asks for nothing while it lands
     const confirming = dep !== null && confirmingInFull(dep);
+    // What already arrived, so the Pay buttons name the whole price before any status answer
+    const arrived = arrivedMoney(v.state, dep);
     let methods = "";
     if (dep !== null) {
         // Money sent while the deposit is in review cannot pay the order until an operator looks
@@ -562,7 +565,7 @@ ${await walletSections(v, inReview(dep))}${askHidden === "" ? `\n${NOSCRIPT}` : 
         : "";
     return page(
         `Pay ${amount} to Bugnet`,
-        `<main id="checkout" class="box" data-order-id="${id}" data-state="${v.state}" data-amount="${amount}" data-amount-micros="${v.amountMicros}" data-expires-at="${expires}" data-now="${v.now.toISOString()}" data-kind="${v.kind}" data-refund-min-micros="${v.refundMinMicros}" data-settle-grace-ms="${v.settleGraceMs}" data-takes-money="${unpaid && !confirming}">
+        `<main id="checkout" class="box" data-order-id="${id}" data-state="${v.state}" data-amount="${amount}" data-amount-micros="${v.amountMicros}" data-expires-at="${expires}" data-now="${v.now.toISOString()}" data-kind="${v.kind}" data-refund-min-micros="${v.refundMinMicros}" data-settle-grace-ms="${v.settleGraceMs}" data-takes-money="${unpaid && !confirming}" data-arrived-micros="${arrived.micros}" data-arrived-review="${arrived.review}">
 <h1 class="description">${escapeHtml(v.description)}</h1>
 <p class="amount"><span class="amount-value">${amount}</span></p>
 <p class="status"><span id="state" class="state" data-state="${v.state}" role="status" aria-live="polite">${stateLabel(v.state, dep)}</span>${time}</p>

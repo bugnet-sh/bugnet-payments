@@ -298,14 +298,21 @@ export function depositLine(
     return { label, message, extra };
 }
 
+// W35, under Pay buttons that name the whole price once money already arrived; in review the
+// support line above already says what to do, so this says only that nothing goes back on its own
+export function arrivedNote(a: { micros: number; review: boolean }): string {
+    if (a.micros <= 0) return "";
+    return a.review
+        ? `The ${amountLabel(a.micros)} in review is not returned on its own.`
+        : `The ${amountLabel(a.micros)} already sent is then returned.`;
+}
+
 export const PAGE_TEXT = {
     // M20: a page without a deposit address
     addressOff: "Paying by address is off right now.",
     connecting: (wallet: string) => `Approve the connection in ${wallet}.`,
     signing: (wallet: string) => `Approve the payment in ${wallet}.`,
     copyFailed: "Copy failed. Select the text and copy it by hand.",
-    // W35, under a Pay button that names the whole price
-    arrived: (micros: number) => `The ${amountLabel(micros)} already sent is then returned.`,
     unreachable: "Cannot reach Bugnet. This page keeps trying; check your connection.",
     tooMany: (s: number) => `Too many requests from your network. This page tries again in ${s} s.`,
 } as const;

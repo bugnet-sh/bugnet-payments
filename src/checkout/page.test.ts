@@ -620,6 +620,43 @@ describe("address-first page", () => {
         expect(html).not.toContain(".box { margin-top: 0;");
     });
 
+    it("an address wraps whole, never cut, on two lines beside the code", async () => {
+        const html = await renderCheckout(offered);
+        const rule = html.slice(
+            html.indexOf(".value.address {"),
+            html.indexOf("}", html.indexOf(".value.address {")),
+        );
+        expect(rule).toContain("white-space: normal;");
+        expect(rule).toContain("overflow-wrap: anywhere;");
+        expect(rule).not.toContain("ellipsis");
+        expect(html).toContain("--column: 520px;");
+    });
+
+    it("the page carries what already arrived, so Pay names the whole price before any poll", async () => {
+        expect(await renderCheckout(offered)).toContain(
+            'data-arrived-micros="0" data-arrived-review="false"',
+        );
+        const partial = {
+            ...offered,
+            deposit: {
+                ...offered.deposit!,
+                status: "partial" as const,
+                receivedMicros: 30_000,
+                remainingMicros: 20_000,
+            },
+        };
+        expect(await renderCheckout(partial)).toContain(
+            'data-takes-money="true" data-arrived-micros="30000" data-arrived-review="false"',
+        );
+        const review = {
+            ...offered,
+            deposit: { ...offered.deposit!, status: "review" as const, receivedMicros: 20_000 },
+        };
+        expect(await renderCheckout(review)).toContain(
+            'data-arrived-micros="20000" data-arrived-review="true"',
+        );
+    });
+
     it("notes keep their spacing", async () => {
         expect(await renderCheckout(offered)).toContain(
             ".note { margin-top: var(--space-4); color: var(--text-muted); }",
