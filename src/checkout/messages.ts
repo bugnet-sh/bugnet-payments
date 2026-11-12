@@ -35,7 +35,7 @@ function showsAddress(c: MessageContext): boolean {
 
 // A sentence's end: the address as the other way to pay, on a page that shows one
 function orSend(c: MessageContext): string {
-    return showsAddress(c) ? ", or send to the address above." : ".";
+    return showsAddress(c) ? ", or send to the address below." : ".";
 }
 
 export const STATE_LABELS: Record<PublicState, string> = {
@@ -48,7 +48,7 @@ export const STATE_LABELS: Record<PublicState, string> = {
 };
 
 const STATUS_LABELS: Record<string, string> = {
-    waiting: "Waiting for your transfer",
+    waiting: "Awaiting payment",
     partial: "Partly paid",
     confirming: "Confirming",
     held: "Waiting for a free slot",
@@ -173,20 +173,19 @@ function keptLine(v: NonNullable<StatusView["deposit"]>, c: MessageContext): str
 const P2 = "The payment is confirming on Solana. This page updates when it lands.";
 const P3 = "This order's payment was returned to the wallet that paid.";
 
-// The deposit section's Amount row, its Copy value, the QR's alt and caption and the exchange
-// note. Once part of the price has arrived they name what is left, as the QR does (spec 14.2):
+// The deposit section's Amount row, its Copy value, the QR's alt and the exchange note. Once part of the price has arrived they name what is left, as the QR does (spec 14.2):
 // a payer copying the price would overpay and pay for the return. With nothing left, the price,
 // which a payment from another wallet still needs while the money waits (M24).
 export function depositAsk(
     amountMicros: number,
     d: Pick<DepositView, "remainingMicros">,
-): { plain: string; alt: string; caption: string; exchange: string } {
+): { plain: string; alt: string; exchange: string } {
     const plain = decimalAmount(d.remainingMicros > 0 ? d.remainingMicros : amountMicros);
     return {
         plain,
         alt: `Solana Pay code for ${plain} USDC`,
-        caption: `Scan with a Solana wallet app to send ${plain} USDC`,
-        exchange: `From an exchange, send exactly ${plain} USDC. Anything returned goes back to the sending address, which an exchange may not credit to you.`,
+        // Money returned goes to the sending address, which an exchange may not credit
+        exchange: `From an exchange, send exactly ${plain} USDC.`,
     };
 }
 
@@ -199,12 +198,12 @@ export function depositLine(
         const message = v.state === "settling" ? P2 : stateStep(v.state, c).message;
         return { label: STATE_LABELS[v.state], message, extra: [] };
     }
-    const plain = decimalAmount(c.amountMicros);
     const kept = d.reason === "below_minimum";
     let message: string;
     switch (d.status) {
         case "waiting":
-            message = `Send ${plain} USDC to the address above by ${c.deadline}. This page updates when it arrives.`;
+            // The amount, the address and the time left are already on the page
+            message = "";
             break;
         case "partial":
             message = `Received ${amountLabel(d.receivedMicros)}. Send ${amountLabel(d.remainingMicros)} more to the same address by ${c.deadline}.`;
@@ -235,9 +234,9 @@ export function depositLine(
                 else if (d.extraMicros > 0) {
                     message =
                         d.returningMicros > 0
-                            ? `Paid. The extra ${amountLabel(d.extraMicros)} is being returned to the address that sent it.`
-                            : `Paid. The extra ${amountLabel(d.extraMicros)} was returned to the address that sent it.`;
-                } else message = "Paid. Go back to your agent; it continues on its own.";
+                            ? `The extra ${amountLabel(d.extraMicros)} is being returned to the address that sent it.`
+                            : `The extra ${amountLabel(d.extraMicros)} was returned to the address that sent it.`;
+                } else message = "Go back to your agent. It continues on its own.";
             }
             break;
         case "refunding":
@@ -296,14 +295,11 @@ export function depositLine(
 
 // W35, while money already sits at the address and the order still takes a wallet payment
 export function walletNoteText(c: MessageContext): string {
-    return `Money already arrived at the address above. A wallet payment charges the full ${amountLabel(c.amountMicros)}, and that money then goes back to the wallet that sent it.`;
+    return `Money already arrived at the address below. Paying by wallet charges the full ${amountLabel(c.amountMicros)} and sends that money back.`;
 }
 
 export const PAGE_TEXT = {
-    noWallet: (hasAddress: boolean) =>
-        hasAddress
-            ? "No browser wallet found. Send to the address above instead."
-            : "No browser wallet found.",
+    noWallet: "No browser wallet found.",
     connecting: (wallet: string) => `Approve the connection in ${wallet}.`,
     signing: (wallet: string) => `Approve the payment in ${wallet}.`,
     copyFailed: "Copy failed. Select the text and copy it by hand.",
@@ -313,7 +309,7 @@ export const PAGE_TEXT = {
 
 function shortBalance(have: number, c: MessageContext & { wallet: string }): string {
     const options = showsAddress(c)
-        ? "Add USDC, pick another account, or send to the address above."
+        ? "Add USDC, pick another account, or send to the address below."
         : "Add USDC or pick another account.";
     return `Your ${c.wallet} account holds ${amountLabel(have)} USDC on Solana and this order needs ${amountLabel(c.amountMicros)}. Nothing was charged. ${options}`;
 }
@@ -341,7 +337,7 @@ export function walletMessage(
         case -32000:
         case -32003:
             return step(
-                `${w} refused this payment. Nothing was charged.${showsAddress(c) ? " Send to the address above instead." : ""}`,
+                `${w} refused this payment. Nothing was charged.${showsAddress(c) ? " Send to the address below instead." : ""}`,
             );
     }
     if (c.haveMicros !== undefined && c.haveMicros < c.amountMicros) {
@@ -406,7 +402,7 @@ export function pageStep(r: PayFlowResult, c: MessageContext & { wallet: string 
     switch (r) {
         case "paid":
             return {
-                message: "Paid. Go back to your agent; it continues on its own.",
+                message: "Go back to your agent. It continues on its own.",
                 state: "paid",
             };
         case "settling_timeout":
@@ -540,7 +536,7 @@ export function stateStep(s: PublicState | undefined, c: MessageContext): PageSt
                 payAfterMs: 0,
             };
         case "paid":
-            return { message: "Paid. Go back to your agent; it continues on its own.", state: s };
+            return { message: "Go back to your agent. It continues on its own.", state: s };
         case "expired":
             return {
                 message: `This order expired at ${c.deadline} and nothing was charged. ${ASK_NEW_LINK}`,

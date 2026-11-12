@@ -60,10 +60,32 @@ interface Page {
     stateLabel: HTMLElement;
     status: StatusDeps;
     ctx: MessageContext;
+    // While the order takes money, and how many usable browser wallets the page found
+    takesMoney: boolean;
+    walletsFound: number;
 }
 
 const STANDARD_CONNECT = "standard:connect";
 const MAINNET = "solana:mainnet";
+
+// A phone cannot scan its own screen and rarely has a browser wallet, so it gets the app links
+const TOUCH = "(hover: none) and (pointer: coarse)";
+
+// Which ways to pay show: a found browser wallet, else the wallet app links on a phone or on a
+// page with no address, and the address whenever the order still takes money there
+function arrange(p: Page): void {
+    const wallet = p.root.querySelector<HTMLElement>("#wallet");
+    const phone = p.root.querySelector<HTMLElement>("#phone");
+    const or = p.root.querySelector<HTMLElement>("#or");
+    const ask = p.root.querySelector<HTMLElement>("#deposit-ask");
+    const address = ask !== null && !ask.hidden;
+    const touch = window.matchMedia(TOUCH).matches;
+    const walletShown = p.takesMoney && (p.walletsFound > 0 || !address);
+    const phoneShown = p.takesMoney && p.walletsFound === 0 && (touch || !address);
+    if (wallet !== null) wallet.hidden = !walletShown;
+    if (phone !== null) phone.hidden = !phoneShown;
+    if (or !== null) or.hidden = !(address && (walletShown || phoneShown));
+}
 
 function usable(w: Wallet): boolean {
     return (
@@ -145,35 +167,53 @@ function startPayment(p: Page): WalletSection {
         }, ms);
     };
 
+    // The button names the wallet it pays with, so one found wallet needs no list
+    const label = () => {
+        if (chosen === undefined) {
+            button.textContent = "Pay";
+            return;
+        }
+        const icon = document.createElement("img");
+        icon.src = chosen.icon;
+        icon.alt = "";
+        button.replaceChildren(icon, `Pay with ${chosen.name}`);
+    };
+
     const render = () => {
         const found = wallets.get().filter(usable);
         if (chosen === undefined || !found.includes(chosen)) chosen = found[0];
         list.replaceChildren(
-            ...found.map((w) => {
+            ...(found.length > 1 ? found : []).map((w) => {
                 const input = document.createElement("input");
                 input.type = "radio";
                 input.name = "wallet";
                 input.checked = w === chosen;
                 input.addEventListener("change", () => {
                     chosen = w;
+                    label();
                     refresh();
                 });
                 const icon = document.createElement("img");
                 icon.src = w.icon;
                 icon.alt = "";
-                const label = document.createElement("label");
-                label.append(input, icon, w.name);
+                const choice = document.createElement("label");
+                choice.append(input, icon, w.name);
                 const item = document.createElement("li");
-                item.className = "wallet";
-                item.append(label);
+                item.append(choice);
                 return item;
             }),
         );
         if (found.length === 0) {
             const item = document.createElement("li");
-            item.textContent = PAGE_TEXT.noWallet(p.ctx.hasAddress !== false);
+            item.className = "none";
+            item.textContent = PAGE_TEXT.noWallet;
             list.append(item);
         }
+        list.hidden = found.length === 1;
+        button.hidden = found.length === 0;
+        label();
+        p.walletsFound = found.length;
+        arrange(p);
         refresh();
     };
 
@@ -275,12 +315,10 @@ function follow(p: Page, wallet: WalletSection | null): void {
     const expiresAt = Date.parse(p.root.dataset.expiresAt ?? "");
     const settleGraceMs = Number(p.root.dataset.settleGraceMs ?? "60000");
     const timeEl = p.root.querySelector<HTMLElement>("#time-left");
-    const untilEl = p.root.querySelector<HTMLElement>("#until");
     const qr = p.root.querySelector<HTMLImageElement>("#deposit img");
     const askEls = {
         amount: p.root.querySelector<HTMLElement>("#deposit-amount"),
         copy: p.root.querySelector<HTMLButtonElement>("#deposit-amount-copy"),
-        caption: p.root.querySelector<HTMLElement>("#deposit figcaption"),
         exchange: p.root.querySelector<HTMLElement>("#exchange-note"),
     };
     // M20 on a page without a deposit, put back once a status error line is no longer true
@@ -292,7 +330,6 @@ function follow(p: Page, wallet: WalletSection | null): void {
     let remaining: number | null = Number.isNaN(drawn) ? null : drawn;
     let lastKey: string | null = null;
     let changedAt = Date.now();
-    if (untilEl !== null) untilEl.textContent = `until ${p.ctx.deadline}`;
 
     const tick = () => {
         if (timeEl !== null) timeEl.textContent = timeLeft(expiresAt, Date.now() + offset);
@@ -316,7 +353,7 @@ function follow(p: Page, wallet: WalletSection | null): void {
         if (p.depositMessage !== null) {
             p.depositMessage.textContent =
                 v.deposit !== null || v.state !== "unpaid"
-                    ? [line.message, ...line.extra].join(" ")
+                    ? [line.message, ...line.extra].filter((t) => t !== "").join(" ")
                     : firstLine;
         }
         // The QR asks for money only while the order lacks some
@@ -325,7 +362,6 @@ function follow(p: Page, wallet: WalletSection | null): void {
             const ask = depositAsk(p.ctx.amountMicros, d);
             if (askEls.amount !== null) askEls.amount.textContent = `${ask.plain} USDC`;
             if (askEls.copy !== null) askEls.copy.dataset.copy = ask.plain;
-            if (askEls.caption !== null) askEls.caption.textContent = ask.caption;
             if (askEls.exchange !== null) askEls.exchange.textContent = ask.exchange;
             if (qr !== null) qr.alt = ask.alt;
         }
@@ -334,7 +370,7 @@ function follow(p: Page, wallet: WalletSection | null): void {
         // Wallet lines offer the address only while the page shows it (M3)
         p.ctx.hasAddress = askEl !== null && !askEl.hidden;
         // A countdown on an order that no longer takes money says nothing true
-        const timeRow = timeEl?.closest("div") ?? null;
+        const timeRow = timeEl?.closest<HTMLElement>(".time") ?? null;
         if (timeRow !== null) timeRow.hidden = !showWalletOptions(v);
         const qrShown = showDepositQr(v);
         const figure = qr?.closest("figure") ?? null;
@@ -344,11 +380,8 @@ function follow(p: Page, wallet: WalletSection | null): void {
             qr.src = `/o/${p.ctx.orderId}/qr.svg?r=${remaining}`;
         }
         wallet?.seen(v);
-        const options = showWalletOptions(v);
-        for (const id of ["#wallet", "#phone"]) {
-            const section = p.root.querySelector<HTMLElement>(id);
-            if (section !== null) section.hidden = !options;
-        }
+        p.takesMoney = showWalletOptions(v);
+        arrange(p);
         if (p.walletNote !== null) {
             const note = walletNote(v, p.ctx);
             p.walletNote.hidden = note === null;
@@ -439,11 +472,12 @@ if (root !== null) {
             orderId: root.dataset.orderId ?? "",
             hasAddress: root.querySelector("#deposit-ask:not([hidden])") !== null,
         },
+        takesMoney: root.dataset.state === "unpaid",
+        walletsFound: 0,
     };
     for (const button of root.querySelectorAll<HTMLButtonElement>("button[data-copy]")) {
-        offerCopy(button, (b) => {
-            const line = b.closest("#deposit") !== null ? p.depositMessage : p.message;
-            if (line !== null) line.textContent = PAGE_TEXT.copyFailed;
+        offerCopy(button, () => {
+            if (p.depositMessage !== null) p.depositMessage.textContent = PAGE_TEXT.copyFailed;
         });
     }
     const wallet =

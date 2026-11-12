@@ -89,7 +89,6 @@ const STYLE = `
     --wordmark-size: 20px;
     --wordmark-line: 24px;
     --mark: 24px;
-    --row: 40px;
     --hairline: 1px;
     --ring: 2px;
     --space-1: 4px;
@@ -109,10 +108,10 @@ const STYLE = `
     --amount-size: 40px;
     --amount-line: 48px;
     --control: 44px;
+    --chip: 40px;
     --copy-button: 24px;
-    --wallet-row: 48px;
-    --wallet-icon: 24px;
-    --qr: 192px;
+    --wallet-icon: 20px;
+    --qr: 136px;
     --usdc: #2775ca;
     --usdc-icon: 20px;
     /* Phones scan the code only on a light square */
@@ -143,7 +142,7 @@ const STYLE = `
     src: url("/fonts/obel-mono-400.woff2") format("woff2");
 }
 * { box-sizing: border-box; }
-/* The script hides rows and blocks whose own rules set a display */
+/* The script hides blocks whose own rules set a display */
 [hidden] { display: none !important; }
 html {
     background: var(--bg);
@@ -169,6 +168,7 @@ body {
 a { color: inherit; text-decoration: none; }
 ::selection { background: var(--accent); color: var(--accent-ink); }
 button { font: inherit; color: inherit; border-radius: 0; }
+p { margin: 0; }
 
 /* An inset shadow draws the hairline, so the band stays exactly --nav tall */
 .top { background: var(--bg); box-shadow: inset 0 calc(var(--hairline) * -1) 0 var(--line); }
@@ -205,8 +205,9 @@ button { font: inherit; color: inherit; border-radius: 0; }
 }
 .description {
     margin: 0;
-    font-size: var(--lead-size);
-    line-height: var(--lead-line);
+    color: var(--text-muted);
+    font-size: var(--ui-size);
+    line-height: var(--ui-line);
     font-weight: 400;
     overflow-wrap: anywhere;
 }
@@ -214,8 +215,8 @@ button { font: inherit; color: inherit; border-radius: 0; }
     display: flex;
     flex-wrap: wrap;
     align-items: baseline;
-    gap: 0 var(--space-2);
-    margin: var(--space-2) 0 0;
+    gap: 0 var(--space-3);
+    margin-top: var(--space-1);
 }
 .amount-value {
     font-family: var(--font-head);
@@ -225,42 +226,122 @@ button { font: inherit; color: inherit; border-radius: 0; }
     color: var(--accent-2);
 }
 .amount-unit { color: var(--text-muted); }
-.facts { margin: var(--space-5) 0 0; border-bottom: var(--hairline) solid var(--line); }
-/* Where the id and its button cannot sit beside the label, they wrap under it, right-aligned */
-.facts div {
+.status {
     display: flex;
     flex-wrap: wrap;
-    align-items: center;
     justify-content: space-between;
     gap: 0 var(--space-4);
-    padding: var(--space-2) 0;
-    min-height: calc(var(--row) + var(--hairline));
-    border-top: var(--hairline) solid var(--line);
+    margin-top: var(--space-2);
 }
-.facts dt { flex-shrink: 0; color: var(--text-muted); }
-.facts dd {
+.state[data-state="paid"] { color: var(--accent); }
+.state[data-state="expired"], .state[data-state="refunded"] { color: var(--text-muted); }
+.state[data-state="review"] { color: var(--warn); }
+.time { color: var(--text-muted); }
+.time time { color: var(--text); }
+#deposit-message { margin-top: var(--space-4); }
+#deposit-message:empty { display: none; }
+
+#wallet, #phone { margin-top: var(--space-5); }
+#wallets {
     display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    list-style: none;
+    margin: 0 0 var(--space-3);
+    padding: 0;
+}
+#wallets li.none { color: var(--text-muted); }
+#wallets label {
+    display: inline-flex;
     align-items: center;
     gap: var(--space-2);
-    min-width: 0;
-    margin: 0 0 0 auto;
+    height: var(--chip);
+    padding: 0 var(--space-3);
+    border: var(--hairline) solid var(--line);
+    cursor: pointer;
 }
-/* An id never wraps mid-token; on a screen too narrow for it, it scrolls inside its cell */
-code {
-    min-width: 0;
-    overflow-x: auto;
-    font-family: var(--font-mono);
+#wallets label:hover { background: var(--surface-hover); }
+#wallets label:has(input:checked) { border-color: var(--accent); }
+#wallets label:has(input:focus-visible) { outline: var(--ring) solid var(--accent); outline-offset: var(--ring); }
+/* The radio stays in the page for keyboards and screen readers; the chip's border shows the choice */
+#wallets input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+#wallets img, .button img { display: block; width: var(--wallet-icon); height: var(--wallet-icon); }
+.button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    width: 100%;
+    height: var(--control);
+    padding: 0 var(--space-4);
+    border: 0;
+    background: var(--accent);
+    color: var(--accent-ink);
+    font-weight: 600;
+    cursor: pointer;
+}
+.button.outline {
+    border: var(--hairline) solid var(--line);
+    background: var(--bg);
+    color: var(--text);
+}
+.button.outline:not(:disabled):hover { background: var(--surface-hover); }
+/* After .button.outline, whose specificity it shares, so a disabled outline button looks it */
+.button:disabled { background: var(--surface); color: var(--text-muted); cursor: default; }
+#message { margin-top: var(--space-3); }
+#message:empty { display: none; }
+.mobile-links { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2); }
+
+.or {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    margin-top: var(--space-5);
+    color: var(--text-muted);
+    font-size: var(--fine-size);
+    line-height: var(--fine-line);
+}
+.or::before, .or::after { content: ""; flex: 1; border-top: var(--hairline) solid var(--line); }
+
+#deposit { margin-top: var(--space-5); }
+h2 {
+    margin: 0 0 var(--space-4);
     font-size: var(--ui-size);
-    white-space: nowrap;
+    line-height: var(--ui-line);
+    font-weight: 600;
+}
+.send { display: flex; gap: var(--space-5); align-items: flex-start; }
+.qr { flex-shrink: 0; margin: 0; }
+.qr img { display: block; width: var(--qr); height: var(--qr); background: var(--qr-paper); }
+.pairs { flex: 1; min-width: 0; margin: 0; }
+.pairs div + div { margin-top: var(--space-4); }
+.pairs dt { color: var(--text-muted); font-size: var(--fine-size); line-height: var(--fine-line); }
+.pairs dd {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin: var(--space-1) 0 0;
 }
 /* A payment address is read and compared by eye, so it wraps instead of hiding its end */
-#deposit dd code {
-    white-space: normal;
-    overflow-wrap: anywhere;
-    overflow-x: visible;
+code {
+    min-width: 0;
+    font-family: var(--font-mono);
     font-size: var(--fine-size);
+    line-height: var(--ui-line);
+    overflow-wrap: anywhere;
 }
-#deposit .qr { margin-top: var(--space-4); }
+/* Centred on the capitals of the text beside it, measured from the baseline, so every engine agrees */
+.usdc {
+    width: var(--usdc-icon);
+    height: var(--usdc-icon);
+    flex-shrink: 0;
+    vertical-align: -0.3em;
+    vertical-align: calc((1cap - var(--usdc-icon)) / 2);
+}
+.with-usdc .usdc { margin-right: var(--space-2); }
+.note { margin-top: var(--space-4); color: var(--text-muted); }
+#wallet-note { margin-top: var(--space-3); color: var(--text-muted); }
 .copy {
     display: grid;
     flex-shrink: 0;
@@ -280,80 +361,20 @@ code {
 .copy[data-copied] span + span { visibility: visible; }
 .copy[data-copied] { color: var(--accent); }
 .copy:hover { color: var(--text); }
-.state[data-state="expired"] { color: var(--text-muted); }
-.state[data-state="review"] { color: var(--warn); }
 
-h2 {
-    margin: var(--space-6) 0 var(--space-3);
-    font-size: var(--ui-size);
-    line-height: var(--ui-line);
-    font-weight: 600;
-}
-#wallets { list-style: none; margin: 0; padding: 0; border-top: var(--hairline) solid var(--line); }
-#wallets li {
+.order {
     display: flex;
     align-items: center;
-    min-height: calc(var(--wallet-row) + var(--hairline));
-    padding: calc((var(--wallet-row) - var(--ui-line)) / 2) 0;
-    border-bottom: var(--hairline) solid var(--line);
-    color: var(--text-muted);
-}
-#wallets li.wallet { padding: 0; }
-#wallets label {
-    display: flex;
-    flex: 1;
-    align-items: center;
+    justify-content: space-between;
     gap: var(--space-3);
-    min-height: var(--wallet-row);
-    color: var(--text);
-    cursor: pointer;
+    margin-top: var(--space-5);
+    padding-top: var(--space-4);
+    border-top: var(--hairline) solid var(--line);
+    color: var(--text-muted);
+    font-size: var(--fine-size);
+    line-height: var(--fine-line);
 }
-#wallets input { margin: 0; accent-color: var(--accent); }
-#wallets img { display: block; width: var(--wallet-icon); height: var(--wallet-icon); }
-.button {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 100%;
-    height: var(--control);
-    padding: 0 var(--space-4);
-    border: 0;
-    background: var(--accent);
-    color: var(--accent-ink);
-    font-weight: 600;
-    cursor: pointer;
-}
-#pay-button { margin-top: var(--space-5); }
-.button.outline {
-    border: var(--hairline) solid var(--line);
-    background: var(--bg);
-    color: var(--text);
-}
-.button.outline:not(:disabled):hover { background: var(--surface-hover); }
-/* After .button.outline, whose specificity it shares, so a disabled outline button looks it */
-.button:disabled { background: var(--surface); color: var(--text-muted); cursor: default; }
-#message { min-height: var(--ui-line); margin: var(--space-3) 0 0; }
-.mobile-links {
-    display: none;
-    flex-direction: column;
-    gap: var(--space-2);
-    margin-bottom: var(--space-5);
-}
-.qr { margin: 0; }
-.qr svg { display: block; width: var(--qr); height: var(--qr); background: var(--qr-paper); }
-.qr img { display: block; width: var(--qr); height: var(--qr); background: var(--qr-paper); }
-/* Centred on the capitals of the text beside it, measured from the baseline, so every engine agrees */
-.usdc {
-    width: var(--usdc-icon);
-    height: var(--usdc-icon);
-    flex-shrink: 0;
-    vertical-align: -0.3em;
-    vertical-align: calc((1cap - var(--usdc-icon)) / 2);
-}
-.with-usdc .usdc { margin-right: var(--space-2); }
-.note { margin: var(--space-3) 0 0; color: var(--text-muted); }
-#deposit-message, #wallet-note { min-height: var(--ui-line); margin: var(--space-3) 0 0; }
-.qr figcaption { margin-top: var(--space-3); color: var(--text-muted); }
+.order span { display: flex; align-items: baseline; gap: var(--space-2); min-width: 0; }
 
 .foot {
     display: flex;
@@ -367,14 +388,19 @@ h2 {
 }
 .foot a:hover { color: var(--text); }
 
+/* A phone cannot scan its own screen */
+@media (hover: none) and (pointer: coarse) {
+    .qr { display: none; }
+}
 @media (max-width: 720px) {
     /* The website's phone inset, so the logo, the box's content and the footer share one edge */
     :root { --box-pad: var(--pad); }
-    code { font-size: var(--fine-size); }
     .box, .foot { width: 100%; max-width: none; }
-    .box { padding: var(--space-5) var(--box-pad); border-inline: 0; border-top: 0; }
+    .box { padding: var(--space-5) var(--box-pad); border: 0; }
     .foot { padding: 0 var(--box-pad); }
-    .mobile-links { display: flex; }
+}
+@media (max-width: 400px) {
+    .send { flex-direction: column; }
 }
 `;
 
@@ -419,7 +445,7 @@ ${FOOTER}
 const MESSAGE = '<p id="message" role="status" aria-live="polite"></p>';
 const SCRIPT = '<script type="module" src="/checkout.js"></script>';
 const NOSCRIPT =
-    "<noscript><p>This page needs JavaScript to show live status. You can still send to the address above.</p></noscript>";
+    '<noscript><p class="note">This page needs JavaScript to show live status. You can still send to the address above.</p></noscript>';
 const COPY_LABELS = "<span>Copy</span><span>Copied</span>";
 
 function copyButton(value: string, id?: string): string {
@@ -427,10 +453,27 @@ function copyButton(value: string, id?: string): string {
     return `<button${idAttr} class="copy" type="button" data-copy="${escapeHtml(value)}">${COPY_LABELS}</button>`;
 }
 
-// mm:ss until the deadline, which the script keeps counting down
+// m:ss until the deadline, which the script keeps counting down
 function timeLeft(expiresAt: Date, now: Date): string {
     const s = Math.max(0, Math.floor((expiresAt.getTime() - now.getTime()) / 1000));
-    return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+// The script shows the wallet sections once it knows which wallets the browser has
+function walletSections(v: CheckoutView): string {
+    const links = walletLinks(v.pageUrl, v.origin);
+    return `<section id="wallet" hidden>
+<ul id="wallets" hidden></ul>
+<button id="pay-button" class="button" type="button" disabled>Pay</button>
+<p id="wallet-note" role="status" hidden></p>
+${MESSAGE}
+</section>
+<section id="phone" hidden>
+<div class="mobile-links">
+<a class="button outline" href="${escapeHtml(links.phantom)}">Open in Phantom</a>
+<a class="button outline" href="${escapeHtml(links.solflare)}">Open in Solflare</a>
+</div>
+</section>`;
 }
 
 function depositSection(v: CheckoutView, deposit: DepositView): string {
@@ -441,44 +484,21 @@ function depositSection(v: CheckoutView, deposit: DepositView): string {
     const qrLoading = deposit.remainingMicros > 0 ? "" : ' loading="lazy"';
     // Money sent while the deposit is in review cannot pay the order until an operator looks
     const askHidden = deposit.status === "review" ? " hidden" : "";
-    return `<section id="deposit">
+    return `<p id="or" class="or" hidden>or</p>
+<section id="deposit">
 <div id="deposit-ask"${askHidden}>
-<h2>Send USDC to this address</h2>
-<dl class="facts">
-<div><dt>Amount</dt><dd><span class="with-usdc">${USDC_ICON}<span id="deposit-amount">${ask.plain} USDC</span></span> ${copyButton(ask.plain, "deposit-amount-copy")}</dd></div>
-<div><dt>Network</dt><dd>Solana</dd></div>
-<div><dt>Address</dt><dd><code>${escapeHtml(deposit.address)}</code> ${copyButton(deposit.address)}</dd></div>
-</dl>
+<h2>Send USDC on Solana</h2>
+<div class="send">
 <figure class="qr"${qrHidden}>
 <img src="/o/${id}/qr.svg?r=${deposit.remainingMicros}" data-remaining="${deposit.remainingMicros}"${qrLoading} alt="${ask.alt}">
-<figcaption>${ask.caption}</figcaption>
 </figure>
-<p class="note">Send only USDC on Solana.</p>
+<dl class="pairs">
+<div><dt>Amount</dt><dd><span class="with-usdc">${USDC_ICON}<span id="deposit-amount">${ask.plain} USDC</span></span> ${copyButton(ask.plain, "deposit-amount-copy")}</dd></div>
+<div><dt>Address</dt><dd><code>${escapeHtml(deposit.address)}</code> ${copyButton(deposit.address)}</dd></div>
+</dl>
+</div>
 <p id="exchange-note" class="note">${ask.exchange}</p>
 </div>
-<p id="deposit-message" role="status" aria-live="polite"></p>
-</section>`;
-}
-
-async function paySections(v: CheckoutView, amount: string, withDeposit: boolean): Promise<string> {
-    const links = walletLinks(v.pageUrl, v.origin);
-    return `<section id="wallet">
-<h2>${withDeposit ? "Or pay with a browser wallet" : "Pay with a browser wallet"}</h2>
-<ul id="wallets"><li>Looking for wallets</li></ul>
-<button id="pay-button" class="button outline" type="button" disabled>Pay ${amount}</button>
-<p id="wallet-note" role="status" hidden></p>
-${MESSAGE}
-</section>
-<section id="phone">
-<h2>Or pay in a phone wallet</h2>
-<div class="mobile-links">
-<a class="button outline" href="${escapeHtml(links.phantom)}">Open in Phantom</a>
-<a class="button outline" href="${escapeHtml(links.solflare)}">Open in Solflare</a>
-</div>
-<figure class="qr">
-${await qrSvg(links.phantom)}
-<figcaption>Scan with your phone to open this page in Phantom</figcaption>
-</figure>
 </section>`;
 }
 
@@ -495,41 +515,33 @@ export async function renderCheckout(v: CheckoutView): Promise<string> {
     const amount = amountLabel(v.amountMicros);
     const id = escapeHtml(v.orderId);
     const expires = v.expiresAt.toISOString();
-    let tail: string;
-    if (v.state === "unpaid") {
+    const unpaid = v.state === "unpaid";
+    let methods = "";
+    if (unpaid) {
         const dep = v.depositsOffered ? v.deposit : null;
         // P4 points at the address, so it comes only with the section that shows one
-        tail =
+        methods =
             dep !== null
-                ? `${depositSection(v, dep)}\n${await paySections(v, amount, true)}\n${NOSCRIPT}`
-                : `<p id="deposit-message" class="note" role="status">Paying by address is off right now. Pay with a browser wallet below, or reload this page later.</p>
-${await paySections(v, amount, false)}`;
-    } else {
-        tail = `<p id="deposit-message" role="status" aria-live="polite">${closedLine(v)}</p>${
-            v.state === "settling" ? `\n${MESSAGE}` : ""
-        }`;
+                ? `${walletSections(v)}\n${depositSection(v, dep)}\n${NOSCRIPT}`
+                : walletSections(v);
+    } else if (v.state === "settling") {
+        methods = MESSAGE;
     }
+    const time = unpaid
+        ? `<span class="time"><time id="time-left" datetime="${expires}">${timeLeft(v.expiresAt, v.now)}</time> left</span>`
+        : "";
     return page(
         `Pay ${amount} to Bugnet`,
         `<main id="checkout" class="box" data-order-id="${id}" data-state="${v.state}" data-amount="${amount}" data-amount-micros="${v.amountMicros}" data-expires-at="${expires}" data-now="${v.now.toISOString()}" data-kind="${v.kind}" data-refund-min-micros="${v.refundMinMicros}" data-settle-grace-ms="${v.settleGraceMs}">
 <h1 class="description">${escapeHtml(v.description)}</h1>
 <p class="amount">
 <span class="amount-value">${amount}</span>
-<span class="amount-unit">${USDC_ICON} USDC on Solana</span>
+<span class="amount-unit with-usdc">${USDC_ICON}USDC</span>
 </p>
-<dl class="facts">
-<div><dt>Order</dt><dd><code>${id}</code>
-${copyButton(v.orderId)}
-</dd></div>
-<div><dt>Status</dt>
-<dd id="state" class="state" data-state="${v.state}">${STATE_LABELS[v.state]}</dd></div>
-${
-    v.state === "unpaid"
-        ? `<div><dt>Time left</dt><dd><time id="time-left" datetime="${expires}">${timeLeft(v.expiresAt, v.now)}</time> <span id="until"></span></dd></div>`
-        : ""
-}
-</dl>
-${tail}
+<p class="status"><span id="state" class="state" data-state="${v.state}">${STATE_LABELS[v.state]}</span>${time}</p>
+<p id="deposit-message" role="status" aria-live="polite">${unpaid ? "" : closedLine(v)}</p>
+${methods}
+<p class="order"><span>Order <code>${id}</code></span>${copyButton(v.orderId)}</p>
 </main>
 ${SCRIPT}`,
     );

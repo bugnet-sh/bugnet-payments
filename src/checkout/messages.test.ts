@@ -67,9 +67,8 @@ const line = (d: Partial<DepositView>, state?: StatusView["state"]) =>
 describe("deposit lines", () => {
     it("waiting, partial and confirming", () => {
         expect(line({})).toEqual({
-            label: "Waiting for your transfer",
-            message:
-                "Send 0.05 USDC to the address above by 14:05. This page updates when it arrives.",
+            label: "Awaiting payment",
+            message: "",
             extra: [],
         });
         expect(
@@ -88,16 +87,12 @@ describe("deposit lines", () => {
         expect(depositAsk(50_000, { remainingMicros: 50_000 })).toEqual({
             plain: "0.05",
             alt: "Solana Pay code for 0.05 USDC",
-            caption: "Scan with a Solana wallet app to send 0.05 USDC",
-            exchange:
-                "From an exchange, send exactly 0.05 USDC. Anything returned goes back to the sending address, which an exchange may not credit to you.",
+            exchange: "From an exchange, send exactly 0.05 USDC.",
         });
         expect(depositAsk(50_000, { remainingMicros: 20_000 })).toEqual({
             plain: "0.02",
             alt: "Solana Pay code for 0.02 USDC",
-            caption: "Scan with a Solana wallet app to send 0.02 USDC",
-            exchange:
-                "From an exchange, send exactly 0.02 USDC. Anything returned goes back to the sending address, which an exchange may not credit to you.",
+            exchange: "From an exchange, send exactly 0.02 USDC.",
         });
         // Covered only with a held wallet's money: another wallet still pays the price (M24)
         expect(depositAsk(50_000, { remainingMicros: 0 }).plain).toBe("0.05");
@@ -123,7 +118,7 @@ describe("deposit lines", () => {
             line({ status: "paid", receivedMicros: 50_000, remainingMicros: 0 }, "paid"),
         ).toEqual({
             label: "Paid",
-            message: "Paid. Go back to your agent; it continues on its own.",
+            message: "Go back to your agent. It continues on its own.",
             extra: [],
         });
     });
@@ -204,7 +199,7 @@ describe("deposit lines", () => {
                 { status: "paid", reason: "extra", extraMicros: 2_000, returningMicros: 2_000 },
                 "paid",
             ).message,
-        ).toBe("Paid. The extra $0.002 is being returned to the address that sent it.");
+        ).toBe("The extra $0.002 is being returned to the address that sent it.");
     });
 
     it("a wallet-paid order reads Paid while stray deposit money goes back (M6)", () => {
@@ -216,14 +211,14 @@ describe("deposit lines", () => {
 
     it("paid, expired, refunding, review, checking and kept", () => {
         expect(line({ status: "paid" }, "paid").message).toBe(
-            "Paid. Go back to your agent; it continues on its own.",
+            "Go back to your agent. It continues on its own.",
         );
         expect(
             line({ status: "paid", extraMicros: 10_000, returningMicros: 10_000 }, "paid").message,
-        ).toBe("Paid. The extra $0.01 is being returned to the address that sent it.");
+        ).toBe("The extra $0.01 is being returned to the address that sent it.");
         expect(
             line({ status: "paid", extraMicros: 10_000, returnedMicros: 10_000 }, "paid").message,
-        ).toBe("Paid. The extra $0.01 was returned to the address that sent it.");
+        ).toBe("The extra $0.01 was returned to the address that sent it.");
         expect(line({ status: "expired" }, "expired").message).toBe(
             "This order expired at 14:05 and nothing was charged. Ask your agent for a new payment link.",
         );
@@ -328,10 +323,10 @@ describe("wallet messages", () => {
             "You declined in Phantom. Nothing was charged. Press Pay to try again.",
         );
         expect(walletMessage(e(-32603), { ...C, haveMicros: 0 }).message).toBe(
-            "Your Phantom account holds $0.00 USDC on Solana and this order needs $0.05. Nothing was charged. Add USDC, pick another account, or send to the address above.",
+            "Your Phantom account holds $0.00 USDC on Solana and this order needs $0.05. Nothing was charged. Add USDC, pick another account, or send to the address below.",
         );
         expect(walletMessage(e(-32603), { ...C, haveMicros: 60_000 }).message).toBe(
-            "Phantom could not prepare the payment. Nothing was charged. Press Pay to try again, or send to the address above.",
+            "Phantom could not prepare the payment. Nothing was charged. Press Pay to try again, or send to the address below.",
         );
         expect(walletMessage(e(4100), C).message).toBe(
             "Phantom has not allowed this page. Unlock Phantom, approve the connection, then press Pay.",
@@ -344,7 +339,7 @@ describe("wallet messages", () => {
         );
         for (const code of [-32000, -32003]) {
             expect(walletMessage(e(code), C).message).toBe(
-                "Phantom refused this payment. Nothing was charged. Send to the address above instead.",
+                "Phantom refused this payment. Nothing was charged. Send to the address below instead.",
             );
         }
     });
@@ -352,7 +347,6 @@ describe("wallet messages", () => {
     it("a page without an address never points at one (M3)", () => {
         const N = { ...C, hasAddress: false };
         const NW = { ...W, hasAddress: false };
-        expect(PAGE_TEXT.noWallet(false)).toBe("No browser wallet found.");
         expect(walletMessage(e(-32603), { ...N, haveMicros: 0 }).message).toBe(
             "Your Phantom account holds $0.00 USDC on Solana and this order needs $0.05. Nothing was charged. Add USDC or pick another account.",
         );
@@ -387,9 +381,7 @@ describe("wallet messages", () => {
     });
 
     it("page-made messages", () => {
-        expect(PAGE_TEXT.noWallet(true)).toBe(
-            "No browser wallet found. Send to the address above instead.",
-        );
+        expect(PAGE_TEXT.noWallet).toBe("No browser wallet found.");
         expect(PAGE_TEXT.connecting("Phantom")).toBe("Approve the connection in Phantom.");
         expect(PAGE_TEXT.signing("Phantom")).toBe("Approve the payment in Phantom.");
         expect(PAGE_TEXT.copyFailed).toBe("Copy failed. Select the text and copy it by hand.");
@@ -412,7 +404,7 @@ describe("wallet messages", () => {
         expect(bare("refunded").message).toBe(
             "This order's payment was returned to the wallet that paid.",
         );
-        expect(bare("paid").message).toBe("Paid. Go back to your agent; it continues on its own.");
+        expect(bare("paid").message).toBe("Go back to your agent. It continues on its own.");
         expect(bare("expired").message).toBe(
             "This order expired at 14:05 and nothing was charged. Ask your agent for a new payment link.",
         );
@@ -426,7 +418,7 @@ describe("wallet messages", () => {
             "Phantom shared no Solana account. Unlock it, pick an account, then press Pay.",
         );
         const unreadable =
-            "This page could not read Bugnet's payment request. Nothing was charged. Reload the page, or send to the address above.";
+            "This page could not read Bugnet's payment request. Nothing was charged. Reload the page, or send to the address below.";
         expect(errorStep(new Error(UNREADABLE_CHALLENGE), W).message).toBe(unreadable);
         expect(errorStep(new Error(NO_OPTION), W).message).toBe(unreadable);
         expect(errorStep(new Error(BUILD_FAILED), W).message).toBe(unreadable);
@@ -502,7 +494,7 @@ describe("refusal messages", () => {
                 W,
             ).message,
         ).toBe(
-            "Bugnet could not accept the transaction Phantom signed. Nothing was charged. Press Pay to try again, or send to the address above.",
+            "Bugnet could not accept the transaction Phantom signed. Nothing was charged. Press Pay to try again, or send to the address below.",
         );
         expect(
             pageStep(
@@ -513,7 +505,7 @@ describe("refusal messages", () => {
                 W,
             ).message,
         ).toBe(
-            "Solana refused the payment, most often because the account holds less than $0.05 USDC. Nothing was charged. Add USDC, or send to the address above.",
+            "Solana refused the payment, most often because the account holds less than $0.05 USDC. Nothing was charged. Add USDC, or send to the address below.",
         );
         expect(pageStep({ refused: "order_closed", code: "allowance_ceiling" }, W).message).toBe(
             "Paid, but this sandbox already holds the most allowance Bugnet allows. The $0.05 is being returned to the paying wallet.",
@@ -557,7 +549,7 @@ describe("refusal messages", () => {
             "Bugnet refused the payment (something_new). Nothing was charged. Press Pay to try again, or write to support@bugnet.org.",
         );
         expect(pageStep({ short: { haveMicros: 0, needMicros: 50_000 } }, W).message).toBe(
-            "Your Phantom account holds $0.00 USDC on Solana and this order needs $0.05. Nothing was charged. Add USDC, pick another account, or send to the address above.",
+            "Your Phantom account holds $0.00 USDC on Solana and this order needs $0.05. Nothing was charged. Add USDC, pick another account, or send to the address below.",
         );
     });
 });

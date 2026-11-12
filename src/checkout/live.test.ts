@@ -139,7 +139,7 @@ describe("live status", () => {
         expect(showWalletOptions(view("paid"))).toBe(false);
         expect(walletNote(view("unpaid", {}), C)).toBeNull();
         const w35 =
-            "Money already arrived at the address above. A wallet payment charges the full $0.05, and that money then goes back to the wallet that sent it.";
+            "Money already arrived at the address below. Paying by wallet charges the full $0.05 and sends that money back.";
         expect(walletNote(view("unpaid", { receivedMicros: 1 }), C)).toBe(w35);
         expect(walletNote(view("unpaid", { otherMicros: 1 }), C)).toBe(w35);
     });
