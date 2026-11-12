@@ -116,7 +116,8 @@ const STYLE = `
     --amount-size: 40px;
     --amount-line: 48px;
     --control: 44px;
-    --field: 40px;
+    --field: 48px;
+    --address-line: 18px;
     --copy-button: 32px;
     --copy-icon: 16px;
     --wallet-icon: 20px;
@@ -243,7 +244,7 @@ p { margin: 0; }
 .time time { color: var(--text); }
 #deposit-message { margin-top: var(--space-4); }
 /* An empty live region stays in the page, so its first line is announced */
-#deposit-message:empty, #message:empty, #copy-message:empty { margin: 0; }
+#deposit-message:empty, #message:empty, #copy-message:empty, #wallet-note:empty { margin: 0; }
 
 #deposit, #wallet, #phone { margin-top: var(--space-5); }
 /* The code and the two fields beside it share one height and one top and bottom edge */
@@ -263,7 +264,7 @@ p { margin: 0; }
     display: flex;
     align-items: center;
     gap: var(--space-2);
-    height: var(--field);
+    min-height: var(--field);
     margin-top: var(--space-1);
     padding: 0 var(--space-1) 0 var(--space-3);
     border: var(--hairline) solid var(--line);
@@ -272,15 +273,15 @@ p { margin: 0; }
 }
 .field:hover { background: var(--surface-hover); }
 .value { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* In the page, out of sight */
-.full {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
+/* An address is compared by eye, so it shows whole and wraps inside its field */
+.value.address {
+    padding-block: calc((var(--field) - 2 * var(--address-line)) / 2 - var(--hairline));
+    overflow: visible;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    line-height: var(--address-line);
 }
+.note { margin-top: var(--space-4); color: var(--text-muted); }
 .unit { color: var(--text-muted); }
 .usdc { display: block; flex: none; width: var(--usdc-icon); height: var(--usdc-icon); }
 .copy {
@@ -339,6 +340,7 @@ p { margin: 0; }
 #wallets { display: grid; gap: var(--space-2); margin-top: var(--space-2); }
 #wallets:empty { margin: 0; }
 #message { margin-top: var(--space-3); }
+#wallet-note { margin-top: var(--space-3); color: var(--text-muted); }
 #copy-message { margin-top: var(--space-3); color: var(--text-muted); }
 /* The app links open this page in a wallet app on the same device, so only touch screens get them */
 .mobile-links { display: none; grid-template-columns: 1fr 1fr; gap: var(--space-2); }
@@ -463,6 +465,7 @@ async function walletSections(v: CheckoutView, phoneShown: boolean): Promise<str
     return `<section id="wallet" hidden>
 <button id="pay-button" class="button" type="button" disabled>Pay</button>
 <div id="wallets"></div>
+<p id="wallet-note" role="status" aria-live="polite"></p>
 ${MESSAGE}
 </section>
 <section id="phone"${hidden}>
@@ -477,14 +480,9 @@ ${await qrSvg(links.phantom)}
 </section>`;
 }
 
-const ADDRESS_ENDS = 8;
-
 function depositSection(v: CheckoutView, deposit: DepositView): string {
     const ask = depositAsk(v.amountMicros, deposit);
     const id = escapeHtml(v.orderId);
-    // Shown as its start and end, the parts people compare, as wallets show addresses; the whole
-    // address stays in the page for screen readers and to select by hand
-    const short = `${deposit.address.slice(0, ADDRESS_ENDS)}\u2026${deposit.address.slice(-ADDRESS_ENDS)}`;
     // With the price covered the QR route answers 404, so the code waits hidden, unloaded
     const qrHidden = deposit.remainingMicros > 0 ? "" : " hidden";
     const qrLoading = deposit.remainingMicros > 0 ? "" : ' loading="lazy"';
@@ -500,7 +498,7 @@ function depositSection(v: CheckoutView, deposit: DepositView): string {
 </div>
 <div class="pair">
 <span class="label">Solana address</span>
-<div class="field"><span class="value" aria-hidden="true">${escapeHtml(short)}</span><span class="full">${escapeHtml(deposit.address)}</span>${copyButton(deposit.address, "Copy address")}</div>
+<div class="field"><span class="value address">${escapeHtml(deposit.address)}</span>${copyButton(deposit.address, "Copy address")}</div>
 </div>
 </div>
 </div>
@@ -509,6 +507,13 @@ function depositSection(v: CheckoutView, deposit: DepositView): string {
 
 // A deposit in review reads as review before the script runs, and without it
 const inReview = (dep: DepositView | null) => dep?.status === "review";
+
+// The label the script would give, so the first paint and a page without the script agree
+function stateLabel(state: PublicState, dep: DepositView | null): string {
+    if (inReview(dep)) return STATE_LABELS.review;
+    if (dep !== null && confirmingInFull(dep)) return STATE_LABELS.settling;
+    return STATE_LABELS[state];
+}
 
 // The page-level line under the status (spec 15.6, M18, M20, P2 and P3)
 function firstLine(v: CheckoutView, dep: DepositView | null): string {
@@ -557,10 +562,10 @@ ${await walletSections(v, inReview(dep))}${askHidden === "" ? `\n${NOSCRIPT}` : 
         : "";
     return page(
         `Pay ${amount} to Bugnet`,
-        `<main id="checkout" class="box" data-order-id="${id}" data-state="${v.state}" data-amount="${amount}" data-amount-micros="${v.amountMicros}" data-expires-at="${expires}" data-now="${v.now.toISOString()}" data-kind="${v.kind}" data-refund-min-micros="${v.refundMinMicros}" data-settle-grace-ms="${v.settleGraceMs}">
+        `<main id="checkout" class="box" data-order-id="${id}" data-state="${v.state}" data-amount="${amount}" data-amount-micros="${v.amountMicros}" data-expires-at="${expires}" data-now="${v.now.toISOString()}" data-kind="${v.kind}" data-refund-min-micros="${v.refundMinMicros}" data-settle-grace-ms="${v.settleGraceMs}" data-takes-money="${unpaid && !confirming}">
 <h1 class="description">${escapeHtml(v.description)}</h1>
 <p class="amount"><span class="amount-value">${amount}</span></p>
-<p class="status"><span id="state" class="state" data-state="${v.state}" role="status" aria-live="polite">${inReview(dep) ? STATE_LABELS.review : STATE_LABELS[v.state]}</span>${time}</p>
+<p class="status"><span id="state" class="state" data-state="${v.state}" role="status" aria-live="polite">${stateLabel(v.state, dep)}</span>${time}</p>
 <p id="deposit-message" role="status" aria-live="polite">${firstLine(v, dep)}</p>
 ${methods}
 <div class="order"><span>Order</span><span class="value">${id}</span>${copyButton(v.orderId, "Copy order ID")}</div>

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { DepositView } from "../deposits/types.ts";
 import {
     arrangement,
+    arrivedMicros,
     confirmingInFull,
     fetchStatus,
     keepPolling,
@@ -226,9 +227,20 @@ describe("which ways to pay show", () => {
         }
     });
 
-    it("each wallet's button names it", () => {
+    it("each wallet's button names it, and the whole price once money already arrived", () => {
         expect(payLabel(undefined)).toBe("Pay");
         expect(payLabel("Phantom")).toBe("Pay with Phantom");
+        expect(payLabel("Phantom", "$0.08")).toBe("Pay $0.08 with Phantom");
+    });
+
+    it("money at the address counts only while the address shows", () => {
+        expect(arrivedMicros(view("unpaid", {}))).toBe(0);
+        expect(arrivedMicros(view("unpaid", { receivedMicros: 20_000, otherMicros: 5_000 }))).toBe(
+            25_000,
+        );
+        // In review that money waits for a person, and is not returned on its own
+        expect(arrivedMicros(view("unpaid", { status: "review", receivedMicros: 20_000 }))).toBe(0);
+        expect(arrivedMicros(view("paid", { receivedMicros: 50_000 }))).toBe(0);
     });
 });
 

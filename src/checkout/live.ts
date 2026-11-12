@@ -178,6 +178,15 @@ export function arrangement(o: {
     return { wallet, phone, phoneLinks, phoneQr, or: o.address && (wallet || phone) };
 }
 
-// Each found wallet gets a button that names it
-export const payLabel = (wallet: string | undefined): string =>
-    wallet === undefined ? "Pay" : `Pay with ${wallet}`;
+// Each found wallet gets a button that names it. Once money already sits at the address the
+// button names the whole price too, since a wallet payment charges all of it (decision 6.14)
+export function payLabel(wallet: string | undefined, price?: string): string {
+    if (wallet === undefined) return "Pay";
+    return price === undefined ? `Pay with ${wallet}` : `Pay ${price} with ${wallet}`;
+}
+
+// Money that already reached the address, which a wallet payment sends back (W35)
+export function arrivedMicros(v: StatusView): number {
+    if (!showDepositAsk(v) || v.deposit === null) return 0;
+    return v.deposit.receivedMicros + v.deposit.otherMicros;
+}

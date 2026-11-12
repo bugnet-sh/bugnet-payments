@@ -22,6 +22,7 @@ import {
     keepPolling,
     needsReload,
     payLabel,
+    arrivedMicros,
     parseStatus,
     pollDelay,
     showDepositAsk,
@@ -174,6 +175,10 @@ function startPayment(p: Page): WalletSection {
         }, ms);
     };
 
+    // Money that already reached the address, which a wallet payment sends back
+    let arrived = 0;
+    const note = p.root.querySelector<HTMLElement>("#wallet-note");
+
     const label = (b: HTMLButtonElement, w: Wallet | undefined) => {
         if (w === undefined) {
             b.textContent = payLabel(undefined);
@@ -182,7 +187,17 @@ function startPayment(p: Page): WalletSection {
         const icon = document.createElement("img");
         icon.src = w.icon;
         icon.alt = "";
-        b.replaceChildren(icon, payLabel(w.name));
+        const price = arrived > 0 ? (p.root.dataset.amount ?? undefined) : undefined;
+        b.replaceChildren(icon, payLabel(w.name, price));
+    };
+
+    const relabel = () => {
+        label(button, found[0]);
+        others.querySelectorAll<HTMLButtonElement>("button").forEach((b, i) => {
+            label(b, found[i + 1]);
+        });
+        const text = arrived > 0 ? PAGE_TEXT.arrived(arrived) : "";
+        if (note !== null && note.textContent !== text) note.textContent = text;
     };
 
     // The first wallet found pays from the green button, every other from one of its own
@@ -269,6 +284,11 @@ function startPayment(p: Page): WalletSection {
     render();
     return {
         seen(v) {
+            const now = arrivedMicros(v);
+            if (now !== arrived) {
+                arrived = now;
+                relabel();
+            }
             if (watch === null || busy) return;
             const next = watchWallet(watch, v.state, Date.now());
             if (next !== "unpaid") {
@@ -495,7 +515,8 @@ if (root !== null) {
             orderId: root.dataset.orderId ?? "",
             hasAddress: root.querySelector("#deposit-ask:not([hidden])") !== null,
         },
-        takesMoney: root.dataset.state === "unpaid",
+        // Never offers a way to pay the server left out, until a status answer says so
+        takesMoney: root.dataset.takesMoney === "true",
         walletsFound: 0,
     };
     for (const button of root.querySelectorAll<HTMLButtonElement>("button[data-copy]")) {

@@ -384,6 +384,7 @@ describe("wallet messages", () => {
 
     it("page-made messages", () => {
         expect(PAGE_TEXT.addressOff).toBe("Paying by address is off right now.");
+        expect(PAGE_TEXT.arrived(30_000)).toBe("The $0.03 already sent is then returned.");
         expect(PAGE_TEXT.connecting("Phantom")).toBe("Approve the connection in Phantom.");
         expect(PAGE_TEXT.signing("Phantom")).toBe("Approve the payment in Phantom.");
         expect(PAGE_TEXT.copyFailed).toBe("Copy failed. Select the text and copy it by hand.");

@@ -304,6 +304,8 @@ export const PAGE_TEXT = {
     connecting: (wallet: string) => `Approve the connection in ${wallet}.`,
     signing: (wallet: string) => `Approve the payment in ${wallet}.`,
     copyFailed: "Copy failed. Select the text and copy it by hand.",
+    // W35, under a Pay button that names the whole price
+    arrived: (micros: number) => `The ${amountLabel(micros)} already sent is then returned.`,
     unreachable: "Cannot reach Bugnet. This page keeps trying; check your connection.",
     tooMany: (s: number) => `Too many requests from your network. This page tries again in ${s} s.`,
 } as const;

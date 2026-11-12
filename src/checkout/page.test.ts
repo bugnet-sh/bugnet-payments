@@ -437,10 +437,8 @@ describe("address-first page", () => {
         expect(dep).toContain(`data-copy="${ADDRESS}" aria-label="Copy address"`);
         expect(dep).toContain('data-copy="0.05" aria-label="Copy amount"');
         expect(dep).toContain('<span class="label">Solana address</span>');
-        // Shown by its two ends, the whole of it in the page for screen readers and selection
-        expect(dep).toContain(
-            `<span class="value" aria-hidden="true">${ADDRESS.slice(0, 8)}\u2026${ADDRESS.slice(-8)}</span><span class="full">${ADDRESS}</span>`,
-        );
+        // Shown whole, wrapping in its field, since people compare it by eye
+        expect(dep).toContain(`<span class="value address">${ADDRESS}</span>`);
         // Icons, never a Copy word, and no mono text
         expect(html).not.toMatch(/>Copy</);
         expect(html).not.toContain("<code");
@@ -554,6 +552,10 @@ describe("address-first page", () => {
         expect(html).toContain('<section id="phone" hidden>');
         expect(html).toContain('<span class="time" hidden>');
         expect(html).not.toContain("<noscript>");
+        // The script starts with no way to pay, and the label already says Confirming
+        expect(html).toContain('data-takes-money="false"');
+        expect(html).toContain('aria-live="polite">Confirming</span>');
+        expect(await renderCheckout(offered)).toContain('data-takes-money="true"');
     });
 
     it("nothing on the page talks about exchanges", async () => {
@@ -569,7 +571,7 @@ describe("address-first page", () => {
         expect(html).toContain('<p id="copy-message" role="status" aria-live="polite"></p>');
         // Empty live regions stay in the page, so their first line is announced
         expect(html).toContain(
-            "#deposit-message:empty, #message:empty, #copy-message:empty { margin: 0; }",
+            "#deposit-message:empty, #message:empty, #copy-message:empty, #wallet-note:empty { margin: 0; }",
         );
         expect(html).not.toMatch(/:empty \{ display: none/);
         expect(html).toContain('aria-label="Copy order ID"');
@@ -618,6 +620,12 @@ describe("address-first page", () => {
         expect(html).not.toContain(".box { margin-top: 0;");
     });
 
+    it("notes keep their spacing", async () => {
+        expect(await renderCheckout(offered)).toContain(
+            ".note { margin-top: var(--space-4); color: var(--text-muted); }",
+        );
+    });
+
     it("each code is drawn at one size on paper", async () => {
         expect(await renderCheckout(offered)).toContain(
             ".qr img, .qr svg { display: block; width: var(--qr); height: var(--qr); background: var(--qr-paper); }",
@@ -629,6 +637,7 @@ describe("address-first page", () => {
         expect(wallet).toBe(`<section id="wallet" hidden>
 <button id="pay-button" class="button" type="button" disabled>Pay</button>
 <div id="wallets"></div>
+<p id="wallet-note" role="status" aria-live="polite"></p>
 <p id="message" role="status" aria-live="polite"></p>
 `);
     });
