@@ -386,6 +386,12 @@ a rollback to a release older than the one that added the key, remove the key fr
 1b97f3a). Otherwise the older release fails its boot check with `unknown key router.<name>`, after
 `--start` has already stopped the running one.
 
+**Rollback below release 2026-11-12b.** Migration 00007's tables and checks stay and do no harm
+to the older release, which cannot finish a write-off. Roll back only when every
+`pcli deposits list` line whose `lost=` is not 0 shows `state=done`, and
+`pcli deposits show <orderId>` for each of them shows no `write-off part` with `state=pending`,
+`state=signed` or `state=sent`.
+
 **Rollback below the deposits release.** Run `vps-install.sh --deposits off` first, then:
 
 1. `vps-install.sh --deposits remove`. It asks the database through `pcli deposits list` and
@@ -719,7 +725,8 @@ allowance wallet, money already swept, or review money already carried to the re
    rotate.
 3. Read every `deposit_unknown_debit` alarm: it fires on any debit of a deposit account that is not
    one of Payments' own moves. Write each one off with `deposits write-off <orderId> <signature>`
-   (below), oldest first.
+   (below), oldest first, except one whose signature a restore printed for that deposit
+   (section 13).
 4. `vps-install.sh --deposits on` (section 8).
 
 **Alarms.**
@@ -905,8 +912,9 @@ tables and the whole restore fails. In order, it:
    `bugnet_payments_before_<UTC time>`, and the new database `bugnet_payments`. The kept one has no
    `pg_hba.conf` line, so only `postgres` opens it, and no nightly dump includes it;
 6. lists each row of `orders`, `refunds`, `deposits`, `deposit_moves`, `x402_payments` and
-   `x402_cold_transfers` that differs between the two, and the installed release's migrations that
-   the restored database has not run.
+   `x402_cold_transfers` that differs between the two, each write-off the kept database has and the
+   restored one lacks or holds otherwise, and the installed release's migrations that the restored
+   database has not run.
 
 It starts nothing. Then:
 
@@ -932,6 +940,10 @@ It starts nothing. Then:
       database. A `deposits` line ends with `signed after the dump:` and the signatures of its
       moves that the kept database has signed, sent or landed and the restored one lacks, or
       `none`.
+    - `deposit_write_offs`: a debit written off after the dump. Its id is
+      `<orderId> <signature>`, each side its micros, and the line ends with `parts:` and the kept
+      database's parts, each `<transfer> <micros>` with `refund=<id> state=<state>` (that
+      refund's state there), `kept=<reason>` or `pay by hand`.
 4. **Pauses and holds.** Refunds and x402 stay paused until the founder has settled every listed
    row by hand. Then lift only what printed `set by the restore`: refunds paused with
    `pcli refunds resume`, x402 payments paused with `pcli x402 resume`, x402 refunds held with
@@ -942,8 +954,10 @@ It starts nothing. Then:
    made after the dump as a debit that is not Payments' own, raises `deposit_unknown_debit` and
    puts the deposit in review. It is Payments' own move only when the alarm's `signature` is one
    the restore printed after `signed after the dump:` on its `orderId`'s line. Then it is
-   **not a leak**: no leak response (section 12), and **never write it off**, which would pay the
-   senders twice; the deposit stays in review until the founder decides how to bring its rows
-   back. Any other unknown debit gets the leak response.
+   **not a leak**: no leak response (section 12), and the deposit stays in review until the
+   founder decides how to bring its rows back. One whose `signature` is on a `deposit_write_offs`
+   line for its `orderId` is already written off and is settled by hand with the other listed
+   rows. **Never write off** either, which would pay the senders twice. Any other unknown debit
+   gets the leak response.
 6. Once every row is settled, drop the kept database:
    `sudo runuser -u postgres -- dropdb bugnet_payments_before_<UTC time>`.
