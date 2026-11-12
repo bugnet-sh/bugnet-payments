@@ -203,7 +203,7 @@ function startPayment(p: Page, seed: Arrived): WalletSection {
         if (note !== null && note.textContent !== text) note.textContent = text;
     };
 
-    // The first wallet found pays from the green button, every other from one of its own
+    // The first wallet found pays from the Pay button, every other from one of its own
     const render = () => {
         found = wallets.get().filter(usable);
         button.hidden = found.length === 0;
@@ -211,7 +211,7 @@ function startPayment(p: Page, seed: Arrived): WalletSection {
             ...found.slice(1).map((w) => {
                 const b = document.createElement("button");
                 b.type = "button";
-                b.className = "button outline";
+                b.className = "button";
                 b.addEventListener("click", () => {
                     if (!busy && payable) void pay(w);
                 });

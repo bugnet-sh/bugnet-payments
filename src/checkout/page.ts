@@ -171,6 +171,7 @@ body {
     min-height: 100vh;
     min-height: 100dvh;
     gap: var(--space-7);
+    padding-bottom: var(--space-7);
     background: var(--bg);
     font-size: var(--ui-size);
     line-height: var(--ui-line);
@@ -200,17 +201,17 @@ p { margin: 0; }
     font-size: var(--wordmark-size);
     line-height: var(--wordmark-line);
 }
+/* The website header's link style, at the band's far right */
+.legal { display: flex; gap: var(--space-5); margin-left: auto; color: var(--text-muted); }
+.legal a:hover { color: var(--text); }
 
-.box, .foot {
-    width: calc(100% - 2 * var(--pad));
-    max-width: var(--column);
-    margin-inline: auto;
-    /* As flex items of the body they would otherwise never shrink below their widest line */
-    min-width: 0;
-}
 /* Auto margins center the card, and fall to zero when it is taller than the screen */
 .box {
-    margin-block: auto;
+    width: calc(100% - 2 * var(--pad));
+    max-width: var(--column);
+    margin: auto;
+    /* As a flex item of the body it would otherwise never shrink below its widest line */
+    min-width: 0;
     padding: var(--box-pad);
     border: var(--hairline) solid var(--line);
     background: var(--bg);
@@ -323,20 +324,14 @@ p { margin: 0; }
     width: 100%;
     height: var(--control);
     padding: 0 var(--space-4);
-    border: 0;
-    background: var(--accent);
-    color: var(--accent-ink);
+    border: var(--hairline) solid var(--line);
+    background: var(--bg);
+    color: var(--text);
     font-weight: 600;
     cursor: pointer;
 }
 .button img { display: block; flex: none; width: var(--wallet-icon); height: var(--wallet-icon); }
-.button.outline {
-    border: var(--hairline) solid var(--line);
-    background: var(--bg);
-    color: var(--text);
-}
-.button.outline:not(:disabled):hover { background: var(--surface-hover); }
-/* After .button.outline, whose specificity it shares, so a disabled outline button looks it */
+.button:not(:disabled):hover { background: var(--surface-hover); }
 .button:disabled { background: var(--surface); color: var(--text-muted); cursor: default; }
 #wallets { display: grid; gap: var(--space-2); margin-top: var(--space-2); }
 #wallets:empty { margin: 0; }
@@ -360,18 +355,6 @@ p { margin: 0; }
 }
 .order .value { color: var(--text); }
 
-.foot {
-    display: flex;
-    gap: var(--space-5);
-    margin: 0 auto var(--space-7);
-    /* The box's border plus its padding, so the links start on the content's left edge */
-    padding: 0 calc(var(--box-pad) + var(--hairline));
-    color: var(--text-muted);
-    font-size: var(--fine-size);
-    line-height: var(--fine-line);
-}
-.foot a:hover { color: var(--text); }
-
 @media (hover: none) and (pointer: coarse) {
     .mobile-links { display: grid; }
     #phone .qr { margin-top: var(--space-4); }
@@ -381,15 +364,13 @@ p { margin: 0; }
     .qr { display: none !important; }
 }
 @media (max-width: 720px) {
-    /* The website's phone inset, so the logo, the box's content and the footer share one edge */
+    /* The website's phone inset, so the logo, the links and the box's content share their edges */
     :root { --box-pad: var(--pad); }
-    .box, .foot { width: 100%; max-width: none; }
-    .box { padding: var(--space-5) var(--box-pad); border: 0; }
-    .foot { padding: 0 var(--box-pad); }
+    .box { width: 100%; max-width: none; padding: var(--space-5) var(--box-pad); border: 0; }
 }
 /* A short laptop screen keeps the Pay button in view */
 @media (min-width: 721px) and (max-height: 760px) {
-    body { gap: var(--space-5); }
+    body { gap: var(--space-5); padding-bottom: var(--space-5); }
     .box { padding-block: var(--space-5); }
 }
 @media (max-width: 400px) {
@@ -409,12 +390,11 @@ const MARK = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="320 264 608 693" 
 
 const HEADER = `<header class="top"><div class="frame">
 <a class="brand" href="https://bugnet.sh/">${MARK}<span>Bugnet</span></a>
-</div></header>`;
-
-const FOOTER = `<footer class="foot">
+<nav class="legal" aria-label="Legal">
 <a href="https://bugnet.sh/terms/">Terms</a>
 <a href="https://bugnet.sh/privacy/">Privacy</a>
-</footer>`;
+</nav>
+</div></header>`;
 
 function page(title: string, main: string): string {
     return `<!doctype html>
@@ -429,7 +409,6 @@ ${PRELOAD}
 <body>
 ${HEADER}
 ${main}
-${FOOTER}
 </body>
 </html>
 `;
@@ -457,7 +436,7 @@ function timeLeft(expiresAt: Date, now: Date): string {
 }
 
 // The script shows the wallet once it knows which wallets the browser has: the first on the
-// green button, any other on a button of its own. The phone part is drawn shown only on a page
+// Pay button, any other on a button of its own. The phone part is drawn shown only on a page
 // with no address, so a page whose script never runs still offers a way to pay; its code opens
 // this page in Phantom and is the page's one QR.
 async function walletSections(v: CheckoutView, phoneShown: boolean): Promise<string> {
@@ -471,8 +450,8 @@ ${MESSAGE}
 </section>
 <section id="phone"${hidden}>
 <div class="mobile-links">
-<a class="button outline" href="${escapeHtml(links.phantom)}">Open in Phantom</a>
-<a class="button outline" href="${escapeHtml(links.solflare)}">Open in Solflare</a>
+<a class="button" href="${escapeHtml(links.phantom)}">Open in Phantom</a>
+<a class="button" href="${escapeHtml(links.solflare)}">Open in Solflare</a>
 </div>
 <figure class="qr"${hidden}>
 ${await qrSvg(links.phantom)}
