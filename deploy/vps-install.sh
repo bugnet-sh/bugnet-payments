@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Installs bugnet-payments on the VPS, as README.md sections 1 to 10 lay out. Run as root.
+# Installs bugnet-payments on the VPS, as README.md sections 1 to 10 and 13 lay out. Run as root.
 #
 #   vps-install.sh <bugnet-payments-VERSION.tgz> [--recipient ADDR] [--event-key B64]
 #                  [--router-url URL] [--index FILE]
 #   vps-install.sh --mtls <staging dir>   server certificate and key from bugnet-dev mtls init
 #   vps-install.sh --pubkeys              order_token_public_key and the four wallet addresses
-#   vps-install.sh --start                checks the settings, then starts or restarts the installed
-#                                         version
+#   vps-install.sh --start                checks the settings, backs up the database, then starts or
+#                                         restarts the installed version
+#   vps-install.sh --backup               dumps the database into /var/backups/bugnet-payments now
 #   vps-install.sh --rpc-urls             reads one BUGNET_SOLANA_RPC_URLS line on stdin into
 #                                         payments.env; deploy/push-rpc-urls.sh sends it
 #   vps-install.sh --payments-token       reads one BUGNET_PAYMENTS_TOKEN line on stdin into
@@ -37,6 +38,9 @@ RELEASE_FILE=$ETC/payments.release
 ROTATING=$ETC/payments.rotating
 OPT=/opt/bugnet/payments
 UNIT_DIR=/etc/systemd/system
+LIB_DIR=/usr/local/lib/bugnet
+BACKUP_SCRIPT=$LIB_DIR/payments-backup.sh
+BACKUP_DIR=/var/backups/bugnet-payments
 NODE_MAJOR=26
 PNPM_VERSION=12.6.0
 SVC_USER=bugnet-payments
@@ -357,6 +361,28 @@ ensure_unit() {
     say "bugnet-payments@$v enabled, not started (run --start once the settings are complete)"
 }
 
+# Spec 23.2: the script and its timer sit outside the release folders, so the newest install step's
+# copy backs up whichever version runs
+ensure_backup() {
+    local v=$1
+    install -d -o root -g root -m 0755 "$LIB_DIR"
+    install -o root -g root -m 0755 "$OPT/$v/deploy/payments-backup.sh" "$BACKUP_SCRIPT"
+    install -o root -g root -m 0644 "$OPT/$v/deploy/bugnet-payments-backup.service" \
+        "$OPT/$v/deploy/bugnet-payments-backup.timer" "$UNIT_DIR/"
+    install -d -o root -g root -m 0700 "$BACKUP_DIR"
+    systemctl daemon-reload
+    systemctl enable --now bugnet-payments-backup.timer
+    say "bugnet-payments-backup.timer enabled: a dump of $DB into $BACKUP_DIR every night"
+}
+
+backup_now() {
+    if [ ! -x "$BACKUP_SCRIPT" ]; then
+        echo "$BACKUP_SCRIPT is missing; run the install step first" >&2
+        return 1
+    fi
+    BUGNET_PAYMENTS_BACKUP_DIR=$BACKUP_DIR "$BACKUP_SCRIPT"
+}
+
 do_install() {
     local tgz=$1 recipient=$2 event_key=$3 router_url=$4 index=$5 v
     [ -f "$tgz" ] || die "no such file: $tgz"
@@ -372,6 +398,7 @@ do_install() {
     ensure_toml "$recipient" "$event_key" "$router_url"
     ensure_index "$index"
     ensure_unit "$v"
+    ensure_backup "$v"
     do_pubkeys
     say "next: fund the wallets, run deploy/push-rpc-urls.sh and deploy/push-payments-token.sh, --mtls, then --start"
 }
@@ -586,6 +613,8 @@ do_start() {
         [ -f "$f" ] || { echo "missing $f" >&2; ok=0; }
     done
     [ "$ok" = 1 ] || die "not starting"
+    # Spec 23.2: a release migrates the database as it starts, so a dump from just before comes first
+    backup_now || die "the backup failed, so nothing was stopped or started"
     for old in $(systemctl list-units --all --plain --no-legend 'bugnet-payments@*' | awk '{print $1}'); do
         [ "$old" = "bugnet-payments@$v.service" ] && continue
         systemctl disable --now "$old"
@@ -809,6 +838,7 @@ main() {
         --mtls) mode=mtls; mtls=${2:?}; shift 2 ;;
         --pubkeys) mode=pubkeys; shift ;;
         --start) mode=start; shift ;;
+        --backup) mode=backup; shift ;;
         --rpc-urls) mode=rpc_urls; shift ;;
         --payments-token) mode=payments_token; shift ;;
         --deposits) mode=deposits; deposits=${2:?}; shift 2 ;;
@@ -831,6 +861,7 @@ main() {
     mtls) do_mtls "$mtls" ;;
     pubkeys) do_pubkeys ;;
     start) no_rotation_halfway; do_start ;;
+    backup) backup_now || die "the backup failed" ;;
     rpc_urls) do_rpc_urls ;;
     payments_token) do_payments_token ;;
     deposits) do_deposits "$deposits" ;;

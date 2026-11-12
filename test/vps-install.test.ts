@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import {
     chmodSync,
+    copyFileSync,
     existsSync,
     mkdirSync,
     mkdtempSync,
@@ -20,6 +21,8 @@ const PUSH = join(import.meta.dirname, "../deploy/push-rpc-urls.sh");
 const RETIRE = join(import.meta.dirname, "../deploy/retire-deposit-seed.sh");
 const PUSH_TOKEN = join(import.meta.dirname, "../deploy/push-payments-token.sh");
 const BACKUP = join(import.meta.dirname, "../deploy/payments-backup.sh");
+const DEPLOY = join(import.meta.dirname, "../deploy");
+const BACKUP_UNITS = ["bugnet-payments-backup.service", "bugnet-payments-backup.timer"];
 
 const KEYS = [
     "BUGNET_PAYMENTS_TOKEN",
@@ -78,10 +81,11 @@ function keysEnv(extra = ""): string {
     return `${lines.join("\n")}\nBUGNET_SOLANA_RPC_URLS=https://rpc1.example,https://rpc2.example\n${extra}`;
 }
 
-// A server with release v9 installed. systemctl, curl, journalctl, chown, setpriv, id, node,
-// runuser, pg_dump and pg_restore are fakes; id makes main run as root, node stands in for
-// dist/cli.js, and node and the Postgres tools log who ran them with which arguments and answer
-// from files the test can change.
+// A server with release v9 and the backup script installed. systemctl, curl, journalctl, chown,
+// install, setpriv, id, node, runuser, pg_dump and pg_restore are fakes; id makes main run as root,
+// install leaves out the owner, node stands in for dist/cli.js, and node, systemctl, install and
+// the Postgres tools log who ran them with which arguments and answer from files the test can
+// change.
 function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) {
     const root = join(dir, "server");
     const etc = join(root, "etc");
@@ -93,6 +97,10 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
     mkdirSync(join(etc, "payments"), { recursive: true });
     mkdirSync(join(opt, "v9"), { recursive: true });
     mkdirSync(bin);
+    mkdirSync(join(root, "systemd"));
+    mkdirSync(join(root, "lib"));
+    copyFileSync(BACKUP, join(root, "lib", "payments-backup.sh"));
+    chmodSync(join(root, "lib", "payments-backup.sh"), 0o755);
     for (const f of ["internal-ca.pem", "payments/x402-server.pem", "payments/x402-index.json"]) {
         writeFileSync(join(etc, f), "");
     }
@@ -107,13 +115,24 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
     writeFileSync(join(root, "moving.out"), "");
     writeFileSync(join(root, "pg_dump.exit"), "0");
     writeFileSync(join(root, "pg_restore.exit"), "0");
+    writeFileSync(join(root, "units.out"), "");
     writeFileSync(log, "");
     const env = envFile(o.env ?? keysEnv());
     const fakes: Record<string, string> = {
-        systemctl: `echo "systemctl $*" >> "${log}"\n[ "$1" != is-active ] || exit ${o.active === true ? 0 : 3}`,
+        systemctl: [
+            `echo "systemctl $*" >> "${log}"`,
+            `[ "$1" != list-units ] || cat "${root}/units.out"`,
+            `[ "$1" != is-active ] || exit ${o.active === true ? 0 : 3}`,
+        ].join("\n"),
         curl: "exit 0",
         journalctl: "exit 0",
         chown: "exit 0",
+        install: [
+            `echo "install $*" >> "${log}"`,
+            "args=()",
+            'while [ $# -gt 0 ]; do case $1 in -o | -g) shift 2 ;; *) args+=("$1"); shift ;; esac; done',
+            'exec /usr/bin/install "${args[@]}"',
+        ].join("\n"),
         id: 'if [ "$1" = -u ]; then echo 0; else exec /usr/bin/id "$@"; fi',
         setpriv: [
             'for a in "$@"; do case $a in --reuid=*) export FAKE_AS=${a#--reuid=} ;; esac; done',
@@ -178,10 +197,11 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
                 "bash",
                 [
                     "-c",
-                    `. "${SCRIPT}"; ETC="$1"; TOML="$1/payments.toml"; RELEASE_FILE="$1/payments.release"; ROTATING="$1/payments.rotating"; OPT="$2"; ${cmd}`,
+                    `. "${SCRIPT}"; ETC="$1"; TOML="$1/payments.toml"; RELEASE_FILE="$1/payments.release"; ROTATING="$1/payments.rotating"; OPT="$2"; UNIT_DIR="$3/systemd"; LIB_DIR="$3/lib"; BACKUP_SCRIPT="$3/lib/payments-backup.sh"; BACKUP_DIR="$3/backups"; ${cmd}`,
                     "bash",
                     etc,
                     opt,
+                    root,
                 ],
                 {
                     input: stdin,
@@ -903,6 +923,186 @@ describe("vps-install.sh payments token", () => {
 });
 
 const DUMP_NAME = /^bugnet_payments-(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z\.dump$/;
+
+function dumpsIn(folder: string): string[] {
+    return existsSync(folder) ? readdirSync(folder).filter((f) => DUMP_NAME.test(f)) : [];
+}
+
+describe("vps-install.sh backups", () => {
+    const OLD_UNIT = "bugnet-payments@v8.service loaded active running Bugnet Payments v8\n";
+
+    it("--backup dumps the database now and touches no unit", () => {
+        const server = fakeServer({ active: true });
+        let r = server.run("main --backup");
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        const dumps = dumpsIn(server.backups);
+        expect(dumps).toHaveLength(1);
+        const dump = join(server.backups, dumps[0]);
+        expect(r.out).toBe(`== wrote ${dump} (${statSync(dump).size} bytes)\n`);
+        expect(server.calls()[0]).toBe("postgres pg_dump --format=custom bugnet_payments");
+        expect(server.calls().some((c) => c.startsWith("systemctl"))).toBe(false);
+
+        writeFileSync(join(server.root, "pg_dump.exit"), "1");
+        r = server.run("main --backup");
+        expect(r.code).toBe(1);
+        expect(r.out).toBe("");
+        expect(r.err).toBe(
+            "payments-backup: pg_dump of bugnet_payments failed; no dump was written\n" +
+                "vps-install: the backup failed\n",
+        );
+        expect(server.calls().some((c) => c.startsWith("systemctl"))).toBe(false);
+    });
+
+    it("--start backs up the database before it stops or restarts any unit", () => {
+        const server = fakeServer({ active: true });
+        writeFileSync(join(server.root, "units.out"), OLD_UNIT);
+        const r = server.run("main --start");
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        expect(dumpsIn(server.backups)).toHaveLength(1);
+        const calls = server.calls();
+        const dumped = calls.indexOf("postgres pg_dump --format=custom bugnet_payments");
+        expect(dumped).toBeGreaterThanOrEqual(0);
+        expect(dumped).toBeLessThan(calls.findIndex((c) => c.startsWith("systemctl")));
+        expect(calls).toContain("systemctl disable --now bugnet-payments@v8.service");
+        expect(calls).toContain("systemctl restart bugnet-payments@v9");
+    });
+
+    it("--start stops, touching no unit, when the backup fails", () => {
+        const cases: [string, string][] = [
+            ["pg_dump.exit", "payments-backup: pg_dump of bugnet_payments failed"],
+            ["pg_restore.exit", "payments-backup: pg_restore --list cannot read the dump"],
+            ["", "lib/payments-backup.sh is missing; run the install step first"],
+        ];
+        for (const [file, message] of cases) {
+            const server = fakeServer({ active: true });
+            writeFileSync(join(server.root, "units.out"), OLD_UNIT);
+            if (file === "") rmSync(join(server.root, "lib", "payments-backup.sh"));
+            else writeFileSync(join(server.root, file), "1");
+            const r = server.run("main --start");
+            expect(r.code).toBe(1);
+            expect(r.err).toContain(message);
+            expect(r.err).toContain(
+                "vps-install: the backup failed, so nothing was stopped or started\n",
+            );
+            expect(server.calls().some((c) => c.startsWith("systemctl"))).toBe(false);
+            expect(existsSync(server.backups) ? readdirSync(server.backups) : []).toEqual([]);
+        }
+    });
+
+    it("no secret reaches the backup's output or the dump", () => {
+        const server = fakeServer({ active: true });
+        writeFileSync(server.env, keysEnv(`BUGNET_DEPOSIT_SEED_PREVIOUS=${OLD_SEED}\n`));
+        for (const cmd of ["main --backup", "main --start"]) {
+            const r = server.run(cmd);
+            expect(r.code).toBe(0);
+            for (const secret of [SEED, OLD_SEED]) {
+                expect(r.all).not.toContain(secret);
+                for (const f of readdirSync(server.backups)) {
+                    expect(readFileSync(join(server.backups, f), "utf8")).not.toContain(secret);
+                }
+            }
+        }
+    });
+
+    it("ensure_backup installs the script and both units and enables the timer", () => {
+        const server = fakeServer();
+        const deploy = join(server.root, "opt", "v9", "deploy");
+        const lib = join(server.root, "lib");
+        const units = join(server.root, "systemd");
+        const script = join(lib, "payments-backup.sh");
+        mkdirSync(deploy);
+        for (const f of ["payments-backup.sh", ...BACKUP_UNITS]) {
+            copyFileSync(join(DEPLOY, f), join(deploy, f));
+        }
+        rmSync(lib, { recursive: true });
+        for (const round of [1, 2]) {
+            writeFileSync(join(server.root, "calls.log"), "");
+            const r = server.run("ensure_backup v9");
+            expect(r.err).toBe("");
+            expect(r.code).toBe(0);
+            expect(readFileSync(script, "utf8")).toBe(readFileSync(BACKUP, "utf8"));
+            expect(statSync(script).mode & 0o777).toBe(0o755);
+            expect(statSync(lib).mode & 0o777).toBe(0o755);
+            for (const unit of BACKUP_UNITS) {
+                const f = join(units, unit);
+                expect(readFileSync(f, "utf8")).toBe(readFileSync(join(DEPLOY, unit), "utf8"));
+                expect(statSync(f).mode & 0o777).toBe(0o644);
+            }
+            expect(statSync(server.backups).mode & 0o777).toBe(0o700);
+            const calls = server.calls();
+            expect(calls.filter((c) => c.startsWith("install"))).toEqual([
+                `install -d -o root -g root -m 0755 ${lib}`,
+                `install -o root -g root -m 0755 ${deploy}/payments-backup.sh ${script}`,
+                `install -o root -g root -m 0644 ${deploy}/${BACKUP_UNITS[0]} ${deploy}/${BACKUP_UNITS[1]} ${units}/`,
+                `install -d -o root -g root -m 0700 ${server.backups}`,
+            ]);
+            expect(calls.filter((c) => c.startsWith("systemctl"))).toEqual([
+                "systemctl daemon-reload",
+                "systemctl enable --now bugnet-payments-backup.timer",
+            ]);
+            if (round === 1) chmodSync(server.backups, 0o755);
+        }
+    });
+
+    it("the install step runs ensure_backup after the service's unit", () => {
+        const server = fakeServer();
+        const tgz = join(dir, "bugnet-payments-v9.tgz");
+        writeFileSync(tgz, "");
+        const steps = [
+            "ensure_node",
+            "ensure_user",
+            "install_code",
+            "ensure_postgres",
+            "ensure_keys",
+            "ensure_router_token",
+            "ensure_toml",
+            "ensure_index",
+            "ensure_unit",
+            "ensure_backup",
+            "do_pubkeys",
+        ];
+        const stubs = steps.map((step) => `${step}() { echo "${step} $*"; }`).join("; ");
+        const r = server.run(`${stubs}; do_install "${tgz}" "" "" "" ""`);
+        expect(r.code).toBe(0);
+        const ran = r.out.split("\n").filter((l) => steps.includes(l.split(" ")[0]));
+        expect(ran.map((l) => l.split(" ")[0])).toEqual(steps);
+        expect(ran).toContain("ensure_backup v9");
+    });
+
+    it("the units run the installed script at 02:15 UTC and may write only the backup folder", () => {
+        const r = spawnSync("bash", ["-c", `. "${SCRIPT}"; echo "$BACKUP_SCRIPT $BACKUP_DIR"`], {
+            encoding: "utf8",
+            env: { ...process.env, VPS_INSTALL_LIB: "1" },
+        });
+        const [script, folder] = r.stdout.trim().split(" ");
+        expect(script).toBe("/usr/local/lib/bugnet/payments-backup.sh");
+        expect(folder).toBe("/var/backups/bugnet-payments");
+        expect(readFileSync(BACKUP, "utf8")).toContain(
+            `BACKUP_DIR=\${BUGNET_PAYMENTS_BACKUP_DIR:-${folder}}\n`,
+        );
+        const service = readFileSync(join(DEPLOY, BACKUP_UNITS[0]), "utf8");
+        for (const line of [
+            "Type=oneshot",
+            "User=root",
+            `ExecStart=${script}`,
+            "ProtectSystem=strict",
+            `ReadWritePaths=${folder}`,
+        ]) {
+            expect(service.split("\n")).toContain(line);
+        }
+        const timer = readFileSync(join(DEPLOY, BACKUP_UNITS[1]), "utf8");
+        for (const line of [
+            "OnCalendar=*-*-* 02:15:00 UTC",
+            "RandomizedDelaySec=15m",
+            "Persistent=true",
+            "WantedBy=timers.target",
+        ]) {
+            expect(timer.split("\n")).toContain(line);
+        }
+    });
+});
 
 describe("payments-backup.sh", () => {
     it("dumps the database as postgres into a 0700 folder as a checked 0600 file", () => {
