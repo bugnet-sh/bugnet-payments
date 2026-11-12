@@ -8,6 +8,7 @@ import {
     readFileSync,
     rmSync,
     statSync,
+    utimesSync,
     writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -970,6 +971,82 @@ describe("payments-backup.sh", () => {
             if (message !== "") expect(r.err).toBe(message);
             expect(readdirSync(server.backups)).toEqual([old]);
         }
+    });
+
+    it("keeps the newest 14 dumps and leaves every other file alone", () => {
+        const server = fakeServer();
+        mkdirSync(server.backups, { mode: 0o700 });
+        const olds = Array.from(
+            { length: 16 },
+            (_, i) => `bugnet_payments-202501${String(i + 1).padStart(2, "0")}T021500Z.dump`,
+        );
+        const others = [
+            "notes.txt",
+            "bugnet_payments-latest.dump",
+            "bugnet_payments-20240101T021500Z.dump.bak",
+            "bugnet_payments-2024-01-01.dump",
+            "other_db-20240101T021500Z.dump",
+        ];
+        for (const f of [...olds, ...others]) writeFileSync(join(server.backups, f), "x");
+        // Named like the oldest dump, but a folder
+        const folder = "bugnet_payments-20240101T021500Z.dump";
+        mkdirSync(join(server.backups, folder));
+        const r = server.backup();
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        const files = readdirSync(server.backups).toSorted();
+        const dumps = files.filter((f) => DUMP_NAME.test(f) && f !== folder);
+        expect(dumps).toHaveLength(14);
+        expect(dumps.slice(0, 13)).toEqual(olds.slice(3));
+        expect(files.filter((f) => !dumps.includes(f))).toEqual([...others, folder].toSorted());
+        expect(
+            r.out
+                .split("\n")
+                .filter((l) => l.startsWith("== removed"))
+                .toSorted(),
+        ).toEqual(olds.slice(0, 3).map((f) => `== removed ${f}`));
+    });
+
+    it("keeps the number BUGNET_PAYMENTS_BACKUP_KEEP names, and refuses one below 1 before dumping", () => {
+        const server = fakeServer();
+        mkdirSync(server.backups, { mode: 0o700 });
+        const olds = ["20250101", "20250102", "20250103"].map(
+            (d) => `bugnet_payments-${d}T021500Z.dump`,
+        );
+        for (const f of olds) writeFileSync(join(server.backups, f), "x");
+        let r = server.backup({ BUGNET_PAYMENTS_BACKUP_KEEP: "2" });
+        expect(r.code).toBe(0);
+        const files = readdirSync(server.backups).toSorted();
+        expect(files).toHaveLength(2);
+        expect(files[0]).toBe(olds[2]);
+        for (const keep of ["0", "x", "014", "-1", "1.5"]) {
+            writeFileSync(join(server.root, "calls.log"), "");
+            r = server.backup({ BUGNET_PAYMENTS_BACKUP_KEEP: keep });
+            expect(r.code).toBe(1);
+            expect(r.err).toBe(
+                "payments-backup: BUGNET_PAYMENTS_BACKUP_KEEP must be a whole number of at least 1\n",
+            );
+            expect(server.calls()).toEqual([]);
+            expect(readdirSync(server.backups).toSorted()).toEqual(files);
+        }
+    });
+
+    it("removes a temporary dump that a killed run left over a day ago, and nothing newer", () => {
+        const server = fakeServer();
+        mkdirSync(server.backups, { mode: 0o700 });
+        const stale = "bugnet_payments-20250101T021500Z.dump.Ab12Cd";
+        const running = "bugnet_payments-20250102T021500Z.dump.Xy34Zw";
+        const other = "bugnet_payments-20250101T021500Z.dump.gz";
+        const twoDaysAgo = new Date(Date.now() - 2 * 86_400_000);
+        for (const f of [stale, running, other]) writeFileSync(join(server.backups, f), "PGDMP");
+        for (const f of [stale, other]) utimesSync(join(server.backups, f), twoDaysAgo, twoDaysAgo);
+        const r = server.backup();
+        expect(r.code).toBe(0);
+        const files = readdirSync(server.backups);
+        expect(files).not.toContain(stale);
+        expect(files).toContain(running);
+        expect(files).toContain(other);
+        expect(r.out).toContain(`== removed ${stale}, left by a stopped run\n`);
     });
 });
 

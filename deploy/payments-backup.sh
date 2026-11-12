@@ -7,6 +7,7 @@ set -euo pipefail
 umask 077
 
 BACKUP_DIR=${BUGNET_PAYMENTS_BACKUP_DIR:-/var/backups/bugnet-payments}
+KEEP=${BUGNET_PAYMENTS_BACKUP_KEEP:-14}
 DB=bugnet_payments
 PG_USER=postgres
 
@@ -15,6 +16,10 @@ die() {
     exit 1
 }
 say() { echo "== $*"; }
+
+case $KEEP in
+*[!0-9]* | 0*) die "BUGNET_PAYMENTS_BACKUP_KEEP must be a whole number of at least 1" ;;
+esac
 
 # pg_dump runs as postgres, which cannot enter root's working directory and would warn about it
 cd /
@@ -36,3 +41,20 @@ if ! chmod 0600 "$tmp" || ! mv -f "$tmp" "$final"; then
 fi
 trap - EXIT INT TERM HUP
 say "wrote $final ($(wc -c <"$final" | tr -d ' ') bytes)"
+
+# The UTC stamp sorts by time, so the newest dumps come first. Only regular files named as this
+# script names its dumps count or go.
+re="^$DB-[0-9]{8}T[0-9]{6}Z[.]dump\$"
+for path in "$BACKUP_DIR/$DB"-*.dump; do
+    if [[ ${path##*/} =~ $re ]] && [ -f "$path" ]; then echo "${path##*/}"; fi
+done | sort -r | tail -n "+$((KEEP + 1))" | while IFS= read -r name; do
+    rm -f -- "$BACKUP_DIR/$name"
+    say "removed $name"
+done
+
+# A run killed outright (SIGKILL, power loss) skips its trap; no run lasts a day
+find "$BACKUP_DIR" -maxdepth 1 -type f -name "$DB-????????T??????Z.dump.??????" -mmin +1440 |
+    while IFS= read -r path; do
+        rm -f -- "$path"
+        say "removed ${path##*/}, left by a stopped run"
+    done
