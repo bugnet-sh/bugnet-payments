@@ -11,10 +11,17 @@ export interface OrderClaims {
     expires_at: string;
     handle_sha256?: string;
     allowance_micros?: number;
+    fee_micros?: number;
     payer?: string;
     fee_payer?: string;
     tx?: string;
     issued_at?: string;
+}
+
+// Which claims the live router decodes; each turns on with its [router] setting
+export interface ClaimSwitches {
+    allowance: boolean;
+    fee: boolean;
 }
 
 export interface PaymentProof {
@@ -45,7 +52,7 @@ export function signOrderToken(key: KeyObject, claims: OrderClaims): string {
 export function claimsFor(
     order: OrderRow,
     expiresAt: Date,
-    allowanceClaim: boolean,
+    on: ClaimSwitches,
     proof?: PaymentProof,
     issuedAt?: Date,
 ): OrderClaims {
@@ -61,8 +68,12 @@ export function claimsFor(
         if (order.handleSha256 === null) throw new Error("extend order has no handle hash");
         claims.handle_sha256 = order.handleSha256;
     }
-    if (order.kind === "start" && order.allowanceMicros > 0 && allowanceClaim) {
+    if (order.kind === "start" && order.allowanceMicros > 0 && on.allowance) {
         claims.allowance_micros = order.allowanceMicros;
+    }
+    // The router leaves the x402 session fee out of the package share
+    if (order.kind === "start" && order.feeMicros > 0 && on.fee) {
+        claims.fee_micros = order.feeMicros;
     }
     if (proof !== undefined) {
         claims.payer = proof.payer;

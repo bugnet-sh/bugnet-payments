@@ -378,6 +378,12 @@ from this release's install step on:
 - a rollback to a release without deposits first needs `vps-install.sh --deposits remove`
   (below).
 
+**Rollback below a `[router]` key.** The same strict decode holds for the router switches. Before
+a rollback to a release older than the one that added the key, remove the key from
+`payments.toml`: `fee_claim` (added with `feat/fee-claim`) and `token_issued_at` (added in
+1b97f3a). Otherwise the older release fails its boot check with `unknown key router.<name>`, after
+`--start` has already stopped the running one.
+
 **Rollback below the deposits release.** Run `vps-install.sh --deposits off` first, then:
 
 1. `vps-install.sh --deposits remove`. It asks the database through `pcli deposits list` and
@@ -506,6 +512,10 @@ copy that differs from it, `x402_reload_failed` fires.
 
 **The router.** Set `[router] allowance_claim = true` only after router Task 28 is live: until
 then the router cannot take the placement claim, and allowance orders must stay refused.
+Set `[router] fee_claim = true` only after the router that decodes `fee_micros` is live, and
+only on a Payments build that knows the key (an older build refuses an unknown setting). Until
+then the router refuses unknown claims, so every x402 start with a session fee would fail and be
+refunded.
 
 **Timeouts.** Egress's `payments_timeout` (3 s) must stay above `[x402] sign_timeout` (2 s), or
 egress gives up on a signature that is still being made. Check both at every deploy.

@@ -498,7 +498,7 @@ async function paid(
             claimsFor(
                 o,
                 tokenExpiresAt,
-                d.settings.router.allowance_claim,
+                { allowance: d.settings.router.allowance_claim, fee: d.settings.router.fee_claim },
                 proof,
                 d.settings.router.token_issued_at ? (redeemedAt ?? undefined) : undefined,
             ),
