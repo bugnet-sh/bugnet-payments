@@ -2039,6 +2039,7 @@ describe("deposits commands", () => {
             amountMicros?: number;
             heldMicros?: number;
             destination?: string | null;
+            payer?: string | null;
             attempts?: number;
             manualReason?: string | null;
             txSignature?: string | null;
@@ -2050,14 +2051,15 @@ describe("deposits commands", () => {
         const closes = m.closes ?? m.kind === "close";
         const res = await db.pool.query<{ id: string }>(
             `insert into deposit_moves (order_id, kind, amount_micros, held_micros, destination,
-                closes, close_to, state, attempts, manual_reason, tx_signature, created_at)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) returning id`,
+                payer, closes, close_to, state, attempts, manual_reason, tx_signature, created_at)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) returning id`,
             [
                 orderId,
                 m.kind,
                 m.amountMicros ?? 0,
                 m.heldMicros ?? 0,
                 m.destination ?? null,
+                m.payer ?? null,
                 closes,
                 closes ? (m.closeTo ?? "Fee") : null,
                 m.state,
@@ -3218,6 +3220,56 @@ describe("deposits commands", () => {
                 [second]: [3_000, row!.id],
                 [third]: [2_000, null],
             });
+        });
+
+        it("drops a return or close planned before the theft", async () => {
+            await seedDeposit(ORDER_A, {
+                order: { state: "expired" },
+                deposit: { state: "draining" },
+            });
+            const a1 = await credit(a, srcA, 20_000);
+            await credit(b, srcB, 15_000);
+            await db.pool.query(
+                `update deposit_transfers set outcome = 'return', reason = 'unpaid'
+                 where order_id = $1`,
+                [ORDER_A],
+            );
+            const planned = async (kind: "return" | "close", micros: number) => {
+                const id = await seedMove(ORDER_A, {
+                    kind,
+                    state: "pending",
+                    ...(kind === "return"
+                        ? { amountMicros: micros, destination: srcA, payer: a.address }
+                        : { heldMicros: micros }),
+                });
+                await db.pool.query(
+                    "update deposit_transfers set move_id = $2 where signature = $1",
+                    [a1, id],
+                );
+                return id;
+            };
+            const moveOf = async (sig: string) =>
+                (await depositLedger(db.pool, ORDER_A))!.transfers.find((t) => t.signature === sig)!
+                    .moveId;
+
+            const ret = await planned("return", 20_000);
+            expect((await writeOff(theft(25_000))).code).toBe(0);
+            expect(await findMove(db.pool, ret)).toBeNull();
+            expect(await moveOf(a1)).toBeNull();
+            expect(
+                (await depositLedger(db.pool, ORDER_A))!.transfers.map((t) => t.lostMicros),
+            ).toEqual([10_000, 15_000]);
+
+            // A's return failed, so the close would carry its rest to the refund float
+            await db.pool.query(
+                `update deposit_transfers set outcome = 'review', reason = 'return_failed'
+                 where signature = $1`,
+                [a1],
+            );
+            const close = await planned("close", 10_000);
+            expect((await writeOff(theft(4_000))).code).toBe(0);
+            expect(await findMove(db.pool, close)).toBeNull();
+            expect(await moveOf(a1)).toBeNull();
         });
 
         it("keeps the review while the chain holds money the ledger does not", async () => {
