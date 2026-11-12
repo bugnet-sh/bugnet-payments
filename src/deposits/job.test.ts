@@ -2203,5 +2203,56 @@ describe("flows on FakeChain", () => {
             expect(chain.balance(sources.B)).toBe(startB);
             await toDone();
         });
+
+        it("parts Bugnet keeps get no payout and keep no deposit from done", async () => {
+            const dep = await deposit();
+            chain.credit(floatAta, 100_000n);
+            const startA = chain.balance(sources.A);
+            const startB = chain.balance(sources.B);
+            await send("A", 20_000n);
+            const own = await chain.transfer({
+                authority: refund,
+                feePayer: refund,
+                source: floatAta,
+                destination: dep.tokenAccount,
+                micros: 5_000n,
+                memo: `t${++memoSeq}`,
+            });
+            chain.advance(1);
+            const dust = await send("B", 600n);
+            await ticks(2, 3_000, watching());
+            expect((await transferOf(own)).reason).toBe("from_bugnet");
+
+            const stolen = chain.debit(dep.tokenAccount, 10_600n);
+            chain.advance(1);
+            later(cfg.idle_every);
+            await tick();
+            expect((await depositOf()).reviewReason).toBe("unknown_debit");
+
+            const done = await writeOff(stolen);
+            expect(done.err).not.toContain("error:");
+            expect(done.code).toBe(0);
+            expect(done.out).toContain(`part ${own} 5000 refund=- kept: Bugnet's own money`);
+            expect(done.out).toContain(`part ${dust} 600 refund=- kept: below refund_min_micros`);
+            expect(done.out.at(-1)).toBe("review cleared");
+            expect(await writeOffRows()).toEqual([[sources.A, 5_000, "pending"]]);
+
+            await expireAndClose();
+            expect(chain.accountExists(dep.tokenAccount)).toBe(false);
+            await payRefunds();
+            expect(await writeOffRows()).toEqual([[sources.A, 5_000, "confirmed"]]);
+            expect(chain.balance(sources.A)).toBe(startA);
+            expect(chain.balance(sources.B)).toBe(startB - 600n);
+            expect(chain.balance(floatAta)).toBe(90_000n);
+
+            await toDone();
+            const view = await depositView(db.pool, await orderOf(), clock, cfg);
+            expect(view).toMatchObject({
+                status: "refunded",
+                returnedMicros: 20_000,
+                keptMicros: 5_600,
+                reviewMicros: 0,
+            });
+        });
     });
 });
