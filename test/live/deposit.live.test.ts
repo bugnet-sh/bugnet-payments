@@ -313,6 +313,8 @@ describe("deposits on mainnet", () => {
         settings = await liveSettings(db.url, eventSeed, {
             deposits: { enabled: true },
             orders: { unpaid_ttl: "2m" },
+            // As on the server: the order token names the payer, the fee payer and the sweep
+            router: { token_payer_claims: true },
         });
         secrets = readSecrets(process.env, settings);
         restoreConsole = routeConsole(log);
@@ -414,7 +416,13 @@ describe("deposits on mainnet", () => {
             paced(async () => (await usdcOf(rpc, testPayer.address)) === payerBefore),
             60_000,
         );
-    }, 420_000);
+        // The close gives the fee payer its rent back
+        await waitForDeposit(
+            id,
+            async (d) => d.state === "closed" && (await accountGone(d.tokenAccount)),
+            180_000,
+        );
+    }, 600_000);
 
     it("late money to a closed address is returned", async () => {
         const { orderId: id } = paid();
