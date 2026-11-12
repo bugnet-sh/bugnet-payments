@@ -716,7 +716,7 @@ allowance wallet, money already swept, or review money already carried to the re
 | Alarm                   | When                                                                                                                                                                                                                                                                  | Operator's action                                                                                                                                                                                   |
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `deposit_review`        | A deposit or a transfer needs a person; `reason` is one of `unattributed`, `unreadable`, `from_bugnet`, `late_limit`, `return_destination_invalid`, `return_failed`, `unknown_debit`, `move_expired_repeatedly`, `moves_failing`, `expired_unchecked`, `double_sweep` | `pcli deposits list --review`, `pcli deposits show <orderId>`; a transfer in review goes back with `deposits return-to`, a deposit whose moves failed with `deposits retry` once the cause is fixed |
-| `deposit_unknown_debit` | A deposit account lost USDC in a transaction that is not Payments' own                                                                                                                                                                                                | The leak response above                                                                                                                                                                             |
+| `deposit_unknown_debit` | A deposit account lost USDC in a transaction that is not Payments' own                                                                                                                                                                                                | The leak response above, except on a deposit a restore listed (section 13)                                                                                                                          |
 | `deposit_index_lag`     | The balance has not matched the recorded transfers for over 30 s, a listing could not be proven complete, an interval stayed unexplained after every entry was fetched, a transaction stayed missing, or the hard stop waited for a scan                              | `pcli rpc status`; move the lagging URL down the local list or remove it, copy it again and restart (section 6)                                                                                     |
 | `deposit_capacity`      | `max_open` deposits hold Bugnet-paid rent (once an hour)                                                                                                                                                                                                              | None needed: senders pay their own rent meanwhile and get it back at the close. Look for a flood of page views                                                                                      |
 | `deposit_create_churn`  | The unpaid-create budget of the last hour is spent (once an hour)                                                                                                                                                                                                     | None needed: senders pay their own rent for the rest of the hour. Look for one client behind many addresses                                                                                         |
@@ -861,16 +861,17 @@ tables and the whole restore fails. In order, it:
 2. restores it as `postgres` with `pg_restore --clean --if-exists --single-transaction` into a new,
    empty database, `bugnet_payments_restoring`, owned by `bugnet_payments`. When that fails it
    drops the new database and stops: nothing was stopped and `bugnet_payments` is as it was;
-3. pauses refunds (`pcli refunds status` shows `restore`), pauses x402 payments and holds x402
-   refunds in the new database;
+3. pauses refunds and x402 payments and holds x402 refunds in the new database, and prints each as
+   `set by the restore: ...`. One the dump already had stays as it was and prints as
+   `in the dump already, left as it was: ...`, with its reason;
 4. disables and stops every `bugnet-payments@` version: the installed one and any other still
    running, such as the newer release after an install step for an older one;
 5. renames both in one transaction: `bugnet_payments` becomes
    `bugnet_payments_before_<UTC time>`, and the new database `bugnet_payments`. The kept one has no
    `pg_hba.conf` line, so only `postgres` opens it, and no nightly dump includes it;
-6. lists each row of `refunds`, `deposit_moves`, `x402_payments` and `x402_cold_transfers` whose
-   state or signature differs between the two, and the installed release's migrations that the
-   restored database has not run.
+6. lists each row of `orders`, `refunds`, `deposits`, `deposit_moves`, `x402_payments` and
+   `x402_cold_transfers` that differs between the two, and the installed release's migrations that
+   the restored database has not run.
 
 It starts nothing. Then:
 
@@ -880,13 +881,30 @@ It starts nothing. Then:
    that release's start runs them again.
 2. `vps-install.sh --start`. If boot refuses with a seed check (section 12), the dump is older than
    a rotation or a retirement; the founder picks the fix, as there.
-3. **Money after the dump.** Each listed row moved money, or owed it, after the dump. A refund the
-   kept database shows signed or confirmed was paid already, and resuming refunds would pay it
-   again. An x402 payment there is money its account spent, which the restored account does not
-   show. A deposit move there that is missing here can be a deposit made after the dump, whose
-   salt, and so its key, is only in the kept database. With no row listed, run
-   `pcli refunds resume`, `pcli x402 refunds release` and `pcli x402 resume`. Otherwise all three
-   wait until the founder has settled every listed row. Read the kept database with
+3. **The list.** Each line is
+   `<table> <id>: <restored> here, <kept> in bugnet_payments_before_<UTC time>`, with the row's
+   state, and for refunds, deposit moves and x402 rows its signature. `none` means the row is on
+   one side only; `differ:` names the other columns that differ, an order's times or a deposit's
+   `moves` and `transfers`. Each listed row moved money, or decides a refund, after the dump:
+    - `orders`: the refund sweeps read the restored row, so an order the kept database shows
+      further on gets a refund it must not. One paid before the dump and redeemed after it reads
+      `paid` here and gets an `unredeemed` refund.
+    - `refunds`: one the kept database shows signed or confirmed was paid already.
+    - `x402_payments`, `x402_cold_transfers`: money an account spent, which the restored account
+      does not show.
+    - `deposits`, `deposit_moves`: Payments' moves, and the transfers it recorded, after the dump.
+      A deposit `none here` was made after the dump; its salt, and so its key, is only in the kept
+      database.
+4. **Pauses and holds.** Refunds and x402 stay paused until the founder has settled every listed
+   row by hand. Then lift only what printed `set by the restore`: refunds paused with
+   `pcli refunds resume`, x402 payments paused with `pcli x402 resume`, x402 refunds held with
+   `pcli x402 refunds release`. Leave what printed `in the dump already` as it was. With nothing
+   listed, lift them at once. Read the kept database with
    `sudo runuser -u postgres -- psql -d bugnet_payments_before_<UTC time>`.
-4. Once every row is settled, drop the kept database:
+5. **`deposit_unknown_debit` on a listed deposit.** After `--start` the deposit job reads a move
+   made after the dump as a debit that is not Payments' own, raises `deposit_unknown_debit` and
+   puts the deposit in review. On a listed deposit it is Payments' own move, **not a leak**: no
+   leak response (section 12), and **never write it off**, which would pay the senders twice. The
+   deposit stays in review until the founder decides how to bring its rows back.
+6. Once every row is settled, drop the kept database:
    `sudo runuser -u postgres -- dropdb bugnet_payments_before_<UTC time>`.
