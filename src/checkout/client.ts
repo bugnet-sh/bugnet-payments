@@ -171,7 +171,7 @@ function startPayment(p: Page): WalletSection {
         );
         if (found.length === 0) {
             const item = document.createElement("li");
-            item.textContent = PAGE_TEXT.noWallet;
+            item.textContent = PAGE_TEXT.noWallet(p.ctx.hasAddress !== false);
             list.append(item);
         }
         refresh();
@@ -331,6 +331,8 @@ function follow(p: Page, wallet: WalletSection | null): void {
         }
         const askEl = p.root.querySelector<HTMLElement>("#deposit-ask");
         if (askEl !== null) askEl.hidden = !showDepositAsk(v);
+        // Wallet lines offer the address only while the page shows it (M3)
+        p.ctx.hasAddress = askEl !== null && !askEl.hidden;
         // A countdown on an order that no longer takes money says nothing true
         const timeRow = timeEl?.closest("div") ?? null;
         if (timeRow !== null) timeRow.hidden = !showWalletOptions(v);
@@ -435,6 +437,7 @@ if (root !== null) {
             deadline: Number.isNaN(expiresAt) ? "" : localTime(expiresAt),
             refundMinMicros: Number(root.dataset.refundMinMicros ?? "0"),
             orderId: root.dataset.orderId ?? "",
+            hasAddress: root.querySelector("#deposit-ask:not([hidden])") !== null,
         },
     };
     for (const button of root.querySelectorAll<HTMLButtonElement>("button[data-copy]")) {

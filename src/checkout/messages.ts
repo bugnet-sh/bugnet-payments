@@ -25,6 +25,17 @@ export interface MessageContext {
     // locale when left out
     formatTime?: (iso: string) => string;
     formatDateTime?: (iso: string) => string;
+    // False on a page that shows no deposit address, whose lines then never point at one (M3)
+    hasAddress?: boolean;
+}
+
+function showsAddress(c: MessageContext): boolean {
+    return c.hasAddress !== false;
+}
+
+// A sentence's end: the address as the other way to pay, on a page that shows one
+function orSend(c: MessageContext): string {
+    return showsAddress(c) ? ", or send to the address above." : ".";
 }
 
 export const STATE_LABELS: Record<PublicState, string> = {
@@ -130,7 +141,11 @@ function returnLine(
     }
 }
 
-function heldLine(v: NonNullable<StatusView["deposit"]>, c: MessageContext): string {
+function heldLine(
+    v: NonNullable<StatusView["deposit"]>,
+    c: MessageContext,
+    pastDeadline: boolean,
+): string {
     const received = amountLabel(v.receivedMicros);
     const until = v.hold === null ? c.deadline : time(c, v.hold.until);
     switch (v.hold?.reason) {
@@ -140,8 +155,13 @@ function heldLine(v: NonNullable<StatusView["deposit"]>, c: MessageContext): str
             return `Received ${received}. Bugnet's allowance service paused for a moment. It tries again until ${until}, then returns the money if it is still paused.`;
         case "router_unavailable":
             return `Received ${received}. Bugnet is confirming this top-up with its sandbox service and tries again until ${until}, then returns the money.`;
-        default:
-            return `Received ${received} from a wallet at its sandbox limit. Bugnet tries again until ${until}, then returns it. ${decimalAmount(c.amountMicros)} USDC from another wallet pays at once.`;
+        default: {
+            const line = `Received ${received} from a wallet at its sandbox limit. Bugnet tries again until ${until}, then returns it.`;
+            // Past the deadline money from another wallet is late and goes back (M4)
+            return pastDeadline
+                ? line
+                : `${line} ${decimalAmount(c.amountMicros)} USDC from another wallet pays at once.`;
+        }
     }
 }
 
@@ -193,7 +213,7 @@ export function depositLine(
             message = `Received ${amountLabel(d.receivedMicros)}. Confirming the payment on Solana.`;
             break;
         case "held":
-            message = heldLine(d, c);
+            message = heldLine(d, c, v.serverNow >= v.expiresAt);
             break;
         case "checking":
             message = "Time is up. Checking for a transfer sent in the last moments.";
@@ -262,10 +282,13 @@ export function depositLine(
             `${amountLabel(d.reviewMicros)} arrived in a way Bugnet cannot return on its own. It is safe. To get it back, write to ${SUPPORT} with order ${c.orderId} and a message signed by the sending wallet.`,
         );
     }
+    // A paid order reads Paid while stray money goes back, the line says the rest (M6)
     const label =
-        d.status === "paid" && v.state === "refunded"
-            ? STATE_LABELS.refunded
-            : (STATUS_LABELS[d.status] ?? STATE_LABELS[v.state]);
+        v.state === "paid"
+            ? STATE_LABELS.paid
+            : d.status === "paid" && v.state === "refunded"
+              ? STATE_LABELS.refunded
+              : (STATUS_LABELS[d.status] ?? STATE_LABELS[v.state]);
     return { label, message, extra };
 }
 
@@ -275,7 +298,10 @@ export function walletNoteText(c: MessageContext): string {
 }
 
 export const PAGE_TEXT = {
-    noWallet: "No browser wallet found. Send to the address above instead.",
+    noWallet: (hasAddress: boolean) =>
+        hasAddress
+            ? "No browser wallet found. Send to the address above instead."
+            : "No browser wallet found.",
     connecting: (wallet: string) => `Approve the connection in ${wallet}.`,
     signing: (wallet: string) => `Approve the payment in ${wallet}.`,
     copyFailed: "Copy failed. Select the text and copy it by hand.",
@@ -284,7 +310,10 @@ export const PAGE_TEXT = {
 } as const;
 
 function shortBalance(have: number, c: MessageContext & { wallet: string }): string {
-    return `Your ${c.wallet} account holds ${amountLabel(have)} USDC on Solana and this order needs ${amountLabel(c.amountMicros)}. Nothing was charged. Add USDC, pick another account, or send to the address above.`;
+    const options = showsAddress(c)
+        ? "Add USDC, pick another account, or send to the address above."
+        : "Add USDC or pick another account.";
+    return `Your ${c.wallet} account holds ${amountLabel(have)} USDC on Solana and this order needs ${amountLabel(c.amountMicros)}. Nothing was charged. ${options}`;
 }
 
 // A wallet's own refusal, by its EIP-1193 code (W4 to W10); the wallet's text is never shown
@@ -310,14 +339,14 @@ export function walletMessage(
         case -32000:
         case -32003:
             return step(
-                `${w} refused this payment. Nothing was charged. Send to the address above instead.`,
+                `${w} refused this payment. Nothing was charged.${showsAddress(c) ? " Send to the address above instead." : ""}`,
             );
     }
     if (c.haveMicros !== undefined && c.haveMicros < c.amountMicros) {
         return step(shortBalance(c.haveMicros, { ...c, wallet: w }));
     }
     return step(
-        `${w} could not prepare the payment. Nothing was charged. Press Pay to try again, or send to the address above.`,
+        `${w} could not prepare the payment. Nothing was charged. Press Pay to try again${orSend(c)}`,
     );
 }
 
@@ -337,7 +366,7 @@ export function errorStep(err: unknown, c: MessageContext & { wallet: string }):
     }
     if (message === UNREADABLE_CHALLENGE || message === NO_OPTION || message === BUILD_FAILED) {
         return step(
-            "This page could not read Bugnet's payment request. Nothing was charged. Reload the page, or send to the address above.",
+            `This page could not read Bugnet's payment request. Nothing was charged. Reload the page${orSend(c)}`,
         );
     }
     return step(
@@ -476,12 +505,12 @@ export function pageStep(r: PayFlowResult, c: MessageContext & { wallet: string 
     if (INVALID.has(r.refused)) {
         if (r.refused === "payment_invalid" && code === SIMULATION_FAILED) {
             return {
-                message: `Solana refused the payment, most often because the account holds less than ${amount} USDC. Nothing was charged. Add USDC, or send to the address above.`,
+                message: `Solana refused the payment, most often because the account holds less than ${amount} USDC. Nothing was charged. Add USDC${orSend(c)}`,
                 payAfterMs: 0,
             };
         }
         return {
-            message: `Bugnet could not accept the transaction ${c.wallet} signed. Nothing was charged. Press Pay to try again, or send to the address above.`,
+            message: `Bugnet could not accept the transaction ${c.wallet} signed. Nothing was charged. Press Pay to try again${orSend(c)}`,
             payAfterMs: 0,
         };
     }

@@ -54,7 +54,7 @@ function dep(over: Partial<DepositView> = {}): DepositView {
 function view(d: Partial<DepositView>, state: StatusView["state"] = "unpaid"): StatusView {
     return {
         state,
-        expiresAt: 0,
+        expiresAt: 1,
         serverNow: 0,
         amountMicros: 50_000,
         kind: "start",
@@ -178,6 +178,24 @@ describe("deposit lines", () => {
         expect(held("router_unavailable").message).toBe(
             "Received $0.05. Bugnet is confirming this top-up with its sandbox service and tries again until 14:06, then returns the money.",
         );
+    });
+
+    it("past the deadline a held wallet's line offers no other wallet (M4)", () => {
+        const v = view({
+            status: "held",
+            receivedMicros: 50_000,
+            hold: { reason: "payer_busy", until: "2030-01-01T00:16:00.000Z" },
+        });
+        expect(depositLine({ ...v, serverNow: 5, expiresAt: 5 }, C).message).toBe(
+            "Received $0.05 from a wallet at its sandbox limit. Bugnet tries again until 14:06, then returns it.",
+        );
+    });
+
+    it("a wallet-paid order reads Paid while stray deposit money goes back (M6)", () => {
+        const stray = { reason: "paid_otherwise", reasonMicros: 2_000 } as const;
+        expect(line({ status: "refunding", ...stray }, "paid").label).toBe("Paid");
+        expect(line({ status: "refunded", ...stray }, "paid").label).toBe("Paid");
+        expect(line({ status: "refunded", ...stray }, "expired").label).toBe("Refunded");
     });
 
     it("paid, expired, refunding, review, checking and kept", () => {
@@ -315,8 +333,45 @@ describe("wallet messages", () => {
         }
     });
 
+    it("a page without an address never points at one (M3)", () => {
+        const N = { ...C, hasAddress: false };
+        const NW = { ...W, hasAddress: false };
+        expect(PAGE_TEXT.noWallet(false)).toBe("No browser wallet found.");
+        expect(walletMessage(e(-32603), { ...N, haveMicros: 0 }).message).toBe(
+            "Your Phantom account holds $0.00 USDC on Solana and this order needs $0.05. Nothing was charged. Add USDC or pick another account.",
+        );
+        expect(walletMessage(e(-32603), { ...N, haveMicros: 60_000 }).message).toBe(
+            "Phantom could not prepare the payment. Nothing was charged. Press Pay to try again.",
+        );
+        expect(walletMessage(e(-32000), N).message).toBe(
+            "Phantom refused this payment. Nothing was charged.",
+        );
+        expect(errorStep(new Error(UNREADABLE_CHALLENGE), NW).message).toBe(
+            "This page could not read Bugnet's payment request. Nothing was charged. Reload the page.",
+        );
+        expect(
+            pageStep(
+                { refused: "payment_invalid", code: "invalid_exact_svm_payload_transaction" },
+                NW,
+            ).message,
+        ).toBe(
+            "Bugnet could not accept the transaction Phantom signed. Nothing was charged. Press Pay to try again.",
+        );
+        expect(
+            pageStep(
+                {
+                    refused: "payment_invalid",
+                    code: "invalid_exact_svm_transaction_simulation_failed",
+                },
+                NW,
+            ).message,
+        ).toBe(
+            "Solana refused the payment, most often because the account holds less than $0.05 USDC. Nothing was charged. Add USDC.",
+        );
+    });
+
     it("page-made messages", () => {
-        expect(PAGE_TEXT.noWallet).toBe(
+        expect(PAGE_TEXT.noWallet(true)).toBe(
             "No browser wallet found. Send to the address above instead.",
         );
         expect(PAGE_TEXT.connecting("Phantom")).toBe("Approve the connection in Phantom.");
