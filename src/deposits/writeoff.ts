@@ -117,6 +117,8 @@ export type WriteOffResult =
           dropped: number;
           review: ReviewReason | null;
           reviewCleared: boolean;
+          // the sweep left manual that the review went back to move_expired_repeatedly for
+          manualSweep: number | null;
           expectedMicros: bigint | null;
       };
 
@@ -217,17 +219,21 @@ export async function writeOff(c: pg.PoolClient, w: WriteOffRequest): Promise<Wr
         w.read === null
             ? null
             : expectedBalanceAt(after.transfers, after.moves, after.writeOffs, w.read.contextSlot);
-    const reviewCleared =
-        deposit.reviewReason === "unknown_debit" &&
-        w.read !== null &&
-        w.read.micros === expectedMicros;
-    if (reviewCleared) await updateDeposit(c, w.orderId, { reviewReason: null });
+    // The scan's unknown_debit replaces the review of a sweep that expired repeatedly, and only
+    // deposits retry requeues that sweep
+    const manual = after.moves.find((m) => m.kind === "sweep" && m.state === "manual");
+    let review = deposit.reviewReason;
+    if (review === "unknown_debit" && w.read !== null && w.read.micros === expectedMicros) {
+        review = manual === undefined ? null : "move_expired_repeatedly";
+        await updateDeposit(c, w.orderId, { reviewReason: review });
+    }
     return {
         parts,
         expired: expires,
         dropped,
-        review: reviewCleared ? null : deposit.reviewReason,
-        reviewCleared,
+        review,
+        reviewCleared: deposit.reviewReason !== null && review === null,
+        manualSweep: review !== deposit.reviewReason && manual !== undefined ? manual.id : null,
         expectedMicros,
     };
 }

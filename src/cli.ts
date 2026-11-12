@@ -2234,12 +2234,15 @@ async function depositsWriteOff(
         expired: result.expired,
         droppedMoves: result.dropped,
         reviewCleared: result.reviewCleared,
+        review: result.review,
     });
     io.out(`deposit ${orderId} wrote off ${sig} micros=${micros} slot=${slot}`);
     for (const p of result.parts) io.out(partLine(p));
     if (result.expired) io.out(`order ${orderId} expired: its payment was written off`);
     if (result.reviewCleared) io.out("review cleared");
-    else if (result.review !== null) {
+    else if (result.manualSweep !== null) {
+        io.out(`review back to ${result.review}: sweep ${result.manualSweep} is still manual`);
+    } else if (result.review !== null) {
         io.out(
             `review stays ${result.review}: the chain holds ${read.micros}, the ledger ${orDash(result.expectedMicros)}`,
         );

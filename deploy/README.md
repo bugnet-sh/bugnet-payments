@@ -752,12 +752,14 @@ allowance wallet, money already swept, or review money already carried to the re
   `pay by hand`, and support pays it on a signed claim. When the debit took a settling payment's
   applied money, its sweep can never land: the payment is archived as failed, the order expires
   and every sender's money goes back. It clears the `unknown_debit` review once the ledger matches
-  the chain; the job then returns, closes and finishes the deposit. It refuses, changing nothing,
-  while a move is signed or sent, for a transaction not found, failed, or one of the deposit's own
-  moves or transfers, for one that took nothing from the deposit, one already written off, and
-  while the chain held more before the debit than the ledger (a credit the scan has not recorded
-  yet: run it again after the next scan) or less (write off the earlier debit first). The payouts
-  obey every refund-float rule: `refunds status` shows a pause, `refunds resume` lifts it.
+  the chain; the job then returns, closes and finishes the deposit. When a sweep is still manual
+  the review goes back to `move_expired_repeatedly` instead, for `deposits retry`. Any other review
+  reason stays. It refuses, changing nothing, while a move is signed or sent, for a transaction not
+  found, failed, or one of the deposit's own moves or transfers, for one that took nothing from the
+  deposit, one already written off, and while the chain held more before the debit than the ledger
+  (a credit the scan has not recorded yet: run it again after the next scan) or less (write off the
+  earlier debit first). The payouts obey every refund-float rule: `refunds status` shows a pause,
+  `refunds resume` lifts it.
 - `manual list`, `manual retry`, `manual resolve` and `manual refund` take split refund parts and
   `deposit` refund rows, one line or one id per part.
 

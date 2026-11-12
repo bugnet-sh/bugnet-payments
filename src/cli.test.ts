@@ -3220,6 +3220,58 @@ describe("deposits commands", () => {
             });
         });
 
+        it("puts the review back to the sweep that is still manual", async () => {
+            await seedDeposit(ORDER_A, {
+                order: { state: "settling", amountMicros: 30_000 },
+                deposit: {
+                    state: "settling",
+                    settled_at: CREATED,
+                    review_reason: "unknown_debit",
+                },
+            });
+            const a1 = await credit(a, srcA, 20_000);
+            const b1 = await credit(b, srcB, 15_000);
+            for (const [sig, applied] of [
+                [a1, 20_000],
+                [b1, 10_000],
+            ] as const) {
+                await db.pool.query(
+                    "update deposit_transfers set applied_micros = $2 where signature = $1",
+                    [sig, applied],
+                );
+            }
+            const sweep = await seedMove(ORDER_A, {
+                kind: "sweep",
+                state: "manual",
+                amountMicros: 30_000,
+                destination: "Recipient",
+                attempts: 3,
+                manualReason: "move_expired_repeatedly",
+                txSignature: SIG(93),
+            });
+            const stolen = theft(5_000);
+            const { code, io } = await writeOff(stolen);
+            expect(io.errText()).not.toContain("error:");
+            expect(code).toBe(0);
+            const lines = io.outText().split("\n");
+            expect(lines).toContain(
+                `part ${b1} 5000 refund=${(await writeOffRefunds())[0]!.id} to=${srcB}`,
+            );
+            expect(lines.at(-1)).toBe(
+                `review back to move_expired_repeatedly: sweep ${sweep} is still manual`,
+            );
+            expect((await findDeposit(db.pool, ORDER_A))!.reviewReason).toBe(
+                "move_expired_repeatedly",
+            );
+            expect((await findMove(db.pool, sweep))!.state).toBe("manual");
+
+            const retried = captureIo();
+            expect(await cli(["deposits", "retry", ORDER_A], retried, { now: () => LATER })).toBe(
+                0,
+            );
+            expect((await findMove(db.pool, sweep))!.state).toBe("pending");
+        });
+
         it("refuses while a move is signed or sent", async () => {
             await seedDeposit(ORDER_A);
             await credit(a, srcA, 20_000);
