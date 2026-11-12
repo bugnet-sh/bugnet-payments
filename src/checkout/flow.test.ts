@@ -728,7 +728,7 @@ describe("watchOrder", () => {
         expect(state).toBe("paid");
         expect(sleeps).toEqual([2000, 2000, 2000, 2000]);
         expect(stateStep(state)).toEqual({
-            message: "Paid. Go back to your agent; it continues on its own.",
+            message: "Go back to your agent. It continues on its own.",
             state: "paid",
         });
     });

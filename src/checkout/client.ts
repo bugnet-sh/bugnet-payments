@@ -18,8 +18,13 @@ import {
     walletError,
 } from "./flow.ts";
 import {
+    arrangement,
     keepPolling,
     needsReload,
+    payLabel,
+    type Arrived,
+    arrivedMoney,
+    initialState,
     parseStatus,
     pollDelay,
     showDepositAsk,
@@ -29,10 +34,10 @@ import {
     type StatusView,
     timeLeft,
     type WalletWatch,
-    walletNote,
     watchWallet,
 } from "./live.ts";
 import {
+    arrivedNote,
     depositAsk,
     depositLine,
     errorStep,
@@ -56,14 +61,40 @@ interface Page {
     root: HTMLElement;
     message: HTMLElement | null;
     depositMessage: HTMLElement | null;
-    walletNote: HTMLElement | null;
     stateLabel: HTMLElement;
     status: StatusDeps;
     ctx: MessageContext;
+    copyMessage: HTMLElement | null;
+    // While the order takes money, and how many usable browser wallets the page found
+    takesMoney: boolean;
+    walletsFound: number;
 }
 
 const STANDARD_CONNECT = "standard:connect";
 const MAINNET = "solana:mainnet";
+
+// A phone cannot scan its own screen and rarely has a browser wallet, so it gets the app links;
+// the page's CSS hides the codes on the same screens
+const PHONE = "(hover: none) and (pointer: coarse) and (max-width: 720px)";
+
+function arrange(p: Page): void {
+    const ask = p.root.querySelector<HTMLElement>("#deposit-ask");
+    const a = arrangement({
+        takesMoney: p.takesMoney,
+        walletsFound: p.walletsFound,
+        address: ask !== null && !ask.hidden,
+        phone: window.matchMedia(PHONE).matches,
+    });
+    const show = (selector: string, shown: boolean) => {
+        const el = p.root.querySelector<HTMLElement>(selector);
+        if (el !== null) el.hidden = !shown;
+    };
+    show("#wallet", a.wallet);
+    show("#phone", a.phone);
+    show("#phone .mobile-links", a.phoneLinks);
+    show("#phone figure", a.phoneQr);
+    show("#or", a.or);
+}
 
 function usable(w: Wallet): boolean {
     return (
@@ -122,18 +153,20 @@ interface WalletSection {
     seen(v: StatusView): void;
 }
 
-function startPayment(p: Page): WalletSection {
-    const list = element<HTMLUListElement>(p.root, "#wallets");
+function startPayment(p: Page, seed: Arrived): WalletSection {
+    const others = element<HTMLElement>(p.root, "#wallets");
     const button = element<HTMLButtonElement>(p.root, "#pay-button");
     const wallets = getWallets();
-    let chosen: Wallet | undefined;
+    let found: Wallet[] = [];
     let busy = false;
     let payable = true;
     // Set after W16 or W17, until the order shows whether the payment landed
     let watch: WalletWatch | null = null;
 
+    const buttons = () => [button, ...others.querySelectorAll<HTMLButtonElement>("button")];
+
     const refresh = () => {
-        button.disabled = busy || !payable || chosen === undefined;
+        for (const b of buttons()) b.disabled = busy || !payable || found.length === 0;
     };
 
     const offerPayAfter = (ms: number | undefined) => {
@@ -145,35 +178,49 @@ function startPayment(p: Page): WalletSection {
         }, ms);
     };
 
+    // Money that already reached the address, as the server drew it until a status answer comes
+    let arrived = seed;
+    const note = p.root.querySelector<HTMLElement>("#wallet-note");
+
+    const label = (b: HTMLButtonElement, w: Wallet | undefined) => {
+        if (w === undefined) {
+            b.textContent = payLabel(undefined);
+            return;
+        }
+        const icon = document.createElement("img");
+        icon.src = w.icon;
+        icon.alt = "";
+        const price = arrived.micros > 0 ? (p.root.dataset.amount ?? undefined) : undefined;
+        b.replaceChildren(icon, payLabel(w.name, price));
+    };
+
+    const relabel = () => {
+        label(button, found[0]);
+        others.querySelectorAll<HTMLButtonElement>("button").forEach((b, i) => {
+            label(b, found[i + 1]);
+        });
+        const text = arrivedNote(arrived);
+        if (note !== null && note.textContent !== text) note.textContent = text;
+    };
+
+    // The first wallet found pays from the green button, every other from one of its own
     const render = () => {
-        const found = wallets.get().filter(usable);
-        if (chosen === undefined || !found.includes(chosen)) chosen = found[0];
-        list.replaceChildren(
-            ...found.map((w) => {
-                const input = document.createElement("input");
-                input.type = "radio";
-                input.name = "wallet";
-                input.checked = w === chosen;
-                input.addEventListener("change", () => {
-                    chosen = w;
-                    refresh();
+        found = wallets.get().filter(usable);
+        button.hidden = found.length === 0;
+        others.replaceChildren(
+            ...found.slice(1).map((w) => {
+                const b = document.createElement("button");
+                b.type = "button";
+                b.className = "button outline";
+                b.addEventListener("click", () => {
+                    if (!busy && payable) void pay(w);
                 });
-                const icon = document.createElement("img");
-                icon.src = w.icon;
-                icon.alt = "";
-                const label = document.createElement("label");
-                label.append(input, icon, w.name);
-                const item = document.createElement("li");
-                item.className = "wallet";
-                item.append(label);
-                return item;
+                return b;
             }),
         );
-        if (found.length === 0) {
-            const item = document.createElement("li");
-            item.textContent = PAGE_TEXT.noWallet(p.ctx.hasAddress !== false);
-            list.append(item);
-        }
+        relabel();
+        p.walletsFound = found.length;
+        arrange(p);
         refresh();
     };
 
@@ -231,13 +278,19 @@ function startPayment(p: Page): WalletSection {
     };
 
     button.addEventListener("click", () => {
-        if (chosen !== undefined && !busy && payable) void pay(chosen);
+        const first = found[0];
+        if (first !== undefined && !busy && payable) void pay(first);
     });
     wallets.on("register", render);
     wallets.on("unregister", render);
     render();
     return {
         seen(v) {
+            const now = arrivedMoney(v.state, v.deposit);
+            if (now.micros !== arrived.micros || now.review !== arrived.review) {
+                arrived = now;
+                relabel();
+            }
             if (watch === null || busy) return;
             const next = watchWallet(watch, v.state, Date.now());
             if (next !== "unpaid") {
@@ -275,13 +328,10 @@ function follow(p: Page, wallet: WalletSection | null): void {
     const expiresAt = Date.parse(p.root.dataset.expiresAt ?? "");
     const settleGraceMs = Number(p.root.dataset.settleGraceMs ?? "60000");
     const timeEl = p.root.querySelector<HTMLElement>("#time-left");
-    const untilEl = p.root.querySelector<HTMLElement>("#until");
     const qr = p.root.querySelector<HTMLImageElement>("#deposit img");
     const askEls = {
         amount: p.root.querySelector<HTMLElement>("#deposit-amount"),
         copy: p.root.querySelector<HTMLButtonElement>("#deposit-amount-copy"),
-        caption: p.root.querySelector<HTMLElement>("#deposit figcaption"),
-        exchange: p.root.querySelector<HTMLElement>("#exchange-note"),
     };
     // M20 on a page without a deposit, put back once a status error line is no longer true
     const firstLine = p.depositMessage?.textContent ?? "";
@@ -292,7 +342,6 @@ function follow(p: Page, wallet: WalletSection | null): void {
     let remaining: number | null = Number.isNaN(drawn) ? null : drawn;
     let lastKey: string | null = null;
     let changedAt = Date.now();
-    if (untilEl !== null) untilEl.textContent = `until ${p.ctx.deadline}`;
 
     const tick = () => {
         if (timeEl !== null) timeEl.textContent = timeLeft(expiresAt, Date.now() + offset);
@@ -316,17 +365,15 @@ function follow(p: Page, wallet: WalletSection | null): void {
         if (p.depositMessage !== null) {
             p.depositMessage.textContent =
                 v.deposit !== null || v.state !== "unpaid"
-                    ? [line.message, ...line.extra].join(" ")
+                    ? [line.message, ...line.extra].filter((t) => t !== "").join(" ")
                     : firstLine;
         }
         // The QR asks for money only while the order lacks some
         const d = v.deposit;
         if (d !== null && v.state === "unpaid") {
             const ask = depositAsk(p.ctx.amountMicros, d);
-            if (askEls.amount !== null) askEls.amount.textContent = `${ask.plain} USDC`;
+            if (askEls.amount !== null) askEls.amount.textContent = ask.plain;
             if (askEls.copy !== null) askEls.copy.dataset.copy = ask.plain;
-            if (askEls.caption !== null) askEls.caption.textContent = ask.caption;
-            if (askEls.exchange !== null) askEls.exchange.textContent = ask.exchange;
             if (qr !== null) qr.alt = ask.alt;
         }
         const askEl = p.root.querySelector<HTMLElement>("#deposit-ask");
@@ -334,7 +381,7 @@ function follow(p: Page, wallet: WalletSection | null): void {
         // Wallet lines offer the address only while the page shows it (M3)
         p.ctx.hasAddress = askEl !== null && !askEl.hidden;
         // A countdown on an order that no longer takes money says nothing true
-        const timeRow = timeEl?.closest("div") ?? null;
+        const timeRow = timeEl?.closest<HTMLElement>(".time") ?? null;
         if (timeRow !== null) timeRow.hidden = !showWalletOptions(v);
         const qrShown = showDepositQr(v);
         const figure = qr?.closest("figure") ?? null;
@@ -343,17 +390,10 @@ function follow(p: Page, wallet: WalletSection | null): void {
             remaining = d.remainingMicros;
             qr.src = `/o/${p.ctx.orderId}/qr.svg?r=${remaining}`;
         }
+        p.takesMoney = showWalletOptions(v);
+        arrange(p);
+        // After arrange, so a line W18 writes lands in a shown wallet part
         wallet?.seen(v);
-        const options = showWalletOptions(v);
-        for (const id of ["#wallet", "#phone"]) {
-            const section = p.root.querySelector<HTMLElement>(id);
-            if (section !== null) section.hidden = !options;
-        }
-        if (p.walletNote !== null) {
-            const note = walletNote(v, p.ctx);
-            p.walletNote.hidden = note === null;
-            p.walletNote.textContent = note ?? "";
-        }
     };
 
     let failures = 0;
@@ -394,21 +434,59 @@ function follow(p: Page, wallet: WalletSection | null): void {
 
 const COPIED_FOR_MS = 1_500;
 
-function offerCopy(button: HTMLButtonElement, failed: (button: HTMLButtonElement) => void): void {
+function offerCopy(button: HTMLButtonElement, failed: () => void, copied: () => void): void {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const label = button.getAttribute("aria-label") ?? "";
     button.addEventListener("click", () => {
         // Without the Clipboard API writeText throws before any promise, so it goes inside one
         Promise.resolve()
             .then(() => navigator.clipboard.writeText(button.dataset.copy ?? ""))
+            // Wallet in-app browsers often lack the Clipboard API but still copy a selection
+            .catch(() => {
+                if (!copySelected(button.dataset.copy ?? "")) throw new Error("copy refused");
+            })
             .then(
                 () => {
+                    copied();
                     button.dataset.copied = "";
+                    button.setAttribute("aria-label", "Copied");
                     clearTimeout(timer);
-                    timer = setTimeout(() => delete button.dataset.copied, COPIED_FOR_MS);
+                    timer = setTimeout(() => {
+                        delete button.dataset.copied;
+                        button.setAttribute("aria-label", label);
+                    }, COPIED_FOR_MS);
                 },
-                () => failed(button),
+                () => failed(),
             );
     });
+}
+
+function copySelected(text: string): boolean {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.append(area);
+    area.select();
+    let done: boolean;
+    try {
+        // The old command, the only copy some WebViews have
+        done = document.execCommand("copy");
+    } catch {
+        done = false;
+    }
+    area.remove();
+    return done;
+}
+
+// Selects a value so it can be copied by hand when the clipboard refuses
+function selectText(el: HTMLElement): void {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
 }
 
 function localTime(ms: number): string {
@@ -421,12 +499,13 @@ function localTime(ms: number): string {
 
 const root = document.getElementById("checkout");
 if (root !== null) {
+    const start = initialState(root.dataset);
     const expiresAt = Date.parse(root.dataset.expiresAt ?? "");
     const p: Page = {
         root,
         message: root.querySelector<HTMLElement>("#message"),
         depositMessage: root.querySelector<HTMLElement>("#deposit-message"),
-        walletNote: root.querySelector<HTMLElement>("#wallet-note"),
+        copyMessage: root.querySelector<HTMLElement>("#copy-message"),
         stateLabel: element<HTMLElement>(root, "#state"),
         status: {
             fetch: (input, init) => fetch(input, init),
@@ -439,16 +518,38 @@ if (root !== null) {
             orderId: root.dataset.orderId ?? "",
             hasAddress: root.querySelector("#deposit-ask:not([hidden])") !== null,
         },
+        // Never offers a way to pay the server left out, until a status answer says so
+        takesMoney: start.takesMoney,
+        walletsFound: 0,
     };
     for (const button of root.querySelectorAll<HTMLButtonElement>("button[data-copy]")) {
-        offerCopy(button, (b) => {
-            const line = b.closest("#deposit") !== null ? p.depositMessage : p.message;
-            if (line !== null) line.textContent = PAGE_TEXT.copyFailed;
+        const field = button.closest<HTMLElement>(".field");
+        const value =
+            button.parentElement?.querySelector<HTMLElement>(".full") ??
+            button.parentElement?.querySelector<HTMLElement>(".value") ??
+            null;
+        // W34 has its own line, so it never replaces what happened to the order
+        offerCopy(
+            button,
+            () => {
+                if (value !== null) selectText(value);
+                if (p.copyMessage !== null) p.copyMessage.textContent = PAGE_TEXT.copyFailed;
+            },
+            () => {
+                if (p.copyMessage !== null) p.copyMessage.textContent = "";
+            },
+        );
+        // A click anywhere on a field copies it, unless the click made a selection of its own;
+        // the icon button stays the keyboard's way in
+        field?.addEventListener("click", (e) => {
+            if (button.contains(e.target as Node)) return;
+            if ((window.getSelection()?.toString() ?? "") !== "") return;
+            button.click();
         });
     }
     const wallet =
         root.dataset.state === "unpaid" && root.querySelector("#pay-button") !== null
-            ? startPayment(p)
+            ? startPayment(p, start.arrived)
             : null;
     follow(p, wallet);
 }

@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { DepositView } from "../deposits/types.ts";
 import {
+    arrangement,
+    arrivedMoney,
+    initialState,
+    confirmingInFull,
     fetchStatus,
     keepPolling,
     needsReload,
     parseStatus,
+    payLabel,
     pollDelay,
     showDepositAsk,
     showDepositQr,
@@ -12,12 +17,10 @@ import {
     statusKey,
     type StatusView,
     timeLeft,
-    walletNote,
     watchWallet,
 } from "./live.ts";
 
 const T = (hms: string) => Date.parse(`2030-01-01T${hms}.000Z`);
-const C = { amountMicros: 50_000, deadline: "14:05", refundMinMicros: 1_000, orderId: "ord_a" };
 
 function view(state: StatusView["state"], d: Partial<DepositView> | null = null): StatusView {
     return {
@@ -134,16 +137,140 @@ describe("live status", () => {
         expect(needsReload("settling", view("paid"))).toBe(false);
     });
 
-    it("showWalletOptions and walletNote", () => {
+    it("every way to pay shows while the order takes money", () => {
         expect(showWalletOptions(view("unpaid", { receivedMicros: 30_000 }))).toBe(true);
         expect(showWalletOptions(view("paid"))).toBe(false);
-        expect(walletNote(view("unpaid", {}), C)).toBeNull();
-        const w35 =
-            "Money already arrived at the address above. A wallet payment charges the full $0.05, and that money then goes back to the wallet that sent it.";
-        expect(walletNote(view("unpaid", { receivedMicros: 1 }), C)).toBe(w35);
-        expect(walletNote(view("unpaid", { otherMicros: 1 }), C)).toBe(w35);
     });
 
+    it("with the whole price in and confirming, the page asks for nothing more", () => {
+        const full = view("unpaid", {
+            status: "confirming",
+            receivedMicros: 50_000,
+            remainingMicros: 0,
+        });
+        expect(confirmingInFull(full.deposit!)).toBe(true);
+        expect(showWalletOptions(full)).toBe(false);
+        expect(showDepositAsk(full)).toBe(false);
+        expect(showDepositQr(full)).toBe(false);
+        // Part of it confirming still asks for the rest
+        const part = view("unpaid", {
+            status: "confirming",
+            receivedMicros: 20_000,
+            remainingMicros: 30_000,
+        });
+        expect(confirmingInFull(part.deposit!)).toBe(false);
+        expect(showDepositAsk(part)).toBe(true);
+    });
+});
+
+describe("which ways to pay show", () => {
+    const at = (o: Partial<Parameters<typeof arrangement>[0]>) =>
+        arrangement({ takesMoney: true, walletsFound: 0, address: true, phone: false, ...o });
+
+    const none = { wallet: false, phone: false, phoneLinks: false, phoneQr: false, or: false };
+
+    it("a found wallet always shows, under the address after an or", () => {
+        for (const phone of [false, true]) {
+            expect(at({ walletsFound: 1, phone })).toEqual({ ...none, wallet: true, or: true });
+        }
+    });
+
+    it("without an address, a found wallet keeps the Phantom code beside it off a phone", () => {
+        // The extension may hold no USDC while the phone does
+        expect(at({ walletsFound: 2, address: false })).toEqual({
+            ...none,
+            wallet: true,
+            phone: true,
+            phoneQr: true,
+        });
+        // A phone with a wallet is inside that wallet: neither links nor a code it cannot scan
+        expect(at({ walletsFound: 1, address: false, phone: true })).toEqual({
+            ...none,
+            wallet: true,
+        });
+    });
+
+    it("with no wallet and an address, a desktop shows the address alone and a phone adds the app links", () => {
+        expect(at({})).toEqual(none);
+        expect(at({ phone: true })).toEqual({ ...none, phone: true, phoneLinks: true, or: true });
+    });
+
+    it("with no wallet and no address, the page offers the phone, its code off a phone", () => {
+        expect(at({ address: false })).toEqual({
+            ...none,
+            phone: true,
+            phoneLinks: true,
+            phoneQr: true,
+        });
+        expect(at({ address: false, phone: true })).toEqual({
+            ...none,
+            phone: true,
+            phoneLinks: true,
+        });
+    });
+
+    it("an order that no longer takes money offers nothing", () => {
+        for (const walletsFound of [0, 1, 2]) {
+            for (const address of [false, true]) {
+                expect(at({ takesMoney: false, walletsFound, address })).toEqual(none);
+            }
+        }
+    });
+
+    it("never draws two codes: the phone code shows only where no address shows", () => {
+        for (const address of [false, true]) {
+            for (const phone of [false, true]) {
+                for (const walletsFound of [0, 1]) {
+                    const a = at({ address, phone, walletsFound });
+                    expect(a.phoneQr && address).toBe(false);
+                }
+            }
+        }
+    });
+
+    it("each wallet's button names it, and the whole price once money already arrived", () => {
+        expect(payLabel(undefined)).toBe("Pay");
+        expect(payLabel("Phantom")).toBe("Pay with Phantom");
+        expect(payLabel("Phantom", "$0.08")).toBe("Pay $0.08 with Phantom");
+    });
+
+    it("money at the address counts while a wallet payment is still offered, review included", () => {
+        const of = (v: StatusView) => arrivedMoney(v.state, v.deposit);
+        expect(of(view("unpaid", {}))).toEqual({ micros: 0, review: false });
+        expect(of(view("unpaid", { receivedMicros: 20_000, otherMicros: 5_000 }))).toEqual({
+            micros: 25_000,
+            review: false,
+        });
+        // In review a wallet payment still charges the whole price; that money waits for a person
+        expect(of(view("unpaid", { status: "review", receivedMicros: 20_000 }))).toEqual({
+            micros: 20_000,
+            review: true,
+        });
+        expect(of(view("paid", { receivedMicros: 50_000 })).micros).toBe(0);
+        expect(of(view("unpaid", null)).micros).toBe(0);
+        const full = { status: "confirming" as const, receivedMicros: 50_000, remainingMicros: 0 };
+        expect(of(view("unpaid", full)).micros).toBe(0);
+    });
+
+    it("the script starts from what the server drew", () => {
+        expect(initialState({})).toEqual({
+            takesMoney: false,
+            arrived: { micros: 0, review: false },
+        });
+        expect(
+            initialState({ takesMoney: "true", arrivedMicros: "30000", arrivedReview: "false" }),
+        ).toEqual({ takesMoney: true, arrived: { micros: 30_000, review: false } });
+        expect(
+            initialState({ takesMoney: "true", arrivedMicros: "20000", arrivedReview: "true" }),
+        ).toEqual({ takesMoney: true, arrived: { micros: 20_000, review: true } });
+        // A bad number reads as nothing arrived
+        for (const bad of ["x", "-5", "1.5", "1e30"]) {
+            expect(initialState({ arrivedMicros: bad }).arrived.micros).toBe(0);
+        }
+    });
+});
+
+describe("status requests", () => {
     it("fetchStatus sends both headers", async () => {
         const seen: { url: string; headers: Record<string, string> }[] = [];
         const fake = (async (url: string, init?: RequestInit) => {

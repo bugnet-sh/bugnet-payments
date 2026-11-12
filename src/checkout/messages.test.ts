@@ -11,6 +11,7 @@ import {
 } from "./flow.ts";
 import type { StatusView } from "./live.ts";
 import {
+    arrivedNote,
     depositAsk,
     depositLine,
     errorStep,
@@ -67,43 +68,40 @@ const line = (d: Partial<DepositView>, state?: StatusView["state"]) =>
 describe("deposit lines", () => {
     it("waiting, partial and confirming", () => {
         expect(line({})).toEqual({
-            label: "Waiting for your transfer",
-            message:
-                "Send 0.05 USDC to the address above by 14:05. This page updates when it arrives.",
+            label: "Awaiting payment",
+            message: "",
             extra: [],
         });
         expect(
             line({ status: "partial", receivedMicros: 30_000, remainingMicros: 20_000 }),
         ).toEqual({
             label: "Partly paid",
-            message: "Received $0.03. Send $0.02 more to the same address by 14:05.",
+            message: "Received $0.03 of $0.05.",
             extra: [],
         });
-        expect(line({ status: "confirming", receivedMicros: 50_000 }).message).toBe(
-            "Received $0.05. Confirming the payment on Solana.",
-        );
+        // The whole price in reads as Confirming alone, under the price it would repeat
+        expect(
+            line({ status: "confirming", receivedMicros: 50_000, remainingMicros: 0 }).message,
+        ).toBe("");
+        expect(
+            line({ status: "confirming", receivedMicros: 30_000, remainingMicros: 20_000 }).message,
+        ).toBe("Received $0.03 of $0.05.");
     });
 
     it("once money has arrived, the section asks for the rest and the line says what arrived", () => {
         expect(depositAsk(50_000, { remainingMicros: 50_000 })).toEqual({
             plain: "0.05",
             alt: "Solana Pay code for 0.05 USDC",
-            caption: "Scan with a Solana wallet app to send 0.05 USDC",
-            exchange:
-                "From an exchange, send exactly 0.05 USDC. Anything returned goes back to the sending address, which an exchange may not credit to you.",
         });
         expect(depositAsk(50_000, { remainingMicros: 20_000 })).toEqual({
             plain: "0.02",
             alt: "Solana Pay code for 0.02 USDC",
-            caption: "Scan with a Solana wallet app to send 0.02 USDC",
-            exchange:
-                "From an exchange, send exactly 0.02 USDC. Anything returned goes back to the sending address, which an exchange may not credit to you.",
         });
         // Covered only with a held wallet's money: another wallet still pays the price (M24)
         expect(depositAsk(50_000, { remainingMicros: 0 }).plain).toBe("0.05");
         expect(
             line({ status: "partial", receivedMicros: 30_000, remainingMicros: 20_000 }).message,
-        ).toBe("Received $0.03. Send $0.02 more to the same address by 14:05.");
+        ).toBe("Received $0.03 of $0.05.");
     });
 
     it("an order paid by deposit and then refunded reads Refunded, never Paid", () => {
@@ -123,7 +121,7 @@ describe("deposit lines", () => {
             line({ status: "paid", receivedMicros: 50_000, remainingMicros: 0 }, "paid"),
         ).toEqual({
             label: "Paid",
-            message: "Paid. Go back to your agent; it continues on its own.",
+            message: "Go back to your agent. It continues on its own.",
             extra: [],
         });
     });
@@ -137,7 +135,7 @@ describe("deposit lines", () => {
             reasonMicros: 20_000,
             blockedUntil: "2030-01-02T00:00:00.000Z",
         });
-        expect(r.message).toBe("Received $0.03. Send $0.02 more to the same address by 14:05.");
+        expect(r.message).toBe("Received $0.03 of $0.05.");
         expect(r.extra).toEqual([
             "Bugnet blocks the wallet that sent $0.02 until 2 Jan 2030, 00:00, so that money is being returned to it.",
         ]);
@@ -150,9 +148,9 @@ describe("deposit lines", () => {
             otherMicros: 10_000,
             remainingMicros: 20_000,
         });
-        expect(r.message).toBe("Received $0.03. Send $0.02 more to the same address by 14:05.");
+        expect(r.message).toBe("Received $0.03 of $0.05.");
         expect(r.extra).toEqual([
-            "$0.01 also arrived from other wallets. It is not counted in the amount above.",
+            "$0.01 also arrived from other wallets. It does not lower the amount below.",
         ]);
     });
 
@@ -204,7 +202,7 @@ describe("deposit lines", () => {
                 { status: "paid", reason: "extra", extraMicros: 2_000, returningMicros: 2_000 },
                 "paid",
             ).message,
-        ).toBe("Paid. The extra $0.002 is being returned to the address that sent it.");
+        ).toBe("The extra $0.002 is being returned to the address that sent it.");
     });
 
     it("a wallet-paid order reads Paid while stray deposit money goes back (M6)", () => {
@@ -216,14 +214,14 @@ describe("deposit lines", () => {
 
     it("paid, expired, refunding, review, checking and kept", () => {
         expect(line({ status: "paid" }, "paid").message).toBe(
-            "Paid. Go back to your agent; it continues on its own.",
+            "Go back to your agent. It continues on its own.",
         );
         expect(
             line({ status: "paid", extraMicros: 10_000, returningMicros: 10_000 }, "paid").message,
-        ).toBe("Paid. The extra $0.01 is being returned to the address that sent it.");
+        ).toBe("The extra $0.01 is being returned to the address that sent it.");
         expect(
             line({ status: "paid", extraMicros: 10_000, returnedMicros: 10_000 }, "paid").message,
-        ).toBe("Paid. The extra $0.01 was returned to the address that sent it.");
+        ).toBe("The extra $0.01 was returned to the address that sent it.");
         expect(line({ status: "expired" }, "expired").message).toBe(
             "This order expired at 14:05 and nothing was charged. Ask your agent for a new payment link.",
         );
@@ -352,7 +350,6 @@ describe("wallet messages", () => {
     it("a page without an address never points at one (M3)", () => {
         const N = { ...C, hasAddress: false };
         const NW = { ...W, hasAddress: false };
-        expect(PAGE_TEXT.noWallet(false)).toBe("No browser wallet found.");
         expect(walletMessage(e(-32603), { ...N, haveMicros: 0 }).message).toBe(
             "Your Phantom account holds $0.00 USDC on Solana and this order needs $0.05. Nothing was charged. Add USDC or pick another account.",
         );
@@ -387,8 +384,14 @@ describe("wallet messages", () => {
     });
 
     it("page-made messages", () => {
-        expect(PAGE_TEXT.noWallet(true)).toBe(
-            "No browser wallet found. Send to the address above instead.",
+        expect(PAGE_TEXT.addressOff).toBe("Paying by address is off right now.");
+        expect(arrivedNote({ micros: 0, review: false })).toBe("");
+        expect(arrivedNote({ micros: 30_000, review: false })).toBe(
+            "The $0.03 already sent is then returned.",
+        );
+        // The support line above already says what to do; this only promises nothing
+        expect(arrivedNote({ micros: 30_000, review: true })).toBe(
+            "The $0.03 in review is not returned on its own.",
         );
         expect(PAGE_TEXT.connecting("Phantom")).toBe("Approve the connection in Phantom.");
         expect(PAGE_TEXT.signing("Phantom")).toBe("Approve the payment in Phantom.");
@@ -406,13 +409,13 @@ describe("wallet messages", () => {
             depositLine({ ...view({}, state), deposit: null }, C);
         expect(bare("settling")).toEqual({
             label: "Confirming",
-            message: "The payment is confirming on Solana. This page updates when it lands.",
+            message: "This page updates when the payment lands.",
             extra: [],
         });
         expect(bare("refunded").message).toBe(
             "This order's payment was returned to the wallet that paid.",
         );
-        expect(bare("paid").message).toBe("Paid. Go back to your agent; it continues on its own.");
+        expect(bare("paid").message).toBe("Go back to your agent. It continues on its own.");
         expect(bare("expired").message).toBe(
             "This order expired at 14:05 and nothing was charged. Ask your agent for a new payment link.",
         );

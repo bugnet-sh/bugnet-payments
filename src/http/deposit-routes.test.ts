@@ -359,7 +359,10 @@ describe("deposit routes with new deposits off", () => {
     it("no new deposit when disabled", async () => {
         await order(app);
         const html = await (await page(app)).text();
+        // No address to show: the page says so and offers the wallet and the phone
         expect(html).toContain("Paying by address is off right now.");
+        expect(html).not.toContain('id="deposit"');
+        expect(html).toContain('<section id="phone">');
         const rows = await app.pool.query("select 1 from deposits where order_id = $1", [ID]);
         expect(rows.rowCount).toBe(0);
     });

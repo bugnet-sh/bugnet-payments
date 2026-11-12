@@ -81,7 +81,9 @@ describe("checkout page", () => {
         expect(html).toContain(`href="${links.solflare}"`);
         expect(html).toContain("Open in Phantom");
         expect(html).toContain("Open in Solflare");
+        // No address on this page, so its one code opens the page in Phantom
         expect(html).toContain(await qrSvg(links.phantom));
+        expect(html.match(/<figure class="qr"/g)).toHaveLength(1);
         expect(html).toContain('id="pay-button"');
         expect(html).toContain('id="wallets"');
     });
@@ -132,7 +134,7 @@ describe("checkout page", () => {
         ] as const) {
             const html = await renderCheckout({ ...view, state });
             expect(html).toContain(
-                `<dd id="state" class="state" data-state="${state}">${label}</dd>`,
+                `<span id="state" class="state" data-state="${state}" role="status" aria-live="polite">${label}</span>`,
             );
             expect(html).toContain(id);
             // The client only wires the Copy button on a closed order's page
@@ -147,7 +149,7 @@ describe("checkout page", () => {
     it("follows a settling order with the client but offers no way to pay", async () => {
         const html = await renderCheckout({ ...view, state: "settling" });
         expect(html).toContain(
-            '<dd id="state" class="state" data-state="settling">Confirming</dd>',
+            '<span id="state" class="state" data-state="settling" role="status" aria-live="polite">Confirming</span>',
         );
         expect(html).toContain('<p id="message" role="status" aria-live="polite"></p>');
         expect(html).toContain('<script type="module" src="/checkout.js"></script>');
@@ -405,7 +407,7 @@ describe("address-first page", () => {
     } as unknown as NonNullable<CheckoutView["deposit"]>;
     const offered: CheckoutView = { ...view, amountMicros: 50_000, deposit, depositsOffered: true };
     const section = (html: string, name: string) => {
-        const at = html.indexOf(`<section id="${name}">`);
+        const at = html.indexOf(`<section id="${name}"`);
         return html.slice(at, html.indexOf("</section>", at));
     };
 
@@ -416,34 +418,67 @@ describe("address-first page", () => {
         expect(decimalAmount(10_000)).toBe("0.01");
     });
 
-    it("deposit section comes first", async () => {
+    it("the address comes first, then an or, then the wallet and the phone", async () => {
         const html = await renderCheckout(offered);
-        const d = html.indexOf('id="deposit"');
-        expect(d).toBeGreaterThan(0);
-        expect(d).toBeLessThan(html.indexOf('id="wallet"'));
-        expect(html.indexOf('id="wallet"')).toBeLessThan(html.indexOf('id="phone"'));
+        const order = ['id="deposit"', 'id="or"', 'id="wallet"', 'id="phone"'].map((a) =>
+            html.indexOf(a),
+        );
+        expect(order[0]).toBeGreaterThan(0);
+        expect([...order].sort((a, b) => a - b)).toEqual(order);
+        // The script shows each once it knows the browser's wallets
+        expect(html).toContain('<section id="wallet" hidden>');
+        expect(html).toContain('<section id="phone" hidden>');
+        expect(html).toContain('<p id="or" class="or" hidden>or</p>');
     });
 
-    it("the address, amount and network are shown with copy buttons", async () => {
+    it("the amount and the Solana address are click-to-copy fields with copy icons", async () => {
         const html = await renderCheckout(offered);
-        expect(html).toContain(`data-copy="${ADDRESS}"`);
-        expect(html).toContain('data-copy="0.05"');
-        expect(html).toContain(">Solana<");
-        expect(html).toContain("Send only USDC on Solana.");
+        const dep = section(html, "deposit");
+        expect(dep).toContain(`data-copy="${ADDRESS}" aria-label="Copy address"`);
+        expect(dep).toContain('data-copy="0.05" aria-label="Copy amount"');
+        expect(dep).toContain('<span class="label">Solana address</span>');
+        // Shown whole, wrapping in its field, since people compare it by eye
+        expect(dep).toContain(`<span class="value address">${ADDRESS}</span>`);
+        // Icons, never a Copy word, and no mono text
+        expect(html).not.toMatch(/>Copy</);
+        expect(html).not.toContain("<code");
+        expect(html).toContain('<svg class="idle"');
     });
 
-    it("both QRs, each with its own caption", async () => {
+    it("USDC is said once on the page, in the amount field", async () => {
         const html = await renderCheckout(offered);
-        expect(html.match(/<figure class="qr">/g)).toHaveLength(2);
+        const body = html.slice(html.indexOf("<main"));
+        expect(body.match(/>USDC</g)).toHaveLength(1);
+        expect(body.match(/class="usdc"/g)).toHaveLength(1);
+        expect(html).toContain('<p class="amount"><span class="amount-value">$0.05</span></p>');
+        expect(html).not.toContain("<h2");
+    });
+
+    it("one code shows: the address's, while the Phantom code waits hidden for a review", async () => {
+        const html = await renderCheckout(offered);
+        expect(html.match(/<figure class="qr">/g)).toHaveLength(1);
         expect(section(html, "deposit")).toContain(`<img src="/o/${id}/qr.svg?r=50000"`);
-        expect(section(html, "deposit")).toContain(
-            "Scan with a Solana wallet app to send 0.05 USDC",
-        );
+        const phone = section(html, "phone");
+        expect(phone).toContain('<figure class="qr" hidden>');
         const phantom = walletLinks(offered.pageUrl, offered.origin).phantom;
-        expect(section(html, "phone")).toContain(await qrSvg(phantom));
-        expect(section(html, "phone")).toContain(
-            "Scan with your phone to open this page in Phantom",
+        expect(phone).toContain(await qrSvg(phantom));
+        // A phone cannot scan its own screen; a tablet can still show its code to one
+        expect(html).toContain(
+            "@media (hover: none) and (pointer: coarse) and (max-width: 720px) {\n    .qr { display: none !important; }",
         );
+    });
+
+    it("a deposit drawn in review shows no address, and the Phantom code instead", async () => {
+        const review = {
+            ...offered,
+            deposit: { ...offered.deposit!, status: "review" as const, remainingMicros: 30_000 },
+        };
+        const html = await renderCheckout(review);
+        expect(html).toContain('<div id="deposit-ask" hidden>');
+        expect(section(html, "phone")).toContain('<figure class="qr">');
+        // The address's code sits inside the hidden ask, so one code shows
+        const outside = html.slice(html.indexOf('<section id="wallet"'));
+        expect(outside.match(/<figure class="qr">/g)).toHaveLength(1);
     });
 
     it("the deposit QR names what it asks for, so the first poll fetches it again only when that changed", async () => {
@@ -465,7 +500,7 @@ describe("address-first page", () => {
         );
     });
 
-    it("once money has arrived, the Amount row, Copy, QR and exchange note ask for the rest", async () => {
+    it("once money has arrived, the Amount field, its copy value and the QR ask for the rest", async () => {
         const partial = {
             ...offered,
             deposit: {
@@ -477,37 +512,74 @@ describe("address-first page", () => {
         };
         const html = await renderCheckout(partial);
         const dep = section(html, "deposit");
-        expect(dep).toContain('<span id="deposit-amount">0.02 USDC</span>');
+        expect(dep).toContain('<span id="deposit-amount" class="value">0.02</span>');
         expect(dep).toContain(
-            '<button id="deposit-amount-copy" class="copy" type="button" data-copy="0.02">',
+            '<button id="deposit-amount-copy" class="copy" type="button" data-copy="0.02" aria-label="Copy amount">',
         );
         expect(dep).toContain('alt="Solana Pay code for 0.02 USDC"');
-        expect(dep).toContain(
-            "<figcaption>Scan with a Solana wallet app to send 0.02 USDC</figcaption>",
-        );
-        expect(dep).toContain("From an exchange, send exactly 0.02 USDC.");
         expect(dep).not.toContain("0.05");
-        // The price and the wallet payment stay whole
+        // The price stays whole
         expect(html).toContain('<span class="amount-value">$0.05</span>');
-        expect(html).toContain(">Pay $0.05</button>");
     });
 
     it("the ask sits in one block the client hides, apart from the deposit line", async () => {
-        const dep = section(await renderCheckout(offered), "deposit");
-        const ask = dep.slice(dep.indexOf('<div id="deposit-ask">'), dep.indexOf("</div>\n<p id"));
-        expect(ask).toContain("<h2>Send USDC to this address</h2>");
-        expect(ask).toContain('<dl class="facts">');
+        const html = await renderCheckout(offered);
+        const ask = html.slice(
+            html.indexOf('<div id="deposit-ask">'),
+            html.indexOf('<section id="wallet"'),
+        );
+        expect(ask).toContain('<div class="fields">');
         expect(ask).toContain('<figure class="qr">');
-        expect(ask).toContain("Send only USDC on Solana.");
-        expect(ask).toContain('id="exchange-note"');
+        expect(ask).toContain('id="or"');
+        // The order's line sits under its status, apart from any way to pay
         expect(ask).not.toContain('id="deposit-message"');
-        expect(dep).toContain('</div>\n<p id="deposit-message"');
-        const review = {
+        expect(
+            html.indexOf('<p id="deposit-message" role="status" aria-live="polite"></p>'),
+        ).toBeLessThan(html.indexOf('id="deposit-ask"'));
+    });
+
+    it("with the whole price in and confirming, nothing asks for money", async () => {
+        const html = await renderCheckout({
             ...offered,
-            deposit: { ...offered.deposit!, status: "review" as const, remainingMicros: 30_000 },
-        };
-        expect(section(await renderCheckout(review), "deposit")).toContain(
-            '<div id="deposit-ask" hidden>',
+            deposit: {
+                ...offered.deposit!,
+                status: "confirming" as const,
+                receivedMicros: 50_000,
+                remainingMicros: 0,
+            },
+        });
+        expect(html).toContain('<div id="deposit-ask" hidden>');
+        expect(html).toContain('<section id="phone" hidden>');
+        expect(html).toContain('<span class="time" hidden>');
+        expect(html).not.toContain("<noscript>");
+        // The script starts with no way to pay, and the label already says Confirming
+        expect(html).toContain('data-takes-money="false"');
+        expect(html).toContain('aria-live="polite">Confirming</span>');
+        expect(await renderCheckout(offered)).toContain('data-takes-money="true"');
+    });
+
+    it("nothing on the page talks about exchanges", async () => {
+        for (const state of ["unpaid", "settling", "paid", "expired", "refunded"] as const) {
+            expect((await renderCheckout({ ...offered, state })).toLowerCase()).not.toContain(
+                "exchange",
+            );
+        }
+    });
+
+    it("a failed copy has its own line, apart from the order's", async () => {
+        const html = await renderCheckout(offered);
+        expect(html).toContain('<p id="copy-message" role="status" aria-live="polite"></p>');
+        // Empty live regions stay in the page, so their first line is announced
+        expect(html).toContain(
+            "#deposit-message:empty, #message:empty, #copy-message:empty, #wallet-note:empty { margin: 0; }",
+        );
+        expect(html).not.toMatch(/:empty \{ display: none/);
+        expect(html).toContain('aria-label="Copy order ID"');
+    });
+
+    it("the code and the two fields beside it share one height", async () => {
+        expect(await renderCheckout(offered)).toContain(
+            "--qr: calc(2 * (var(--fine-line) + var(--space-1) + var(--field)) + var(--space-3));",
         );
     });
 
@@ -548,18 +620,63 @@ describe("address-first page", () => {
         expect(html).not.toContain(".box { margin-top: 0;");
     });
 
-    it("the deposit QR image is sized like the phone QR", async () => {
+    it("an address wraps whole, never cut, on two lines beside the code", async () => {
+        const html = await renderCheckout(offered);
+        const rule = html.slice(
+            html.indexOf(".value.address {"),
+            html.indexOf("}", html.indexOf(".value.address {")),
+        );
+        expect(rule).toContain("white-space: normal;");
+        expect(rule).toContain("overflow-wrap: anywhere;");
+        expect(rule).not.toContain("ellipsis");
+        expect(html).toContain("--column: 520px;");
+    });
+
+    it("the page carries what already arrived, so Pay names the whole price before any poll", async () => {
         expect(await renderCheckout(offered)).toContain(
-            ".qr img { display: block; width: var(--qr); height: var(--qr);",
+            'data-arrived-micros="0" data-arrived-review="false"',
+        );
+        const partial = {
+            ...offered,
+            deposit: {
+                ...offered.deposit!,
+                status: "partial" as const,
+                receivedMicros: 30_000,
+                remainingMicros: 20_000,
+            },
+        };
+        expect(await renderCheckout(partial)).toContain(
+            'data-takes-money="true" data-arrived-micros="30000" data-arrived-review="false"',
+        );
+        const review = {
+            ...offered,
+            deposit: { ...offered.deposit!, status: "review" as const, receivedMicros: 20_000 },
+        };
+        expect(await renderCheckout(review)).toContain(
+            'data-arrived-micros="20000" data-arrived-review="true"',
         );
     });
 
-    it("the wallet note is there and hidden", async () => {
+    it("notes keep their spacing", async () => {
+        expect(await renderCheckout(offered)).toContain(
+            ".note { margin-top: var(--space-4); color: var(--text-muted); }",
+        );
+    });
+
+    it("each code is drawn at one size on paper", async () => {
+        expect(await renderCheckout(offered)).toContain(
+            ".qr img, .qr svg { display: block; width: var(--qr); height: var(--qr); background: var(--qr-paper); }",
+        );
+    });
+
+    it("the wallet part is the Pay button, any other wallet's button and the wallet's line", async () => {
         const wallet = section(await renderCheckout(offered), "wallet");
-        const note = wallet.indexOf('<p id="wallet-note"');
-        expect(note).toBeGreaterThan(0);
-        expect(wallet.slice(note, wallet.indexOf(">", note))).toContain("hidden");
-        expect(note).toBeLessThan(wallet.indexOf('id="message"'));
+        expect(wallet).toBe(`<section id="wallet" hidden>
+<button id="pay-button" class="button" type="button" disabled>Pay</button>
+<div id="wallets"></div>
+<p id="wallet-note" role="status" aria-live="polite"></p>
+<p id="message" role="status" aria-live="polite"></p>
+`);
     });
 
     it("a disabled Pay button looks disabled, outline or not", async () => {
@@ -572,33 +689,38 @@ describe("address-first page", () => {
         expect(html).not.toContain(".button.outline:hover");
     });
 
-    it("wallet section is secondary", async () => {
+    it("Pay is the page's one green button, named by the script once it finds a wallet", async () => {
         const html = await renderCheckout(offered);
-        expect(html).toContain("Or pay with a browser wallet");
         expect(section(html, "wallet")).toContain(
-            '<button id="pay-button" class="button outline" type="button" disabled>',
+            '<button id="pay-button" class="button" type="button" disabled>Pay</button>',
         );
+        expect(html.match(/class="button"/g)).toHaveLength(1);
     });
 
     it("no deposit offered", async () => {
         const html = await renderCheckout({ ...offered, depositsOffered: false });
         expect(html).not.toContain('id="deposit"');
-        expect(html).toContain("Pay with a browser wallet");
-        expect(html).not.toContain("Or pay with a browser wallet");
+        expect(html).not.toContain('id="or"');
         expect(html).toContain(
-            "Paying by address is off right now. Pay with a browser wallet below, or reload this page later.",
+            '<p id="deposit-message" role="status" aria-live="polite">Paying by address is off right now.</p>',
         );
+        // Shown before the script runs, so the page offers a way to pay without it
+        const phone = section(html, "phone");
+        expect(html).toContain('<section id="phone">');
+        expect(phone).toContain('<figure class="qr">');
+        expect(phone).toContain("<figcaption>Scan with Phantom on your phone</figcaption>");
+        expect(html).toContain('<section id="wallet" hidden>');
     });
 
     it("page-level messages", async () => {
         expect(await renderCheckout({ ...view, state: "settling" })).toContain(
-            "The payment is confirming on Solana. This page updates when it lands.",
+            "This page updates when the payment lands.",
         );
         expect(await renderCheckout({ ...view, state: "refunded" })).toContain(
             "This order's payment was returned to the wallet that paid.",
         );
         const P4 =
-            "<noscript><p>This page needs JavaScript to show live status. You can still send to the address above.</p></noscript>";
+            '<noscript><p class="note">This page needs JavaScript to show live status. You can still send to the address above.</p></noscript>';
         expect(await renderCheckout(offered)).toContain(P4);
         // Only a page that shows the address
         for (const state of ["settling", "paid", "expired", "refunded", "review"] as const) {
@@ -606,6 +728,20 @@ describe("address-first page", () => {
         }
         expect(await renderCheckout({ ...offered, depositsOffered: false })).not.toContain(
             "<noscript>",
+        );
+        // A deposit in review hides the address, so P4 would point at nothing
+        const review = {
+            ...offered,
+            deposit: { ...offered.deposit!, status: "review" as const },
+        };
+        const html = await renderCheckout(review);
+        expect(html).not.toContain("<noscript>");
+        // Without the script the page still says it is in review, and why
+        expect(html).toContain(
+            `data-state="unpaid" role="status" aria-live="polite">Under review</span>`,
+        );
+        expect(html).toContain(
+            `<p id="deposit-message" role="status" aria-live="polite">This payment needs a check by hand. The money is safe. Write to support@bugnet.org with order ${id}.</p>`,
         );
     });
 
@@ -627,6 +763,8 @@ describe("address-first page", () => {
         for (const html of pages) {
             for (const bad of [
                 "\u00b7",
+                "Waiting for your transfer",
+                "No browser wallet",
                 "Unexpected error",
                 "payment refused:",
                 "did not go through",

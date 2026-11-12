@@ -1,7 +1,6 @@
 import type { DepositView } from "../deposits/types.ts";
 import type { PublicState } from "../http/public.ts";
 import type { OrderKind } from "../orders/types.ts";
-import { type MessageContext, walletNoteText } from "./messages.ts";
 
 export { fetchStatus } from "./flow.ts";
 
@@ -131,16 +130,22 @@ export function needsReload(renderedState: string | undefined, v: StatusView): b
     return v.state === "unpaid" && renderedState !== undefined && renderedState !== "unpaid";
 }
 
-// The wallet and phone sections go only once the order no longer takes money
+// The whole price arrived and is confirming: the page asks for nothing more while it lands,
+// since a way to pay left in view invites a second payment (owner ruling, 2026-11-12)
+export function confirmingInFull(d: Pick<DepositView, "status" | "remainingMicros">): boolean {
+    return d.status === "confirming" && d.remainingMicros <= 0;
+}
+
+// Every way to pay goes once the order no longer takes money
 export function showWalletOptions(v: StatusView): boolean {
-    return v.state === "unpaid";
+    return v.state === "unpaid" && (v.deposit === null || !confirmingInFull(v.deposit));
 }
 
 // The address and its notes ask for money, so they show only while money sent there can still
 // pay the order: a closed order says only what happened (spec 15.1), and a deposit in review
 // signs nothing until an operator looks
 export function showDepositAsk(v: StatusView): boolean {
-    return v.state === "unpaid" && v.deposit?.status !== "review";
+    return showWalletOptions(v) && v.deposit?.status !== "review";
 }
 
 // The deposit QR asks for money, so it shows only while the order still lacks some
@@ -148,8 +153,67 @@ export function showDepositQr(v: StatusView): boolean {
     return showDepositAsk(v) && v.deposit !== null && v.deposit.remainingMicros > 0;
 }
 
-// W35 while the order still takes a wallet payment and money already reached the address
-export function walletNote(v: StatusView, c: MessageContext): string | null {
-    if (!showWalletOptions(v) || v.deposit === null) return null;
-    return v.deposit.receivedMicros + v.deposit.otherMicros > 0 ? walletNoteText(c) : null;
+// Which ways to pay the page shows. A found browser wallet shows its Pay button. Without one, the
+// wallet app links show on a phone or on a page with no address. The code that opens the page in
+// Phantom shows whenever no address shows, off a phone, even beside a found wallet, which may
+// hold no USDC; so a page never draws two codes.
+export interface Arrangement {
+    wallet: boolean;
+    phone: boolean;
+    phoneLinks: boolean;
+    phoneQr: boolean;
+    or: boolean;
+}
+
+export function arrangement(o: {
+    takesMoney: boolean;
+    walletsFound: number;
+    address: boolean;
+    phone: boolean;
+}): Arrangement {
+    const wallet = o.takesMoney && o.walletsFound > 0;
+    const phoneLinks = o.takesMoney && o.walletsFound === 0 && (o.phone || !o.address);
+    const phoneQr = o.takesMoney && !o.address && !o.phone;
+    const phone = phoneLinks || phoneQr;
+    return { wallet, phone, phoneLinks, phoneQr, or: o.address && (wallet || phone) };
+}
+
+// Each found wallet gets a button that names it. Once money already sits at the address the
+// button names the whole price too, since a wallet payment charges all of it (decision 6.14)
+export function payLabel(wallet: string | undefined, price?: string): string {
+    if (wallet === undefined) return "Pay";
+    return price === undefined ? `Pay with ${wallet}` : `Pay ${price} with ${wallet}`;
+}
+
+// Money that already reached the address while the order still takes a wallet payment, which
+// charges the whole price whatever arrived (W35). It goes back after, unless the deposit is in
+// review, where it waits for a person.
+export interface Arrived {
+    micros: number;
+    review: boolean;
+}
+
+export function arrivedMoney(
+    state: PublicState,
+    d: Pick<DepositView, "status" | "receivedMicros" | "otherMicros" | "remainingMicros"> | null,
+): Arrived {
+    if (state !== "unpaid" || d === null || confirmingInFull(d))
+        return { micros: 0, review: false };
+    return { micros: d.receivedMicros + d.otherMicros, review: d.status === "review" };
+}
+
+// What the server drew the page with, so before its first status answer the script never offers
+// more, or warns less, than that page
+export function initialState(data: Readonly<Record<string, string | undefined>>): {
+    takesMoney: boolean;
+    arrived: Arrived;
+} {
+    const micros = Number(data.arrivedMicros ?? "0");
+    return {
+        takesMoney: data.takesMoney === "true",
+        arrived: {
+            micros: Number.isSafeInteger(micros) && micros > 0 ? micros : 0,
+            review: data.arrivedReview === "true",
+        },
+    };
 }
