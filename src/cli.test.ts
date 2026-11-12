@@ -37,7 +37,13 @@ import { newOrderId } from "./orders/ids.ts";
 import { findOrder } from "./orders/store.ts";
 import type { OrderRow } from "./orders/types.ts";
 import { pauseRefunds, refundsPaused, resumeRefunds } from "./refunds/executor.ts";
-import { findOrderRefund, findRefundById, refundGroup } from "./refunds/request.ts";
+import {
+    findOrderRefund,
+    findRefundById,
+    type RefundDbRow,
+    refundGroup,
+    toRefund,
+} from "./refunds/request.ts";
 import { insertRefundGroup, refundTargets } from "./refunds/split.ts";
 import { generateExportableKeypair } from "./solana/keys.ts";
 import { testDb, type TestDb } from "./testing/db.ts";
@@ -3029,6 +3035,288 @@ describe("deposits commands", () => {
             expect(piped.code).toBe(0);
             expect(chain.lamports(to)).toBe(1_000_000n);
             expect(piped.io.outText() + piped.io.errText()).not.toContain(SEED_7);
+        });
+    });
+
+    describe("write-off", () => {
+        let chain: FakeChain;
+        let a: KeyPairSigner;
+        let b: KeyPairSigner;
+        let srcA: string;
+        let srcB: string;
+        let memo = 0;
+
+        beforeEach(async () => {
+            chain = await startFakeChain();
+            [a, b] = await Promise.all([testSigner(85), testSigner(86)]);
+            [srcA, srcB] = await Promise.all([usdcAta(a.address), usdcAta(b.address)]);
+            chain.setTokenAccount({ address: srcA, owner: a.address, amount: 100_000n });
+            chain.setTokenAccount({ address: srcB, owner: b.address, amount: 100_000n });
+            chain.setTokenAccount({ address: TOKEN_A, owner: ADDRESS_A, amount: 0n });
+        });
+        afterEach(async () => {
+            await chain.close();
+        });
+
+        const slotOf = async (sig: string): Promise<bigint> => {
+            const { value } = await chain.rpc
+                .getSignatureStatuses([toSignature(sig)], { searchTransactionHistory: true })
+                .send();
+            return BigInt(value[0]!.slot);
+        };
+
+        // Money from a sender, recorded as the scan records it unless record is false
+        async function credit(
+            from: KeyPairSigner,
+            source: string,
+            micros: number,
+            o: { record?: boolean; advance?: boolean; unattributed?: boolean } = {},
+        ): Promise<string> {
+            const sig = await chain.transfer({
+                authority: from,
+                feePayer: from,
+                source,
+                destination: TOKEN_A,
+                micros: BigInt(micros),
+                memo: `w${++memo}`,
+            });
+            if (o.advance !== false) chain.advance(1);
+            if (o.record === false) return sig;
+            await seedTransfer(ORDER_A, {
+                signature: sig,
+                amountMicros: micros,
+                slot: await slotOf(sig),
+                ...(o.unattributed === true
+                    ? { outcome: "review", reason: "unattributed" }
+                    : { owner: from.address, source }),
+            });
+            return sig;
+        }
+
+        function theft(micros: number, o: { advance?: boolean } = {}): string {
+            const sig = chain.debit(TOKEN_A, BigInt(micros));
+            if (o.advance !== false) chain.advance(1);
+            return sig;
+        }
+
+        async function writeOff(sig: string, orderId = ORDER_A) {
+            const io = captureIo();
+            const code = await cli(["deposits", "write-off", orderId, sig], io, {
+                rpc: chain.rpc,
+                now: () => LATER,
+            });
+            return { code, io };
+        }
+
+        const writeOffRefunds = async () =>
+            (
+                await db.pool.query<RefundDbRow>(
+                    `select * from refunds where order_id = $1 and reason = 'deposit_write_off'
+                     order by part`,
+                    [ORDER_A],
+                )
+            ).rows.map(toRefund);
+
+        it("splits a theft over the senders' money and pays each known sender's part", async () => {
+            await seedDeposit(ORDER_A, { deposit: { review_reason: "unknown_debit" } });
+            const a1 = await credit(a, srcA, 20_000);
+            const b1 = await credit(b, srcB, 15_000);
+            const stolen = theft(25_000);
+            const { code, io } = await writeOff(stolen);
+            expect(io.errText()).not.toContain("error:");
+            expect(code).toBe(0);
+            const [ra, rb] = await writeOffRefunds();
+            expect(io.outText().split("\n")).toEqual([
+                `deposit ${ORDER_A} wrote off ${stolen} micros=25000 slot=${await slotOf(stolen)}`,
+                `part ${a1} 10000 refund=${ra!.id} to=${srcA}`,
+                `part ${b1} 15000 refund=${rb!.id} to=${srcB}`,
+                "review cleared",
+            ]);
+            expect(ra).toMatchObject({
+                kind: "deposit",
+                reason: "deposit_write_off",
+                part: 0,
+                amountMicros: 10_000,
+                destination: srcA,
+                payer: a.address,
+                fromWallet: "refund",
+                depositSignature: a1,
+                state: "pending",
+            });
+            expect(rb).toMatchObject({ part: 1, amountMicros: 15_000, depositSignature: b1 });
+            const ledger = (await depositLedger(db.pool, ORDER_A))!;
+            expect(ledger.deposit.reviewReason).toBeNull();
+            expect(ledger.writeOffs).toMatchObject([{ signature: stolen, micros: 25_000 }]);
+            expect(ledger.transfers.map((t) => [t.signature, t.lostMicros])).toEqual([
+                [a1, 10_000],
+                [b1, 15_000],
+            ]);
+
+            const twice = await writeOff(stolen);
+            expect(twice.code).toBe(1);
+            expect(twice.io.errText()).toContain(`${stolen} is already written off for ${ORDER_A}`);
+        });
+
+        it("prints a part with no known sender and pays it nothing", async () => {
+            await seedDeposit(ORDER_A, { deposit: { review_reason: "unknown_debit" } });
+            const u1 = await credit(a, srcA, 7_000, { unattributed: true });
+            const stolen = theft(3_000);
+            const { code, io } = await writeOff(stolen);
+            expect(code).toBe(0);
+            expect(io.outText().split("\n")).toContain(
+                `part ${u1} 3000 refund=- pay by hand: no known sender`,
+            );
+            expect(await writeOffRefunds()).toEqual([]);
+        });
+
+        it("refuses while a move is signed or sent", async () => {
+            await seedDeposit(ORDER_A);
+            await credit(a, srcA, 20_000);
+            const stolen = theft(5_000);
+            for (const state of ["signed", "sent"]) {
+                const id = await seedMove(ORDER_A, { kind: "close", state, txSignature: SIG(91) });
+                const { code, io } = await writeOff(stolen);
+                expect(code).toBe(1);
+                expect(io.errText()).toContain(`deposit ${ORDER_A} has a move in flight`);
+                await db.pool.query("delete from deposit_moves where id = $1", [id]);
+            }
+            expect((await depositLedger(db.pool, ORDER_A))!.writeOffs).toEqual([]);
+        });
+
+        it("refuses a transaction it cannot find or that failed", async () => {
+            await seedDeposit(ORDER_A);
+            await credit(a, srcA, 20_000);
+            const missing = await writeOff(SIG(92));
+            expect(missing.code).toBe(1);
+            expect(missing.io.errText()).toContain(`transaction ${SIG(92)} is not found`);
+            chain.failNext();
+            const failed = theft(5_000);
+            const refused = await writeOff(failed);
+            expect(refused.code).toBe(1);
+            expect(refused.io.errText()).toContain(`transaction ${failed} failed`);
+        });
+
+        it("refuses one of the deposit's own moves or recorded transfers", async () => {
+            await seedDeposit(ORDER_A);
+            const a1 = await credit(a, srcA, 20_000);
+            const ours = theft(5_000);
+            await seedMove(ORDER_A, { kind: "close", state: "confirmed", txSignature: ours });
+            const move = await writeOff(ours);
+            expect(move.code).toBe(1);
+            expect(move.io.errText()).toContain(`${ours} is a move of ${ORDER_A}`);
+            const transfer = await writeOff(a1);
+            expect(transfer.code).toBe(1);
+            expect(transfer.io.errText()).toContain(`${a1} is a transfer of ${ORDER_A}`);
+        });
+
+        it("refuses a transaction that took nothing from the deposit", async () => {
+            await seedDeposit(ORDER_A);
+            await credit(a, srcA, 20_000);
+            const more = await credit(b, srcB, 1_000, { record: false });
+            const pad = await chain.noOp({ touching: TOKEN_A, signer: a });
+            chain.advance(1);
+            for (const sig of [more, pad]) {
+                const { code, io } = await writeOff(sig);
+                expect(code).toBe(1);
+                expect(io.errText()).toContain(`${sig} took no money from deposit ${ORDER_A}`);
+            }
+        });
+
+        it("refuses while a credit before the debit is not recorded", async () => {
+            await seedDeposit(ORDER_A);
+            await credit(a, srcA, 20_000);
+            const late = await credit(b, srcB, 5_000, { record: false });
+            const stolen = theft(22_000);
+            const behind = await writeOff(stolen);
+            expect(behind.code).toBe(1);
+            expect(behind.io.errText()).toContain(
+                `a credit at or before slot ${await slotOf(stolen)} is not recorded yet`,
+            );
+            await seedTransfer(ORDER_A, {
+                signature: late,
+                amountMicros: 5_000,
+                owner: b.address,
+                source: srcB,
+                slot: await slotOf(late),
+            });
+            expect((await writeOff(stolen)).code).toBe(0);
+        });
+
+        it("refuses a later debit while an earlier one is not written off", async () => {
+            await seedDeposit(ORDER_A);
+            await credit(a, srcA, 20_000);
+            const first = theft(5_000);
+            const second = theft(5_000);
+            const refused = await writeOff(second);
+            expect(refused.code).toBe(1);
+            expect(refused.io.errText()).toContain(
+                `the ledger expects 20000 before ${second} and the chain held 15000`,
+            );
+            expect((await writeOff(first)).code).toBe(0);
+            expect((await writeOff(second)).code).toBe(0);
+            const ledger = (await depositLedger(db.pool, ORDER_A))!;
+            expect(ledger.transfers[0]!.lostMicros).toBe(10_000);
+        });
+
+        it("orders a credit of the debit's own slot by the listing", async () => {
+            await seedDeposit(ORDER_A);
+            const first = await credit(a, srcA, 20_000);
+            const same = await credit(b, srcB, 4_000, { advance: false });
+            const stolen = theft(22_000, { advance: false });
+            const after = await credit(a, srcA, 9_000);
+            expect(await slotOf(same)).toBe(await slotOf(stolen));
+            expect(await slotOf(after)).toBe(await slotOf(stolen));
+            const { code, io } = await writeOff(stolen);
+            expect(io.errText()).not.toContain("error:");
+            expect(code).toBe(0);
+            const ledger = (await depositLedger(db.pool, ORDER_A))!;
+            const lost = Object.fromEntries(
+                ledger.transfers.map((t) => [t.signature, t.lostMicros]),
+            );
+            expect(lost).toEqual({ [first]: 18_000, [same]: 4_000, [after]: 0 });
+        });
+
+        it("refuses a done deposit and an order with no deposit", async () => {
+            await seedDeposit(ORDER_A, { order: { state: "paid" }, deposit: { state: "done" } });
+            await credit(a, srcA, 20_000);
+            const stolen = theft(5_000);
+            const done = await writeOff(stolen);
+            expect(done.code).toBe(1);
+            expect(done.io.errText()).toContain(`deposit ${ORDER_A} is done`);
+            const none = await writeOff(stolen, ORDER_B);
+            expect(none.code).toBe(1);
+            expect(none.io.errText()).toContain(ORDER_B);
+        });
+
+        it("list and show print the lost money and the parts", async () => {
+            await seedDeposit(ORDER_A, { deposit: { review_reason: "unknown_debit" } });
+            const a1 = await credit(a, srcA, 20_000);
+            const u1 = await credit(b, srcB, 6_000, { unattributed: true });
+            const stolen = theft(9_000);
+            expect((await writeOff(stolen)).code).toBe(0);
+            const [ra] = await writeOffRefunds();
+
+            const list = captureIo();
+            expect(await cli(["deposits", "list"], list)).toBe(0);
+            expect(list.outText()).toBe(
+                `${ORDER_A} state=open received=26000 returned=0 kept=0 review=0 held=0 lost=9000 reason=-`,
+            );
+
+            const show = captureIo();
+            expect(await cli(["deposits", "show", ORDER_A], show)).toBe(0);
+            const lines = show.outText().split("\n");
+            expect(lines.find((l) => l.startsWith(`transfer ${a1} `))).toContain("lost=3000");
+            expect(lines.find((l) => l.startsWith(`transfer ${u1} `))).toContain("lost=6000");
+            expect(lines).toContain(
+                `write-off ${stolen} 9000 slot=${await slotOf(stolen)} at=${LATER.toISOString()}`,
+            );
+            expect(lines).toContain(`write-off part ${stolen} ${u1} 6000 refund=-`);
+            expect(lines).toContain(
+                `write-off part ${stolen} ${a1} 3000 refund=${ra!.id} state=pending`,
+            );
+            expect(lines.find((l) => l.startsWith("refund deposit part 0 "))).toContain(
+                `id=${ra!.id}`,
+            );
         });
     });
 });
