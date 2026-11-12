@@ -2,7 +2,7 @@ import QRCode from "qrcode";
 import type { DepositView } from "../deposits/types.ts";
 import type { PublicState } from "../http/public.ts";
 import type { OrderKind } from "../orders/types.ts";
-import { amountLabel, decimalAmount, depositAsk, STATE_LABELS } from "./messages.ts";
+import { amountLabel, decimalAmount, depositAsk, PAGE_TEXT, STATE_LABELS } from "./messages.ts";
 import { USDC_ICON } from "./usdc.ts";
 
 export { amountLabel, decimalAmount };
@@ -239,7 +239,8 @@ p { margin: 0; }
 .time { color: var(--text-muted); }
 .time time { color: var(--text); }
 #deposit-message { margin-top: var(--space-4); }
-#deposit-message:empty { display: none; }
+/* An empty live region stays in the page, so its first line is announced */
+#deposit-message:empty, #message:empty, #copy-message:empty { margin: 0; }
 
 #wallet, #phone { margin-top: var(--space-5); }
 #wallets {
@@ -289,8 +290,11 @@ p { margin: 0; }
 /* After .button.outline, whose specificity it shares, so a disabled outline button looks it */
 .button:disabled { background: var(--surface); color: var(--text-muted); cursor: default; }
 #message { margin-top: var(--space-3); }
-#message:empty { display: none; }
-.mobile-links { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2); }
+#copy-message { margin-top: var(--space-3); color: var(--text-muted); }
+/* The app links open this page in a wallet app on the same device, so only touch screens get them */
+.mobile-links { display: none; grid-template-columns: 1fr 1fr; gap: var(--space-2); }
+#phone .qr { margin: 0; }
+#phone figcaption { margin-top: var(--space-3); color: var(--text-muted); }
 
 .or {
     display: flex;
@@ -312,7 +316,7 @@ h2 {
 }
 .send { display: flex; gap: var(--space-5); align-items: flex-start; }
 .qr { flex-shrink: 0; margin: 0; }
-.qr img { display: block; width: var(--qr); height: var(--qr); background: var(--qr-paper); }
+.qr img, .qr svg { display: block; width: var(--qr); height: var(--qr); background: var(--qr-paper); }
 .pairs { flex: 1; min-width: 0; margin: 0; }
 .pairs div + div { margin-top: var(--space-4); }
 .pairs dt { color: var(--text-muted); font-size: var(--fine-size); line-height: var(--fine-line); }
@@ -388,9 +392,13 @@ code {
 }
 .foot a:hover { color: var(--text); }
 
-/* A phone cannot scan its own screen */
 @media (hover: none) and (pointer: coarse) {
-    .qr { display: none; }
+    .mobile-links { display: grid; }
+    #phone .qr { margin-top: var(--space-4); }
+}
+/* A phone cannot scan its own screen; a tablet's code can still go to a phone */
+@media (hover: none) and (pointer: coarse) and (max-width: 720px) {
+    .qr { display: none !important; }
 }
 @media (max-width: 720px) {
     /* The website's phone inset, so the logo, the box's content and the footer share one edge */
@@ -398,6 +406,11 @@ code {
     .box, .foot { width: 100%; max-width: none; }
     .box { padding: var(--space-5) var(--box-pad); border: 0; }
     .foot { padding: 0 var(--box-pad); }
+}
+/* A short laptop screen keeps the Pay button in view */
+@media (min-width: 721px) and (max-height: 760px) {
+    body { gap: var(--space-5); }
+    .box { padding-block: var(--space-5); }
 }
 @media (max-width: 400px) {
     .send { flex-direction: column; }
@@ -459,20 +472,27 @@ function timeLeft(expiresAt: Date, now: Date): string {
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
-// The script shows the wallet sections once it knows which wallets the browser has
-function walletSections(v: CheckoutView): string {
+// The script shows the wallet once it knows which wallets the browser has. Without an address
+// the phone part shows from the start, so a page whose script never runs still offers a way to
+// pay; its code opens this page in Phantom and is the page's one QR, shown only then.
+async function walletSections(v: CheckoutView, address: boolean): Promise<string> {
     const links = walletLinks(v.pageUrl, v.origin);
+    const hidden = address ? " hidden" : "";
     return `<section id="wallet" hidden>
 <ul id="wallets" hidden></ul>
 <button id="pay-button" class="button" type="button" disabled>Pay</button>
 <p id="wallet-note" role="status" hidden></p>
 ${MESSAGE}
 </section>
-<section id="phone" hidden>
+<section id="phone"${hidden}>
 <div class="mobile-links">
 <a class="button outline" href="${escapeHtml(links.phantom)}">Open in Phantom</a>
 <a class="button outline" href="${escapeHtml(links.solflare)}">Open in Solflare</a>
 </div>
+<figure class="qr"${hidden}>
+${await qrSvg(links.phantom)}
+<figcaption>Scan to pay in Phantom on your phone</figcaption>
+</figure>
 </section>`;
 }
 
@@ -482,11 +502,7 @@ function depositSection(v: CheckoutView, deposit: DepositView): string {
     // With the price covered the QR route answers 404, so the code waits hidden, unloaded
     const qrHidden = deposit.remainingMicros > 0 ? "" : " hidden";
     const qrLoading = deposit.remainingMicros > 0 ? "" : ' loading="lazy"';
-    // Money sent while the deposit is in review cannot pay the order until an operator looks
-    const askHidden = deposit.status === "review" ? " hidden" : "";
-    return `<p id="or" class="or" hidden>or</p>
-<section id="deposit">
-<div id="deposit-ask"${askHidden}>
+    return `<section id="deposit">
 <h2>Send USDC on Solana</h2>
 <div class="send">
 <figure class="qr"${qrHidden}>
@@ -498,12 +514,12 @@ function depositSection(v: CheckoutView, deposit: DepositView): string {
 </dl>
 </div>
 <p id="exchange-note" class="note">${ask.exchange}</p>
-</div>
 </section>`;
 }
 
-// The page-level line for an order that no longer takes money (spec 15.6, P2 and P3)
-function closedLine(v: CheckoutView): string {
+// The page-level line under the status (spec 15.6, M20, P2 and P3)
+function firstLine(v: CheckoutView, dep: DepositView | null): string {
+    if (v.state === "unpaid") return dep === null ? PAGE_TEXT.addressOff : "";
     if (v.deposit !== null) return "";
     if (v.state === "settling")
         return "The payment is confirming on Solana. This page updates when it lands.";
@@ -516,14 +532,20 @@ export async function renderCheckout(v: CheckoutView): Promise<string> {
     const id = escapeHtml(v.orderId);
     const expires = v.expiresAt.toISOString();
     const unpaid = v.state === "unpaid";
+    const dep = unpaid && v.depositsOffered ? v.deposit : null;
     let methods = "";
-    if (unpaid) {
-        const dep = v.depositsOffered ? v.deposit : null;
-        // P4 points at the address, so it comes only with the section that shows one
-        methods =
-            dep !== null
-                ? `${walletSections(v)}\n${depositSection(v, dep)}\n${NOSCRIPT}`
-                : walletSections(v);
+    if (dep !== null) {
+        // Money sent while the deposit is in review cannot pay the order until an operator looks
+        const askHidden = dep.status === "review" ? " hidden" : "";
+        // The address comes first, as the main way to pay (founder, 2026-11-10); P4 points at it
+        methods = `<div id="deposit-ask"${askHidden}>
+${depositSection(v, dep)}
+<p id="or" class="or" hidden>or</p>
+</div>
+${await walletSections(v, askHidden === "")}
+${NOSCRIPT}`;
+    } else if (unpaid) {
+        methods = await walletSections(v, false);
     } else if (v.state === "settling") {
         methods = MESSAGE;
     }
@@ -538,10 +560,11 @@ export async function renderCheckout(v: CheckoutView): Promise<string> {
 <span class="amount-value">${amount}</span>
 <span class="amount-unit with-usdc">${USDC_ICON}USDC</span>
 </p>
-<p class="status"><span id="state" class="state" data-state="${v.state}">${STATE_LABELS[v.state]}</span>${time}</p>
-<p id="deposit-message" role="status" aria-live="polite">${unpaid ? "" : closedLine(v)}</p>
+<p class="status"><span id="state" class="state" data-state="${v.state}" role="status" aria-live="polite">${STATE_LABELS[v.state]}</span>${time}</p>
+<p id="deposit-message" role="status" aria-live="polite">${firstLine(v, dep)}</p>
 ${methods}
 <p class="order"><span>Order <code>${id}</code></span>${copyButton(v.orderId)}</p>
+<p id="copy-message" role="status" aria-live="polite"></p>
 </main>
 ${SCRIPT}`,
     );

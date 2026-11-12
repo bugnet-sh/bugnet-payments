@@ -18,7 +18,9 @@ import {
     walletError,
 } from "./flow.ts";
 import {
+    arrangement,
     keepPolling,
+    walletNoteShown,
     needsReload,
     parseStatus,
     pollDelay,
@@ -28,6 +30,7 @@ import {
     statusKey,
     type StatusView,
     timeLeft,
+    walletChoice,
     type WalletWatch,
     walletNote,
     watchWallet,
@@ -60,6 +63,7 @@ interface Page {
     stateLabel: HTMLElement;
     status: StatusDeps;
     ctx: MessageContext;
+    copyMessage: HTMLElement | null;
     // While the order takes money, and how many usable browser wallets the page found
     takesMoney: boolean;
     walletsFound: number;
@@ -68,23 +72,29 @@ interface Page {
 const STANDARD_CONNECT = "standard:connect";
 const MAINNET = "solana:mainnet";
 
-// A phone cannot scan its own screen and rarely has a browser wallet, so it gets the app links
-const TOUCH = "(hover: none) and (pointer: coarse)";
+// A phone cannot scan its own screen and rarely has a browser wallet, so it gets the app links;
+// the page's CSS hides the codes on the same screens
+const PHONE = "(hover: none) and (pointer: coarse) and (max-width: 720px)";
 
-// Which ways to pay show: a found browser wallet, else the wallet app links on a phone or on a
-// page with no address, and the address whenever the order still takes money there
 function arrange(p: Page): void {
-    const wallet = p.root.querySelector<HTMLElement>("#wallet");
-    const phone = p.root.querySelector<HTMLElement>("#phone");
-    const or = p.root.querySelector<HTMLElement>("#or");
     const ask = p.root.querySelector<HTMLElement>("#deposit-ask");
-    const address = ask !== null && !ask.hidden;
-    const touch = window.matchMedia(TOUCH).matches;
-    const walletShown = p.takesMoney && (p.walletsFound > 0 || !address);
-    const phoneShown = p.takesMoney && p.walletsFound === 0 && (touch || !address);
-    if (wallet !== null) wallet.hidden = !walletShown;
-    if (phone !== null) phone.hidden = !phoneShown;
-    if (or !== null) or.hidden = !(address && (walletShown || phoneShown));
+    const a = arrangement({
+        takesMoney: p.takesMoney,
+        walletsFound: p.walletsFound,
+        address: ask !== null && !ask.hidden,
+        phone: window.matchMedia(PHONE).matches,
+    });
+    const show = (selector: string, shown: boolean) => {
+        const el = p.root.querySelector<HTMLElement>(selector);
+        if (el !== null) el.hidden = !shown;
+    };
+    show("#wallet", a.wallet);
+    show("#phone", a.phone);
+    show("#phone figure", a.phoneQr);
+    show("#or", a.or);
+    // W35 speaks to a payment by wallet, so it shows only beside a Pay button
+    const note = p.walletNote;
+    if (note !== null) note.hidden = !walletNoteShown(a, p.walletsFound, note.textContent ?? "");
 }
 
 function usable(w: Wallet): boolean {
@@ -167,16 +177,16 @@ function startPayment(p: Page): WalletSection {
         }, ms);
     };
 
-    // The button names the wallet it pays with, so one found wallet needs no list
     const label = () => {
+        const text = walletChoice([], chosen?.name).label;
         if (chosen === undefined) {
-            button.textContent = "Pay";
+            button.textContent = text;
             return;
         }
         const icon = document.createElement("img");
         icon.src = chosen.icon;
         icon.alt = "";
-        button.replaceChildren(icon, `Pay with ${chosen.name}`);
+        button.replaceChildren(icon, text);
     };
 
     const render = () => {
@@ -209,8 +219,12 @@ function startPayment(p: Page): WalletSection {
             item.textContent = PAGE_TEXT.noWallet;
             list.append(item);
         }
-        list.hidden = found.length === 1;
-        button.hidden = found.length === 0;
+        const choice = walletChoice(
+            found.map((w) => w.name),
+            chosen?.name,
+        );
+        list.hidden = !choice.list;
+        button.hidden = !choice.button;
         label();
         p.walletsFound = found.length;
         arrange(p);
@@ -380,13 +394,9 @@ function follow(p: Page, wallet: WalletSection | null): void {
             qr.src = `/o/${p.ctx.orderId}/qr.svg?r=${remaining}`;
         }
         wallet?.seen(v);
+        if (p.walletNote !== null) p.walletNote.textContent = walletNote(v, p.ctx) ?? "";
         p.takesMoney = showWalletOptions(v);
         arrange(p);
-        if (p.walletNote !== null) {
-            const note = walletNote(v, p.ctx);
-            p.walletNote.hidden = note === null;
-            p.walletNote.textContent = note ?? "";
-        }
     };
 
     let failures = 0;
@@ -427,7 +437,7 @@ function follow(p: Page, wallet: WalletSection | null): void {
 
 const COPIED_FOR_MS = 1_500;
 
-function offerCopy(button: HTMLButtonElement, failed: (button: HTMLButtonElement) => void): void {
+function offerCopy(button: HTMLButtonElement, failed: () => void, copied: () => void): void {
     let timer: ReturnType<typeof setTimeout> | undefined;
     button.addEventListener("click", () => {
         // Without the Clipboard API writeText throws before any promise, so it goes inside one
@@ -435,11 +445,12 @@ function offerCopy(button: HTMLButtonElement, failed: (button: HTMLButtonElement
             .then(() => navigator.clipboard.writeText(button.dataset.copy ?? ""))
             .then(
                 () => {
+                    copied();
                     button.dataset.copied = "";
                     clearTimeout(timer);
                     timer = setTimeout(() => delete button.dataset.copied, COPIED_FOR_MS);
                 },
-                () => failed(button),
+                () => failed(),
             );
     });
 }
@@ -460,6 +471,7 @@ if (root !== null) {
         message: root.querySelector<HTMLElement>("#message"),
         depositMessage: root.querySelector<HTMLElement>("#deposit-message"),
         walletNote: root.querySelector<HTMLElement>("#wallet-note"),
+        copyMessage: root.querySelector<HTMLElement>("#copy-message"),
         stateLabel: element<HTMLElement>(root, "#state"),
         status: {
             fetch: (input, init) => fetch(input, init),
@@ -476,9 +488,16 @@ if (root !== null) {
         walletsFound: 0,
     };
     for (const button of root.querySelectorAll<HTMLButtonElement>("button[data-copy]")) {
-        offerCopy(button, () => {
-            if (p.depositMessage !== null) p.depositMessage.textContent = PAGE_TEXT.copyFailed;
-        });
+        // W34 has its own line, so it never replaces what happened to the order
+        offerCopy(
+            button,
+            () => {
+                if (p.copyMessage !== null) p.copyMessage.textContent = PAGE_TEXT.copyFailed;
+            },
+            () => {
+                if (p.copyMessage !== null) p.copyMessage.textContent = "";
+            },
+        );
     }
     const wallet =
         root.dataset.state === "unpaid" && root.querySelector("#pay-button") !== null

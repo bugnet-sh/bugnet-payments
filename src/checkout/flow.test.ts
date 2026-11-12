@@ -493,7 +493,7 @@ describe("refusals through payWithWallet", () => {
     const ctx = { ...CTX, formatDateTime: () => "2 Jan 2030, 00:00" };
     const RETRY = { "Retry-After": "7" };
     const W25 =
-        "Bugnet could not accept the transaction Phantom signed. Nothing was charged. Press Pay to try again, or send to the address below.";
+        "Bugnet could not accept the transaction Phantom signed. Nothing was charged. Press Pay to try again, or send to the address above.";
     const W24 = (wait: string) =>
         `Bugnet cannot take the payment right now. Nothing was charged. Press Pay again${wait}.`;
     const settlingFor = (n: number) =>
@@ -545,7 +545,7 @@ describe("refusals through payWithWallet", () => {
                         code: "invalid_exact_svm_transaction_simulation_failed",
                     }),
             },
-            "Solana refused the payment, most often because the account holds less than $0.05 USDC. Nothing was charged. Add USDC, or send to the address below.",
+            "Solana refused the payment, most often because the account holds less than $0.05 USDC. Nothing was charged. Add USDC, or send to the address above.",
         ],
         [
             "W20",

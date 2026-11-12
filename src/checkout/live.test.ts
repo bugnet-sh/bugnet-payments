@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DepositView } from "../deposits/types.ts";
 import {
+    arrangement,
     fetchStatus,
     keepPolling,
     needsReload,
@@ -12,7 +13,9 @@ import {
     statusKey,
     type StatusView,
     timeLeft,
+    walletChoice,
     walletNote,
+    walletNoteShown,
     watchWallet,
 } from "./live.ts";
 
@@ -139,11 +142,108 @@ describe("live status", () => {
         expect(showWalletOptions(view("paid"))).toBe(false);
         expect(walletNote(view("unpaid", {}), C)).toBeNull();
         const w35 =
-            "Money already arrived at the address below. Paying by wallet charges the full $0.05 and sends that money back.";
+            "Money already arrived at the address above. Paying by wallet charges the full $0.05 and sends that money back.";
         expect(walletNote(view("unpaid", { receivedMicros: 1 }), C)).toBe(w35);
         expect(walletNote(view("unpaid", { otherMicros: 1 }), C)).toBe(w35);
     });
 
+    it("in review the wallet note points at no address and promises no return", () => {
+        const note = walletNote(view("unpaid", { status: "review", receivedMicros: 1 }), C);
+        expect(note).toBe(
+            "Paying by wallet charges the full $0.05. The money in review is not returned on its own.",
+        );
+        expect(note).not.toContain("address");
+        expect(walletNote(view("unpaid", { status: "review" }), C)).toBeNull();
+    });
+});
+
+describe("which ways to pay show", () => {
+    const at = (o: Partial<Parameters<typeof arrangement>[0]>) =>
+        arrangement({ takesMoney: true, walletsFound: 0, address: true, phone: false, ...o });
+
+    it("a found wallet always shows, under the address after an or", () => {
+        for (const phone of [false, true]) {
+            expect(at({ walletsFound: 1, phone })).toEqual({
+                wallet: true,
+                phone: false,
+                phoneQr: false,
+                or: true,
+            });
+        }
+        expect(at({ walletsFound: 2, address: false })).toEqual({
+            wallet: true,
+            phone: false,
+            phoneQr: true,
+            or: false,
+        });
+    });
+
+    it("with no wallet and an address, a desktop shows the address alone and a phone adds the app links", () => {
+        expect(at({})).toEqual({ wallet: false, phone: false, phoneQr: false, or: false });
+        expect(at({ phone: true })).toEqual({
+            wallet: false,
+            phone: true,
+            phoneQr: false,
+            or: true,
+        });
+    });
+
+    it("with no wallet and no address, the page says so and offers the phone, its code included", () => {
+        for (const phone of [false, true]) {
+            expect(at({ address: false, phone })).toEqual({
+                wallet: true,
+                phone: true,
+                phoneQr: true,
+                or: false,
+            });
+        }
+    });
+
+    it("an order that no longer takes money offers nothing", () => {
+        for (const walletsFound of [0, 1, 2]) {
+            for (const address of [false, true]) {
+                const a = at({ takesMoney: false, walletsFound, address });
+                expect([a.wallet, a.phone, a.or]).toEqual([false, false, false]);
+            }
+        }
+    });
+
+    it("never draws two codes: the phone code shows only where no address shows", () => {
+        for (const address of [false, true]) {
+            for (const phone of [false, true]) {
+                for (const walletsFound of [0, 1]) {
+                    const a = at({ address, phone, walletsFound });
+                    expect(a.phoneQr && address).toBe(false);
+                }
+            }
+        }
+    });
+
+    it("the wallet note shows only beside a Pay button", () => {
+        const shown = at({ walletsFound: 1 });
+        expect(walletNoteShown(shown, 1, "W35")).toBe(true);
+        expect(walletNoteShown(shown, 1, "")).toBe(false);
+        // In review with no wallet the wallet part shows only to say none was found
+        expect(walletNoteShown(at({ address: false }), 0, "W35")).toBe(false);
+        expect(walletNoteShown(at({ takesMoney: false, walletsFound: 1 }), 1, "W35")).toBe(false);
+    });
+
+    it("the Pay button names its wallet; the list shows only for none or several", () => {
+        expect(walletChoice([], undefined)).toEqual({ list: true, button: false, label: "Pay" });
+        expect(walletChoice(["Phantom"], "Phantom")).toEqual({
+            list: false,
+            button: true,
+            label: "Pay with Phantom",
+        });
+        expect(walletChoice(["Phantom", "Solflare"], "Solflare")).toEqual({
+            list: true,
+            button: true,
+            label: "Pay with Solflare",
+        });
+    });
+});
+
+describe("status requests", () => {
     it("fetchStatus sends both headers", async () => {
         const seen: { url: string; headers: Record<string, string> }[] = [];
         const fake = (async (url: string, init?: RequestInit) => {

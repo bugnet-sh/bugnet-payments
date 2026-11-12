@@ -35,7 +35,7 @@ function showsAddress(c: MessageContext): boolean {
 
 // A sentence's end: the address as the other way to pay, on a page that shows one
 function orSend(c: MessageContext): string {
-    return showsAddress(c) ? ", or send to the address below." : ".";
+    return showsAddress(c) ? ", or send to the address above." : ".";
 }
 
 export const STATE_LABELS: Record<PublicState, string> = {
@@ -184,8 +184,8 @@ export function depositAsk(
     return {
         plain,
         alt: `Solana Pay code for ${plain} USDC`,
-        // Money returned goes to the sending address, which an exchange may not credit
-        exchange: `From an exchange, send exactly ${plain} USDC.`,
+        // Money returned goes to the sending address, which an exchange may not credit (22.6)
+        exchange: `From an exchange, send exactly ${plain} USDC. Any refund goes to the exchange, which may not credit you.`,
     };
 }
 
@@ -206,7 +206,8 @@ export function depositLine(
             message = "";
             break;
         case "partial":
-            message = `Received ${amountLabel(d.receivedMicros)}. Send ${amountLabel(d.remainingMicros)} more to the same address by ${c.deadline}.`;
+            // The Amount row, the address and the time left say the rest
+            message = `Received ${amountLabel(d.receivedMicros)} of ${amountLabel(c.amountMicros)}.`;
             break;
         case "confirming":
             message = `Received ${amountLabel(d.receivedMicros)}. Confirming the payment on Solana.`;
@@ -295,11 +296,18 @@ export function depositLine(
 
 // W35, while money already sits at the address and the order still takes a wallet payment
 export function walletNoteText(c: MessageContext): string {
-    return `Money already arrived at the address below. Paying by wallet charges the full ${amountLabel(c.amountMicros)} and sends that money back.`;
+    return `Money already arrived at the address above. Paying by wallet charges the full ${amountLabel(c.amountMicros)} and sends that money back.`;
+}
+
+// W35 while the deposit is in review: the address is hidden and that money waits for a person
+export function walletNoteReviewText(c: MessageContext): string {
+    return `Paying by wallet charges the full ${amountLabel(c.amountMicros)}. The money in review is not returned on its own.`;
 }
 
 export const PAGE_TEXT = {
     noWallet: "No browser wallet found.",
+    // M20: a page without a deposit address
+    addressOff: "Paying by address is off right now.",
     connecting: (wallet: string) => `Approve the connection in ${wallet}.`,
     signing: (wallet: string) => `Approve the payment in ${wallet}.`,
     copyFailed: "Copy failed. Select the text and copy it by hand.",
@@ -309,7 +317,7 @@ export const PAGE_TEXT = {
 
 function shortBalance(have: number, c: MessageContext & { wallet: string }): string {
     const options = showsAddress(c)
-        ? "Add USDC, pick another account, or send to the address below."
+        ? "Add USDC, pick another account, or send to the address above."
         : "Add USDC or pick another account.";
     return `Your ${c.wallet} account holds ${amountLabel(have)} USDC on Solana and this order needs ${amountLabel(c.amountMicros)}. Nothing was charged. ${options}`;
 }
@@ -337,7 +345,7 @@ export function walletMessage(
         case -32000:
         case -32003:
             return step(
-                `${w} refused this payment. Nothing was charged.${showsAddress(c) ? " Send to the address below instead." : ""}`,
+                `${w} refused this payment. Nothing was charged.${showsAddress(c) ? " Send to the address above instead." : ""}`,
             );
     }
     if (c.haveMicros !== undefined && c.haveMicros < c.amountMicros) {

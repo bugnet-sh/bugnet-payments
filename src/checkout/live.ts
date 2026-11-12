@@ -1,7 +1,7 @@
 import type { DepositView } from "../deposits/types.ts";
 import type { PublicState } from "../http/public.ts";
 import type { OrderKind } from "../orders/types.ts";
-import { type MessageContext, walletNoteText } from "./messages.ts";
+import { type MessageContext, walletNoteReviewText, walletNoteText } from "./messages.ts";
 
 export { fetchStatus } from "./flow.ts";
 
@@ -148,8 +148,46 @@ export function showDepositQr(v: StatusView): boolean {
     return showDepositAsk(v) && v.deposit !== null && v.deposit.remainingMicros > 0;
 }
 
-// W35 while the order still takes a wallet payment and money already reached the address
+// W35 while the order still takes a wallet payment and money already reached the address; while
+// the deposit is in review the address is hidden and that money waits for a person
 export function walletNote(v: StatusView, c: MessageContext): string | null {
     if (!showWalletOptions(v) || v.deposit === null) return null;
-    return v.deposit.receivedMicros + v.deposit.otherMicros > 0 ? walletNoteText(c) : null;
+    if (v.deposit.receivedMicros + v.deposit.otherMicros <= 0) return null;
+    return showDepositAsk(v) ? walletNoteText(c) : walletNoteReviewText(c);
+}
+
+// Which ways to pay the page shows. A found browser wallet always shows. Without one, the wallet
+// part says so only on a page with no address, and the phone part shows on a phone or on a page
+// with no address; its code, which opens the page in Phantom, only when no address shows, so a
+// page never draws two codes.
+export interface Arrangement {
+    wallet: boolean;
+    phone: boolean;
+    phoneQr: boolean;
+    or: boolean;
+}
+
+export function arrangement(o: {
+    takesMoney: boolean;
+    walletsFound: number;
+    address: boolean;
+    phone: boolean;
+}): Arrangement {
+    const wallet = o.takesMoney && (o.walletsFound > 0 || !o.address);
+    const phone = o.takesMoney && o.walletsFound === 0 && (o.phone || !o.address);
+    return { wallet, phone, phoneQr: !o.address, or: o.address && (wallet || phone) };
+}
+
+export function walletNoteShown(a: Arrangement, walletsFound: number, note: string): boolean {
+    return a.wallet && walletsFound > 0 && note !== "";
+}
+
+// The Pay button names the wallet it pays with, so one wallet needs no list: the list shows the
+// choices for two or more, and the no-wallet line for none
+export function walletChoice(found: readonly string[], chosen: string | undefined) {
+    return {
+        list: found.length !== 1,
+        button: found.length > 0,
+        label: chosen === undefined ? "Pay" : `Pay with ${chosen}`,
+    };
 }
