@@ -3254,14 +3254,19 @@ describe("deposits commands", () => {
             expect(await writeOffRefunds()).toMatchObject([{ id: ra!.id, amountMicros: 10_000 }]);
             const ledger = (await depositLedger(db.pool, ORDER_A))!;
             expect(
-                ledger.writeOffParts.map((p) => [p.transferSignature, p.micros, p.refundId]),
+                ledger.writeOffParts.map((p) => [
+                    p.transferSignature,
+                    p.micros,
+                    p.refundId,
+                    p.keptReason,
+                ]),
             ).toEqual(
                 expect.arrayContaining([
-                    [a1, 10_000, ra!.id],
-                    [f1, 5_000, null],
-                    [k1, 600, null],
-                    [a1, 200, null],
-                    [u1, 700, null],
+                    [a1, 10_000, ra!.id, null],
+                    [f1, 5_000, null, "bugnet_own"],
+                    [k1, 600, null, "bugnet_own"],
+                    [a1, 200, null, "below_refund_min"],
+                    [u1, 700, null, "below_refund_min"],
                 ]),
             );
             expect(ledger.writeOffParts).toHaveLength(5);
@@ -3587,24 +3592,29 @@ describe("deposits commands", () => {
             const stolen = theft(9_000);
             expect((await writeOff(stolen)).code).toBe(0);
             const [ra] = await writeOffRefunds();
+            const dust = theft(500);
+            expect((await writeOff(dust)).code).toBe(0);
 
             const list = captureIo();
             expect(await cli(["deposits", "list"], list)).toBe(0);
             expect(list.outText()).toBe(
-                `${ORDER_A} state=open received=26000 returned=0 kept=0 review=0 held=0 lost=9000 reason=-`,
+                `${ORDER_A} state=open received=26000 returned=0 kept=0 review=0 held=0 lost=9500 reason=-`,
             );
 
             const show = captureIo();
             expect(await cli(["deposits", "show", ORDER_A], show)).toBe(0);
             const lines = show.outText().split("\n");
-            expect(lines.find((l) => l.startsWith(`transfer ${a1} `))).toContain("lost=3000");
+            expect(lines.find((l) => l.startsWith(`transfer ${a1} `))).toContain("lost=3500");
             expect(lines.find((l) => l.startsWith(`transfer ${u1} `))).toContain("lost=6000");
             expect(lines).toContain(
                 `write-off ${stolen} 9000 slot=${await slotOf(stolen)} at=${LATER.toISOString()}`,
             );
-            expect(lines).toContain(`write-off part ${stolen} ${u1} 6000 refund=-`);
+            expect(lines).toContain(`write-off part ${stolen} ${u1} 6000 pay by hand`);
             expect(lines).toContain(
                 `write-off part ${stolen} ${a1} 3000 refund=${ra!.id} state=pending`,
+            );
+            expect(lines).toContain(
+                `write-off part ${dust} ${a1} 500 kept: below refund_min_micros`,
             );
             expect(lines.find((l) => l.startsWith("refund deposit part 0 "))).toContain(
                 `id=${ra!.id}`,

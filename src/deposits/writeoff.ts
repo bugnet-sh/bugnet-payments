@@ -24,7 +24,7 @@ import {
     setTransferOutcomes,
     updateDeposit,
 } from "./store.ts";
-import type { MoveRow, ReviewReason, TransferRow } from "./types.ts";
+import type { KeptReason, MoveRow, ReviewReason, TransferRow } from "./types.ts";
 
 export interface SplitInput {
     transfers: readonly TransferRow[];
@@ -92,12 +92,17 @@ export function keptReason(
     t: Pick<TransferRow, "outcome" | "reason">,
     micros: number,
     refundMinMicros: number,
-): string | null {
+): KeptReason | null {
     const keep = t.outcome === "keep" || (t.outcome === "paid" && t.reason === "below_minimum");
-    if (keep || t.reason === "from_bugnet") return "Bugnet's own money";
-    if (micros < refundMinMicros) return "below refund_min_micros";
+    if (keep || t.reason === "from_bugnet") return "bugnet_own";
+    if (micros < refundMinMicros) return "below_refund_min";
     return null;
 }
+
+export const KEPT_TEXT: Readonly<Record<KeptReason, string>> = {
+    bugnet_own: "Bugnet's own money",
+    below_refund_min: "below refund_min_micros",
+};
 
 export interface WriteOffRequest {
     orderId: string;
@@ -123,7 +128,7 @@ export interface WrittenPart {
     // the payout went into this write-off row of the transfer, which was still pending
     joined: boolean;
     // why Bugnet keeps the part (keptReason)
-    kept: string | null;
+    kept: KeptReason | null;
     // why a part of a known sender got no payout: its earlier write-off row is past pending
     unpaid: string | null;
 }
@@ -223,6 +228,7 @@ export async function writeOff(c: pg.PoolClient, w: WriteOffRequest): Promise<Wr
             transferSignature: p.signature,
             micros: p.micros,
             refundId: null,
+            keptReason: null,
         })),
     );
     if (expires) await expireSettling(c, w, order, ledger.transfers, sweeps);
@@ -274,7 +280,14 @@ async function payPart(
     };
     const none = { ...base, refundId: null, joined: false, kept: null, unpaid: null };
     const kept = keptReason(t, p.micros, w.refundMinMicros);
-    if (kept !== null) return { ...none, kept };
+    if (kept !== null) {
+        await c.query(
+            `update deposit_write_off_parts set kept_reason = $4
+             where order_id = $1 and signature = $2 and transfer_signature = $3`,
+            [w.orderId, w.signature, t.signature, kept],
+        );
+        return { ...none, kept };
+    }
     if (t.sourceOwner === null || t.sourceTokenAccount === null) return none;
     const group = await lockRefundGroup(c, w.orderId, "deposit");
     const existing = group.find(

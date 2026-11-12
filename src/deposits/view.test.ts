@@ -3,7 +3,14 @@ import { depositLine } from "../checkout/messages.ts";
 import { publicState, type PublicState } from "../http/public.ts";
 import type { OrderRow } from "../orders/types.ts";
 import type { RefundRow } from "../refunds/request.ts";
-import type { DepositRow, HoldRow, MoveRow, TransferRow, WriteOffPartRow } from "./types.ts";
+import type {
+    DepositRow,
+    HoldRow,
+    KeptReason,
+    MoveRow,
+    TransferRow,
+    WriteOffPartRow,
+} from "./types.ts";
 import { depositStatus, depositSummary, depositViewFrom, type DepositSummary } from "./view.ts";
 
 const ORDER_ID = "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -185,12 +192,18 @@ function writeOffRefund(id: number, state: RefundRow["state"], signature: string
     };
 }
 
-const part = (transferSignature: string, micros: number, refundId: number | null) => ({
+const part = (
+    transferSignature: string,
+    micros: number,
+    refundId: number | null,
+    keptReason: KeptReason | null = null,
+) => ({
     orderId: ORDER_ID,
     signature: "theft",
     transferSignature,
     micros,
     refundId,
+    keptReason,
 });
 
 function view(o: Order, l: Ledger, now = NOW) {
@@ -838,8 +851,8 @@ describe("written-off money on the page (spec 23.1)", () => {
                 transfers: [a1, k1, u1],
                 moves: [move(1, "return", "confirmed")],
                 writeOffParts: [
-                    part("A1", 500, null),
-                    part("K1", 600, null),
+                    part("A1", 500, null, "below_refund_min"),
+                    part("K1", 600, null, "bugnet_own"),
                     part("U1", 7_000, null),
                 ],
             }),
@@ -849,6 +862,30 @@ describe("written-off money on the page (spec 23.1)", () => {
             ["U1", "review"],
             ["K1", "kept"],
             ["A1", "returned"],
+        ]);
+    });
+
+    it("a part is kept by the reason stored when it was written off, not by its transfer now", () => {
+        // B1 was a return to pay by hand when written off and was kept afterwards; F1 came from a
+        // Bugnet wallet before the planner named it
+        const b1 = t("B1", "OwnB", 5_000, 100, {
+            outcome: "keep",
+            reason: "below_minimum",
+            lostMicros: 5_000,
+        });
+        const f1 = t("F1", "OwnF", 4_000, 101, { outcome: "open", lostMicros: 4_000 });
+        const v = view(
+            order("expired"),
+            ledger({
+                deposit: deposit({ state: "closed" }),
+                transfers: [b1, f1],
+                writeOffParts: [part("B1", 5_000, null), part("F1", 4_000, null, "bugnet_own")],
+            }),
+        );
+        expect(v).toMatchObject({ keptMicros: 4_000, reviewMicros: 5_000 });
+        expect(v.transfers.map((x) => [x.signature, x.outcome])).toEqual([
+            ["F1", "kept"],
+            ["B1", "review"],
         ]);
     });
 

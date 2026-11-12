@@ -10,13 +10,17 @@ create table deposit_write_offs (
 );
 
 -- The debit split onto the senders' transfers; refund_id is the float payout of a part whose
--- sender is known
+-- sender is known, kept_reason why Bugnet keeps a part, decided when it is written off. A part
+-- with neither is paid by hand
 create table deposit_write_off_parts (
     order_id text not null,
     signature text not null,
     transfer_signature text not null,
     micros bigint not null check (micros > 0),
     refund_id bigint references refunds (id),
+    kept_reason text check (kept_reason in ('bugnet_own', 'below_refund_min')),
+    constraint deposit_write_off_parts_kept_check
+        check (kept_reason is null or refund_id is null),
     primary key (order_id, signature, transfer_signature),
     foreign key (order_id, signature) references deposit_write_offs (order_id, signature),
     foreign key (order_id, transfer_signature) references deposit_transfers (order_id, signature)

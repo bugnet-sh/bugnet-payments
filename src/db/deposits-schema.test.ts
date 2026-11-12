@@ -352,18 +352,24 @@ describe("migration 00007", () => {
     function part(
         orderId: string,
         transferSignature: string,
-        o: { signature?: string; micros?: number; refundId?: number | null } = {},
+        o: {
+            signature?: string;
+            micros?: number;
+            refundId?: number | null;
+            keptReason?: string | null;
+        } = {},
     ) {
         return db.pool.query(
             `insert into deposit_write_off_parts (order_id, signature, transfer_signature, micros,
-                refund_id)
-             values ($1, $2, $3, $4, $5)`,
+                refund_id, kept_reason)
+             values ($1, $2, $3, $4, $5, $6)`,
             [
                 orderId,
                 o.signature ?? THEFT,
                 transferSignature,
                 o.micros ?? 4_000,
                 o.refundId ?? null,
+                o.keptReason ?? null,
             ],
         );
     }
@@ -382,6 +388,33 @@ describe("migration 00007", () => {
         await part(id, sig);
         expect(await code(part(id, sig))).toBe("23505");
         expect(await code(writeOff("ord_unknownunknownunknownunk"))).toBe("23503");
+    });
+
+    it("a part Bugnet keeps names why, and a kept part has no refund row", async () => {
+        const id = await freshDeposit();
+        const sigs = ["a", "b", "c", "d"].map((x) => x.repeat(88));
+        for (const sig of sigs) await transfer(id, sig);
+        await writeOff(id);
+        await part(id, sigs[0]!, { keptReason: "bugnet_own" });
+        await part(id, sigs[1]!, { keptReason: "below_refund_min" });
+        expect(await failure(part(id, sigs[2]!, { keptReason: "dust" }))).toEqual({
+            code: "23514",
+            constraint: "deposit_write_off_parts_kept_reason_check",
+        });
+        const r = await db.pool.query<{ id: string }>(
+            `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state,
+                part, deposit_signature, from_wallet)
+             values ($1, 'deposit', 'deposit_write_off', 1000, 'dest', 'payer', 'pending', 0, $2,
+                'refund')
+             returning id`,
+            [id, sigs[3]],
+        );
+        const refundId = Number(r.rows[0]!.id);
+        expect(await failure(part(id, sigs[3]!, { refundId, keptReason: "bugnet_own" }))).toEqual({
+            code: "23514",
+            constraint: "deposit_write_off_parts_kept_check",
+        });
+        await part(id, sigs[3]!, { refundId });
     });
 
     it("one theft transaction gives one row per deposit", async () => {

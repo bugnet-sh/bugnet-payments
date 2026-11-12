@@ -16,6 +16,7 @@ import { createAndCloseLamports } from "./plan.ts";
 import type {
     DepositRow,
     HoldRow,
+    KeptReason,
     MoveRow,
     NewMove,
     NewTransfer,
@@ -99,6 +100,7 @@ interface WriteOffPartDbRow extends pg.QueryResultRow {
     transfer_signature: string;
     micros: Int8;
     refund_id: Int8 | null;
+    kept_reason: KeptReason | null;
 }
 
 interface MoveDbRow extends pg.QueryResultRow {
@@ -227,6 +229,7 @@ function toWriteOffPart(r: WriteOffPartDbRow): WriteOffPartRow {
         transferSignature: r.transfer_signature,
         micros: Number(r.micros),
         refundId: num(r.refund_id),
+        keptReason: r.kept_reason,
     };
 }
 
@@ -406,9 +409,9 @@ export async function insertWriteOff(
     for (const p of parts) {
         await c.query(
             `insert into deposit_write_off_parts (order_id, signature, transfer_signature, micros,
-                refund_id)
-             values ($1, $2, $3, $4, $5)`,
-            [w.orderId, w.signature, p.transferSignature, p.micros, p.refundId],
+                refund_id, kept_reason)
+             values ($1, $2, $3, $4, $5, $6)`,
+            [w.orderId, w.signature, p.transferSignature, p.micros, p.refundId, p.keptReason],
         );
     }
 }

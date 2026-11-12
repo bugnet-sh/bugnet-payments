@@ -1056,7 +1056,7 @@ describe("changes under the settle", () => {
                         micros: 1_000,
                         writtenAt: clock,
                     },
-                    [{ transferSignature: sent, micros: 1_000, refundId: null }],
+                    [{ transferSignature: sent, micros: 1_000, refundId: null, keptReason: null }],
                 ),
             );
         };

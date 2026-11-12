@@ -730,8 +730,8 @@ allowance wallet, money already swept, or review money already carried to the re
   float, `lost` what written-off debits took. `--moving` lists only deposits with a move in
   flight.
 - `deposits show <orderId>`: the deposit, its transfers with owner, source and `lost=`, its moves
-  with their signatures, its write-offs and their parts with each part's refund row, its holds, and
-  for a shared payment its shares and every refund part.
+  with their signatures, its write-offs and their parts with each part's refund row, `kept:` and
+  why, or `pay by hand`, its holds, and for a shared payment its shares and every refund part.
 - `deposits retry <orderId>`: clears the review reason and puts the deposit's manual sweep back to
   pending; refused while a move is in flight, and for an `unknown_debit`, which only
   `deposits write-off` clears.
@@ -752,7 +752,7 @@ allowance wallet, money already swept, or review money already carried to the re
   that sender's source account; the command prints a part with no known sender as
   `pay by hand`, and support pays it on a signed claim. A part of Bugnet's own money (kept dust, or
   a transfer from one of Bugnet's wallets) or below `refund_min_micros` gets no row: it is printed
-  as `kept` and stays written off. When the debit took a settling payment's
+  as `kept`, stays written off, and the reason is stored with the part. When the debit took a settling payment's
   applied money, its sweep can never land: the payment is archived as failed, the order expires
   and every sender's money goes back. It clears the `unknown_debit` review once the ledger matches
   the chain; the job then returns, closes and finishes the deposit. When a sweep is still manual

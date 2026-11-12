@@ -96,13 +96,18 @@ export interface WriteOffRow {
     writtenAt: Date;
 }
 
-// refundId: the float payout of a part whose sender is known
+// Why Bugnet keeps a written-off part, decided when it is written off (spec 23.1)
+export type KeptReason = "bugnet_own" | "below_refund_min";
+
+// refundId: the float payout of a part whose sender is known; a part with neither it nor
+// keptReason is paid by hand
 export interface WriteOffPartRow {
     orderId: string;
     signature: string;
     transferSignature: string;
     micros: number;
     refundId: number | null;
+    keptReason: KeptReason | null;
 }
 
 export interface MoveRow {

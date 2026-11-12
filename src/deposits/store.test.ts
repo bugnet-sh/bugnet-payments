@@ -542,7 +542,7 @@ describe("depositLedger and depositView", () => {
             insertWriteOff(
                 c,
                 { orderId: o.id, signature: "theft2", slot: 140n, micros: 5_000, writtenAt: NOW },
-                [{ transferSignature: "B1", micros: 5_000, refundId: null }],
+                [{ transferSignature: "B1", micros: 5_000, refundId: null, keptReason: null }],
             ),
         );
         await tx((c) =>
@@ -550,8 +550,8 @@ describe("depositLedger and depositView", () => {
                 c,
                 { orderId: o.id, signature: "theft1", slot: 130n, micros: 12_000, writtenAt: NOW },
                 [
-                    { transferSignature: "B1", micros: 10_000, refundId: null },
-                    { transferSignature: "A1", micros: 2_000, refundId: null },
+                    { transferSignature: "B1", micros: 10_000, refundId: null, keptReason: null },
+                    { transferSignature: "A1", micros: 2_000, refundId: null, keptReason: null },
                 ],
             ),
         );

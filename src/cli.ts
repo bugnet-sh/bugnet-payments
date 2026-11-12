@@ -36,7 +36,7 @@ import {
     updateDeposit,
 } from "./deposits/store.ts";
 import type { DepositRow, NewTransfer, TransferRow } from "./deposits/types.ts";
-import { type WrittenPart, writeOff } from "./deposits/writeoff.ts";
+import { KEPT_TEXT, type WrittenPart, writeOff } from "./deposits/writeoff.ts";
 import { isRecord } from "./is-record.ts";
 import { isKeysCommand, KEYS_USAGE, runKeys, waitForLanding } from "./keys/commands.ts";
 import { parseEnvText } from "./keys/tool.ts";
@@ -1452,11 +1452,11 @@ async function depositsShow(
         );
     }
     for (const p of ledger.writeOffParts) {
-        const refund =
-            p.refundId === null
-                ? "refund=-"
-                : `refund=${p.refundId} state=${refundState.get(p.refundId) ?? "-"}`;
-        io.out(`write-off part ${p.signature} ${p.transferSignature} ${p.micros} ${refund}`);
+        let payout = "pay by hand";
+        if (p.refundId !== null) {
+            payout = `refund=${p.refundId} state=${refundState.get(p.refundId) ?? "-"}`;
+        } else if (p.keptReason !== null) payout = `kept: ${KEPT_TEXT[p.keptReason]}`;
+        io.out(`write-off part ${p.signature} ${p.transferSignature} ${p.micros} ${payout}`);
     }
     for (const h of ledger.holds) {
         const owner = h.owner === "" ? "shared" : h.owner;
@@ -2133,7 +2133,7 @@ function ledgerBefore(ledger: Ledger, slot: bigint, older: ReadonlySet<string>):
 const partLine = (p: WrittenPart): string => {
     const head = `part ${p.transferSignature} ${p.micros}`;
     if (p.refundId !== null) return `${head} refund=${p.refundId} to=${p.destination}`;
-    if (p.kept !== null) return `${head} refund=- kept: ${p.kept}`;
+    if (p.kept !== null) return `${head} refund=- kept: ${KEPT_TEXT[p.kept]}`;
     const why = p.unpaid ?? "no known sender";
     return `${head} refund=- pay by hand: ${why}`;
 };

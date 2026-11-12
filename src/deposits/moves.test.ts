@@ -639,7 +639,7 @@ describe("the guard", () => {
             insertWriteOff(
                 c,
                 { orderId: ORDER_A, signature: debit, slot, micros: 1_000, writtenAt: clock },
-                [{ transferSignature: sigs[0]!, micros: 1_000, refundId: null }],
+                [{ transferSignature: sigs[0]!, micros: 1_000, refundId: null, keptReason: null }],
             ),
         );
         const move = await pending(returnTo(6_000), sigs);

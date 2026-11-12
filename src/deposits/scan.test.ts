@@ -809,7 +809,7 @@ describe("scanDeposit", () => {
                     micros: 1_000,
                     writtenAt: clock,
                 },
-                [{ transferSignature: sent, micros: 1_000, refundId: null }],
+                [{ transferSignature: sent, micros: 1_000, refundId: null, keptReason: null }],
             );
             await c.query("update deposits set review_reason = null where order_id = $1", [
                 ORDER_A,
@@ -859,7 +859,7 @@ describe("scanDeposit", () => {
                         micros: 1_000,
                         writtenAt: clock,
                     },
-                    [{ transferSignature: sent, micros: 1_000, refundId: null }],
+                    [{ transferSignature: sent, micros: 1_000, refundId: null, keptReason: null }],
                 );
                 await c.query("update deposits set review_reason = null where order_id = $1", [
                     ORDER_A,
@@ -935,7 +935,7 @@ describe("scanDeposit", () => {
                     micros: 1_000,
                     writtenAt: clock,
                 },
-                [{ transferSignature: sent, micros: 1_000, refundId: null }],
+                [{ transferSignature: sent, micros: 1_000, refundId: null, keptReason: null }],
             ),
         );
         chain.advance(1);

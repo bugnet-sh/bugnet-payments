@@ -23,7 +23,6 @@ import type {
     TransferRow,
     WriteOffPartRow,
 } from "./types.ts";
-import { keptReason } from "./writeoff.ts";
 
 export interface DepositSummary {
     onTimeMicros: number;
@@ -132,8 +131,8 @@ function facts(order: StatusOrder, l: DepositLedger, now: Date, cfg: StatusCfg):
     const outcomes = new Map<string, { outcome: ViewOutcome; returnSignature: string | null }>();
     const takes = takesMoney(order.state);
     for (const t of l.transfers) {
-        // A written-off part comes back through its own payout, unless Bugnet keeps it; no known
-        // sender, by hand
+        // A written-off part comes back through its own payout, unless it was kept when written
+        // off; any other, by hand
         let lost: { outcome: ViewOutcome; returnSignature: string | null } | null = null;
         for (const p of l.writeOffParts) {
             if (p.transferSignature !== t.signature) continue;
@@ -145,10 +144,7 @@ function facts(order: StatusOrder, l: DepositLedger, now: Date, cfg: StatusCfg):
             } else if (payout !== undefined && RETURNING_REFUND.has(payout.state)) {
                 returning += p.micros;
                 outcome = "returning";
-            } else if (
-                payout === undefined &&
-                keptReason(t, p.micros, cfg.refund_min_micros) !== null
-            ) {
+            } else if (payout === undefined && p.keptReason !== null) {
                 kept += p.micros;
                 outcome = "kept";
             } else {
