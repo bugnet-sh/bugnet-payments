@@ -3232,8 +3232,16 @@ describe("deposits commands", () => {
             ]);
 
             const twice = await writeOff(stolen);
-            expect(twice.code).toBe(1);
-            expect(twice.io.errText()).toContain(`${stolen} is already written off for ${ORDER_A}`);
+            expect(twice.io.errText()).not.toContain("error:");
+            expect(twice.code).toBe(0);
+            expect(twice.io.outText().split("\n")).toEqual([
+                `deposit ${ORDER_A} already wrote off ${stolen}; nothing new recorded`,
+                "no review to clear",
+            ]);
+            expect(await writeOffRefunds()).toEqual([ra, rb]);
+            expect((await depositLedger(db.pool, ORDER_A))!.writeOffParts).toEqual(
+                ledger.writeOffParts,
+            );
         });
 
         it("prints a part with no known sender and pays it nothing", async () => {
@@ -3463,6 +3471,83 @@ describe("deposits commands", () => {
             expect((await findDeposit(db.pool, ORDER_A))!.reviewReason).toBe("unknown_debit");
         });
 
+        it("run again for a debit already written off, records nothing and checks the review", async () => {
+            await seedDeposit(ORDER_A, { deposit: { review_reason: "unknown_debit" } });
+            await credit(a, srcA, 20_000);
+            const stolen = theft(5_000);
+            const late = await credit(b, srcB, 3_000, { record: false });
+            expect((await writeOff(stolen)).code).toBe(0);
+            const [ra] = await writeOffRefunds();
+            const before = await depositLedger(db.pool, ORDER_A);
+
+            // The scan has not recorded B yet
+            const early = await writeOff(stolen);
+            expect(early.io.errText()).not.toContain("error:");
+            expect(early.code).toBe(0);
+            expect(early.io.outText().split("\n")).toEqual([
+                `deposit ${ORDER_A} already wrote off ${stolen}; nothing new recorded`,
+                "review stays unknown_debit: the chain holds 18000, the ledger 15000",
+            ]);
+            expect((await findDeposit(db.pool, ORDER_A))!.reviewReason).toBe("unknown_debit");
+
+            await seedTransfer(ORDER_A, {
+                signature: late,
+                amountMicros: 3_000,
+                owner: b.address,
+                source: srcB,
+                slot: await slotOf(late),
+            });
+            const cleared = await writeOff(stolen);
+            expect(cleared.io.errText()).not.toContain("error:");
+            expect(cleared.code).toBe(0);
+            expect(cleared.io.outText().split("\n")).toEqual([
+                `deposit ${ORDER_A} already wrote off ${stolen}; nothing new recorded`,
+                "review cleared",
+            ]);
+            const after = (await depositLedger(db.pool, ORDER_A))!;
+            expect(after.deposit.reviewReason).toBeNull();
+            expect(after.writeOffs).toEqual(before!.writeOffs);
+            expect(after.writeOffParts).toEqual(before!.writeOffParts);
+            expect(await writeOffRefunds()).toEqual([ra]);
+        });
+
+        it("run again, keeps a review a sweep left manual, or one a write-off may not clear", async () => {
+            await seedDeposit(ORDER_A, { deposit: { review_reason: "unknown_debit" } });
+            await credit(a, srcA, 20_000);
+            const stolen = theft(5_000);
+            const late = await credit(b, srcB, 3_000, { record: false });
+            expect((await writeOff(stolen)).code).toBe(0);
+            await seedTransfer(ORDER_A, {
+                signature: late,
+                amountMicros: 3_000,
+                owner: b.address,
+                source: srcB,
+                slot: await slotOf(late),
+            });
+            const sweep = await seedMove(ORDER_A, {
+                kind: "sweep",
+                state: "manual",
+                amountMicros: 1_000,
+                destination: "Recipient",
+                attempts: 3,
+                manualReason: "move_expired_repeatedly",
+                txSignature: SIG(93),
+            });
+            const manual = await writeOff(stolen);
+            expect(manual.code).toBe(0);
+            expect(manual.io.outText().split("\n").at(-1)).toBe(
+                `review back to move_expired_repeatedly: sweep ${sweep} is still manual`,
+            );
+            const other = await writeOff(stolen);
+            expect(other.code).toBe(0);
+            expect(other.io.outText().split("\n").at(-1)).toBe(
+                "review stays move_expired_repeatedly: a write-off clears only unknown_debit",
+            );
+            expect((await findDeposit(db.pool, ORDER_A))!.reviewReason).toBe(
+                "move_expired_repeatedly",
+            );
+        });
+
         it("keeps a review other than unknown_debit", async () => {
             await seedDeposit(ORDER_A);
             await credit(a, srcA, 20_000);
@@ -3647,6 +3732,14 @@ describe("deposits commands", () => {
             const done = await writeOff(stolen);
             expect(done.code).toBe(1);
             expect(done.io.errText()).toContain(`deposit ${ORDER_A} is done`);
+            await db.pool.query(
+                `insert into deposit_write_offs (order_id, signature, slot, micros, written_at)
+                 values ($1, $2, $3, 5000, $4)`,
+                [ORDER_A, stolen, await slotOf(stolen), LATER],
+            );
+            const again = await writeOff(stolen);
+            expect(again.code).toBe(1);
+            expect(again.io.errText()).toContain(`deposit ${ORDER_A} is done`);
             const none = await writeOff(stolen, ORDER_B);
             expect(none.code).toBe(1);
             expect(none.io.errText()).toContain(ORDER_B);

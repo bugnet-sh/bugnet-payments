@@ -36,7 +36,13 @@ import {
     updateDeposit,
 } from "./deposits/store.ts";
 import type { DepositRow, NewTransfer, TransferRow } from "./deposits/types.ts";
-import { KEPT_TEXT, type WrittenPart, writeOff } from "./deposits/writeoff.ts";
+import {
+    KEPT_TEXT,
+    recheckReview,
+    type ReviewCheck,
+    type WrittenPart,
+    writeOff,
+} from "./deposits/writeoff.ts";
 import { isRecord } from "./is-record.ts";
 import { isKeysCommand, KEYS_USAGE, runKeys, waitForLanding } from "./keys/commands.ts";
 import { parseEnvText } from "./keys/tool.ts";
@@ -2085,9 +2091,6 @@ function writeOffRefusal(ledger: Ledger, orderId: string, sig: string): string |
     if (ledger.deposit.state === "done") {
         return `deposit ${orderId} is done, so the job no longer reads it`;
     }
-    if (ledger.writeOffs.some((w) => w.signature === sig)) {
-        return `${sig} is already written off for ${orderId}`;
-    }
     if (ledger.moves.some((m) => m.state === "signed" || m.state === "sent")) {
         return `deposit ${orderId} has a move in flight; try again shortly`;
     }
@@ -2147,6 +2150,72 @@ function ledgerBefore(ledger: Ledger, slot: bigint, older: ReadonlySet<string>):
     return sum;
 }
 
+// A read at or after every slot the ledger knows, so nothing it recorded is missing from it
+async function freshRead(
+    rpc: SolanaRpc,
+    ledger: Ledger,
+    floor: bigint,
+    timeoutMs: number,
+): Promise<{ micros: bigint; contextSlot: bigint }> {
+    let pin = floor;
+    for (const s of [
+        ledger.deposit.checkedSlot,
+        ...ledger.transfers.map((t) => t.slot),
+        ...ledger.moves.map((m) => m.landedSlot),
+        ...ledger.writeOffs.map((w) => w.slot),
+    ]) {
+        if (s !== null && s > pin) pin = s;
+    }
+    const token = ledger.deposit.tokenAccount;
+    const read = (
+        await readDepositBalances(rpc, [address(token)], { timeoutMs, minContextSlot: pin })
+    ).get(token)!;
+    return { micros: read.micros, contextSlot: read.contextSlot };
+}
+
+function reviewLine(r: ReviewCheck, chainMicros: bigint): string | null {
+    if (r.reviewCleared) return "review cleared";
+    if (r.manualSweep !== null) {
+        return `review back to ${r.review}: sweep ${r.manualSweep} is still manual`;
+    }
+    if (r.review === "unknown_debit") {
+        return `review stays unknown_debit: the chain holds ${chainMicros}, the ledger ${orDash(r.expectedMicros)}`;
+    }
+    if (r.review !== null) return `review stays ${r.review}: a write-off clears only unknown_debit`;
+    return null;
+}
+
+/**
+ * Owner's ruling, spec 23.1: run again for a debit already written off, the command records
+ * nothing and checks the review again, so a credit the scan recorded after the first run no
+ * longer keeps unknown_debit for good.
+ */
+async function recheckWriteOff(
+    ctx: CliContext,
+    io: CliIo,
+    ledger: Ledger,
+    sig: string,
+): Promise<number> {
+    const { orderId } = ledger.deposit;
+    const slot = ledger.writeOffs.find((w) => w.signature === sig)!.slot;
+    const read = await freshRead(await ctx.rpc(), ledger, slot, ctx.settings.solana.rpc_timeout);
+    const result = await withTx(
+        ctx.pool,
+        (c) => recheckReview(c, { orderId, signature: sig, read }),
+        ctx.log,
+    );
+    if ("refused" in result) return fail(io, result.refused);
+    ctx.log.info("deposit write-off review check", {
+        orderId,
+        signature: sig,
+        reviewCleared: result.reviewCleared,
+        review: result.review,
+    });
+    io.out(`deposit ${orderId} already wrote off ${sig}; nothing new recorded`);
+    io.out(reviewLine(result, read.micros) ?? "no review to clear");
+    return 0;
+}
+
 const partLine = (p: WrittenPart): string => {
     const head = `part ${p.transferSignature} ${p.micros}`;
     if (p.refundId !== null) return `${head} refund=${p.refundId} to=${p.destination}`;
@@ -2168,6 +2237,8 @@ async function depositsWriteOff(
 ): Promise<number> {
     const ledger = await depositLedger(ctx.pool, orderId);
     if (ledger === null) return fail(io, noDeposit(orderId));
+    const written = ledger.writeOffs.some((w) => w.signature === sig);
+    if (written && ledger.deposit.state !== "done") return recheckWriteOff(ctx, io, ledger, sig);
     const refused = writeOffRefusal(ledger, orderId, sig);
     if (refused !== null) return fail(io, refused);
     const bugnetOwners = await bugnetOwnersOf(ctx);
@@ -2211,20 +2282,7 @@ async function depositsWriteOff(
         return fail(io, `the ledger expects ${expected} before ${sig} and the chain held ${held}`);
     }
 
-    let pin = slot;
-    for (const s of [
-        deposit.checkedSlot,
-        ...ledger.transfers.map((t) => t.slot),
-        ...ledger.moves.map((m) => m.landedSlot),
-    ]) {
-        if (s !== null && s > pin) pin = s;
-    }
-    const read = (
-        await readDepositBalances(rpc, [address(deposit.tokenAccount)], {
-            timeoutMs,
-            minContextSlot: pin,
-        })
-    ).get(deposit.tokenAccount)!;
+    const read = await freshRead(rpc, ledger, slot, timeoutMs);
     const micros = Number(item.micros);
     const result = await withTx(
         ctx.pool,
@@ -2237,7 +2295,7 @@ async function depositsWriteOff(
                 olderInSlot: older,
                 refundMinMicros: ctx.settings.deposits.refund_min_micros,
                 bugnetOwners,
-                read: { micros: read.micros, contextSlot: read.contextSlot },
+                read,
                 at: ctx.now(),
                 x402: ctx.settings.x402,
                 log: ctx.log,
@@ -2265,16 +2323,8 @@ async function depositsWriteOff(
     io.out(`deposit ${orderId} wrote off ${sig} micros=${micros} slot=${slot}`);
     for (const p of result.parts) io.out(partLine(p));
     if (result.expired) io.out(`order ${orderId} expired: its payment was written off`);
-    if (result.reviewCleared) io.out("review cleared");
-    else if (result.manualSweep !== null) {
-        io.out(`review back to ${result.review}: sweep ${result.manualSweep} is still manual`);
-    } else if (result.review === "unknown_debit") {
-        io.out(
-            `review stays unknown_debit: the chain holds ${read.micros}, the ledger ${orDash(result.expectedMicros)}`,
-        );
-    } else if (result.review !== null) {
-        io.out(`review stays ${result.review}: a write-off clears only unknown_debit`);
-    }
+    const review = reviewLine(result, read.micros);
+    if (review !== null) io.out(review);
     return 0;
 }
 

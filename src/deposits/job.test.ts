@@ -2209,6 +2209,80 @@ describe("flows on FakeChain", () => {
             await toDone();
         });
 
+        it("a write-off made before the scan recorded a later credit clears the review when run again", async () => {
+            const dep = await deposit();
+            chain.credit(floatAta, 100_000n);
+            const startA = chain.balance(sources.A);
+            const startB = chain.balance(sources.B);
+            await send("A", 20_000n);
+            await ticks(2, 3_000, watching());
+            expect((await ledgerOf()).transfers).toHaveLength(1);
+
+            const stolen = chain.debit(dep.tokenAccount, 5_000n);
+            chain.advance(1);
+            later(cfg.idle_every);
+            await tick();
+            expect((await depositOf()).reviewReason).toBe("unknown_debit");
+
+            // B's money lands after the theft, before the scan reads it
+            const b1 = await send("B", 3_000n);
+            const first = await writeOff(stolen);
+            expect(first.err).not.toContain("error:");
+            expect(first.code).toBe(0);
+            expect(first.out.at(-1)).toBe(
+                "review stays unknown_debit: the chain holds 18000, the ledger 15000",
+            );
+            expect(await writeOffRows()).toEqual([[sources.A, 5_000, "pending"]]);
+
+            later(cfg.closed_every);
+            await tick();
+            await until(
+                async () => (await ledgerOf()).transfers.some((t) => t.signature === b1),
+                5,
+                cfg.closed_every,
+            );
+            expect((await depositOf()).reviewReason).toBe("unknown_debit");
+            expect(alarms("deposit_unknown_debit")).toHaveLength(1);
+            const second = await writeOff(stolen);
+            expect(second.err).not.toContain("error:");
+            expect(second.code).toBe(0);
+            expect(second.out).toEqual([
+                `deposit ${ORDER_A} already wrote off ${stolen}; nothing new recorded`,
+                "review cleared",
+            ]);
+            const third = await writeOff(stolen);
+            expect(third.out).toEqual([
+                `deposit ${ORDER_A} already wrote off ${stolen}; nothing new recorded`,
+                "no review to clear",
+            ]);
+            expect(await depositOf()).toMatchObject({ reviewReason: null });
+            expect((await ledgerOf()).writeOffs).toHaveLength(1);
+            expect(await writeOffRows()).toEqual([[sources.A, 5_000, "pending"]]);
+
+            await expireAndClose();
+            expect(
+                (await movesOf())
+                    .filter((m) => m.kind === "return")
+                    .map((m) => [m.destination, m.amountMicros, m.state])
+                    .sort(),
+            ).toEqual(
+                [
+                    [sources.A, 15_000, "confirmed"],
+                    [sources.B, 3_000, "confirmed"],
+                ].sort(),
+            );
+            expect(chain.accountExists(dep.tokenAccount)).toBe(false);
+            await payRefunds();
+            expect(await writeOffRows()).toEqual([[sources.A, 5_000, "confirmed"]]);
+            expect(chain.balance(sources.A)).toBe(startA);
+            expect(chain.balance(sources.B)).toBe(startB);
+            expect(chain.balance(floatAta)).toBe(95_000n);
+
+            await toDone();
+            const view = await depositView(db.pool, await orderOf(), clock, cfg);
+            expect(view).toMatchObject({ status: "refunded", returnedMicros: 23_000 });
+        });
+
         it("parts Bugnet keeps get no payout and keep no deposit from done", async () => {
             const dep = await deposit();
             chain.credit(floatAta, 100_000n);

@@ -140,18 +140,20 @@ export interface WrittenPart {
     unpaid: string | null;
 }
 
+export interface ReviewCheck {
+    review: ReviewReason | null;
+    reviewCleared: boolean;
+    // the sweep left manual that the review went back to move_expired_repeatedly for
+    manualSweep: number | null;
+    expectedMicros: bigint | null;
+}
+
 export type WriteOffResult =
     | { refused: string }
-    | {
-          parts: WrittenPart[];
-          expired: boolean;
-          dropped: number;
-          review: ReviewReason | null;
-          reviewCleared: boolean;
-          // the sweep left manual that the review went back to move_expired_repeatedly for
-          manualSweep: number | null;
-          expectedMicros: bigint | null;
-      };
+    | ({ parts: WrittenPart[]; expired: boolean; dropped: number } & ReviewCheck);
+
+type Read = WriteOffRequest["read"];
+type Ledger = NonNullable<Awaited<ReturnType<typeof depositLedger>>>;
 
 const IN_FLIGHT = ["signed", "sent"];
 
@@ -245,27 +247,57 @@ export async function writeOff(c: pg.PoolClient, w: WriteOffRequest): Promise<Wr
     const current = new Map(after.transfers.map((t) => [t.signature, t]));
     const parts: WrittenPart[] = [];
     for (const p of split.parts) parts.push(await payPart(c, w, current.get(p.signature)!, p));
+    const review = await checkReview(c, after, w.read);
+    return { parts, expired: expires, dropped, ...review };
+}
+
+/**
+ * Clears unknown_debit once the write-offs bring the expected balance down to the read's (spec
+ * 23.1). The scan's unknown_debit replaces the review of a sweep that expired repeatedly, and only
+ * deposits retry requeues that sweep, so the review goes back to it.
+ */
+async function checkReview(c: pg.PoolClient, ledger: Ledger, read: Read): Promise<ReviewCheck> {
+    const { deposit } = ledger;
     const expectedMicros =
-        w.read === null
+        read === null
             ? null
-            : expectedBalanceAt(after.transfers, after.moves, after.writeOffs, w.read.contextSlot);
-    // The scan's unknown_debit replaces the review of a sweep that expired repeatedly, and only
-    // deposits retry requeues that sweep
-    const manual = after.moves.find((m) => m.kind === "sweep" && m.state === "manual");
+            : expectedBalanceAt(ledger.transfers, ledger.moves, ledger.writeOffs, read.contextSlot);
+    const manual = ledger.moves.find((m) => m.kind === "sweep" && m.state === "manual");
     let review = deposit.reviewReason;
-    if (review === "unknown_debit" && w.read !== null && w.read.micros === expectedMicros) {
+    if (review === "unknown_debit" && read !== null && read.micros === expectedMicros) {
         review = manual === undefined ? null : "move_expired_repeatedly";
-        await updateDeposit(c, w.orderId, { reviewReason: review });
+        await updateDeposit(c, deposit.orderId, { reviewReason: review });
     }
     return {
-        parts,
-        expired: expires,
-        dropped,
         review,
         reviewCleared: deposit.reviewReason !== null && review === null,
         manualSweep: review !== deposit.reviewReason && manual !== undefined ? manual.id : null,
         expectedMicros,
     };
+}
+
+/**
+ * A write-off run again for a debit already written off records nothing and only checks the
+ * review again (owner's ruling, spec 23.1): a credit the scan had not recorded at the first run
+ * kept the read above the ledger, and once the scan records it the review can clear. Same locks
+ * and rule as the first run.
+ */
+export async function recheckReview(
+    c: pg.PoolClient,
+    r: { orderId: string; signature: string; read: NonNullable<Read> },
+): Promise<{ refused: string } | ReviewCheck> {
+    await lockPayment(c, r.orderId);
+    const order = await lockOrder(c, r.orderId);
+    const deposit = await lockDeposit(c, r.orderId);
+    if (order === null || deposit === null) return { refused: `no deposit for ${r.orderId}` };
+    if (deposit.state === "done") {
+        return { refused: `deposit ${r.orderId} is done, so the job no longer reads it` };
+    }
+    const ledger = (await depositLedger(c, r.orderId))!;
+    if (!ledger.writeOffs.some((w) => w.signature === r.signature)) {
+        return { refused: `${r.signature} is not written off for ${r.orderId}` };
+    }
+    return checkReview(c, ledger, r.read);
 }
 
 /**
