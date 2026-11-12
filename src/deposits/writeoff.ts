@@ -86,15 +86,20 @@ export function splitDebit(i: SplitInput): { parts: SplitPart[]; shortMicros: nu
 
 /**
  * Why a part gets no payout although its sender may be known (owner's ruling, spec 23.1): Bugnet
- * pays nothing back to itself, and dust is never returned (D1).
+ * pays nothing back to itself, and dust is never returned (D1). A transfer from one of Bugnet's
+ * wallets is Bugnet's before the planner names it from_bugnet, which it does not while the
+ * balance is below the ledger.
  */
 export function keptReason(
-    t: Pick<TransferRow, "outcome" | "reason">,
+    t: Pick<TransferRow, "outcome" | "reason" | "sourceOwner">,
     micros: number,
     refundMinMicros: number,
+    bugnetOwners: ReadonlySet<string>,
 ): KeptReason | null {
     const keep = t.outcome === "keep" || (t.outcome === "paid" && t.reason === "below_minimum");
-    if (keep || t.reason === "from_bugnet") return "bugnet_own";
+    const own =
+        t.reason === "from_bugnet" || (t.sourceOwner !== null && bugnetOwners.has(t.sourceOwner));
+    if (keep || own) return "bugnet_own";
     if (micros < refundMinMicros) return "below_refund_min";
     return null;
 }
@@ -112,6 +117,8 @@ export interface WriteOffRequest {
     olderInSlot: ReadonlySet<string>;
     // [deposits] refund_min_micros
     refundMinMicros: number;
+    // Bugnet's own wallets: the fee payer, refund wallet, allowance wallet and recipient
+    bugnetOwners: ReadonlySet<string>;
     // A read of the account after the debit; review clears only when it matches the ledger
     read: { micros: bigint; contextSlot: bigint } | null;
     at: Date;
@@ -279,7 +286,7 @@ async function payPart(
         destination: t.sourceTokenAccount,
     };
     const none = { ...base, refundId: null, joined: false, kept: null, unpaid: null };
-    const kept = keptReason(t, p.micros, w.refundMinMicros);
+    const kept = keptReason(t, p.micros, w.refundMinMicros, w.bugnetOwners);
     if (kept !== null) {
         await c.query(
             `update deposit_write_off_parts set kept_reason = $4

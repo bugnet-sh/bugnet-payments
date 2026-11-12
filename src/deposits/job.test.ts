@@ -30,7 +30,7 @@ import { seedWriteOffPart } from "../testing/deposits.ts";
 import { createFakeRpc, epochAt } from "../testing/fake-rpc.ts";
 import { type FakeChain, startFakeChain } from "../testing/fake-chain.ts";
 import { type FakeRouter, startFakeRouter } from "../testing/fake-router.ts";
-import { testSigner } from "../testing/keys.ts";
+import { testSecret, testSigner } from "../testing/keys.ts";
 import { seedAllowanceOrder, seedOrder, seedPayment } from "../testing/orders.ts";
 import { resetLedger, seedAccount, TEST_HANDLE_SHA256 } from "../testing/x402.ts";
 import { createAllowanceFunding } from "../x402/funding.ts";
@@ -2016,9 +2016,14 @@ describe("flows on FakeChain", () => {
         async function writeOff(signature: string, id = ORDER_A) {
             const out: string[] = [];
             const err: string[] = [];
+            // Bugnet's fee payer and refund wallet, whose money the write-off keeps
+            const env = {
+                BUGNET_FEE_PAYER_KEY: testSecret(22, feePayer),
+                BUGNET_REFUND_KEY: testSecret(12, refund),
+            };
             const code = await cliMain(
                 ["-config", config, "deposits", "write-off", id, signature],
-                {},
+                env,
                 { out: (x) => out.push(x), err: (x) => err.push(x) },
                 { rpc: chain.rpc, now: () => clock },
             );

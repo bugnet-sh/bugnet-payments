@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { createDepositWatch, type DepositWatch } from "../deposits/job.ts";
 import { DepositKeys } from "../deposits/keys.ts";
 import type { ServiceImpl } from "@connectrpc/connect";
-import { getAddressEncoder, getBase58Decoder, type KeyPairSigner } from "@solana/kit";
+import type { KeyPairSigner } from "@solana/kit";
 import type { PaymentRequirements } from "@x402/core/types";
 import type pg from "pg";
 import { stringify } from "smol-toml";
@@ -25,7 +25,7 @@ import {
     TEST_LVBH,
 } from "./fake-rpc.ts";
 import { startFakeRouter } from "./fake-router.ts";
-import { testSigner } from "./keys.ts";
+import { testSecret, testSigner } from "./keys.ts";
 import { TEST_PAYTO, testIndex, usdcAccountAnswer } from "./x402.ts";
 
 export interface TestAppOptions {
@@ -75,13 +75,6 @@ const EVENT_SEED = Buffer.alloc(32, 9);
 const FEE_PAYER_SEED = 5;
 const ALLOWANCE_SEED = 11;
 const REFUND_SEED = 6;
-
-function keypairSecret(seed: number, signer: KeyPairSigner): string {
-    const bytes = new Uint8Array(64);
-    bytes.fill(seed, 0, 32);
-    bytes.set(getAddressEncoder().encode(signer.address), 32);
-    return getBase58Decoder().decode(bytes);
-}
 
 export async function testApp(over: TestAppOptions = {}): Promise<TestApp> {
     const stops: Array<() => Promise<void>> = [];
@@ -134,12 +127,12 @@ async function buildApp(over: TestAppOptions, stops: Array<() => Promise<void>>)
         routerToken: randomBytes(16).toString("hex"),
         orderSeed: randomBytes(32),
         claimKey: randomBytes(32),
-        feePayerKey: keypairSecret(FEE_PAYER_SEED, feePayer),
+        feePayerKey: testSecret(FEE_PAYER_SEED, feePayer),
         refundKey: "",
         rpcUrls: [],
         rpcUrlsFrom: "BUGNET_SOLANA_RPC_URL",
         rpcSingleIgnored: false,
-        allowanceKey: keypairSecret(ALLOWANCE_SEED, allowance),
+        allowanceKey: testSecret(ALLOWANCE_SEED, allowance),
         x402TlsKey: "",
         depositSeed: over.deposits === undefined ? null : TEST_DEPOSIT_SEED,
         depositSeedPrevious: null,

@@ -220,7 +220,14 @@ describe("keptReason", () => {
         ["a part at the minimum", { outcome: "open", reason: null }, 1_000, null],
         ["a paid transfer's extra", { outcome: "paid", reason: "extra" }, 5_000, null],
         ["a return", { outcome: "return", reason: "unpaid" }, 5_000, null],
+        [
+            "a Bugnet wallet the planner has not named yet",
+            { outcome: "open", reason: null, sourceOwner: "Bugnet" },
+            5_000,
+            "bugnet_own",
+        ],
     ] as const)("%s", (_, over, micros, reason) => {
-        expect(keptReason(t("A1", 30_000, 100, over), micros, 1_000)).toBe(reason);
+        const owners = new Set(["Bugnet"]);
+        expect(keptReason(t("A1", 30_000, 100, over), micros, 1_000, owners)).toBe(reason);
     });
 });

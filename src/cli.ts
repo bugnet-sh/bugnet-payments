@@ -79,7 +79,7 @@ import { signV0Transaction, usdcTransferChecked } from "./solana/transfer.ts";
 import { blockPayTo, readControls, setControls, unblockPayTo } from "./x402/controls.ts";
 import { type AllowanceFunding, createAllowanceFunding } from "./x402/funding.ts";
 import { openIncidents, resolveIncident } from "./x402/incidents.ts";
-import { SERVICE_ID } from "./x402/ids.ts";
+import { bugnetAddresses, SERVICE_ID } from "./x402/ids.ts";
 import { type ResignProof, resignProof } from "./x402/resign.ts";
 import { ledgerCheck } from "./x402/ledger-check.ts";
 import { x402Status } from "./x402/status.ts";
@@ -1287,6 +1287,7 @@ export function probeFails(
 const SEED = "BUGNET_DEPOSIT_SEED";
 const SEED_PREVIOUS = "BUGNET_DEPOSIT_SEED_PREVIOUS";
 const FEE_PAYER_KEY = "BUGNET_FEE_PAYER_KEY";
+const REFUND_KEY = "BUGNET_REFUND_KEY";
 // Each credit return-late sends back carries this memo with the credit's signature, so a later
 // run sees it was returned
 const LATE_MEMO = "bugnet-late ";
@@ -1770,6 +1771,22 @@ async function feePayerOf(env: NodeJS.ProcessEnv): Promise<KeyPairSigner> {
     return loadKeypair(key, FEE_PAYER_KEY);
 }
 
+// The fee payer and refund wallet are known by their keys, the others by the config
+async function bugnetOwnersOf(ctx: CliContext): Promise<ReadonlySet<string>> {
+    const refundKey = (ctx.env[REFUND_KEY] ?? "").trim();
+    if (refundKey === "") throw new Error(`${REFUND_KEY} must be set`);
+    const [feePayer, refund] = await Promise.all([
+        feePayerOf(ctx.env),
+        loadKeypair(refundKey, REFUND_KEY),
+    ]);
+    return bugnetAddresses({
+        feePayer: feePayer.address,
+        allowanceWallet: ctx.settings.x402.allowance_wallet,
+        refundWallet: refund.address,
+        recipient: ctx.settings.solana.recipient,
+    }).all;
+}
+
 /**
  * Signed by the deposit key with Bugnet's fee payer, sent, and followed until it lands. A send
  * can error after the endpoint forwarded the transaction, so an error never ends the command:
@@ -2153,6 +2170,7 @@ async function depositsWriteOff(
     if (ledger === null) return fail(io, noDeposit(orderId));
     const refused = writeOffRefusal(ledger, orderId, sig);
     if (refused !== null) return fail(io, refused);
+    const bugnetOwners = await bugnetOwnersOf(ctx);
     const { deposit } = ledger;
     const rpc = await ctx.rpc();
     const timeoutMs = ctx.settings.solana.rpc_timeout;
@@ -2218,6 +2236,7 @@ async function depositsWriteOff(
                 micros,
                 olderInSlot: older,
                 refundMinMicros: ctx.settings.deposits.refund_min_micros,
+                bugnetOwners,
                 read: { micros: read.micros, contextSlot: read.contextSlot },
                 at: ctx.now(),
                 x402: ctx.settings.x402,

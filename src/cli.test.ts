@@ -50,7 +50,7 @@ import { testDb, type TestDb } from "./testing/db.ts";
 import { heldRefundId, seedWriteOffPart } from "./testing/deposits.ts";
 import { type FakeChain, startFakeChain } from "./testing/fake-chain.ts";
 import { createFakeRpc } from "./testing/fake-rpc.ts";
-import { testSigner } from "./testing/keys.ts";
+import { testSecret, testSigner } from "./testing/keys.ts";
 import { seedOrder, seedPayment, seedSharedPayment } from "./testing/orders.ts";
 import { withTx } from "./db/pool.ts";
 import { usdcAta } from "./solana/accounts.ts";
@@ -3094,6 +3094,34 @@ describe("deposits commands", () => {
         let srcA: string;
         let srcB: string;
         let memo = 0;
+        // Bugnet's wallets: the fee payer and refund wallet by their keys, the allowance wallet
+        // and recipient by the config
+        let fee: KeyPairSigner;
+        let float: KeyPairSigner;
+        let allowance: KeyPairSigner;
+        let ownEnv: Record<string, string>;
+        let ownConfig: string;
+
+        beforeAll(async () => {
+            [fee, float, allowance] = await Promise.all([
+                testSigner(87),
+                testSigner(88),
+                testSigner(89),
+            ]);
+            ownEnv = {
+                BUGNET_FEE_PAYER_KEY: testSecret(87, fee),
+                BUGNET_REFUND_KEY: testSecret(88, float),
+            };
+            ownConfig = join(dir, "write-off.toml");
+            writeFileSync(
+                ownConfig,
+                stringify({
+                    database: { url: db.url },
+                    solana: { recipient: loadSettings(config).solana.recipient },
+                    x402: { allowance_wallet: allowance.address },
+                }),
+            );
+        });
 
         beforeEach(async () => {
             chain = await startFakeChain();
@@ -3148,12 +3176,14 @@ describe("deposits commands", () => {
             return sig;
         }
 
-        async function writeOff(sig: string, orderId = ORDER_A) {
+        async function writeOff(sig: string, orderId = ORDER_A, env = ownEnv) {
             const io = captureIo();
-            const code = await cli(["deposits", "write-off", orderId, sig], io, {
-                rpc: chain.rpc,
-                now: () => LATER,
-            });
+            const code = await cliMain(
+                ["-config", ownConfig, "deposits", "write-off", orderId, sig],
+                env,
+                io,
+                { rpc: chain.rpc, now: () => LATER },
+            );
             return { code, io };
         }
 
@@ -3270,6 +3300,43 @@ describe("deposits commands", () => {
                 ]),
             );
             expect(ledger.writeOffParts).toHaveLength(5);
+        });
+
+        it("keeps a part from one of Bugnet's wallets the planner has not named yet", async () => {
+            await seedDeposit(ORDER_A, { deposit: { review_reason: "unknown_debit" } });
+            const a1 = await credit(a, srcA, 20_000);
+            // The recipient of the config
+            const recipient = await testSigner(1);
+            const own: string[] = [];
+            for (const wallet of [fee, float, allowance, recipient]) {
+                const source = await usdcAta(wallet.address);
+                chain.setTokenAccount({ address: source, owner: wallet.address, amount: 10_000n });
+                // Recorded as the scan records it; the planner has not named it from_bugnet yet
+                own.push(await credit(wallet, source, 2_000));
+            }
+            const { code, io } = await writeOff(theft(28_000));
+            expect(io.errText()).not.toContain("error:");
+            expect(code).toBe(0);
+            const [ra] = await writeOffRefunds();
+            expect(io.outText().split("\n").slice(1, -1)).toEqual([
+                `part ${a1} 20000 refund=${ra!.id} to=${srcA}`,
+                ...own.map((sig) => `part ${sig} 2000 refund=- kept: Bugnet's own money`),
+            ]);
+            expect(await writeOffRefunds()).toHaveLength(1);
+            const parts = (await depositLedger(db.pool, ORDER_A))!.writeOffParts;
+            expect(parts.filter((p) => p.keptReason === "bugnet_own")).toHaveLength(4);
+        });
+
+        it("needs Bugnet's fee payer and refund keys to tell its wallets apart", async () => {
+            await seedDeposit(ORDER_A, { deposit: { review_reason: "unknown_debit" } });
+            await credit(a, srcA, 20_000);
+            const stolen = theft(5_000);
+            for (const name of ["BUGNET_FEE_PAYER_KEY", "BUGNET_REFUND_KEY"]) {
+                const { code, io } = await writeOff(stolen, ORDER_A, { ...ownEnv, [name]: "" });
+                expect(code).toBe(1);
+                expect(io.errText()).toContain(`${name} must be set`);
+            }
+            expect((await depositLedger(db.pool, ORDER_A))!.writeOffs).toEqual([]);
         });
 
         it("pays a part of kept dust once the write-off expires the payment", async () => {
