@@ -475,15 +475,20 @@ compared_rows() {
         for c in $ORDER_TIMES; do query+=", coalesce(extract(epoch from $c)::text, '-')"; done
         query+=" from orders"
         ;;
-    # A deposit's moves and transfers as one digest each: after the dump, its later moves read as
-    # debits that are not Payments' own
+    # A deposit's moves and transfers as one digest each, then the signatures of its moves signed,
+    # sent or landed: after the dump, those moves read as debits that are not Payments' own
     deposits)
         query="select d.order_id, d.state,
-            coalesce((select md5(string_agg(format('%s %s %s', m.id, m.state, m.tx_signature),
-                ',' order by m.id)) from deposit_moves m where m.order_id = d.order_id), '-'),
+            coalesce((select md5(string_agg(format('%s %s %s %s', m.id, m.state, m.tx_signature,
+                m.landed_slot), ',' order by m.id)) from deposit_moves m
+                where m.order_id = d.order_id), '-'),
             coalesce((select md5(string_agg(format('%s %s %s %s %s', t.signature, t.outcome,
                 t.applied_micros, t.move_id, t.refund_id), ',' order by t.signature))
-                from deposit_transfers t where t.order_id = d.order_id), '-')
+                from deposit_transfers t where t.order_id = d.order_id), '-'),
+            coalesce((select string_agg(m.tx_signature, ',' order by m.id) from deposit_moves m
+                where m.order_id = d.order_id and m.tx_signature is not null
+                    and (m.state in ('signed', 'sent', 'confirmed') or m.landed_slot is not null)),
+                '-')
             from deposits d"
         ;;
     *) query="select id, state, coalesce(tx_signature, '-') from $table" ;;
@@ -493,7 +498,8 @@ compared_rows() {
 
 # Every row that moves money, or decides a refund, and differs between the restored database ($1)
 # and the one it replaces ($2, named $3 once kept). Each spec is the table, how many fields a line
-# shows, and the names of the rest.
+# shows, and the names of the fields compared after them. A deposit's last field lists signatures,
+# and its line ends with those the kept database has and the restored one lacks.
 money_differences() {
     local new=$1 old=$2 kept=$3 spec table shown names here before
     for spec in "orders 1 $ORDER_TIMES" "refunds 2" "deposits 1 moves transfers" "deposit_moves 2" \
@@ -516,14 +522,25 @@ money_differences() {
             function differ(a, b,   x, y, nm, n, i, s) {
                 if (a == "" || b == "") return ""
                 split(a, x, " ")
-                n = split(b, y, " ")
-                split(names, nm, " ")
-                for (i = shown + 2; i <= n; i++)
-                    if (x[i] != y[i]) s = s (s == "" ? "; differ: " : ", ") nm[i - shown - 1]
+                split(b, y, " ")
+                n = split(names, nm, " ")
+                for (i = 1; i <= n; i++)
+                    if (x[shown + 1 + i] != y[shown + 1 + i])
+                        s = s (s == "" ? "; differ: " : ", ") nm[i]
                 return s
             }
+            function signed(a, b,   x, y, sig, col, n, i, s) {
+                col = shown + 2 + split(names, x, " ")
+                if (split(b, y, " ") < col) return ""
+                split(a, x, " ")
+                n = split(y[col], sig, ",")
+                for (i = 1; i <= n; i++)
+                    if (sig[i] != "-" && index("," x[col] ",", "," sig[i] ",") == 0)
+                        s = s " " sig[i]
+                return "; signed after the dump:" (s == "" ? " none" : s)
+            }
             function report(id, a, b) {
-                print t " " id ": " side(a) " here, " side(b) " in " kept differ(a, b)
+                print t " " id ": " side(a) " here, " side(b) " in " kept differ(a, b) signed(a, b)
             }
             FILENAME == ARGV[1] { if (NF) { here[$1] = $0; ids[++count] = $1 } next }
             NF { seen[$1] = 1; if (here[$1] != $0) report($1, here[$1], $0) }

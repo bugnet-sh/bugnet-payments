@@ -1433,7 +1433,7 @@ describe("vps-install.sh restore", () => {
         expect(r.out).not.toContain(SAME);
     });
 
-    it("--restore lists each deposit with moves or transfers after the dump", () => {
+    it("--restore lists each deposit with moves or transfers after the dump and its signatures", () => {
         const [MOVED, CREDITED, SAME, LATER_DEPOSIT] = [
             orderId("e"),
             orderId("f"),
@@ -1481,10 +1481,12 @@ describe("vps-install.sh restore", () => {
                 move(SAME, "create", "confirmed", "CreateG");
                 transfer(CREDITED, "CreditF");
             },
-            // A credit swept, a transfer sent to review, and a new deposit, all after the dump
+            // A credit swept, a close that failed, a transfer sent to review, and a new deposit
+            // with a create in flight, all after the dump
             after: () => {
                 transfer(MOVED, "CreditE");
                 move(MOVED, "sweep", "confirmed", "SweepE");
+                move(MOVED, "close", "failed", "CloseE");
                 sql(db, `update deposits set state = 'done' where order_id = '${MOVED}'`);
                 sql(
                     db,
@@ -1493,7 +1495,7 @@ describe("vps-install.sh restore", () => {
                 );
                 orders([LATER_DEPOSIT]);
                 deposit(LATER_DEPOSIT, "open");
-                move(LATER_DEPOSIT, "create", "pending", null);
+                move(LATER_DEPOSIT, "create", "sent", "CreateH");
             },
         });
         const r = restore();
@@ -1503,11 +1505,15 @@ describe("vps-install.sh restore", () => {
         expect(r.out).toContain(
             `== rows that differ from ${kept}:\n` +
                 `orders ${LATER_DEPOSIT}: none here, unpaid in ${kept}\n` +
-                `deposits ${MOVED}: open here, done in ${kept}; differ: moves, transfers\n` +
-                `deposits ${CREDITED}: settling here, settling in ${kept}; differ: transfers\n` +
-                `deposits ${LATER_DEPOSIT}: none here, open in ${kept}\n` +
+                `deposits ${MOVED}: open here, done in ${kept}; differ: moves, transfers; ` +
+                "signed after the dump: SweepE\n" +
+                `deposits ${CREDITED}: settling here, settling in ${kept}; differ: transfers; ` +
+                "signed after the dump: none\n" +
+                `deposits ${LATER_DEPOSIT}: none here, open in ${kept}; ` +
+                "signed after the dump: CreateH\n" +
                 `deposit_moves 4: none here, confirmed SweepE in ${kept}\n` +
-                `deposit_moves 5: none here, pending - in ${kept}\n` +
+                `deposit_moves 5: none here, failed CloseE in ${kept}\n` +
+                `deposit_moves 6: none here, sent CreateH in ${kept}\n` +
                 "== bugnet-payments@v9",
         );
         expect(r.out).not.toContain(SAME);
