@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { type Address, getAddressDecoder, isSolanaError, type KeyPairSigner } from "@solana/kit";
+import type pg from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { withTx } from "../db/pool.ts";
 import { memoryLog } from "../log.ts";
@@ -27,7 +28,14 @@ import {
     TxCache,
     unexplainedIn,
 } from "./scan.ts";
-import { depositLedger, ensureDeposit, findDeposit, insertMove, insertWriteOff } from "./store.ts";
+import {
+    depositLedger,
+    ensureDeposit,
+    findDeposit,
+    insertMove,
+    insertWriteOff,
+    lockDeposit,
+} from "./store.ts";
 import type { DepositRow, MoveRow, MoveState, NewMove, TransferRow } from "./types.ts";
 
 const ORDER_A = "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -826,6 +834,87 @@ describe("scanDeposit", () => {
         // The cursor passed the debit, and the old trail agrees
         expect((await scanNow(dep, trail)).invariant).toBe("held");
     });
+
+    it.each(["during its fetch", "while the scan waits on the deposit lock"])(
+        "a write-off that commits %s is never flagged again",
+        async (when) => {
+            const { dep, trail } = await deposit();
+            const sent = await send(5_000n);
+            expect((await scanNow(dep, trail)).invariant).toBe("held");
+            const anchor = (await ledger()).deposit;
+            const debit = chain.debit(TOKEN_A, 1_000n);
+            expect((await scanNow(dep, trail)).invariant).toBe("below");
+            expect((await ledger()).deposit.reviewReason).toBe("unknown_debit");
+            const { value } = await chain.rpc
+                .getSignatureStatuses([debit as never], { searchTransactionHistory: true })
+                .send();
+            const writeOff = async (c: pg.PoolClient) => {
+                await lockDeposit(c, ORDER_A);
+                await insertWriteOff(
+                    c,
+                    {
+                        orderId: ORDER_A,
+                        signature: debit,
+                        slot: BigInt(value[0]!.slot),
+                        micros: 1_000,
+                        writtenAt: clock,
+                    },
+                    [{ transferSignature: sent, micros: 1_000, refundId: null }],
+                );
+                await c.query("update deposits set review_reason = null where order_id = $1", [
+                    ORDER_A,
+                ]);
+            };
+            let committed: Promise<void> = Promise.resolve();
+            const holdLock = async () => {
+                const c = await db.pool.connect();
+                await c.query("begin");
+                await writeOff(c);
+                committed = (async () => {
+                    for (let i = 0; i < 250; i++) {
+                        const waiting = await db.pool.query(
+                            "select 1 from pg_stat_activity where wait_event_type = 'Lock'",
+                        );
+                        if (waiting.rowCount !== 0) break;
+                        await new Promise((r) => setTimeout(r, 20));
+                    }
+                    await c.query("commit");
+                    c.release();
+                })();
+            };
+            // The step loaded its ledger before the write-off, which runs during the fetch
+            const racing = new Proxy(chain.rpc, {
+                get: (target, prop, recv) => {
+                    const fn = Reflect.get(target, prop, recv);
+                    if (prop !== "getTransaction") return fn;
+                    return (sig: string, config: unknown) => {
+                        const call = fn.call(target, sig, config);
+                        if (sig !== debit) return call;
+                        return {
+                            send: async (o: unknown) => {
+                                if (when === "during its fetch") await withTx(db.pool, writeOff);
+                                else await holdLock();
+                                return await call.send(o);
+                            },
+                        };
+                    };
+                },
+            });
+
+            // A new process: no memory of the debit and no cache
+            const restarted = new ReadTrail({
+                slot: anchor.checkedSlot!,
+                micros: anchor.balanceMicros,
+            });
+            cache = new TxCache(10_000);
+            const res = await scanNow(dep, restarted, { ...deps(), rpc: racing });
+            await committed;
+            expect(res.invariant).toBe("held");
+            expect(alarms("deposit_unknown_debit")).toHaveLength(1);
+            expect(alarms("deposit_review")).toHaveLength(1);
+            expect((await ledger()).deposit.reviewReason).toBeNull();
+        },
+    );
 
     it("a written-off debit is never fetched again while money beside it is not listed yet", async () => {
         const { dep, trail } = await deposit();

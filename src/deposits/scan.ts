@@ -24,7 +24,14 @@ import type { Log } from "../log.ts";
 import { TOKEN_PROGRAM, USDC_MINT } from "../solana/constants.ts";
 import { deadline, type SolanaRpc } from "../solana/rpc.ts";
 import { parseChainTx, type TokenAccountChange, usdcHeldBy } from "../x402/match.ts";
-import { depositLedger, insertTransfers, lockDeposit, moveCursor, updateDeposit } from "./store.ts";
+import {
+    depositLedger,
+    insertTransfers,
+    lockDeposit,
+    moveCursor,
+    updateDeposit,
+    writeOffsOf,
+} from "./store.ts";
 import type {
     DepositRow,
     MoveRow,
@@ -742,15 +749,23 @@ async function apply(s: Step, item: ScanItem): Promise<void> {
         return;
     }
     if (item.kind !== "unknown_debit" || s.m.debitsAlarmed.has(item.signature)) return;
+    // The step's ledger may predate a write-off of this debit that has committed since
+    const flagged = await withTx(s.d.pool, async (c) => {
+        await lockDeposit(c, s.deposit.orderId);
+        const { writeOffs } = await writeOffsOf(c, s.deposit.orderId);
+        if (writeOffs.some((w) => w.signature === item.signature)) {
+            s.writeOffs = writeOffs;
+            return false;
+        }
+        await updateDeposit(c, s.deposit.orderId, { reviewReason: "unknown_debit" });
+        return true;
+    });
+    if (!flagged) return;
     // Only the deposit key can debit the account, so a debit that is not ours means a leak
     s.d.log.alarm("deposit_unknown_debit", {
         orderId: s.deposit.orderId,
         signature: item.signature,
         micros: item.micros.toString(),
-    });
-    await withTx(s.d.pool, async (c) => {
-        await lockDeposit(c, s.deposit.orderId);
-        await updateDeposit(c, s.deposit.orderId, { reviewReason: "unknown_debit" });
     });
     // Spec 17: the operator's review alarm names this reason too
     s.d.log.alarm("deposit_review", {
