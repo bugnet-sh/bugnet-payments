@@ -22,10 +22,17 @@ mkdir -p "$BACKUP_DIR"
 chmod 0700 "$BACKUP_DIR"
 
 final="$BACKUP_DIR/$DB-$(date -u +%Y%m%dT%H%M%SZ).dump"
-tmp=$(mktemp "$final.XXXXXX")
+tmp=$(mktemp "$final.XXXXXX") || die "cannot create a temporary file in $BACKUP_DIR"
+# shellcheck disable=SC2064
+trap "rm -f -- $(printf '%q' "$tmp")" EXIT
+trap 'exit 1' INT TERM HUP
 # postgres cannot write into the root-only folder, so the dump comes back through this shell
-runuser -u "$PG_USER" -- pg_dump --format=custom "$DB" >"$tmp"
-pg_restore --list "$tmp" >/dev/null
-chmod 0600 "$tmp"
-mv -f "$tmp" "$final"
+runuser -u "$PG_USER" -- pg_dump --format=custom "$DB" >"$tmp" ||
+    die "pg_dump of $DB failed; no dump was written"
+pg_restore --list "$tmp" >/dev/null ||
+    die "pg_restore --list cannot read the dump of $DB; no dump was written"
+if ! chmod 0600 "$tmp" || ! mv -f "$tmp" "$final"; then
+    die "cannot rename the dump to $final"
+fi
+trap - EXIT INT TERM HUP
 say "wrote $final ($(wc -c <"$final" | tr -d ' ') bytes)"

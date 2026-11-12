@@ -935,6 +935,42 @@ describe("payments-backup.sh", () => {
             rmSync(dump);
         }
     });
+
+    it("a failed dump, check or run leaves no partial file and exits non-zero", () => {
+        const old = "bugnet_payments-20250101T021500Z.dump";
+        const cases: [string, (root: string) => void, string][] = [
+            [
+                "pg_dump fails after writing part of the dump",
+                (root) => writeFileSync(join(root, "pg_dump.exit"), "1"),
+                "payments-backup: pg_dump of bugnet_payments failed; no dump was written\n",
+            ],
+            [
+                "pg_restore --list cannot read the dump",
+                (root) => writeFileSync(join(root, "pg_restore.exit"), "1"),
+                "payments-backup: pg_restore --list cannot read the dump of bugnet_payments; no dump was written\n",
+            ],
+            [
+                "the run is stopped while the dump is checked",
+                (root) =>
+                    writeFileSync(
+                        join(root, "bin", "pg_restore"),
+                        '#!/usr/bin/env bash\nkill -TERM "$PPID"\nexit 1\n',
+                    ),
+                "",
+            ],
+        ];
+        for (const [, breakIt, message] of cases) {
+            const server = fakeServer();
+            mkdirSync(server.backups, { mode: 0o700 });
+            writeFileSync(join(server.backups, old), "PGDMP old\n", { mode: 0o600 });
+            breakIt(server.root);
+            const r = server.backup();
+            expect(r.code).not.toBe(0);
+            expect(r.out).toBe("");
+            if (message !== "") expect(r.err).toBe(message);
+            expect(readdirSync(server.backups)).toEqual([old]);
+        }
+    });
 });
 
 describe("retire-deposit-seed.sh", () => {
