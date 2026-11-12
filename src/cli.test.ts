@@ -3245,7 +3245,9 @@ describe("deposits commands", () => {
                 const { code, io } = await writeOff(theft(1_000));
                 expect(io.errText()).not.toContain("error:");
                 expect(code).toBe(0);
-                expect(io.outText()).not.toContain("review cleared");
+                expect(io.outText().split("\n").at(-1)).toBe(
+                    `review stays ${reason}: a write-off clears only unknown_debit`,
+                );
                 expect((await findDeposit(db.pool, ORDER_A))!.reviewReason).toBe(reason);
             }
         });

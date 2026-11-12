@@ -2242,10 +2242,12 @@ async function depositsWriteOff(
     if (result.reviewCleared) io.out("review cleared");
     else if (result.manualSweep !== null) {
         io.out(`review back to ${result.review}: sweep ${result.manualSweep} is still manual`);
-    } else if (result.review !== null) {
+    } else if (result.review === "unknown_debit") {
         io.out(
-            `review stays ${result.review}: the chain holds ${read.micros}, the ledger ${orDash(result.expectedMicros)}`,
+            `review stays unknown_debit: the chain holds ${read.micros}, the ledger ${orDash(result.expectedMicros)}`,
         );
+    } else if (result.review !== null) {
+        io.out(`review stays ${result.review}: a write-off clears only unknown_debit`);
     }
     return 0;
 }
