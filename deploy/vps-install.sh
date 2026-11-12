@@ -8,6 +8,9 @@
 #   vps-install.sh --start                checks the settings, backs up the database, then starts or
 #                                         restarts the installed version
 #   vps-install.sh --backup               dumps the database into /var/backups/bugnet-payments now
+#   vps-install.sh --restore <dump>       restores the dump into a new database, stops every
+#                                         version, gives the new database the name and keeps the
+#                                         old one beside it; starts nothing (README section 13)
 #   vps-install.sh --rpc-urls             reads one BUGNET_SOLANA_RPC_URLS line on stdin into
 #                                         payments.env; deploy/push-rpc-urls.sh sends it
 #   vps-install.sh --payments-token       reads one BUGNET_PAYMENTS_TOKEN line on stdin into
@@ -381,6 +384,89 @@ backup_now() {
         return 1
     fi
     BUGNET_PAYMENTS_BACKUP_DIR=$BACKUP_DIR "$BACKUP_SCRIPT"
+}
+
+# Postgres tools as postgres, which logs in by peer; from /, since postgres cannot enter root's
+# folders
+as_postgres() { (cd / && runuser -u postgres -- "$@"); }
+
+pg_sql() {
+    local db=$1
+    shift
+    as_postgres psql -X -q -v ON_ERROR_STOP=1 -d "$db" "$@"
+}
+
+pg_has_database() {
+    [ "$(pg_sql postgres -At -c "select 1 from pg_database where datname = '$1'")" = 1 ]
+}
+
+pg_drop_database() {
+    pg_sql postgres -c "set client_min_messages = warning" -c "drop database if exists $1"
+}
+
+# Every version, running or only enabled, so none runs on the database while it is replaced or
+# starts on the restored one before --start
+stop_every_version() {
+    local v=$1 unit
+    for unit in $({
+        systemctl list-units --all --plain --no-legend 'bugnet-payments@*' | awk '{print $1}'
+        echo "bugnet-payments@$v.service"
+    } | sort -u); do
+        systemctl disable --now "$unit" || return 1
+        say "stopped and disabled $unit"
+    done
+}
+
+# The installed release's migrations that the restored database has not run; its start runs them
+pending_migrations() {
+    local v=$1 f
+    LC_ALL=C comm -23 \
+        <(for f in "$OPT/$v/migrations"/*.sql; do
+            f=${f##*/}
+            if [[ $f =~ ^[0-9]{5}_[a-z0-9_]+\.sql$ ]]; then echo "$f"; fi
+        done | LC_ALL=C sort) \
+        <(pg_sql "$DB" -At -c 'select version from schema_migrations' 2>/dev/null | LC_ALL=C sort)
+}
+
+restore_abort() {
+    pg_drop_database "$1" >/dev/null 2>&1 || true
+    die "$2"
+}
+
+# Spec 23.2. The dump goes into a new database, which then takes the name: a restore over the live
+# one fails as soon as a later migration's table has a foreign key into a table in the dump, and
+# the database it replaces stays whole beside it with everything after the dump.
+do_restore() {
+    local dump=$1 v new kept pending
+    [ -f "$dump" ] || die "no such file: $dump"
+    pg_restore --list "$dump" >/dev/null 2>&1 || die "pg_restore --list cannot read $dump; nothing was changed"
+    v=$(installed_version)
+    new=${DB}_restoring
+    kept=${DB}_before_$(date -u +%Y%m%d_%H%M%S)
+    pg_drop_database "$new" || die "cannot drop $new, left by an earlier run; nothing was changed"
+    as_postgres createdb --owner "$ROLE" "$new" || die "cannot create $new; nothing was changed"
+    if ! as_postgres pg_restore --clean --if-exists --single-transaction -d "$new" <"$dump"; then
+        restore_abort "$new" "the restore failed, so nothing was stopped and $DB was not changed"
+    fi
+    stop_every_version "$v" ||
+        restore_abort "$new" "a version did not stop; $DB was not changed, run --restore again"
+    if pg_has_database "$DB"; then
+        pg_sql postgres -1 -c "alter database $DB rename to $kept" -c "alter database $new rename to $DB" ||
+            restore_abort "$new" "cannot rename the databases (pg_stat_activity shows who holds $DB); $DB was not changed and every version is stopped: run --restore again, or --start"
+        say "$DB is now the dump; the database it replaced is $kept, which only postgres opens"
+    else
+        pg_sql postgres -c "alter database $new rename to $DB" ||
+            restore_abort "$new" "cannot rename $new to $DB; every version is stopped: run --restore again"
+        say "$DB is now the dump; there was no $DB to keep"
+    fi
+    pending=$(pending_migrations "$v" | tr '\n' ' ')
+    pending=${pending% }
+    if [ -n "$pending" ]; then
+        say "bugnet-payments@$v would run these migrations again at its start: $pending"
+    else
+        say "bugnet-payments@$v runs no migration the restored database lacks"
+    fi
+    say "nothing was started; README section 13 says what comes before --start"
 }
 
 do_install() {
@@ -830,7 +916,7 @@ do_retire_seed() {
 
 main() {
     local tgz="" recipient="" event_key="" router_url="" index="" mode=install mtls=""
-    local deposits="" remove=0
+    local deposits="" remove=0 dump=""
     [ "$(id -u)" = 0 ] || die "run as root"
     [ $# -gt 0 ] || die "usage: see the comment at the top of this file"
     while [ $# -gt 0 ]; do
@@ -843,6 +929,7 @@ main() {
         --pubkeys) mode=pubkeys; shift ;;
         --start) mode=start; shift ;;
         --backup) mode=backup; shift ;;
+        --restore) mode=restore; dump=${2:?}; shift 2 ;;
         --rpc-urls) mode=rpc_urls; shift ;;
         --payments-token) mode=payments_token; shift ;;
         --deposits) mode=deposits; deposits=${2:?}; shift 2 ;;
@@ -866,6 +953,7 @@ main() {
     pubkeys) do_pubkeys ;;
     start) no_rotation_halfway; do_start backup ;;
     backup) backup_now || die "the backup failed" ;;
+    restore) do_restore "$dump" ;;
     rpc_urls) do_rpc_urls ;;
     payments_token) do_payments_token ;;
     deposits) do_deposits "$deposits" ;;

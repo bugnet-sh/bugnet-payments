@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
     chmodSync,
     copyFileSync,
@@ -192,7 +193,7 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
             readFileSync(log, "utf8")
                 .split("\n")
                 .filter((l) => l !== ""),
-        run(cmd: string, stdin = "", cwd = dir) {
+        run(cmd: string, stdin = "", cwd = dir, extraEnv: Record<string, string> = {}) {
             const r = spawnSync(
                 "bash",
                 [
@@ -209,6 +210,7 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
                     cwd,
                     env: {
                         ...process.env,
+                        ...extraEnv,
                         PATH: `${bin}:${process.env.PATH ?? ""}`,
                         PWD: cwd,
                         VPS_INSTALL_LIB: "1",
@@ -1133,6 +1135,220 @@ describe("vps-install.sh backups", () => {
             "WantedBy=timers.target",
         ]) {
             expect(timer.split("\n")).toContain(line);
+        }
+    });
+});
+
+const MIGRATIONS = join(import.meta.dirname, "../migrations");
+const MIGRATION_FILES = readdirSync(MIGRATIONS)
+    .filter((f) => /^\d{5}_[a-z0-9_]+\.sql$/.test(f))
+    .toSorted();
+const PG_URL = new URL(
+    process.env.BUGNET_TEST_PG_URL || "postgres://localhost:5432/postgres?sslmode=disable",
+);
+// The script's psql, createdb and pg_restore read these, so they reach the test server
+const PG_ENV: Record<string, string> = {
+    PGHOST: PG_URL.hostname,
+    PGPORT: PG_URL.port || "5432",
+    ...(PG_URL.username === "" ? {} : { PGUSER: decodeURIComponent(PG_URL.username) }),
+    ...(PG_URL.password === "" ? {} : { PGPASSWORD: decodeURIComponent(PG_URL.password) }),
+    ...(PG_URL.searchParams.has("sslmode")
+        ? { PGSSLMODE: PG_URL.searchParams.get("sslmode")! }
+        : {}),
+};
+
+function pg(cmd: string, args: string[]): string {
+    const r = spawnSync(cmd, args, { encoding: "utf8", env: { ...process.env, ...PG_ENV } });
+    if (r.status !== 0) throw new Error(`${cmd} ${args.join(" ")}: ${r.stderr}`);
+    return r.stdout.trim();
+}
+
+function sql(db: string, text: string): string {
+    return pg("psql", ["-X", "-q", "-v", "ON_ERROR_STOP=1", "-At", "-d", db, "-c", text]);
+}
+
+// As src/db/migrate.ts does, one file at a time
+function migrateTo(db: string, files: readonly string[]) {
+    sql(
+        db,
+        "create table if not exists schema_migrations (version text primary key, applied_at timestamptz not null default now())",
+    );
+    for (const f of files) {
+        pg("psql", ["-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", db, "-f", join(MIGRATIONS, f)]);
+        sql(db, `insert into schema_migrations (version) values ('${f}')`);
+    }
+}
+
+function databasesLike(prefix: string): string[] {
+    const out = sql("postgres", `select datname from pg_database where datname like '${prefix}%'`);
+    return out === "" ? [] : out.split("\n").toSorted();
+}
+
+describe("vps-install.sh restore", () => {
+    const PRE = MIGRATION_FILES.slice(0, 4);
+    const LATER = MIGRATION_FILES.slice(4);
+    const UNITS =
+        "bugnet-payments@v10.service loaded active running Bugnet Payments v10\n" +
+        "bugnet-payments@v9.service loaded inactive dead Bugnet Payments v9\n";
+    let db: string;
+
+    beforeEach(() => {
+        db = `bn_pay_restore_${randomBytes(6).toString("hex")}`;
+    });
+    afterEach(() => {
+        for (const name of databasesLike(db)) {
+            sql("postgres", `drop database if exists ${name} with (force)`);
+        }
+    });
+
+    // A database at 00004, its dump, then a release whose migrations add tables with foreign keys
+    // into the dumped ones, on a server where v10 still runs while v9 is installed. Postgres runs
+    // for real; runuser logs and runs the tool as this user.
+    function scene(o: { before?: () => void; after?: () => void } = {}) {
+        expect(PRE.at(-1)).toBe("00004_paid_via.sql");
+        sql("postgres", `create database ${db}`);
+        migrateTo(db, PRE);
+        o.before?.();
+        const dump = join(dir, "pre.dump");
+        pg("pg_dump", ["--format=custom", "-d", db, "-f", dump]);
+        o.after?.();
+        migrateTo(db, LATER);
+        const server = fakeServer({ active: true });
+        const bin = join(server.root, "bin");
+        rmSync(join(bin, "pg_dump"));
+        rmSync(join(bin, "pg_restore"));
+        writeFileSync(
+            join(bin, "runuser"),
+            [
+                "#!/usr/bin/env bash",
+                `echo "runuser $*" >> "${join(server.root, "calls.log")}"`,
+                'while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done',
+                'shift; exec "$@"',
+                "",
+            ].join("\n"),
+        );
+        writeFileSync(join(server.root, "units.out"), UNITS);
+        mkdirSync(join(server.root, "opt", "v9", "migrations"));
+        for (const f of MIGRATION_FILES) {
+            copyFileSync(join(MIGRATIONS, f), join(server.root, "opt", "v9", "migrations", f));
+        }
+        const role = sql("postgres", "select current_user");
+        const restore = (file = dump) =>
+            server.run(`DB=${db}; ROLE=${role}; main --restore "${file}"`, "", dir, PG_ENV);
+        return { server, dump, role, restore };
+    }
+
+    it("--restore goes back before migrations whose tables point into the dump, keeping the old database", () => {
+        const { server, role, restore } = scene();
+        const r = restore();
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        expect(
+            sql(db, "select string_agg(version, ' ' order by version) from schema_migrations"),
+        ).toBe(PRE.join(" "));
+        expect(sql(db, "select to_regclass('public.deposits') is null")).toBe("t");
+        expect(
+            sql(
+                "postgres",
+                `select pg_get_userbyid(datdba) from pg_database where datname = '${db}'`,
+            ),
+        ).toBe(role);
+        expect(
+            sql(
+                db,
+                "select string_agg(distinct tableowner, ' ') from pg_tables where schemaname = 'public'",
+            ),
+        ).toBe(role);
+        const kept = databasesLike(`${db}_before_`);
+        expect(kept).toHaveLength(1);
+        expect(kept[0]).toMatch(new RegExp(`^${db}_before_\\d{8}_\\d{6}$`));
+        expect(sql(kept[0]!, "select count(*) from schema_migrations")).toBe(
+            String(MIGRATION_FILES.length),
+        );
+        expect(sql(kept[0]!, "select to_regclass('public.deposits') is not null")).toBe("t");
+        expect(databasesLike(`${db}_restoring`)).toEqual([]);
+        expect(r.out).toContain(
+            `== ${db} is now the dump; the database it replaced is ${kept[0]}, which only postgres opens\n`,
+        );
+        expect(r.out).toContain(
+            `== bugnet-payments@v9 would run these migrations again at its start: ${LATER.join(" ")}\n`,
+        );
+        expect(r.out).toContain(
+            "== nothing was started; README section 13 says what comes before --start\n",
+        );
+        const calls = server.calls();
+        expect(calls.some((c) => /^systemctl (start|restart|enable)/.test(c))).toBe(false);
+    });
+
+    it("--restore stops and disables every version, not only the installed one, before the rename", () => {
+        const { server, restore } = scene();
+        const r = restore();
+        expect(r.code).toBe(0);
+        const calls = server.calls();
+        const stops = calls.filter((c) => c.startsWith("systemctl disable"));
+        expect(stops).toEqual([
+            "systemctl disable --now bugnet-payments@v10.service",
+            "systemctl disable --now bugnet-payments@v9.service",
+        ]);
+        const restored = calls.findIndex((c) => / pg_restore .* -d /.test(c));
+        const renamed = calls.findIndex((c) => c.includes("alter database"));
+        expect(restored).toBeGreaterThanOrEqual(0);
+        expect(calls.indexOf(stops[0]!)).toBeGreaterThan(restored);
+        expect(calls.indexOf(stops[1]!)).toBeLessThan(renamed);
+        expect(r.out).toContain("== stopped and disabled bugnet-payments@v10.service\n");
+    });
+
+    it("--restore names no migration when the installed release has none the dump lacks", () => {
+        const { server, restore } = scene();
+        for (const f of LATER) rmSync(join(server.root, "opt", "v9", "migrations", f));
+        const r = restore();
+        expect(r.code).toBe(0);
+        expect(r.out).toContain(
+            "== bugnet-payments@v9 runs no migration the restored database lacks\n",
+        );
+    });
+
+    it("a failed restore stops nothing and leaves the database as it was", () => {
+        const { server, restore } = scene();
+        const real = spawnSync("bash", ["-c", "command -v pg_restore"], { encoding: "utf8" });
+        writeFileSync(
+            join(server.root, "bin", "pg_restore"),
+            [
+                "#!/usr/bin/env bash",
+                `case " $* " in *" --list "*) exec "${real.stdout.trim()}" "$@" ;; esac`,
+                'echo "pg_restore: error: could not execute query" >&2',
+                "exit 1",
+                "",
+            ].join("\n"),
+        );
+        chmodSync(join(server.root, "bin", "pg_restore"), 0o755);
+        const r = restore();
+        expect(r.code).toBe(1);
+        expect(r.err).toContain(
+            `vps-install: the restore failed, so nothing was stopped and ${db} was not changed\n`,
+        );
+        expect(server.calls().some((c) => c.startsWith("systemctl"))).toBe(false);
+        expect(sql(db, "select count(*) from schema_migrations")).toBe(
+            String(MIGRATION_FILES.length),
+        );
+        expect(databasesLike(`${db}_`)).toEqual([]);
+    });
+
+    it("--restore refuses a file that is not a dump before it touches anything", () => {
+        const server = fakeServer({ active: true });
+        const file = join(dir, "not.dump");
+        writeFileSync(file, "nope\n");
+        for (const [f, message] of [
+            [file, `pg_restore --list cannot read ${file}; nothing was changed`],
+            [join(dir, "missing.dump"), `no such file: ${join(dir, "missing.dump")}`],
+        ] as const) {
+            writeFileSync(join(server.root, "calls.log"), "");
+            const r = server.run(`main --restore "${f}"`);
+            expect(r.code).toBe(1);
+            expect(r.err).toBe(`vps-install: ${message}\n`);
+            expect(server.calls().filter((c) => !c.startsWith("root pg_restore --list"))).toEqual(
+                [],
+            );
         }
     });
 });
