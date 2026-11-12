@@ -955,8 +955,8 @@ It starts nothing. Then:
    made after the dump as a debit that is not Payments' own, raises `deposit_unknown_debit` and
    puts the deposit in review. It is Payments' own move only when the alarm's `signature` is one
    the restore printed after `signed after the dump:` on its `orderId`'s line. Then it is
-   **not a leak**: no leak response (section 12), and the deposit stays in review until the
-   founder decides how to bring its rows back. One whose `signature` is on a `deposit_write_offs`
+   **not a leak**: no leak response (section 12), and the deposit stays in review until its
+   rows are settled by hand with the other listed rows (founder, 2026-11-13). One whose `signature` is on a `deposit_write_offs`
    line for its `orderId` is already written off and is settled by hand with the other listed
    rows. **Never write off** either, which would pay the senders twice. Any other unknown debit
    gets the leak response.
