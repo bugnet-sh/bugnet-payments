@@ -1,6 +1,8 @@
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
     chmodSync,
+    copyFileSync,
     existsSync,
     mkdirSync,
     mkdtempSync,
@@ -8,6 +10,7 @@ import {
     readFileSync,
     rmSync,
     statSync,
+    utimesSync,
     writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,6 +21,9 @@ const SCRIPT = join(import.meta.dirname, "../deploy/vps-install.sh");
 const PUSH = join(import.meta.dirname, "../deploy/push-rpc-urls.sh");
 const RETIRE = join(import.meta.dirname, "../deploy/retire-deposit-seed.sh");
 const PUSH_TOKEN = join(import.meta.dirname, "../deploy/push-payments-token.sh");
+const BACKUP = join(import.meta.dirname, "../deploy/payments-backup.sh");
+const DEPLOY = join(import.meta.dirname, "../deploy");
+const BACKUP_UNITS = ["bugnet-payments-backup.service", "bugnet-payments-backup.timer"] as const;
 
 const KEYS = [
     "BUGNET_PAYMENTS_TOKEN",
@@ -76,9 +82,11 @@ function keysEnv(extra = ""): string {
     return `${lines.join("\n")}\nBUGNET_SOLANA_RPC_URLS=https://rpc1.example,https://rpc2.example\n${extra}`;
 }
 
-// A server with release v9 installed. systemctl, curl, journalctl, chown, setpriv, id and node are
-// fakes; id makes main run as root, and node stands in for dist/cli.js, logs who ran it with which
-// arguments, and answers from files the test can change.
+// A server with release v9 and the backup script installed. systemctl, curl, journalctl, chown,
+// install, setpriv, id, node, runuser, pg_dump and pg_restore are fakes; id makes main run as root,
+// install leaves out the owner, node stands in for dist/cli.js, and node, systemctl, install and
+// the Postgres tools log who ran them with which arguments and answer from files the test can
+// change.
 function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) {
     const root = join(dir, "server");
     const etc = join(root, "etc");
@@ -90,6 +98,10 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
     mkdirSync(join(etc, "payments"), { recursive: true });
     mkdirSync(join(opt, "v9"), { recursive: true });
     mkdirSync(bin);
+    mkdirSync(join(root, "systemd"));
+    mkdirSync(join(root, "lib"));
+    copyFileSync(BACKUP, join(root, "lib", "payments-backup.sh"));
+    chmodSync(join(root, "lib", "payments-backup.sh"), 0o755);
     for (const f of ["internal-ca.pem", "payments/x402-server.pem", "payments/x402-index.json"]) {
         writeFileSync(join(etc, f), "");
     }
@@ -102,13 +114,26 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
     writeFileSync(join(root, "list.out"), "");
     writeFileSync(join(root, "all.out"), "");
     writeFileSync(join(root, "moving.out"), "");
+    writeFileSync(join(root, "pg_dump.exit"), "0");
+    writeFileSync(join(root, "pg_restore.exit"), "0");
+    writeFileSync(join(root, "units.out"), "");
     writeFileSync(log, "");
     const env = envFile(o.env ?? keysEnv());
     const fakes: Record<string, string> = {
-        systemctl: `echo "systemctl $*" >> "${log}"\n[ "$1" != is-active ] || exit ${o.active === true ? 0 : 3}`,
+        systemctl: [
+            `echo "systemctl $*" >> "${log}"`,
+            `[ "$1" != list-units ] || cat "${root}/units.out"`,
+            `[ "$1" != is-active ] || exit ${o.active === true ? 0 : 3}`,
+        ].join("\n"),
         curl: "exit 0",
         journalctl: "exit 0",
         chown: "exit 0",
+        install: [
+            `echo "install $*" >> "${log}"`,
+            "args=()",
+            'while [ $# -gt 0 ]; do case $1 in -o | -g) shift 2 ;; *) args+=("$1"); shift ;; esac; done',
+            'exec /usr/bin/install "${args[@]}"',
+        ].join("\n"),
         id: 'if [ "$1" = -u ]; then echo 0; else exec /usr/bin/id "$@"; fi',
         setpriv: [
             'for a in "$@"; do case $a in --reuid=*) export FAKE_AS=${a#--reuid=} ;; esac; done',
@@ -134,29 +159,50 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
             '*) echo "unexpected: $*" >&2; exit 9 ;;',
             "esac",
         ].join("\n"),
+        runuser: [
+            'while [ $# -gt 0 ] && [ "$1" != -- ]; do',
+            "    case $1 in -u) export FAKE_AS=$2; shift 2 ;; *) shift ;; esac",
+            "done",
+            'shift; exec "$@"',
+        ].join("\n"),
+        // The dump holds its own environment, so a test can see no secret reached it
+        pg_dump: [
+            `echo "\${FAKE_AS:-root} pg_dump $*" >> "${log}"`,
+            "echo PGDMP; env",
+            `exit "$(cat "${root}/pg_dump.exit")"`,
+        ].join("\n"),
+        pg_restore: [
+            `echo "\${FAKE_AS:-root} pg_restore $*" >> "${log}"`,
+            'for last in "$@"; do :; done',
+            '[ "$(head -c 5 "$last")" = PGDMP ] || { echo "pg_restore: error: not an archive" >&2; exit 1; }',
+            `exit "$(cat "${root}/pg_restore.exit")"`,
+        ].join("\n"),
     };
     for (const [name, body] of Object.entries(fakes)) {
         writeFileSync(join(bin, name), `#!/usr/bin/env bash\n${body}\n`);
         chmodSync(join(bin, name), 0o755);
     }
+    const backups = join(root, "backups");
     return {
         root,
         toml,
         env,
+        backups,
         rotating: join(etc, "payments.rotating"),
         calls: () =>
             readFileSync(log, "utf8")
                 .split("\n")
                 .filter((l) => l !== ""),
-        run(cmd: string, stdin = "", cwd = dir) {
+        run(cmd: string, stdin = "", cwd = dir, extraEnv: Record<string, string> = {}) {
             const r = spawnSync(
                 "bash",
                 [
                     "-c",
-                    `. "${SCRIPT}"; ETC="$1"; TOML="$1/payments.toml"; RELEASE_FILE="$1/payments.release"; ROTATING="$1/payments.rotating"; OPT="$2"; ${cmd}`,
+                    `. "${SCRIPT}"; ETC="$1"; TOML="$1/payments.toml"; RELEASE_FILE="$1/payments.release"; ROTATING="$1/payments.rotating"; OPT="$2"; UNIT_DIR="$3/systemd"; LIB_DIR="$3/lib"; BACKUP_SCRIPT="$3/lib/payments-backup.sh"; BACKUP_DIR="$3/backups"; ${cmd}`,
                     "bash",
                     etc,
                     opt,
+                    root,
                 ],
                 {
                     input: stdin,
@@ -164,6 +210,7 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
                     cwd,
                     env: {
                         ...process.env,
+                        ...extraEnv,
                         PATH: `${bin}:${process.env.PATH ?? ""}`,
                         PWD: cwd,
                         VPS_INSTALL_LIB: "1",
@@ -171,6 +218,20 @@ function fakeServer(o: { usage?: string; active?: boolean; env?: string } = {}) 
                     },
                 },
             );
+            return { code: r.status, out: r.stdout, err: r.stderr, all: r.stdout + r.stderr };
+        },
+        // Runs deploy/payments-backup.sh itself, as the timer does
+        backup(extra: Record<string, string> = {}) {
+            const r = spawnSync("bash", [BACKUP], {
+                encoding: "utf8",
+                cwd: dir,
+                env: {
+                    ...process.env,
+                    PATH: `${bin}:${process.env.PATH ?? ""}`,
+                    BUGNET_PAYMENTS_BACKUP_DIR: backups,
+                    ...extra,
+                },
+            });
             return { code: r.status, out: r.stdout, err: r.stderr, all: r.stdout + r.stderr };
         },
     };
@@ -863,6 +924,802 @@ describe("vps-install.sh payments token", () => {
     });
 });
 
+const DUMP_NAME = /^bugnet_payments-(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z\.dump$/;
+
+function dumpsIn(folder: string): string[] {
+    return existsSync(folder) ? readdirSync(folder).filter((f) => DUMP_NAME.test(f)) : [];
+}
+
+describe("vps-install.sh backups", () => {
+    const OLD_UNIT = "bugnet-payments@v8.service loaded active running Bugnet Payments v8\n";
+
+    it("--backup dumps the database now and touches no unit", () => {
+        const server = fakeServer({ active: true });
+        let r = server.run("main --backup");
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        const dumps = dumpsIn(server.backups);
+        expect(dumps).toHaveLength(1);
+        const dump = join(server.backups, dumps[0]!);
+        expect(r.out).toBe(`== wrote ${dump} (${statSync(dump).size} bytes)\n`);
+        expect(server.calls()[0]).toBe("postgres pg_dump --format=custom bugnet_payments");
+        expect(server.calls().some((c) => c.startsWith("systemctl"))).toBe(false);
+
+        writeFileSync(join(server.root, "pg_dump.exit"), "1");
+        r = server.run("main --backup");
+        expect(r.code).toBe(1);
+        expect(r.out).toBe("");
+        expect(r.err).toBe(
+            "payments-backup: pg_dump of bugnet_payments failed; no dump was written\n" +
+                "vps-install: the backup failed\n",
+        );
+        expect(server.calls().some((c) => c.startsWith("systemctl"))).toBe(false);
+    });
+
+    it("--start backs up the database before it stops or restarts any unit", () => {
+        const server = fakeServer({ active: true });
+        writeFileSync(join(server.root, "units.out"), OLD_UNIT);
+        const r = server.run("main --start");
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        expect(dumpsIn(server.backups)).toHaveLength(1);
+        const calls = server.calls();
+        const dumped = calls.indexOf("postgres pg_dump --format=custom bugnet_payments");
+        expect(dumped).toBeGreaterThanOrEqual(0);
+        expect(dumped).toBeLessThan(calls.findIndex((c) => c.startsWith("systemctl")));
+        expect(calls).toContain("systemctl disable --now bugnet-payments@v8.service");
+        expect(calls).toContain("systemctl restart bugnet-payments@v9");
+    });
+
+    it("--start stops, touching no unit, when the backup fails", () => {
+        const cases: [string, string][] = [
+            ["pg_dump.exit", "payments-backup: pg_dump of bugnet_payments failed"],
+            ["pg_restore.exit", "payments-backup: pg_restore --list cannot read the dump"],
+            ["", "lib/payments-backup.sh is missing; run the install step first"],
+        ];
+        for (const [file, message] of cases) {
+            const server = fakeServer({ active: true });
+            writeFileSync(join(server.root, "units.out"), OLD_UNIT);
+            if (file === "") rmSync(join(server.root, "lib", "payments-backup.sh"));
+            else writeFileSync(join(server.root, file), "1");
+            const r = server.run("main --start");
+            expect(r.code).toBe(1);
+            expect(r.err).toContain(message);
+            expect(r.err).toContain(
+                "vps-install: the backup failed, so nothing was stopped or started\n",
+            );
+            expect(server.calls().some((c) => c.startsWith("systemctl"))).toBe(false);
+            expect(existsSync(server.backups) ? readdirSync(server.backups) : []).toEqual([]);
+        }
+    });
+
+    it("--deposits, the rotation and the retirement restart the running release without a dump", () => {
+        const cases: [string, string, (s: ReturnType<typeof fakeServer>) => void][] = [
+            [
+                "main --deposits off",
+                "",
+                (s) => {
+                    writeFileSync(s.toml, "[solana]\n\n[deposits]\nenabled = true\n");
+                },
+            ],
+            ["main --rotate-deposit-seed", "", () => {}],
+            [
+                "main --retire-deposit-seed - --remove-previous",
+                `BUGNET_DEPOSIT_SEED_V1=${OLD_SEED}\n`,
+                (s) => {
+                    writeFileSync(s.env, keysEnv(`BUGNET_DEPOSIT_SEED_PREVIOUS=${OLD_SEED}\n`));
+                    writeFileSync(s.toml, "[deposits]\nenabled = false\nseed_version = 2\n");
+                },
+            ],
+        ];
+        for (const [cmd, stdin, setup] of cases) {
+            const server = fakeServer({ active: true });
+            setup(server);
+            // A dump would fail, so a restart that waited on one would never happen
+            writeFileSync(join(server.root, "pg_dump.exit"), "1");
+            const r = server.run(`on_terminal() { false; }; ${cmd}`, stdin);
+            expect(r.all).not.toContain("backup");
+            expect(r.code).toBe(0);
+            expect(server.calls().some((c) => c.includes("pg_dump"))).toBe(false);
+            expect(server.calls()).toContain("systemctl restart bugnet-payments@v9");
+            expect(existsSync(server.rotating)).toBe(false);
+        }
+    });
+
+    it("no secret reaches the backup's output or the dump", () => {
+        const server = fakeServer({ active: true });
+        writeFileSync(server.env, keysEnv(`BUGNET_DEPOSIT_SEED_PREVIOUS=${OLD_SEED}\n`));
+        for (const cmd of ["main --backup", "main --start"]) {
+            const r = server.run(cmd);
+            expect(r.code).toBe(0);
+            for (const secret of [SEED, OLD_SEED]) {
+                expect(r.all).not.toContain(secret);
+                for (const f of readdirSync(server.backups)) {
+                    expect(readFileSync(join(server.backups, f), "utf8")).not.toContain(secret);
+                }
+            }
+        }
+    });
+
+    it("ensure_backup installs the script and both units and enables the timer", () => {
+        const server = fakeServer();
+        const deploy = join(server.root, "opt", "v9", "deploy");
+        const lib = join(server.root, "lib");
+        const units = join(server.root, "systemd");
+        const script = join(lib, "payments-backup.sh");
+        mkdirSync(deploy);
+        for (const f of ["payments-backup.sh", ...BACKUP_UNITS]) {
+            copyFileSync(join(DEPLOY, f), join(deploy, f));
+        }
+        rmSync(lib, { recursive: true });
+        for (const round of [1, 2]) {
+            writeFileSync(join(server.root, "calls.log"), "");
+            const r = server.run("ensure_backup v9");
+            expect(r.err).toBe("");
+            expect(r.code).toBe(0);
+            expect(readFileSync(script, "utf8")).toBe(readFileSync(BACKUP, "utf8"));
+            expect(statSync(script).mode & 0o777).toBe(0o755);
+            expect(statSync(lib).mode & 0o777).toBe(0o755);
+            for (const unit of BACKUP_UNITS) {
+                const f = join(units, unit);
+                expect(readFileSync(f, "utf8")).toBe(readFileSync(join(DEPLOY, unit), "utf8"));
+                expect(statSync(f).mode & 0o777).toBe(0o644);
+            }
+            expect(statSync(server.backups).mode & 0o777).toBe(0o700);
+            const calls = server.calls();
+            expect(calls.filter((c) => c.startsWith("install"))).toEqual([
+                `install -d -o root -g root -m 0755 ${lib}`,
+                `install -o root -g root -m 0755 ${deploy}/payments-backup.sh ${script}`,
+                `install -o root -g root -m 0644 ${deploy}/${BACKUP_UNITS[0]} ${deploy}/${BACKUP_UNITS[1]} ${units}/`,
+                `install -d -o root -g root -m 0700 ${server.backups}`,
+            ]);
+            expect(calls.filter((c) => c.startsWith("systemctl"))).toEqual([
+                "systemctl daemon-reload",
+                "systemctl enable --now bugnet-payments-backup.timer",
+            ]);
+            if (round === 1) chmodSync(server.backups, 0o755);
+        }
+    });
+
+    it("the install step runs ensure_backup after the service's unit", () => {
+        const server = fakeServer();
+        const tgz = join(dir, "bugnet-payments-v9.tgz");
+        writeFileSync(tgz, "");
+        const steps = [
+            "ensure_node",
+            "ensure_user",
+            "install_code",
+            "ensure_postgres",
+            "ensure_keys",
+            "ensure_router_token",
+            "ensure_toml",
+            "ensure_index",
+            "ensure_unit",
+            "ensure_backup",
+            "do_pubkeys",
+        ];
+        const stubs = steps.map((step) => `${step}() { echo "${step} $*"; }`).join("; ");
+        const r = server.run(`${stubs}; do_install "${tgz}" "" "" "" ""`);
+        expect(r.code).toBe(0);
+        const ran = r.out.split("\n").filter((l) => steps.includes(l.split(" ")[0]!));
+        expect(ran.map((l) => l.split(" ")[0])).toEqual(steps);
+        expect(ran).toContain("ensure_backup v9");
+    });
+
+    it("the units run the installed script at 02:15 UTC and may write only the backup folder", () => {
+        const r = spawnSync("bash", ["-c", `. "${SCRIPT}"; echo "$BACKUP_SCRIPT $BACKUP_DIR"`], {
+            encoding: "utf8",
+            env: { ...process.env, VPS_INSTALL_LIB: "1" },
+        });
+        const [script, folder] = r.stdout.trim().split(" ");
+        expect(script).toBe("/usr/local/lib/bugnet/payments-backup.sh");
+        expect(folder).toBe("/var/backups/bugnet-payments");
+        expect(readFileSync(BACKUP, "utf8")).toContain(
+            `BACKUP_DIR=\${BUGNET_PAYMENTS_BACKUP_DIR:-${folder}}\n`,
+        );
+        const service = readFileSync(join(DEPLOY, BACKUP_UNITS[0]), "utf8");
+        for (const line of [
+            "Type=oneshot",
+            "User=root",
+            `ExecStart=${script}`,
+            "ProtectSystem=strict",
+            `ReadWritePaths=${folder}`,
+        ]) {
+            expect(service.split("\n")).toContain(line);
+        }
+        const timer = readFileSync(join(DEPLOY, BACKUP_UNITS[1]), "utf8");
+        for (const line of [
+            "OnCalendar=*-*-* 02:15:00 UTC",
+            "RandomizedDelaySec=15m",
+            "Persistent=true",
+            "WantedBy=timers.target",
+        ]) {
+            expect(timer.split("\n")).toContain(line);
+        }
+    });
+});
+
+const MIGRATIONS = join(import.meta.dirname, "../migrations");
+const MIGRATION_FILES = readdirSync(MIGRATIONS)
+    .filter((f) => /^\d{5}_[a-z0-9_]+\.sql$/.test(f))
+    .toSorted();
+const PG_URL = new URL(
+    process.env.BUGNET_TEST_PG_URL || "postgres://localhost:5432/postgres?sslmode=disable",
+);
+// The script's psql, createdb and pg_restore read these, so they reach the test server
+const PG_ENV: Record<string, string> = {
+    PGHOST: PG_URL.hostname,
+    PGPORT: PG_URL.port || "5432",
+    ...(PG_URL.username === "" ? {} : { PGUSER: decodeURIComponent(PG_URL.username) }),
+    ...(PG_URL.password === "" ? {} : { PGPASSWORD: decodeURIComponent(PG_URL.password) }),
+    ...(PG_URL.searchParams.has("sslmode")
+        ? { PGSSLMODE: PG_URL.searchParams.get("sslmode")! }
+        : {}),
+};
+
+function pg(cmd: string, args: string[]): string {
+    const r = spawnSync(cmd, args, { encoding: "utf8", env: { ...process.env, ...PG_ENV } });
+    if (r.status !== 0) throw new Error(`${cmd} ${args.join(" ")}: ${r.stderr}`);
+    return r.stdout.trim();
+}
+
+function sql(db: string, text: string): string {
+    return pg("psql", ["-X", "-q", "-v", "ON_ERROR_STOP=1", "-At", "-d", db, "-c", text]);
+}
+
+// As src/db/migrate.ts does, one file at a time
+function migrateTo(db: string, files: readonly string[]) {
+    sql(
+        db,
+        "create table if not exists schema_migrations (version text primary key, applied_at timestamptz not null default now())",
+    );
+    for (const f of files) {
+        pg("psql", ["-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", db, "-f", join(MIGRATIONS, f)]);
+        sql(db, `insert into schema_migrations (version) values ('${f}')`);
+    }
+}
+
+function databasesLike(prefix: string): string[] {
+    const out = sql("postgres", `select datname from pg_database where datname like '${prefix}%'`);
+    return out === "" ? [] : out.split("\n").toSorted();
+}
+
+const orderId = (c: string) => `ord_${c.repeat(26)}`;
+
+describe("vps-install.sh restore", () => {
+    const PRE = MIGRATION_FILES.slice(0, 4);
+    const LATER = MIGRATION_FILES.slice(4);
+    const UNITS =
+        "bugnet-payments@v10.service loaded active running Bugnet Payments v10\n" +
+        "bugnet-payments@v9.service loaded inactive dead Bugnet Payments v9\n";
+    let db: string;
+
+    beforeEach(() => {
+        db = `bn_pay_restore_${randomBytes(6).toString("hex")}`;
+    });
+    afterEach(() => {
+        for (const name of databasesLike(db)) {
+            sql("postgres", `drop database if exists ${name} with (force)`);
+        }
+    });
+
+    // A database at 00004, its dump, then a release whose migrations add tables with foreign keys
+    // into the dumped ones, on a server where v10 still runs while v9 is installed. Postgres runs
+    // for real; runuser logs and runs the tool as this user.
+    function scene(o: { dumpedAt?: number; before?: () => void; after?: () => void } = {}) {
+        expect(PRE.at(-1)).toBe("00004_paid_via.sql");
+        const at = o.dumpedAt ?? PRE.length;
+        sql("postgres", `create database ${db}`);
+        migrateTo(db, MIGRATION_FILES.slice(0, at));
+        o.before?.();
+        const dump = join(dir, "pre.dump");
+        pg("pg_dump", ["--format=custom", "-d", db, "-f", dump]);
+        o.after?.();
+        migrateTo(db, MIGRATION_FILES.slice(at));
+        const server = fakeServer({ active: true });
+        const bin = join(server.root, "bin");
+        rmSync(join(bin, "pg_dump"));
+        rmSync(join(bin, "pg_restore"));
+        writeFileSync(
+            join(bin, "runuser"),
+            [
+                "#!/usr/bin/env bash",
+                `echo "runuser $*" >> "${join(server.root, "calls.log")}"`,
+                'while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done',
+                'shift; exec "$@"',
+                "",
+            ].join("\n"),
+        );
+        writeFileSync(join(server.root, "units.out"), UNITS);
+        mkdirSync(join(server.root, "opt", "v9", "migrations"));
+        for (const f of MIGRATION_FILES) {
+            copyFileSync(join(MIGRATIONS, f), join(server.root, "opt", "v9", "migrations", f));
+        }
+        const role = sql("postgres", "select current_user");
+        const restore = (file = dump) =>
+            server.run(`DB=${db}; ROLE=${role}; main --restore "${file}"`, "", dir, PG_ENV);
+        return { server, dump, role, restore };
+    }
+
+    it("--restore goes back before migrations whose tables point into the dump, keeping the old database", () => {
+        const { server, role, restore } = scene();
+        const r = restore();
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        expect(
+            sql(db, "select string_agg(version, ' ' order by version) from schema_migrations"),
+        ).toBe(PRE.join(" "));
+        expect(sql(db, "select to_regclass('public.deposits') is null")).toBe("t");
+        expect(
+            sql(
+                "postgres",
+                `select pg_get_userbyid(datdba) from pg_database where datname = '${db}'`,
+            ),
+        ).toBe(role);
+        expect(
+            sql(
+                db,
+                "select string_agg(distinct tableowner, ' ') from pg_tables where schemaname = 'public'",
+            ),
+        ).toBe(role);
+        const kept = databasesLike(`${db}_before_`);
+        expect(kept).toHaveLength(1);
+        expect(kept[0]).toMatch(new RegExp(`^${db}_before_\\d{8}_\\d{6}$`));
+        expect(sql(kept[0]!, "select count(*) from schema_migrations")).toBe(
+            String(MIGRATION_FILES.length),
+        );
+        expect(sql(kept[0]!, "select to_regclass('public.deposits') is not null")).toBe("t");
+        expect(databasesLike(`${db}_restoring`)).toEqual([]);
+        expect(r.out).toContain(
+            `== ${db} is now the dump; the database it replaced is ${kept[0]}, which only postgres opens\n`,
+        );
+        expect(r.out).toContain(
+            `== bugnet-payments@v9 would run these migrations again at its start: ${LATER.join(" ")}\n`,
+        );
+        expect(r.out).toContain(
+            "== nothing was started; README section 13 says what comes before --start\n",
+        );
+        const calls = server.calls();
+        expect(calls.some((c) => /^systemctl (start|restart|enable)/.test(c))).toBe(false);
+    });
+
+    it("--restore stops and disables every version, not only the installed one, before the rename", () => {
+        const { server, restore } = scene();
+        const r = restore();
+        expect(r.code).toBe(0);
+        const calls = server.calls();
+        const stops = calls.filter((c) => c.startsWith("systemctl disable"));
+        expect(stops).toEqual([
+            "systemctl disable --now bugnet-payments@v10.service",
+            "systemctl disable --now bugnet-payments@v9.service",
+        ]);
+        const restored = calls.findIndex((c) => / pg_restore .* -d /.test(c));
+        const renamed = calls.findIndex((c) => c.includes("alter database"));
+        expect(restored).toBeGreaterThanOrEqual(0);
+        expect(calls.indexOf(stops[0]!)).toBeGreaterThan(restored);
+        expect(calls.indexOf(stops[1]!)).toBeLessThan(renamed);
+        expect(r.out).toContain("== stopped and disabled bugnet-payments@v10.service\n");
+    });
+
+    it("--restore names no migration when the installed release has none the dump lacks", () => {
+        const { server, restore } = scene();
+        for (const f of LATER) rmSync(join(server.root, "opt", "v9", "migrations", f));
+        const r = restore();
+        expect(r.code).toBe(0);
+        expect(r.out).toContain(
+            "== bugnet-payments@v9 runs no migration the restored database lacks\n",
+        );
+    });
+
+    it("--restore pauses refunds and x402 and lists the rows that moved money after the dump", () => {
+        const ORDER = "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const { restore } = scene({
+            before: () => {
+                sql(
+                    db,
+                    `insert into orders (id, kind, package_id, amount_micros, description, claim_sha256, state, expires_at)
+                     values ('${ORDER}', 'start', 'p', 1000000, 'd', '\\x00', 'refunding', now())`,
+                );
+                sql(
+                    db,
+                    `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state)
+                     values ('${ORDER}', 'full', 'operator', 1000000, 'Dest', 'Payer', 'pending')`,
+                );
+            },
+            // The executor signed and landed the refund after the dump
+            after: () => {
+                sql(
+                    db,
+                    "update refunds set state = 'confirmed', tx_signature = 'SigAfterDump', signed_at = now()",
+                );
+            },
+        });
+        const r = restore();
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        const kept = databasesLike(`${db}_before_`)[0]!;
+        expect(sql(db, "select paused, reason from refund_controls")).toBe("t|restore");
+        expect(sql(db, "select paused, refunds_held, reason from x402_controls")).toBe(
+            "t|t|restore",
+        );
+        expect(sql(kept, "select paused from refund_controls")).toBe("f");
+        expect(sql(kept, "select paused, refunds_held from x402_controls")).toBe("f|f");
+        expect(r.out).toContain(
+            "== set by the restore: refunds paused\n" +
+                "== set by the restore: x402 payments paused\n" +
+                "== set by the restore: x402 refunds held\n" +
+                `== rows that differ from ${kept}:\n` +
+                `refunds 1: pending - here, confirmed SigAfterDump in ${kept}\n` +
+                "deposits: not compared, missing from one of the two databases\n" +
+                "deposit_moves: not compared, missing from one of the two databases\n",
+        );
+    });
+
+    it("--restore keeps and names each pause or hold the dump already had", () => {
+        const { restore } = scene({
+            before: () => {
+                sql(
+                    db,
+                    "update refund_controls set paused = true, reason = 'operator check', paused_at = now()",
+                );
+                sql(
+                    db,
+                    "update x402_controls set disabled = true, refunds_held = true, reason = 'x402 kill'",
+                );
+            },
+        });
+        const r = restore();
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        expect(sql(db, "select paused, reason from refund_controls")).toBe("t|operator check");
+        expect(sql(db, "select disabled, paused, refunds_held, reason from x402_controls")).toBe(
+            "t|t|t|x402 kill",
+        );
+        expect(r.out).toContain(
+            "== in the dump already, left as it was: refunds paused (reason: operator check)\n" +
+                "== set by the restore: x402 payments paused\n" +
+                "== in the dump already, left as it was: x402 refunds held (reason: x402 kill)\n" +
+                "== in the dump already, left as it was: x402 killed (reason: x402 kill)\n" +
+                "== rows that differ from ",
+        );
+    });
+
+    it("--restore lists every order whose state or refund times moved on after the dump", () => {
+        const [PAID, SEEN, SAME, LATER_ORDER] = [
+            orderId("a"),
+            orderId("b"),
+            orderId("c"),
+            orderId("d"),
+        ];
+        const insert = `insert into orders (id, kind, package_id, amount_micros, description,
+            claim_sha256, state, expires_at, paid_at, redeemed_at, token_expires_at) values`;
+        const { restore } = scene({
+            before: () => {
+                sql(
+                    db,
+                    `${insert} ('${PAID}', 'start', 'p', 1, 'd', '\\x00', 'paid', now(), now(), null, null),
+                        ('${SEEN}', 'start', 'p', 1, 'd', '\\x00', 'redeemed', now(), now(), now(), now()),
+                        ('${SAME}', 'start', 'p', 1, 'd', '\\x00', 'paid', now(), now(), null, null)`,
+                );
+            },
+            // Redeemed, confirmed by the router and abandoned, and a new order, all after the dump
+            after: () => {
+                sql(
+                    db,
+                    `update orders set state = 'redeemed', redeemed_at = now(),
+                        token_expires_at = now() where id = '${PAID}'`,
+                );
+                sql(
+                    db,
+                    `update orders set router_confirmed_at = now(), abandon_at = now()
+                        where id = '${SEEN}'`,
+                );
+                sql(
+                    db,
+                    `${insert} ('${LATER_ORDER}', 'start', 'p', 1, 'd', '\\x00', 'unpaid', now(), null, null, null)`,
+                );
+            },
+        });
+        const r = restore();
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        const kept = databasesLike(`${db}_before_`)[0]!;
+        expect(r.out).toContain(
+            `== rows that differ from ${kept}:\n` +
+                `orders ${PAID}: paid here, redeemed in ${kept}; differ: redeemed_at, token_expires_at\n` +
+                `orders ${SEEN}: redeemed here, redeemed in ${kept}; differ: router_confirmed_at, abandon_at\n` +
+                `orders ${LATER_ORDER}: none here, unpaid in ${kept}\n`,
+        );
+        expect(r.out).not.toContain(SAME);
+    });
+
+    it("--restore lists each deposit with moves or transfers after the dump and its signatures", () => {
+        const [MOVED, CREDITED, SAME, LATER_DEPOSIT] = [
+            orderId("e"),
+            orderId("f"),
+            orderId("g"),
+            orderId("h"),
+        ];
+        const orders = (ids: string[]) =>
+            sql(
+                db,
+                `insert into orders (id, kind, package_id, amount_micros, description,
+                    claim_sha256, state, expires_at) values ` +
+                    ids
+                        .map((id) => `('${id}', 'start', 'p', 1, 'd', '\\x00', 'unpaid', now())`)
+                        .join(", "),
+            );
+        const deposit = (id: string, state: string) =>
+            sql(
+                db,
+                `insert into deposits (order_id, address, token_account, key_version, salt, state,
+                    created_at) values ('${id}', 'A${id}', 'T${id}', 1, '\\x${"00".repeat(16)}',
+                    '${state}', now())`,
+            );
+        const move = (id: string, kind: string, state: string, sig: string | null) =>
+            sql(
+                db,
+                `insert into deposit_moves (order_id, kind, amount_micros, state, tx_signature,
+                    created_at) values ('${id}', '${kind}', ${kind === "sweep" ? 1 : 0},
+                    '${state}', ${sig === null ? "null" : `'${sig}'`}, now())`,
+            );
+        const transfer = (id: string, sig: string) =>
+            sql(
+                db,
+                `insert into deposit_transfers (order_id, signature, slot, seq, block_time,
+                    seen_at, amount_micros) values ('${id}', '${sig}', 1, 0, now(), now(), 1)`,
+            );
+        const { restore } = scene({
+            dumpedAt: 5,
+            before: () => {
+                orders([MOVED, CREDITED, SAME]);
+                deposit(MOVED, "open");
+                deposit(CREDITED, "settling");
+                deposit(SAME, "open");
+                move(MOVED, "create", "confirmed", "CreateE");
+                move(CREDITED, "create", "confirmed", "CreateF");
+                move(SAME, "create", "confirmed", "CreateG");
+                transfer(CREDITED, "CreditF");
+            },
+            // A credit swept, a close that failed, a transfer sent to review, and a new deposit
+            // with a create in flight, all after the dump
+            after: () => {
+                transfer(MOVED, "CreditE");
+                move(MOVED, "sweep", "confirmed", "SweepE");
+                move(MOVED, "close", "failed", "CloseE");
+                sql(db, `update deposits set state = 'done' where order_id = '${MOVED}'`);
+                sql(
+                    db,
+                    `update deposit_transfers set outcome = 'review', reason = 'operator'
+                        where order_id = '${CREDITED}'`,
+                );
+                orders([LATER_DEPOSIT]);
+                deposit(LATER_DEPOSIT, "open");
+                move(LATER_DEPOSIT, "create", "sent", "CreateH");
+            },
+        });
+        const r = restore();
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        const kept = databasesLike(`${db}_before_`)[0]!;
+        expect(r.out).toContain(
+            `== rows that differ from ${kept}:\n` +
+                `orders ${LATER_DEPOSIT}: none here, unpaid in ${kept}\n` +
+                `deposits ${MOVED}: open here, done in ${kept}; differ: moves, transfers; ` +
+                "signed after the dump: SweepE\n" +
+                `deposits ${CREDITED}: settling here, settling in ${kept}; differ: transfers; ` +
+                "signed after the dump: none\n" +
+                `deposits ${LATER_DEPOSIT}: none here, open in ${kept}; ` +
+                "signed after the dump: CreateH\n" +
+                `deposit_moves 4: none here, confirmed SweepE in ${kept}\n` +
+                `deposit_moves 5: none here, failed CloseE in ${kept}\n` +
+                `deposit_moves 6: none here, sent CreateH in ${kept}\n` +
+                "== bugnet-payments@v9",
+        );
+        expect(r.out).not.toContain(SAME);
+    });
+
+    it("--restore says so when no row that moves money differs", () => {
+        const { restore } = scene({ dumpedAt: 5 });
+        const r = restore();
+        expect(r.code).toBe(0);
+        const kept = databasesLike(`${db}_before_`)[0]!;
+        expect(r.out).toContain(
+            `== no order, refund, deposit or x402 payment differs from ${kept}\n`,
+        );
+        expect(r.out).not.toContain("not compared");
+    });
+
+    it("a failed restore stops nothing and leaves the database as it was", () => {
+        const { server, restore } = scene();
+        const real = spawnSync("bash", ["-c", "command -v pg_restore"], { encoding: "utf8" });
+        writeFileSync(
+            join(server.root, "bin", "pg_restore"),
+            [
+                "#!/usr/bin/env bash",
+                `case " $* " in *" --list "*) exec "${real.stdout.trim()}" "$@" ;; esac`,
+                'echo "pg_restore: error: could not execute query" >&2',
+                "exit 1",
+                "",
+            ].join("\n"),
+        );
+        chmodSync(join(server.root, "bin", "pg_restore"), 0o755);
+        const r = restore();
+        expect(r.code).toBe(1);
+        expect(r.err).toContain(
+            `vps-install: the restore failed, so nothing was stopped and ${db} was not changed\n`,
+        );
+        expect(server.calls().some((c) => c.startsWith("systemctl"))).toBe(false);
+        expect(sql(db, "select count(*) from schema_migrations")).toBe(
+            String(MIGRATION_FILES.length),
+        );
+        expect(databasesLike(`${db}_`)).toEqual([]);
+    });
+
+    it("--restore refuses a file that is not a dump before it touches anything", () => {
+        const server = fakeServer({ active: true });
+        const file = join(dir, "not.dump");
+        writeFileSync(file, "nope\n");
+        for (const [f, message] of [
+            [file, `pg_restore --list cannot read ${file}; nothing was changed`],
+            [join(dir, "missing.dump"), `no such file: ${join(dir, "missing.dump")}`],
+        ] as const) {
+            writeFileSync(join(server.root, "calls.log"), "");
+            const r = server.run(`main --restore "${f}"`);
+            expect(r.code).toBe(1);
+            expect(r.err).toBe(`vps-install: ${message}\n`);
+            expect(server.calls().filter((c) => !c.startsWith("root pg_restore --list"))).toEqual(
+                [],
+            );
+        }
+    });
+});
+
+describe("payments-backup.sh", () => {
+    it("dumps the database as postgres into a 0700 folder as a checked 0600 file", () => {
+        const server = fakeServer();
+        for (const made of [false, true]) {
+            if (made) {
+                rmSync(server.backups, { recursive: true });
+                mkdirSync(server.backups, { mode: 0o755 });
+                writeFileSync(join(server.root, "calls.log"), "");
+            }
+            const r = server.backup();
+            expect(r.err).toBe("");
+            expect(r.code).toBe(0);
+            const files = readdirSync(server.backups);
+            expect(files).toHaveLength(1);
+            const name = files[0]!;
+            expect(name).toMatch(DUMP_NAME);
+            // The stamp is UTC and the time of the run
+            const at = Date.parse(name.replace(DUMP_NAME, "$1-$2-$3T$4:$5:$6Z"));
+            expect(Math.abs(Date.now() - at)).toBeLessThan(60_000);
+            const dump = join(server.backups, name);
+            expect(statSync(server.backups).mode & 0o777).toBe(0o700);
+            expect(statSync(dump).mode & 0o777).toBe(0o600);
+            expect(readFileSync(dump, "utf8")).toMatch(/^PGDMP\n/);
+            const calls = server.calls();
+            expect(calls).toHaveLength(2);
+            expect(calls[0]).toBe("postgres pg_dump --format=custom bugnet_payments");
+            expect(calls[1]).toBe(`root pg_restore --list ${dump}.${calls[1]!.slice(-6)}`);
+            expect(r.out).toBe(`== wrote ${dump} (${statSync(dump).size} bytes)\n`);
+            rmSync(dump);
+        }
+    });
+
+    it("a failed dump, check or run leaves no partial file and exits non-zero", () => {
+        const old = "bugnet_payments-20250101T021500Z.dump";
+        const cases: [string, (root: string) => void, string][] = [
+            [
+                "pg_dump fails after writing part of the dump",
+                (root) => writeFileSync(join(root, "pg_dump.exit"), "1"),
+                "payments-backup: pg_dump of bugnet_payments failed; no dump was written\n",
+            ],
+            [
+                "pg_restore --list cannot read the dump",
+                (root) => writeFileSync(join(root, "pg_restore.exit"), "1"),
+                "payments-backup: pg_restore --list cannot read the dump of bugnet_payments; no dump was written\n",
+            ],
+            [
+                "the run is stopped while the dump is checked",
+                (root) =>
+                    writeFileSync(
+                        join(root, "bin", "pg_restore"),
+                        '#!/usr/bin/env bash\nkill -TERM "$PPID"\nexit 1\n',
+                    ),
+                "",
+            ],
+        ];
+        for (const [, breakIt, message] of cases) {
+            const server = fakeServer();
+            mkdirSync(server.backups, { mode: 0o700 });
+            writeFileSync(join(server.backups, old), "PGDMP old\n", { mode: 0o600 });
+            breakIt(server.root);
+            const r = server.backup();
+            expect(r.code).not.toBe(0);
+            expect(r.out).toBe("");
+            if (message !== "") expect(r.err).toBe(message);
+            expect(readdirSync(server.backups)).toEqual([old]);
+        }
+    });
+
+    it("keeps the newest 14 dumps and leaves every other file alone", () => {
+        const server = fakeServer();
+        mkdirSync(server.backups, { mode: 0o700 });
+        const olds = Array.from(
+            { length: 16 },
+            (_, i) => `bugnet_payments-202501${String(i + 1).padStart(2, "0")}T021500Z.dump`,
+        );
+        const others = [
+            "notes.txt",
+            "bugnet_payments-latest.dump",
+            "bugnet_payments-20240101T021500Z.dump.bak",
+            "bugnet_payments-2024-01-01.dump",
+            "other_db-20240101T021500Z.dump",
+        ];
+        for (const f of [...olds, ...others]) writeFileSync(join(server.backups, f), "x");
+        // Named like the oldest dump, but a folder
+        const folder = "bugnet_payments-20240101T021500Z.dump";
+        mkdirSync(join(server.backups, folder));
+        const r = server.backup();
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        const files = readdirSync(server.backups).toSorted();
+        const dumps = files.filter((f) => DUMP_NAME.test(f) && f !== folder);
+        expect(dumps).toHaveLength(14);
+        expect(dumps.slice(0, 13)).toEqual(olds.slice(3));
+        expect(files.filter((f) => !dumps.includes(f))).toEqual([...others, folder].toSorted());
+        expect(
+            r.out
+                .split("\n")
+                .filter((l) => l.startsWith("== removed"))
+                .toSorted(),
+        ).toEqual(olds.slice(0, 3).map((f) => `== removed ${f}`));
+    });
+
+    it("keeps the number BUGNET_PAYMENTS_BACKUP_KEEP names, and refuses one below 1 before dumping", () => {
+        const server = fakeServer();
+        mkdirSync(server.backups, { mode: 0o700 });
+        const olds = ["20250101", "20250102", "20250103"].map(
+            (d) => `bugnet_payments-${d}T021500Z.dump`,
+        );
+        for (const f of olds) writeFileSync(join(server.backups, f), "x");
+        let r = server.backup({ BUGNET_PAYMENTS_BACKUP_KEEP: "2" });
+        expect(r.code).toBe(0);
+        const files = readdirSync(server.backups).toSorted();
+        expect(files).toHaveLength(2);
+        expect(files[0]).toBe(olds[2]);
+        for (const keep of ["0", "x", "014", "-1", "1.5"]) {
+            writeFileSync(join(server.root, "calls.log"), "");
+            r = server.backup({ BUGNET_PAYMENTS_BACKUP_KEEP: keep });
+            expect(r.code).toBe(1);
+            expect(r.err).toBe(
+                "payments-backup: BUGNET_PAYMENTS_BACKUP_KEEP must be a whole number of at least 1\n",
+            );
+            expect(server.calls()).toEqual([]);
+            expect(readdirSync(server.backups).toSorted()).toEqual(files);
+        }
+    });
+
+    it("removes a temporary dump that a killed run left over a day ago, and nothing newer", () => {
+        const server = fakeServer();
+        mkdirSync(server.backups, { mode: 0o700 });
+        const stale = "bugnet_payments-20250101T021500Z.dump.Ab12Cd";
+        const running = "bugnet_payments-20250102T021500Z.dump.Xy34Zw";
+        const other = "bugnet_payments-20250101T021500Z.dump.gz";
+        const twoDaysAgo = new Date(Date.now() - 2 * 86_400_000);
+        for (const f of [stale, running, other]) writeFileSync(join(server.backups, f), "PGDMP");
+        for (const f of [stale, other]) utimesSync(join(server.backups, f), twoDaysAgo, twoDaysAgo);
+        const r = server.backup();
+        expect(r.code).toBe(0);
+        const files = readdirSync(server.backups);
+        expect(files).not.toContain(stale);
+        expect(files).toContain(running);
+        expect(files).toContain(other);
+        expect(r.out).toContain(`== removed ${stale}, left by a stopped run\n`);
+    });
+});
+
 describe("retire-deposit-seed.sh", () => {
     const LINE = `BUGNET_DEPOSIT_SEED_V1=${OLD_SEED}`;
 
@@ -1095,7 +1952,7 @@ describe("push-rpc-urls.sh", () => {
     });
 
     it("the deploy scripts parse", () => {
-        for (const file of [SCRIPT, PUSH, RETIRE, PUSH_TOKEN]) {
+        for (const file of [SCRIPT, PUSH, RETIRE, PUSH_TOKEN, BACKUP]) {
             expect(spawnSync("bash", ["-n", file]).status).toBe(0);
         }
     });

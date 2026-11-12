@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Installs bugnet-payments on the VPS, as README.md sections 1 to 10 lay out. Run as root.
+# Installs bugnet-payments on the VPS, as README.md sections 1 to 10 and 13 lay out. Run as root.
 #
 #   vps-install.sh <bugnet-payments-VERSION.tgz> [--recipient ADDR] [--event-key B64]
 #                  [--router-url URL] [--index FILE]
 #   vps-install.sh --mtls <staging dir>   server certificate and key from bugnet-dev mtls init
 #   vps-install.sh --pubkeys              order_token_public_key and the four wallet addresses
-#   vps-install.sh --start                checks the settings, then starts or restarts the installed
-#                                         version
+#   vps-install.sh --start                checks the settings, backs up the database, then starts or
+#                                         restarts the installed version
+#   vps-install.sh --backup               dumps the database into /var/backups/bugnet-payments now
+#   vps-install.sh --restore <dump>       restores the dump into a new database, stops every
+#                                         version, gives the new database the name and keeps the
+#                                         old one beside it; starts nothing (README section 13)
 #   vps-install.sh --rpc-urls             reads one BUGNET_SOLANA_RPC_URLS line on stdin into
 #                                         payments.env; deploy/push-rpc-urls.sh sends it
 #   vps-install.sh --payments-token       reads one BUGNET_PAYMENTS_TOKEN line on stdin into
@@ -37,6 +41,9 @@ RELEASE_FILE=$ETC/payments.release
 ROTATING=$ETC/payments.rotating
 OPT=/opt/bugnet/payments
 UNIT_DIR=/etc/systemd/system
+LIB_DIR=/usr/local/lib/bugnet
+BACKUP_SCRIPT=$LIB_DIR/payments-backup.sh
+BACKUP_DIR=/var/backups/bugnet-payments
 NODE_MAJOR=26
 PNPM_VERSION=12.6.0
 SVC_USER=bugnet-payments
@@ -357,6 +364,245 @@ ensure_unit() {
     say "bugnet-payments@$v enabled, not started (run --start once the settings are complete)"
 }
 
+# Spec 23.2: the script and its timer sit outside the release folders, so the newest install step's
+# copy backs up whichever version runs
+ensure_backup() {
+    local v=$1
+    install -d -o root -g root -m 0755 "$LIB_DIR"
+    install -o root -g root -m 0755 "$OPT/$v/deploy/payments-backup.sh" "$BACKUP_SCRIPT"
+    install -o root -g root -m 0644 "$OPT/$v/deploy/bugnet-payments-backup.service" \
+        "$OPT/$v/deploy/bugnet-payments-backup.timer" "$UNIT_DIR/"
+    install -d -o root -g root -m 0700 "$BACKUP_DIR"
+    systemctl daemon-reload
+    systemctl enable --now bugnet-payments-backup.timer
+    say "bugnet-payments-backup.timer enabled: a dump of $DB into $BACKUP_DIR every night"
+}
+
+backup_now() {
+    if [ ! -x "$BACKUP_SCRIPT" ]; then
+        echo "$BACKUP_SCRIPT is missing; run the install step first" >&2
+        return 1
+    fi
+    BUGNET_PAYMENTS_BACKUP_DIR=$BACKUP_DIR "$BACKUP_SCRIPT"
+}
+
+# Postgres tools as postgres, which logs in by peer; from /, since postgres cannot enter root's
+# folders
+as_postgres() { (cd / && runuser -u postgres -- "$@"); }
+
+pg_sql() {
+    local db=$1
+    shift
+    as_postgres psql -X -q -v ON_ERROR_STOP=1 -d "$db" "$@"
+}
+
+pg_has_database() {
+    [ "$(pg_sql postgres -At -c "select 1 from pg_database where datname = '$1'")" = 1 ]
+}
+
+pg_drop_database() {
+    pg_sql postgres -c "set client_min_messages = warning" -c "drop database if exists $1"
+}
+
+# Every version systemd has loaded, and the installed one, so none runs on the database while it is
+# replaced or starts on the restored one before --start
+stop_every_version() {
+    local v=$1 unit
+    for unit in $({
+        systemctl list-units --all --plain --no-legend 'bugnet-payments@*' | awk '{print $1}'
+        echo "bugnet-payments@$v.service"
+    } | sort -u); do
+        systemctl disable --now "$unit" || return 1
+        say "stopped and disabled $unit"
+    done
+}
+
+# The installed release's migrations that the restored database has not run; its start runs them
+pending_migrations() {
+    local v=$1 f
+    LC_ALL=C comm -23 \
+        <(for f in "$OPT/$v/migrations"/*.sql; do
+            f=${f##*/}
+            if [[ $f =~ ^[0-9]{5}_[a-z0-9_]+\.sql$ ]]; then echo "$f"; fi
+        done | LC_ALL=C sort) \
+        <(pg_sql "$DB" -At -c 'select version from schema_migrations' 2>/dev/null | LC_ALL=C sort)
+}
+
+# A restore brings back an older point of a money ledger: a refund signed after the dump reads as
+# pending again, and an x402 account as not having spent what it spent. Nothing pays from it until
+# a person has compared it with the database it replaced. Prints each pause or hold it sets, and
+# each one the dump already had, which keeps its reason as pauseRefunds and engageControl do.
+hold_money() {
+    pg_sql "$1" -1 -At -f - <<'SQL'
+select case when engaged
+        then format('in the dump already, left as it was: %s (%s)', what,
+            coalesce('reason: ' || reason, 'no reason'))
+        else 'set by the restore: ' || what end
+from (
+    select 1, 'refunds paused', paused, reason from refund_controls where id = 1
+    union all
+    select 2, 'x402 payments paused', paused, reason from x402_controls where id = 1
+    union all
+    select 3, 'x402 refunds held', refunds_held, reason from x402_controls where id = 1
+    union all
+    select 4, 'x402 killed', disabled, reason from x402_controls where id = 1 and disabled
+) as c (n, what, engaged, reason)
+order by n;
+update refund_controls set paused = true, reason = 'restore', paused_at = now()
+where id = 1 and not paused;
+update x402_controls set paused = true, refunds_held = true, reason = coalesce(reason, 'restore'),
+    changed_at = now()
+where id = 1;
+SQL
+}
+
+say_each() {
+    local line
+    while IFS= read -r line; do say "$line"; done <<<"$1"
+}
+
+# The order columns that change and that the refund sweeps read besides state
+# (src/jobs/sweeper.ts); expires_at never changes
+ORDER_TIMES="paid_at redeemed_at token_expires_at event_seen_at router_confirmed_at abandon_at"
+
+# One line per row: its id, the fields a listed row shows, then those it names when they differ.
+# No value holds a space.
+compared_rows() {
+    local db=$1 table=$2 query c
+    case $table in
+    orders)
+        query="select id, state"
+        for c in $ORDER_TIMES; do query+=", coalesce(extract(epoch from $c)::text, '-')"; done
+        query+=" from orders"
+        ;;
+    # A deposit's moves and transfers as one digest each, then the signatures of its moves signed,
+    # sent or landed: after the dump, those moves read as debits that are not Payments' own
+    deposits)
+        query="select d.order_id, d.state,
+            coalesce((select md5(string_agg(format('%s %s %s %s', m.id, m.state, m.tx_signature,
+                m.landed_slot), ',' order by m.id)) from deposit_moves m
+                where m.order_id = d.order_id), '-'),
+            coalesce((select md5(string_agg(format('%s %s %s %s %s', t.signature, t.outcome,
+                t.applied_micros, t.move_id, t.refund_id), ',' order by t.signature))
+                from deposit_transfers t where t.order_id = d.order_id), '-'),
+            coalesce((select string_agg(m.tx_signature, ',' order by m.id) from deposit_moves m
+                where m.order_id = d.order_id and m.tx_signature is not null
+                    and (m.state in ('signed', 'sent', 'confirmed') or m.landed_slot is not null)),
+                '-')
+            from deposits d"
+        ;;
+    *) query="select id, state, coalesce(tx_signature, '-') from $table" ;;
+    esac
+    pg_sql "$db" -At -F ' ' -c "$query order by 1" 2>/dev/null
+}
+
+# Every row that moves money, or decides a refund, and differs between the restored database ($1)
+# and the one it replaces ($2, named $3 once kept). Each spec is the table, how many fields a line
+# shows, and the names of the fields compared after them. A deposit's last field lists signatures,
+# and its line ends with those the kept database has and the restored one lacks.
+money_differences() {
+    local new=$1 old=$2 kept=$3 spec table shown names here before
+    for spec in "orders 1 $ORDER_TIMES" "refunds 2" "deposits 1 moves transfers" "deposit_moves 2" \
+        "x402_payments 2" "x402_cold_transfers 2"; do
+        read -r table shown names <<<"$spec"
+        if ! here=$(compared_rows "$new" "$table") ||
+            ! before=$(compared_rows "$old" "$table"); then
+            echo "$table: not compared, missing from one of the two databases"
+            continue
+        fi
+        # shellcheck disable=SC2016
+        awk -v t="$table" -v kept="$kept" -v shown="$shown" -v names="$names" '
+            function side(row,   f, i, s) {
+                if (row == "") return "none"
+                split(row, f, " ")
+                s = f[2]
+                for (i = 3; i <= shown + 1; i++) s = s " " f[i]
+                return s
+            }
+            function differ(a, b,   x, y, nm, n, i, s) {
+                if (a == "" || b == "") return ""
+                split(a, x, " ")
+                split(b, y, " ")
+                n = split(names, nm, " ")
+                for (i = 1; i <= n; i++)
+                    if (x[shown + 1 + i] != y[shown + 1 + i])
+                        s = s (s == "" ? "; differ: " : ", ") nm[i]
+                return s
+            }
+            function signed(a, b,   x, y, sig, col, n, i, s) {
+                col = shown + 2 + split(names, x, " ")
+                if (split(b, y, " ") < col) return ""
+                split(a, x, " ")
+                n = split(y[col], sig, ",")
+                for (i = 1; i <= n; i++)
+                    if (sig[i] != "-" && index("," x[col] ",", "," sig[i] ",") == 0)
+                        s = s " " sig[i]
+                return "; signed after the dump:" (s == "" ? " none" : s)
+            }
+            function report(id, a, b) {
+                print t " " id ": " side(a) " here, " side(b) " in " kept differ(a, b) signed(a, b)
+            }
+            FILENAME == ARGV[1] { if (NF) { here[$1] = $0; ids[++count] = $1 } next }
+            NF { seen[$1] = 1; if (here[$1] != $0) report($1, here[$1], $0) }
+            END {
+                for (i = 1; i <= count; i++) if (!(ids[i] in seen)) report(ids[i], here[ids[i]], "")
+            }
+        ' <(printf '%s\n' "$here") <(printf '%s\n' "$before")
+    done
+}
+
+restore_abort() {
+    pg_drop_database "$1" >/dev/null 2>&1 || true
+    die "$2"
+}
+
+# Spec 23.2. The dump goes into a new database, which then takes the name: a restore over the live
+# one fails as soon as a later migration's table has a foreign key into a table in the dump, and
+# the database it replaces stays whole beside it with everything after the dump.
+do_restore() {
+    local dump=$1 v new kept held pending differences=""
+    [ -f "$dump" ] || die "no such file: $dump"
+    pg_restore --list "$dump" >/dev/null 2>&1 || die "pg_restore --list cannot read $dump; nothing was changed"
+    v=$(installed_version)
+    new=${DB}_restoring
+    kept=${DB}_before_$(date -u +%Y%m%d_%H%M%S)
+    pg_drop_database "$new" || die "cannot drop $new, left by an earlier run; nothing was changed"
+    as_postgres createdb --owner "$ROLE" "$new" || die "cannot create $new; nothing was changed"
+    if ! as_postgres pg_restore --clean --if-exists --single-transaction -d "$new" <"$dump"; then
+        restore_abort "$new" "the restore failed, so nothing was stopped and $DB was not changed"
+    fi
+    held=$(hold_money "$new") ||
+        restore_abort "$new" "cannot pause refunds and x402 in the restored database, so nothing was stopped and $DB was not changed"
+    stop_every_version "$v" ||
+        restore_abort "$new" "a version did not stop; $DB was not changed, run --restore again"
+    if pg_has_database "$DB"; then
+        differences=$(money_differences "$new" "$DB" "$kept" || echo "the rows could not be compared")
+        pg_sql postgres -1 -c "alter database $DB rename to $kept" -c "alter database $new rename to $DB" ||
+            restore_abort "$new" "cannot rename the databases (pg_stat_activity shows who holds $DB); $DB was not changed and every version is stopped: run --restore again, or --start"
+        say "$DB is now the dump; the database it replaced is $kept, which only postgres opens"
+        say_each "$held"
+        if [ -n "$differences" ]; then
+            say "rows that differ from $kept:"
+            printf '%s\n' "$differences"
+        else
+            say "no order, refund, deposit or x402 payment differs from $kept"
+        fi
+    else
+        pg_sql postgres -c "alter database $new rename to $DB" ||
+            restore_abort "$new" "cannot rename $new to $DB; every version is stopped: run --restore again"
+        say "$DB is now the dump; there was no $DB to keep"
+        say_each "$held"
+    fi
+    pending=$(pending_migrations "$v" | tr '\n' ' ')
+    pending=${pending% }
+    if [ -n "$pending" ]; then
+        say "bugnet-payments@$v would run these migrations again at its start: $pending"
+    else
+        say "bugnet-payments@$v runs no migration the restored database lacks"
+    fi
+    say "nothing was started; README section 13 says what comes before --start"
+}
+
 do_install() {
     local tgz=$1 recipient=$2 event_key=$3 router_url=$4 index=$5 v
     [ -f "$tgz" ] || die "no such file: $tgz"
@@ -372,6 +618,7 @@ do_install() {
     ensure_toml "$recipient" "$event_key" "$router_url"
     ensure_index "$index"
     ensure_unit "$v"
+    ensure_backup "$v"
     do_pubkeys
     say "next: fund the wallets, run deploy/push-rpc-urls.sh and deploy/push-payments-token.sh, --mtls, then --start"
 }
@@ -566,8 +813,11 @@ do_pubkeys() {
     echo "recipient=${recipient:-<not set>}"
 }
 
+# With backup, as --start: a release migrates the database as it starts, so a dump from just before
+# comes first (spec 23.2). A restart of the running release after a settings change migrates
+# nothing, and the leak response must not wait on a dump.
 do_start() {
-    local v ok=1 old
+    local backup=${1:-} v ok=1 old
     v=$(installed_version)
     grep -q '<' "$TOML" && { echo "fill the <...> values in $TOML" >&2; ok=0; }
     # This release reads a missing [deposits] as enabled = true, which after --deposits remove would
@@ -586,6 +836,9 @@ do_start() {
         [ -f "$f" ] || { echo "missing $f" >&2; ok=0; }
     done
     [ "$ok" = 1 ] || die "not starting"
+    if [ "$backup" = backup ]; then
+        backup_now || die "the backup failed, so nothing was stopped or started"
+    fi
     for old in $(systemctl list-units --all --plain --no-legend 'bugnet-payments@*' | awk '{print $1}'); do
         [ "$old" = "bugnet-payments@$v.service" ] && continue
         systemctl disable --now "$old"
@@ -797,7 +1050,7 @@ do_retire_seed() {
 
 main() {
     local tgz="" recipient="" event_key="" router_url="" index="" mode=install mtls=""
-    local deposits="" remove=0
+    local deposits="" remove=0 dump=""
     [ "$(id -u)" = 0 ] || die "run as root"
     [ $# -gt 0 ] || die "usage: see the comment at the top of this file"
     while [ $# -gt 0 ]; do
@@ -809,6 +1062,8 @@ main() {
         --mtls) mode=mtls; mtls=${2:?}; shift 2 ;;
         --pubkeys) mode=pubkeys; shift ;;
         --start) mode=start; shift ;;
+        --backup) mode=backup; shift ;;
+        --restore) mode=restore; dump=${2:?}; shift 2 ;;
         --rpc-urls) mode=rpc_urls; shift ;;
         --payments-token) mode=payments_token; shift ;;
         --deposits) mode=deposits; deposits=${2:?}; shift 2 ;;
@@ -830,7 +1085,9 @@ main() {
     install) [ -n "$tgz" ] || die "the install step needs the tarball"; do_install "$tgz" "$recipient" "$event_key" "$router_url" "$index" ;;
     mtls) do_mtls "$mtls" ;;
     pubkeys) do_pubkeys ;;
-    start) no_rotation_halfway; do_start ;;
+    start) no_rotation_halfway; do_start backup ;;
+    backup) backup_now || die "the backup failed" ;;
+    restore) do_restore "$dump" ;;
     rpc_urls) do_rpc_urls ;;
     payments_token) do_payments_token ;;
     deposits) do_deposits "$deposits" ;;

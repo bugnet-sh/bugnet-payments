@@ -14,6 +14,7 @@ VPS next to the router (data-plane 15.1).
 | Public site  | `127.0.0.1:8450`: `pay.bugnet.sh` behind the TLS terminator (decision 11)      |
 | Unit         | `deploy/bugnet-payments@.service`, copied to `/etc/systemd/system/`            |
 | x402 signer  | `127.0.0.1:8449`: mTLS, loopback only, no HAProxy rule (section 10)            |
+| Backups      | `/var/backups/bugnet-payments`, `root:root 0700`, every night (section 13)     |
 
 8446 is the website's port, 8449 is the x402 signer.
 
@@ -40,8 +41,8 @@ The install directory needs all of these: `dist/main.js` and `dist/cli.js` keep 
 external, so they need `node_modules/`; `pnpm install` needs `vendor/` (pay-kit) and the lockfile;
 the service reads `migrations/` at start and serves `dist/checkout.js` and `dist/fonts/`, all
 relative to its working directory; `config/` holds `example.toml`, every setting at its default;
-`deploy/` holds the unit and these notes. On the server, with Node 26 at `/usr/bin/node` and
-pnpm 12.6:
+`deploy/` holds the units, the backup script and these notes. On the server, with Node 26 at
+`/usr/bin/node` and pnpm 12.6:
 
 ```sh
 sudo mkdir -p "/opt/bugnet/payments/$v"
@@ -374,7 +375,8 @@ check fails with a `reason` ending `unknown key deposits`, and every restart fai
 from this release's install step on:
 
 - run `--start` right after the install step. Until then the older version still runs, but a
-  crash or a reboot leaves it unable to start. `--start` stops it and starts this release;
+  crash or a reboot leaves it unable to start. `--start` backs up the database, stops it and
+  starts this release;
 - a rollback to a release without deposits first needs `vps-install.sh --deposits remove`
   (below).
 
@@ -618,10 +620,10 @@ the account that sent it, and closes the token account to get the rent back. Des
 **The seed and key recovery.** A deposit's key is derived from `BUGNET_DEPOSIT_SEED` and that
 deposit's random 16-byte salt in `deposits.salt`. Order ids are public, so the salt keeps the seed
 alone from giving any key. The key itself is never stored. Recovery needs both the env file and
-the database. No backup step exists yet: the current seed and `BUGNET_DEPOSIT_SEED_PREVIOUS` live
-only in `/etc/bugnet/payments.env`, the archive holds retired seeds only, and the database has no
-scripted backup. Without the database and those two seed lines, money still in a deposit, and
-late money sent to a closed address, cannot be moved.
+the database. The database is dumped every night on the server (section 13). The current seed and
+`BUGNET_DEPOSIT_SEED_PREVIOUS` live only in `/etc/bugnet/payments.env`, which no backup holds, and
+the archive on the Mac holds retired seeds only. Without the database and those two seed lines,
+money still in a deposit, and late money sent to a closed address, cannot be moved.
 
 **Boot checks on the seeds.** A failed one stops the whole service, not only deposits. The journal
 shows `"msg":"boot check failed"` with one of these `reason` texts, and `--start` ends with
@@ -682,9 +684,9 @@ deploy/retire-deposit-seed.sh [ssh options] HOST
 
 Every step can run again: a line already archived with the same value is not appended twice, and
 one with another value stops the run. The seed moves only through pipes: never an argument, never
-printed, and no seed file is left on the server. Keep the archive offline with the database
-backups, and never delete a line from it: a user who saved a closed address and sends to it again
-can still get the money back.
+printed, and no seed file is left on the server. Keep the archive offline on the Mac (the database
+backups stay on the server, section 13), and never delete a line from it: a user who saved a
+closed address and sends to it again can still get the money back.
 
 **Returning money with a retired seed.** `deposits return-late` and `deposits return-sol` take
 `--archive -` and read the archive on stdin, so it never touches the server's disk. On the Mac:
@@ -724,7 +726,7 @@ allowance wallet, money already swept, or review money already carried to the re
 | Alarm                   | When                                                                                                                                                                                                                                                                  | Operator's action                                                                                                                                                                                   |
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `deposit_review`        | A deposit or a transfer needs a person; `reason` is one of `unattributed`, `unreadable`, `from_bugnet`, `late_limit`, `return_destination_invalid`, `return_failed`, `unknown_debit`, `move_expired_repeatedly`, `moves_failing`, `expired_unchecked`, `double_sweep` | `pcli deposits list --review`, `pcli deposits show <orderId>`; a transfer in review goes back with `deposits return-to`, a deposit whose moves failed with `deposits retry` once the cause is fixed |
-| `deposit_unknown_debit` | A deposit account lost USDC in a transaction that is not Payments' own                                                                                                                                                                                                | The leak response above                                                                                                                                                                             |
+| `deposit_unknown_debit` | A deposit account lost USDC in a transaction that is not Payments' own                                                                                                                                                                                                | The leak response above, unless a restore printed its signature for that deposit (section 13)                                                                                                       |
 | `deposit_index_lag`     | The balance has not matched the recorded transfers for over 30 s, a listing could not be proven complete, an interval stayed unexplained after every entry was fetched, a transaction stayed missing, or the hard stop waited for a scan                              | `pcli rpc status`; move the lagging URL down the local list or remove it, copy it again and restart (section 6)                                                                                     |
 | `deposit_capacity`      | `max_open` deposits hold Bugnet-paid rent (once an hour)                                                                                                                                                                                                              | None needed: senders pay their own rent meanwhile and get it back at the close. Look for a flood of page views                                                                                      |
 | `deposit_create_churn`  | The unpaid-create budget of the last hour is spent (once an hour)                                                                                                                                                                                                     | None needed: senders pay their own rent for the rest of the hour. Look for one client behind many addresses                                                                                         |
@@ -819,3 +821,104 @@ goes back to its sender.
 
 **RPC.** The job's own caps, 3 calls a second and 30,000 a day, sit on top of the router's limits
 (section 6).
+
+## 13. Backups
+
+`bugnet-payments-backup.timer` runs `bugnet-payments-backup.service` every night at 02:15 UTC, up
+to 15 minutes later; a night the server was off runs at the next boot. The service runs
+`/usr/local/lib/bugnet/payments-backup.sh` (`deploy/payments-backup.sh`) as root. It runs
+`pg_dump --format=custom bugnet_payments` as `postgres`, checks the dump with `pg_restore --list`,
+then renames it to `/var/backups/bugnet-payments/bugnet_payments-<UTC stamp>.dump`, mode `0600`,
+in a `root:root 0700` folder. A failed run exits non-zero and leaves no partial file. The install
+step installs the script and both units and enables the timer.
+
+- **How many.** The newest 14 dumps stay; each run deletes older ones, and only files named like
+  its dumps. Every dump counts, the ones `--start` and `--backup` take too.
+- **Before a start.** `vps-install.sh --start` takes a dump before it stops or restarts anything,
+  so a release's migrations always have a dump from just before them. When the dump fails it
+  stops and changes nothing. `--deposits`, `--rotate-deposit-seed` and the retirement restart the
+  running version without a dump: it migrates nothing, and the leak response (section 12) never
+  waits on a backup.
+- **Now.** `vps-install.sh --backup`.
+- **Not in a backup.** `payments.env`, by design: retiring a seed must leave no copy of it on the
+  server (section 12), and an old env file in a backup would keep the retired seed for two weeks.
+  A restore uses the env file and `payments.toml` on the server, and the archive on the Mac for
+  retired seeds.
+- **Same server.** The dumps stay on this server, so losing the server loses them too.
+
+Check the last runs, and once after the first install that the unit runs at all:
+
+```sh
+systemctl list-timers bugnet-payments-backup.timer
+sudo systemctl start bugnet-payments-backup.service
+sudo journalctl -u bugnet-payments-backup -o cat -n 20   # == wrote /var/backups/... (N bytes)
+sudo ls -l /var/backups/bugnet-payments
+```
+
+**Restore.** On the server, with the dump to go back to:
+
+```sh
+v=$(cat /etc/bugnet/payments.release)
+sudo "/opt/bugnet/payments/$v/deploy/vps-install.sh" \
+    --restore /var/backups/bugnet-payments/bugnet_payments-<UTC stamp>.dump
+```
+
+It never restores over the live database. Once a later migration's table has a foreign key into a
+table in the dump (most new tables point at `orders`), `pg_restore --clean` cannot drop the dumped
+tables and the whole restore fails. In order, it:
+
+1. checks the dump with `pg_restore --list`;
+2. restores it as `postgres` with `pg_restore --clean --if-exists --single-transaction` into a new,
+   empty database, `bugnet_payments_restoring`, owned by `bugnet_payments`. When that fails it
+   drops the new database and stops: nothing was stopped and `bugnet_payments` is as it was;
+3. pauses refunds and x402 payments and holds x402 refunds in the new database, and prints each as
+   `set by the restore: ...`. One the dump already had stays as it was and prints as
+   `in the dump already, left as it was: ...`, with its reason;
+4. disables and stops every `bugnet-payments@` version: the installed one and any other still
+   running, such as the newer release after an install step for an older one;
+5. renames both in one transaction: `bugnet_payments` becomes
+   `bugnet_payments_before_<UTC time>`, and the new database `bugnet_payments`. The kept one has no
+   `pg_hba.conf` line, so only `postgres` opens it, and no nightly dump includes it;
+6. lists each row of `orders`, `refunds`, `deposits`, `deposit_moves`, `x402_payments` and
+   `x402_cold_transfers` that differs between the two, and the installed release's migrations that
+   the restored database has not run.
+
+It starts nothing. Then:
+
+1. **Migrations.** When it names migrations and the restore is meant to undo them (a bad
+   migration), first run the install step with the tarball of the release that ran before
+   (section 8): every `--start` takes its dump just before the release it starts migrates. Else
+   that release's start runs them again.
+2. `vps-install.sh --start`. If boot refuses with a seed check (section 12), the dump is older than
+   a rotation or a retirement; the founder picks the fix, as there.
+3. **The list.** Each line is
+   `<table> <id>: <restored> here, <kept> in bugnet_payments_before_<UTC time>`, with the row's
+   state, and for refunds, deposit moves and x402 rows its signature. `none` means the row is on
+   one side only; `differ:` names the other columns that differ, an order's times or a deposit's
+   `moves` and `transfers`. Each listed row moved money, or decides a refund, after the dump:
+    - `orders`: the refund sweeps read the restored row, so an order the kept database shows
+      further on gets a refund it must not. One paid before the dump and redeemed after it reads
+      `paid` here and gets an `unredeemed` refund.
+    - `refunds`: one the kept database shows signed or confirmed was paid already.
+    - `x402_payments`, `x402_cold_transfers`: money an account spent, which the restored account
+      does not show.
+    - `deposits`, `deposit_moves`: Payments' moves, and the transfers it recorded, after the dump.
+      A deposit `none here` was made after the dump; its salt, and so its key, is only in the kept
+      database. A `deposits` line ends with `signed after the dump:` and the signatures of its
+      moves that the kept database has signed, sent or landed and the restored one lacks, or
+      `none`.
+4. **Pauses and holds.** Refunds and x402 stay paused until the founder has settled every listed
+   row by hand. Then lift only what printed `set by the restore`: refunds paused with
+   `pcli refunds resume`, x402 payments paused with `pcli x402 resume`, x402 refunds held with
+   `pcli x402 refunds release`. Leave what printed `in the dump already` as it was. With nothing
+   listed, lift them at once. Read the kept database with
+   `sudo runuser -u postgres -- psql -d bugnet_payments_before_<UTC time>`.
+5. **`deposit_unknown_debit` after a restore.** After `--start` the deposit job reads a move
+   made after the dump as a debit that is not Payments' own, raises `deposit_unknown_debit` and
+   puts the deposit in review. It is Payments' own move only when the alarm's `signature` is one
+   the restore printed after `signed after the dump:` on its `orderId`'s line. Then it is
+   **not a leak**: no leak response (section 12), and **never write it off**, which would pay the
+   senders twice; the deposit stays in review until the founder decides how to bring its rows
+   back. Any other unknown debit gets the leak response.
+6. Once every row is settled, drop the kept database:
+   `sudo runuser -u postgres -- dropdb bugnet_payments_before_<UTC time>`.

@@ -1,0 +1,28 @@
+# Dumps the bugnet_payments database into /var/backups/bugnet-payments (spec 23.2), started by
+# bugnet-payments-backup.timer; vps-install.sh installs the script and both units
+[Unit]
+Description=Bugnet Payments database backup
+After=postgresql.service
+
+[Service]
+Type=oneshot
+# Root writes the root-only folder; the script runs pg_dump as postgres through runuser, which
+# needs root's setuid and setgid, so no CapabilityBoundingSet
+User=root
+ExecStart=/usr/local/lib/bugnet/payments-backup.sh
+ReadWritePaths=/var/backups/bugnet-payments
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# The Postgres socket only
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+LimitCORE=0
+# Bounds a dump that hangs, for example on a lock; the script removes its partial file when stopped
+TimeoutStartSec=30min
