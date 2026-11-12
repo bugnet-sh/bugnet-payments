@@ -20,7 +20,8 @@ export type RefundReason =
     | "x402_unspent"
     | "x402_ceiling"
     | "x402_closed"
-    | "deposit_held";
+    | "deposit_held"
+    | "deposit_write_off";
 
 export interface RefundRow {
     id: number;

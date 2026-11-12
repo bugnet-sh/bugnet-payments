@@ -331,7 +331,7 @@ export async function confirmPayment(db: Queryable, orderId: string, at: Date): 
 export async function archivePayment(
     db: Queryable,
     orderId: string,
-    reason: "onchain_failed" | "blockhash_expired",
+    reason: "onchain_failed" | "blockhash_expired" | "written_off",
 ): Promise<boolean> {
     const res = await db.query(
         `with moved as (
