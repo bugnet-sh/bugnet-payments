@@ -385,7 +385,9 @@ async function busyByLedger(pool: pg.Pool, now: Date, cfg: Cfg): Promise<Set<str
                 or exists (select 1 from deposit_transfers t where t.order_id = d.order_id
                     and (t.outcome = 'open'
                         or ((t.outcome = 'return' or (t.outcome = 'paid' and t.reason = 'extra'))
-                            and t.applied_micros < t.amount_micros
+                            and t.applied_micros + coalesce((select sum(p.micros)
+                                from deposit_write_off_parts p where p.order_id = t.order_id
+                                    and p.transfer_signature = t.signature), 0) < t.amount_micros
                             and not exists (select 1 from deposit_moves c
                                 where c.id = t.move_id and c.state = 'confirmed'))))
                 or (d.state = 'open' and o.state = 'unpaid'
@@ -873,8 +875,10 @@ async function earlyChecks(
                 !d.bugnetOwners.has(t.sourceOwner),
         );
     const sums = new Map<string, number>();
-    for (const t of open)
-        sums.set(t.sourceOwner!, (sums.get(t.sourceOwner!) ?? 0) + t.amountMicros);
+    for (const t of open) {
+        const left = t.amountMicros - t.lostMicros;
+        sums.set(t.sourceOwner!, (sums.get(t.sourceOwner!) ?? 0) + left);
+    }
     let target: Awaited<ReturnType<typeof targetOf>> | undefined;
     for (const [owner, sum] of sums) {
         if (m.early.has(owner) || sum < cfg.refund_min_micros) continue;
@@ -1126,7 +1130,7 @@ function owesMoney(ledger: Ledger): boolean {
     return ledger.transfers.some(
         (t) =>
             (t.outcome === "return" || (t.outcome === "paid" && t.reason === "extra")) &&
-            t.appliedMicros < t.amountMicros &&
+            t.appliedMicros + t.lostMicros < t.amountMicros &&
             (t.moveId === null || !confirmed.has(t.moveId)),
     );
 }

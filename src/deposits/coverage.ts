@@ -58,6 +58,10 @@ function owned(t: TransferRow): t is Owned {
     return t.sourceOwner !== null && t.sourceTokenAccount !== null;
 }
 
+// A transfer counts only with what a written-off debit left of it (spec 23.1)
+const unlost = (t: TransferRow): TransferRow =>
+    t.lostMicros === 0 ? t : { ...t, amountMicros: t.amountMicros - t.lostMicros };
+
 // Per-owner sums in the order of each owner's first transfer
 function totals(transfers: readonly Owned[]): Map<string, number> {
     const sums = new Map<string, number>();
@@ -186,6 +190,8 @@ export function coverage(
     const deadline = expiresAt.getTime();
     const onTime = transfers
         .filter((t) => t.outcome === "open" && t.blockTime.getTime() <= deadline)
+        .map(unlost)
+        .filter((t) => t.amountMicros > 0)
         .filter(owned)
         .sort(chainOrder);
     const sums = totals(onTime);

@@ -254,7 +254,7 @@ async function assign(d: SettleDeps, orderId: string, rows: readonly Assigned[])
         d.pool,
         async (c) => {
             await lockDeposit(c, orderId);
-            const open = await openSignatures(c, orderId);
+            const open = await openLeft(c, orderId);
             await setTransferOutcomes(
                 c,
                 orderId,
@@ -302,12 +302,17 @@ async function holdDeposit(
     return "held";
 }
 
-async function openSignatures(c: pg.PoolClient, orderId: string): Promise<Set<string>> {
-    const { rows } = await c.query<{ signature: string }>(
-        "select signature from deposit_transfers where order_id = $1 and outcome = 'open'",
+// Each open transfer with what a written-off debit left of it (spec 23.1)
+async function openLeft(c: pg.PoolClient, orderId: string): Promise<Map<string, number>> {
+    const { rows } = await c.query<{ signature: string; left: string }>(
+        `select t.signature, (t.amount_micros - coalesce((select sum(p.micros)
+                from deposit_write_off_parts p
+                where p.order_id = t.order_id and p.transfer_signature = t.signature), 0))::text
+                as left
+         from deposit_transfers t where t.order_id = $1 and t.outcome = 'open'`,
         [orderId],
     );
-    return new Set(rows.map((r) => r.signature));
+    return new Map(rows.map((r) => [r.signature, Number(r.left)]));
 }
 
 // The crossing transfer stays paid and takes only the reason of its rest
@@ -381,8 +386,11 @@ async function signSweep(
             const current = await lockOrder(c, order.id);
             const dep = await lockDeposit(c, order.id);
             if (current === null || dep === null || !stillSettles(current, dep)) return null;
-            const open = await openSignatures(c, order.id);
-            if ([...plan.applied.keys()].some((s) => !open.has(s))) return null;
+            // A write-off committed since the plan may leave an applied transfer short
+            const open = await openLeft(c, order.id);
+            if ([...plan.applied].some(([s, applied]) => (open.get(s) ?? 0) < applied)) {
+                return null;
+            }
 
             const sweep: NewMove = {
                 orderId: order.id,
