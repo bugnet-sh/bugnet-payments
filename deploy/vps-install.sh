@@ -437,30 +437,63 @@ hold_money() {
         -c "update x402_controls set paused = true, refunds_held = true, reason = coalesce(reason, 'restore'), changed_at = now() where id = 1"
 }
 
-money_rows() {
-    pg_sql "$1" -At -F ' ' -c "select id, state, coalesce(tx_signature, '-') from $2 order by id" 2>/dev/null
+# The order columns that change and that the refund sweeps read besides state
+# (src/jobs/sweeper.ts); expires_at never changes
+ORDER_TIMES="paid_at redeemed_at token_expires_at event_seen_at router_confirmed_at abandon_at"
+
+# One line per row: its id, the fields a listed row shows, then those it names when they differ.
+# No value holds a space.
+compared_rows() {
+    local db=$1 table=$2 query c
+    case $table in
+    orders)
+        query="select id, state"
+        for c in $ORDER_TIMES; do query+=", coalesce(extract(epoch from $c)::text, '-')"; done
+        query+=" from orders"
+        ;;
+    *) query="select id, state, coalesce(tx_signature, '-') from $table" ;;
+    esac
+    pg_sql "$db" -At -F ' ' -c "$query order by 1" 2>/dev/null
 }
 
-# Every row of the tables that move money whose state or signature differs between the restored
-# database ($1) and the one it replaces ($2, named $3 once kept)
+# Every row that moves money, or decides a refund, and differs between the restored database ($1)
+# and the one it replaces ($2, named $3 once kept). Each spec is the table, how many fields a line
+# shows, and the names of the rest.
 money_differences() {
-    local new=$1 old=$2 kept=$3 table here before
-    for table in refunds deposit_moves x402_payments x402_cold_transfers; do
-        if ! here=$(money_rows "$new" "$table") || ! before=$(money_rows "$old" "$table"); then
+    local new=$1 old=$2 kept=$3 spec table shown names here before
+    for spec in "orders 1 $ORDER_TIMES" "refunds 2" "deposit_moves 2" "x402_payments 2" \
+        "x402_cold_transfers 2"; do
+        read -r table shown names <<<"$spec"
+        if ! here=$(compared_rows "$new" "$table") ||
+            ! before=$(compared_rows "$old" "$table"); then
             echo "$table: not compared, missing from one of the two databases"
             continue
         fi
         # shellcheck disable=SC2016
-        awk -v t="$table" -v kept="$kept" '
-            FILENAME == ARGV[1] { if (NF) { here[$1] = $2 " " $3; ids[++n] = $1 } next }
-            NF {
-                seen[$1] = 1
-                if (!($1 in here)) print t " " $1 ": none here, " $2 " " $3 " in " kept
-                else if (here[$1] != $2 " " $3) print t " " $1 ": " here[$1] " here, " $2 " " $3 " in " kept
+        awk -v t="$table" -v kept="$kept" -v shown="$shown" -v names="$names" '
+            function side(row,   f, i, s) {
+                if (row == "") return "none"
+                split(row, f, " ")
+                s = f[2]
+                for (i = 3; i <= shown + 1; i++) s = s " " f[i]
+                return s
             }
+            function differ(a, b,   x, y, nm, n, i, s) {
+                if (a == "" || b == "") return ""
+                split(a, x, " ")
+                n = split(b, y, " ")
+                split(names, nm, " ")
+                for (i = shown + 2; i <= n; i++)
+                    if (x[i] != y[i]) s = s (s == "" ? "; differ: " : ", ") nm[i - shown - 1]
+                return s
+            }
+            function report(id, a, b) {
+                print t " " id ": " side(a) " here, " side(b) " in " kept differ(a, b)
+            }
+            FILENAME == ARGV[1] { if (NF) { here[$1] = $0; ids[++count] = $1 } next }
+            NF { seen[$1] = 1; if (here[$1] != $0) report($1, here[$1], $0) }
             END {
-                for (i = 1; i <= n; i++)
-                    if (!(ids[i] in seen)) print t " " ids[i] ": " here[ids[i]] " here, none in " kept
+                for (i = 1; i <= count; i++) if (!(ids[i] in seen)) report(ids[i], here[ids[i]], "")
             }
         ' <(printf '%s\n' "$here") <(printf '%s\n' "$before")
     done
@@ -500,7 +533,7 @@ do_restore() {
             say "rows that differ from $kept:"
             printf '%s\n' "$differences"
         else
-            say "no refund, deposit move or x402 payment differs from $kept"
+            say "no order, refund, deposit move or x402 payment differs from $kept"
         fi
     else
         pg_sql postgres -c "alter database $new rename to $DB" ||

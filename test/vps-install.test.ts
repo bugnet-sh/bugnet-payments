@@ -1350,13 +1350,59 @@ describe("vps-install.sh restore", () => {
         );
     });
 
+    it("--restore lists every order whose state or refund times moved on after the dump", () => {
+        const [PAID, SEEN, SAME, LATER_ORDER] = ["a", "b", "c", "d"].map(
+            (c) => `ord_${c.repeat(26)}`,
+        );
+        const insert = `insert into orders (id, kind, package_id, amount_micros, description,
+            claim_sha256, state, expires_at, paid_at, redeemed_at, token_expires_at) values`;
+        const { restore } = scene({
+            before: () => {
+                sql(
+                    db,
+                    `${insert} ('${PAID}', 'start', 'p', 1, 'd', '\\x00', 'paid', now(), now(), null, null),
+                        ('${SEEN}', 'start', 'p', 1, 'd', '\\x00', 'redeemed', now(), now(), now(), now()),
+                        ('${SAME}', 'start', 'p', 1, 'd', '\\x00', 'paid', now(), now(), null, null)`,
+                );
+            },
+            // Redeemed, confirmed by the router and abandoned, and a new order, all after the dump
+            after: () => {
+                sql(
+                    db,
+                    `update orders set state = 'redeemed', redeemed_at = now(),
+                        token_expires_at = now() where id = '${PAID}'`,
+                );
+                sql(
+                    db,
+                    `update orders set router_confirmed_at = now(), abandon_at = now()
+                        where id = '${SEEN}'`,
+                );
+                sql(
+                    db,
+                    `${insert} ('${LATER_ORDER}', 'start', 'p', 1, 'd', '\\x00', 'unpaid', now(), null, null, null)`,
+                );
+            },
+        });
+        const r = restore();
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        const kept = databasesLike(`${db}_before_`)[0]!;
+        expect(r.out).toContain(
+            `== rows that differ from ${kept}:\n` +
+                `orders ${PAID}: paid here, redeemed in ${kept}; differ: redeemed_at, token_expires_at\n` +
+                `orders ${SEEN}: redeemed here, redeemed in ${kept}; differ: router_confirmed_at, abandon_at\n` +
+                `orders ${LATER_ORDER}: none here, unpaid in ${kept}\n`,
+        );
+        expect(r.out).not.toContain(SAME);
+    });
+
     it("--restore says so when no row that moves money differs", () => {
         const { restore } = scene({ dumpedAt: 5 });
         const r = restore();
         expect(r.code).toBe(0);
         const kept = databasesLike(`${db}_before_`)[0]!;
         expect(r.out).toContain(
-            `== no refund, deposit move or x402 payment differs from ${kept}\n`,
+            `== no order, refund, deposit move or x402 payment differs from ${kept}\n`,
         );
         expect(r.out).not.toContain("not compared");
     });
