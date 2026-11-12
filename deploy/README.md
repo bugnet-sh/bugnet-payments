@@ -14,6 +14,7 @@ VPS next to the router (data-plane 15.1).
 | Public site  | `127.0.0.1:8450`: `pay.bugnet.sh` behind the TLS terminator (decision 11)      |
 | Unit         | `deploy/bugnet-payments@.service`, copied to `/etc/systemd/system/`            |
 | x402 signer  | `127.0.0.1:8449`: mTLS, loopback only, no HAProxy rule (section 10)            |
+| Backups      | `/var/backups/bugnet-payments`, `root:root 0700`, every night (section 13)     |
 
 8446 is the website's port, 8449 is the x402 signer.
 
@@ -40,8 +41,8 @@ The install directory needs all of these: `dist/main.js` and `dist/cli.js` keep 
 external, so they need `node_modules/`; `pnpm install` needs `vendor/` (pay-kit) and the lockfile;
 the service reads `migrations/` at start and serves `dist/checkout.js` and `dist/fonts/`, all
 relative to its working directory; `config/` holds `example.toml`, every setting at its default;
-`deploy/` holds the unit and these notes. On the server, with Node 26 at `/usr/bin/node` and
-pnpm 12.6:
+`deploy/` holds the units, the backup script and these notes. On the server, with Node 26 at
+`/usr/bin/node` and pnpm 12.6:
 
 ```sh
 sudo mkdir -p "/opt/bugnet/payments/$v"
@@ -374,7 +375,8 @@ check fails with a `reason` ending `unknown key deposits`, and every restart fai
 from this release's install step on:
 
 - run `--start` right after the install step. Until then the older version still runs, but a
-  crash or a reboot leaves it unable to start. `--start` stops it and starts this release;
+  crash or a reboot leaves it unable to start. `--start` backs up the database, stops it and
+  starts this release;
 - a rollback to a release without deposits first needs `vps-install.sh --deposits remove`
   (below).
 
@@ -608,10 +610,10 @@ the account that sent it, and closes the token account to get the rent back. Des
 **The seed and key recovery.** A deposit's key is derived from `BUGNET_DEPOSIT_SEED` and that
 deposit's random 16-byte salt in `deposits.salt`. Order ids are public, so the salt keeps the seed
 alone from giving any key. The key itself is never stored. Recovery needs both the env file and
-the database. No backup step exists yet: the current seed and `BUGNET_DEPOSIT_SEED_PREVIOUS` live
-only in `/etc/bugnet/payments.env`, the archive holds retired seeds only, and the database has no
-scripted backup. Without the database and those two seed lines, money still in a deposit, and
-late money sent to a closed address, cannot be moved.
+the database. The database is dumped every night on the server (section 13). The current seed and
+`BUGNET_DEPOSIT_SEED_PREVIOUS` live only in `/etc/bugnet/payments.env`, which no backup holds, and
+the archive on the Mac holds retired seeds only. Without the database and those two seed lines,
+money still in a deposit, and late money sent to a closed address, cannot be moved.
 
 **Boot checks on the seeds.** A failed one stops the whole service, not only deposits. The journal
 shows `"msg":"boot check failed"` with one of these `reason` texts, and `--start` ends with
@@ -672,9 +674,9 @@ deploy/retire-deposit-seed.sh [ssh options] HOST
 
 Every step can run again: a line already archived with the same value is not appended twice, and
 one with another value stops the run. The seed moves only through pipes: never an argument, never
-printed, and no seed file is left on the server. Keep the archive offline with the database
-backups, and never delete a line from it: a user who saved a closed address and sends to it again
-can still get the money back.
+printed, and no seed file is left on the server. Keep the archive offline on the Mac (the database
+backups stay on the server, section 13), and never delete a line from it: a user who saved a
+closed address and sends to it again can still get the money back.
 
 **Returning money with a retired seed.** `deposits return-late` and `deposits return-sol` take
 `--archive -` and read the archive on stdin, so it never touches the server's disk. On the Mac:
@@ -809,3 +811,54 @@ goes back to its sender.
 
 **RPC.** The job's own caps, 3 calls a second and 30,000 a day, sit on top of the router's limits
 (section 6).
+
+## 13. Backups
+
+`bugnet-payments-backup.timer` runs `bugnet-payments-backup.service` every night at 02:15 UTC, up
+to 15 minutes later; a night the server was off runs at the next boot. The service runs
+`/usr/local/lib/bugnet/payments-backup.sh` (`deploy/payments-backup.sh`) as root. It runs
+`pg_dump --format=custom bugnet_payments` as `postgres`, checks the dump with `pg_restore --list`,
+then renames it to `/var/backups/bugnet-payments/bugnet_payments-<UTC stamp>.dump`, mode `0600`,
+in a `root:root 0700` folder. A failed run exits non-zero and leaves no partial file. The install
+step installs the script and both units and enables the timer.
+
+- **How many.** The newest 14 dumps stay; each run deletes older ones, and only files named like
+  its dumps. Every dump counts, the ones `--start` and `--backup` take too.
+- **Before a start.** `vps-install.sh --start` takes a dump before it stops or restarts anything,
+  so a release's migrations always have a dump from just before them. When the dump fails it
+  stops and changes nothing. `--deposits`, `--rotate-deposit-seed` and the retirement do the same
+  when they restart the running version.
+- **Now.** `vps-install.sh --backup`.
+- **Not in a backup.** `payments.env`, by design: retiring a seed must leave no copy of it on the
+  server (section 12), and an old env file in a backup would keep the retired seed for two weeks.
+  A restore uses the env file and `payments.toml` on the server, and the archive on the Mac for
+  retired seeds.
+- **Same server.** The dumps stay on this server, so losing the server loses them too.
+
+Check the last runs, and once after the first install that the unit runs at all:
+
+```sh
+systemctl list-timers bugnet-payments-backup.timer
+sudo systemctl start bugnet-payments-backup.service
+sudo journalctl -u bugnet-payments-backup -o cat -n 20   # == wrote /var/backups/... (N bytes)
+sudo ls -l /var/backups/bugnet-payments
+```
+
+**Restore.** On the server, with the dump to go back to:
+
+```sh
+v=$(cat /etc/bugnet/payments.release)
+dump=/var/backups/bugnet-payments/bugnet_payments-<UTC stamp>.dump
+sudo systemctl stop "bugnet-payments@$v"
+# postgres cannot read the root-only folder, so root opens the dump
+sudo sh -c 'runuser -u postgres -- pg_restore --clean --if-exists --single-transaction \
+    -d bugnet_payments <"$0"' "$dump"
+sudo "/opt/bugnet/payments/$v/deploy/vps-install.sh" --start
+```
+
+`--clean --if-exists` drops each object in the dump before it restores it, and
+`--single-transaction` leaves the database as it was when any step fails. Tables a later migration
+added are not in the dump and stay: before a release that would add them again starts, drop the
+database, create it again (section 4) and restore into the empty one. If boot then refuses with a
+seed check (section 12), the dump is older than a rotation or a retirement; the founder picks the
+fix, as there.

@@ -6,11 +6,12 @@
 #   for example: deploy/retire-deposit-seed.sh -p PORT -i KEY_FILE USER@HOST
 #
 # The archive is BUGNET_DEPOSIT_ARCHIVE, by default ~/.bugnet/deposit-seeds.env: mode 0600, never
-# inside a git checkout, kept with the database backups. The server prints the archive line and
-# removes nothing; this script appends it, reads it back, and only then sends it back, and the
-# server removes BUGNET_DEPOSIT_SEED_PREVIOUS only when it matches. So a seed lost in transit is
-# never removed. The seed moves only through pipes and shell builtins: never an argument, so it
-# shows in no process list, and never printed. It prints names only.
+# inside a git checkout, kept offline on this Mac; the database backups stay on the server. The
+# server prints the archive line and removes nothing; this script appends it, reads it back, and
+# only then sends it back, and the server removes BUGNET_DEPOSIT_SEED_PREVIOUS only when it
+# matches. So a seed lost in transit is never removed. The seed moves only through pipes and shell
+# builtins: never an argument, so it shows in no process list, and never printed. It prints names
+# only.
 set -euo pipefail
 
 die() {
