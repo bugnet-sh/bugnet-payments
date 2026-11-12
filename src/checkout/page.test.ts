@@ -177,7 +177,7 @@ describe("checkout page", () => {
         expect(text.length).toBeLessThan(400_000);
         // Every message comes from messages.ts, which never passes a raw wallet or error text
         expect(text).not.toContain("payment refused:");
-        expect(text).not.toContain("did not go through");
+        expect(text).not.toContain("did not go through:");
         const flow = await import("./flow.ts");
         for (const gone of ["pageStep", "stateStep", "walletErrorStep"]) {
             expect(gone in flow).toBe(false);

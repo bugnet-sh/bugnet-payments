@@ -388,9 +388,10 @@ a rollback to a release older than the one that added the key, remove the key fr
 
 **Rollback below release 2026-11-12b.** Migration 00007's tables and checks stay and do no harm
 to the older release, which cannot finish a write-off. Roll back only when every
-`pcli deposits list` line whose `lost=` is not 0 shows `state=done`, and
+`pcli deposits list` line whose `lost=` is not 0 shows `state=done` and `held=0`, and
 `pcli deposits show <orderId>` for each of them shows no `write-off part` with `state=pending`,
-`state=signed` or `state=sent`.
+`state=signed` or `state=sent`. With held money left, the older release's `deposits return-to`
+would also pay back the part a write-off already paid.
 
 **Rollback below the deposits release.** Run `vps-install.sh --deposits off` first, then:
 
