@@ -991,6 +991,39 @@ describe("vps-install.sh backups", () => {
         }
     });
 
+    it("--deposits, the rotation and the retirement restart the running release without a dump", () => {
+        const cases: [string, string, (s: ReturnType<typeof fakeServer>) => void][] = [
+            [
+                "main --deposits off",
+                "",
+                (s) => {
+                    writeFileSync(s.toml, "[solana]\n\n[deposits]\nenabled = true\n");
+                },
+            ],
+            ["main --rotate-deposit-seed", "", () => {}],
+            [
+                "main --retire-deposit-seed - --remove-previous",
+                `BUGNET_DEPOSIT_SEED_V1=${OLD_SEED}\n`,
+                (s) => {
+                    writeFileSync(s.env, keysEnv(`BUGNET_DEPOSIT_SEED_PREVIOUS=${OLD_SEED}\n`));
+                    writeFileSync(s.toml, "[deposits]\nenabled = false\nseed_version = 2\n");
+                },
+            ],
+        ];
+        for (const [cmd, stdin, setup] of cases) {
+            const server = fakeServer({ active: true });
+            setup(server);
+            // A dump would fail, so a restart that waited on one would never happen
+            writeFileSync(join(server.root, "pg_dump.exit"), "1");
+            const r = server.run(`on_terminal() { false; }; ${cmd}`, stdin);
+            expect(r.all).not.toContain("backup");
+            expect(r.code).toBe(0);
+            expect(server.calls().some((c) => c.includes("pg_dump"))).toBe(false);
+            expect(server.calls()).toContain("systemctl restart bugnet-payments@v9");
+            expect(existsSync(server.rotating)).toBe(false);
+        }
+    });
+
     it("no secret reaches the backup's output or the dump", () => {
         const server = fakeServer({ active: true });
         writeFileSync(server.env, keysEnv(`BUGNET_DEPOSIT_SEED_PREVIOUS=${OLD_SEED}\n`));

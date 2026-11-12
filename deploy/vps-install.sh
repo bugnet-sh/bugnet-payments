@@ -593,8 +593,11 @@ do_pubkeys() {
     echo "recipient=${recipient:-<not set>}"
 }
 
+# With backup, as --start: a release migrates the database as it starts, so a dump from just before
+# comes first (spec 23.2). A restart of the running release after a settings change migrates
+# nothing, and the leak response must not wait on a dump.
 do_start() {
-    local v ok=1 old
+    local backup=${1:-} v ok=1 old
     v=$(installed_version)
     grep -q '<' "$TOML" && { echo "fill the <...> values in $TOML" >&2; ok=0; }
     # This release reads a missing [deposits] as enabled = true, which after --deposits remove would
@@ -613,8 +616,9 @@ do_start() {
         [ -f "$f" ] || { echo "missing $f" >&2; ok=0; }
     done
     [ "$ok" = 1 ] || die "not starting"
-    # Spec 23.2: a release migrates the database as it starts, so a dump from just before comes first
-    backup_now || die "the backup failed, so nothing was stopped or started"
+    if [ "$backup" = backup ]; then
+        backup_now || die "the backup failed, so nothing was stopped or started"
+    fi
     for old in $(systemctl list-units --all --plain --no-legend 'bugnet-payments@*' | awk '{print $1}'); do
         [ "$old" = "bugnet-payments@$v.service" ] && continue
         systemctl disable --now "$old"
@@ -860,7 +864,7 @@ main() {
     install) [ -n "$tgz" ] || die "the install step needs the tarball"; do_install "$tgz" "$recipient" "$event_key" "$router_url" "$index" ;;
     mtls) do_mtls "$mtls" ;;
     pubkeys) do_pubkeys ;;
-    start) no_rotation_halfway; do_start ;;
+    start) no_rotation_halfway; do_start backup ;;
     backup) backup_now || die "the backup failed" ;;
     rpc_urls) do_rpc_urls ;;
     payments_token) do_payments_token ;;

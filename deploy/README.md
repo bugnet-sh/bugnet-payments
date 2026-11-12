@@ -826,8 +826,9 @@ step installs the script and both units and enables the timer.
   its dumps. Every dump counts, the ones `--start` and `--backup` take too.
 - **Before a start.** `vps-install.sh --start` takes a dump before it stops or restarts anything,
   so a release's migrations always have a dump from just before them. When the dump fails it
-  stops and changes nothing. `--deposits`, `--rotate-deposit-seed` and the retirement do the same
-  when they restart the running version.
+  stops and changes nothing. `--deposits`, `--rotate-deposit-seed` and the retirement restart the
+  running version without a dump: it migrates nothing, and the leak response (section 12) never
+  waits on a backup.
 - **Now.** `vps-install.sh --backup`.
 - **Not in a backup.** `payments.env`, by design: retiring a seed must leave no copy of it on the
   server (section 12), and an old env file in a backup would keep the retired seed for two weeks.
