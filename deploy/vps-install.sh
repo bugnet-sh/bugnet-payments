@@ -549,6 +549,50 @@ money_differences() {
             }
         ' <(printf '%s\n' "$here") <(printf '%s\n' "$before")
     done
+    write_off_differences "$new" "$old" "$kept"
+}
+
+# One tab-separated line per write-off: order, signature, micros, its parts as compared, then each
+# part's payout with that refund's state, shown and not compared. Nothing before migration 00007.
+write_off_rows() {
+    local has
+    has=$(pg_sql "$1" -At -c "select to_regclass('public.deposit_write_off_parts') is not null") ||
+        return 1
+    [ "$has" = t ] || return 0
+    pg_sql "$1" -At -F $'\t' -c "select w.order_id, w.signature, w.micros,
+        coalesce(string_agg(format('%s %s %s %s', p.transfer_signature, p.micros, p.refund_id,
+            p.kept_reason), ',' order by p.transfer_signature)
+            filter (where p.signature is not null), '-'),
+        coalesce(string_agg(format('%s %s %s', p.transfer_signature, p.micros, case
+            when p.refund_id is not null then format('refund=%s state=%s', p.refund_id, r.state)
+            when p.kept_reason is not null then 'kept=' || p.kept_reason
+            else 'pay by hand' end), ', ' order by p.transfer_signature)
+            filter (where p.signature is not null), 'none')
+        from deposit_write_offs w
+        left join deposit_write_off_parts p using (order_id, signature)
+        left join refunds r on r.id = p.refund_id
+        group by w.order_id, w.signature, w.micros
+        order by 1, 2"
+}
+
+# Spec 23.1. Each write-off the kept database ($2, named $3) has and the restored one ($1) lacks or
+# holds otherwise: after --start the job reads its debit as unknown again, and a second write-off
+# pays its senders twice.
+write_off_differences() {
+    local new=$1 old=$2 kept=$3 here before
+    if ! here=$(write_off_rows "$new") || ! before=$(write_off_rows "$old"); then
+        echo "deposit_write_offs: not compared"
+        return
+    fi
+    awk -F '\t' -v kept="$kept" '
+        FILENAME == ARGV[1] { if (NF) { micros[$1 " " $2] = $3; parts[$1 " " $2] = $4 } next }
+        NF {
+            k = $1 " " $2
+            if ((k in micros) && micros[k] == $3 && parts[k] == $4) next
+            print "deposit_write_offs " k ": " ((k in micros) ? micros[k] : "none") " here, " \
+                $3 " in " kept "; parts: " $5
+        }
+    ' <(printf '%s\n' "$here") <(printf '%s\n' "$before")
 }
 
 restore_abort() {

@@ -1203,9 +1203,68 @@ describe("vps-install.sh restore", () => {
         }
     });
 
+    const orders = (ids: string[]) =>
+        sql(
+            db,
+            `insert into orders (id, kind, package_id, amount_micros, description, claim_sha256,
+                state, expires_at) values ` +
+                ids
+                    .map((id) => `('${id}', 'start', 'p', 1, 'd', '\\x00', 'unpaid', now())`)
+                    .join(", "),
+        );
+    const deposit = (id: string, state: string) =>
+        sql(
+            db,
+            `insert into deposits (order_id, address, token_account, key_version, salt, state,
+                created_at) values ('${id}', 'A${id}', 'T${id}', 1, '\\x${"00".repeat(16)}',
+                '${state}', now())`,
+        );
+    const transfer = (id: string, sig: string) =>
+        sql(
+            db,
+            `insert into deposit_transfers (order_id, signature, slot, seq, block_time, seen_at,
+                amount_micros) values ('${id}', '${sig}', 1, 0, now(), now(), 1)`,
+        );
+    // A debit written off: each part paid by a deposit_write_off refund in that state, kept for its
+    // reason, or paid by hand
+    const writeOff = (
+        id: string,
+        sig: string,
+        parts: { transfer: string; micros: number; refund?: string; kept?: string }[],
+    ) => {
+        const micros = parts.reduce((sum, p) => sum + p.micros, 0);
+        sql(
+            db,
+            `insert into deposit_write_offs (order_id, signature, slot, micros, written_at)
+                values ('${id}', '${sig}', 2, ${micros}, now())`,
+        );
+        for (const p of parts) {
+            const refund =
+                p.refund === undefined
+                    ? "null"
+                    : sql(
+                          db,
+                          `insert into refunds (order_id, kind, part, reason, amount_micros,
+                            destination, payer, state, tx_signature, from_wallet,
+                            deposit_signature)
+                        values ('${id}', 'deposit', (select count(*) from refunds),
+                            'deposit_write_off', ${p.micros}, 'Dest', 'Payer', '${p.refund}',
+                            ${p.refund === "pending" ? "null" : `'Pay${p.transfer}'`}, 'refund',
+                            '${p.transfer}')
+                        returning id`,
+                      );
+            sql(
+                db,
+                `insert into deposit_write_off_parts (order_id, signature, transfer_signature,
+                    micros, refund_id, kept_reason) values ('${id}', '${sig}', '${p.transfer}',
+                    ${p.micros}, ${refund}, ${p.kept === undefined ? "null" : `'${p.kept}'`})`,
+            );
+        }
+    };
+
     // A database at 00004, its dump, then a release whose migrations add tables with foreign keys
-    // into the dumped ones, on a server where v10 still runs while v9 is installed. Postgres runs
-    // for real; runuser logs and runs the tool as this user.
+    // into the dumped ones and which then moves money, on a server where v10 still runs while v9 is
+    // installed. Postgres runs for real; runuser logs and runs the tool as this user.
     function scene(o: { dumpedAt?: number; before?: () => void; after?: () => void } = {}) {
         expect(PRE.at(-1)).toBe("00004_paid_via.sql");
         const at = o.dumpedAt ?? PRE.length;
@@ -1214,8 +1273,8 @@ describe("vps-install.sh restore", () => {
         o.before?.();
         const dump = join(dir, "pre.dump");
         pg("pg_dump", ["--format=custom", "-d", db, "-f", dump]);
-        o.after?.();
         migrateTo(db, MIGRATION_FILES.slice(at));
+        o.after?.();
         const server = fakeServer({ active: true });
         const bin = join(server.root, "bin");
         rmSync(join(bin, "pg_dump"));
@@ -1440,34 +1499,12 @@ describe("vps-install.sh restore", () => {
             orderId("g"),
             orderId("h"),
         ];
-        const orders = (ids: string[]) =>
-            sql(
-                db,
-                `insert into orders (id, kind, package_id, amount_micros, description,
-                    claim_sha256, state, expires_at) values ` +
-                    ids
-                        .map((id) => `('${id}', 'start', 'p', 1, 'd', '\\x00', 'unpaid', now())`)
-                        .join(", "),
-            );
-        const deposit = (id: string, state: string) =>
-            sql(
-                db,
-                `insert into deposits (order_id, address, token_account, key_version, salt, state,
-                    created_at) values ('${id}', 'A${id}', 'T${id}', 1, '\\x${"00".repeat(16)}',
-                    '${state}', now())`,
-            );
         const move = (id: string, kind: string, state: string, sig: string | null) =>
             sql(
                 db,
                 `insert into deposit_moves (order_id, kind, amount_micros, state, tx_signature,
                     created_at) values ('${id}', '${kind}', ${kind === "sweep" ? 1 : 0},
                     '${state}', ${sig === null ? "null" : `'${sig}'`}, now())`,
-            );
-        const transfer = (id: string, sig: string) =>
-            sql(
-                db,
-                `insert into deposit_transfers (order_id, signature, slot, seq, block_time,
-                    seen_at, amount_micros) values ('${id}', '${sig}', 1, 0, now(), now(), 1)`,
             );
         const { restore } = scene({
             dumpedAt: 5,
@@ -1517,6 +1554,81 @@ describe("vps-install.sh restore", () => {
                 "== bugnet-payments@v9",
         );
         expect(r.out).not.toContain(SAME);
+    });
+
+    it("--restore lists each write-off the restored database lacks or holds otherwise", () => {
+        const [SAME, CHANGED, LATER] = [orderId("i"), orderId("j"), orderId("k")];
+        const { restore } = scene({
+            dumpedAt: MIGRATION_FILES.length,
+            before: () => {
+                orders([SAME, CHANGED, LATER]);
+                for (const id of [SAME, CHANGED, LATER]) deposit(id, "open");
+                transfer(SAME, "CreditS");
+                transfer(CHANGED, "CreditD");
+                for (const sig of ["CreditA", "CreditB", "CreditC"]) transfer(LATER, sig);
+                writeOff(SAME, "ThiefS", [
+                    { transfer: "CreditS", micros: 1000, refund: "pending" },
+                ]);
+                writeOff(CHANGED, "ThiefD", [{ transfer: "CreditD", micros: 500 }]);
+            },
+            // A write-off payout confirmed, a part changed by hand, and a debit written off, all
+            // after the dump
+            after: () => {
+                sql(db, "update refunds set state = 'confirmed', tx_signature = 'PayCreditS'");
+                sql(
+                    db,
+                    "update deposit_write_off_parts set kept_reason = 'bugnet_own' where signature = 'ThiefD'",
+                );
+                writeOff(LATER, "ThiefL", [
+                    { transfer: "CreditA", micros: 20000, refund: "signed" },
+                    { transfer: "CreditB", micros: 600, kept: "below_refund_min" },
+                    { transfer: "CreditC", micros: 9400 },
+                ]);
+            },
+        });
+        const r = restore();
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        const kept = databasesLike(`${db}_before_`)[0]!;
+        expect(r.out).toContain(
+            `== rows that differ from ${kept}:\n` +
+                `refunds 1: pending - here, confirmed PayCreditS in ${kept}\n` +
+                `refunds 2: none here, signed PayCreditA in ${kept}\n` +
+                `deposit_write_offs ${CHANGED} ThiefD: 500 here, 500 in ${kept}; ` +
+                "parts: CreditD 500 kept=bugnet_own\n" +
+                `deposit_write_offs ${LATER} ThiefL: none here, 30000 in ${kept}; ` +
+                "parts: CreditA 20000 refund=2 state=signed, CreditB 600 kept=below_refund_min, " +
+                "CreditC 9400 pay by hand\n" +
+                "== bugnet-payments@v9",
+        );
+        expect(r.out).not.toContain("ThiefS");
+    });
+
+    it("--restore lists every write-off when the dump is older than the write-off tables", () => {
+        const ID = orderId("l");
+        const { restore } = scene({
+            dumpedAt: 5,
+            before: () => {
+                orders([ID]);
+                deposit(ID, "open");
+                transfer(ID, "CreditX");
+            },
+            after: () => {
+                writeOff(ID, "ThiefX", [{ transfer: "CreditX", micros: 1, refund: "pending" }]);
+            },
+        });
+        const r = restore();
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        const kept = databasesLike(`${db}_before_`)[0]!;
+        expect(r.out).toContain(
+            `== rows that differ from ${kept}:\n` +
+                `refunds 1: none here, pending - in ${kept}\n` +
+                `deposit_write_offs ${ID} ThiefX: none here, 1 in ${kept}; ` +
+                "parts: CreditX 1 refund=1 state=pending\n" +
+                "== bugnet-payments@v9",
+        );
+        expect(r.out).not.toContain("not compared");
     });
 
     it("--restore says so when no row that moves money differs", () => {
