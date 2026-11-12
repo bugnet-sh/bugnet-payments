@@ -7,6 +7,7 @@ import { sendFont } from "../checkout/fonts.ts";
 import {
     CHECKOUT_CSP,
     decimalAmount,
+    FAVICON_SVG,
     qrSvg,
     renderCheckout,
     renderNotFound,
@@ -225,6 +226,19 @@ async function sendScript(res: ServerResponse, file: string): Promise<void> {
     res.end(body);
 }
 
+const FAVICON_BODY = Buffer.from(FAVICON_SVG);
+
+function sendFavicon(res: ServerResponse, method: "GET" | "HEAD"): void {
+    res.writeHead(200, {
+        "Content-Type": "image/svg+xml",
+        "Content-Length": String(FAVICON_BODY.length),
+        "Cache-Control": "public, max-age=86400",
+        "Content-Security-Policy": "default-src 'none'",
+        "X-Content-Type-Options": "nosniff",
+    });
+    res.end(method === "HEAD" ? undefined : FAVICON_BODY);
+}
+
 function settlementHeaders(transaction: string, payer: string): Record<string, string> {
     const value = encodePaymentResponseHeader({
         success: true,
@@ -354,6 +368,11 @@ export function createPublicHandler(d: PublicDeps): Handler {
         if (path.startsWith("/fonts/")) return await sendFont(req, res, path, d.checkoutJsPath);
         if (path === "/checkout.js") {
             if (req.method === "GET") await sendScript(res, d.checkoutJsPath);
+            else refuse(405, "method_not_allowed");
+            return;
+        }
+        if (path === "/favicon.svg") {
+            if (req.method === "GET" || req.method === "HEAD") sendFavicon(res, req.method);
             else refuse(405, "method_not_allowed");
             return;
         }

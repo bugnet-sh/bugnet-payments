@@ -19,6 +19,7 @@ import {
     amountLabel,
     CHECKOUT_CSP,
     type CheckoutView,
+    FAVICON_SVG,
     qrSvg,
     renderCheckout,
     renderNotFound,
@@ -120,6 +121,18 @@ describe("checkout page", () => {
         const notFound = renderNotFound();
         expect(notFound).toContain("<title>Order not found</title>");
         expect(notFound).not.toContain("\u00b7");
+        const icon = '<link rel="icon" href="/favicon.svg" type="image/svg+xml">';
+        expect(html).toContain(icon);
+        expect(notFound).toContain(icon);
+    });
+
+    it("uses the brand icon as the favicon", async () => {
+        const brand = await readFile("../bugnet-website/packages/brand/icon.svg", "utf8").catch(
+            () => null,
+        );
+        if (brand !== null) expect(FAVICON_SVG).toBe(brand);
+        expect(FAVICON_SVG).toMatch(/^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
+        expect(FAVICON_SVG).not.toMatch(/<script|on[a-z]+=|href=/i);
     });
 
     it("ships every allowlisted font with its family's license", async () => {
@@ -311,6 +324,21 @@ describe("checkout routes", () => {
         expect(r.headers.get("cache-control")).toBe("no-store");
         expect(await r.text()).toBe(bundle);
         const post = await fetch(`${app.publicOrigin}/checkout.js`, { method: "POST" });
+        expect(post.status).toBe(405);
+    });
+
+    it("serves the favicon for a day, GET and HEAD only", async () => {
+        const r = await get(app, "/favicon.svg");
+        expect(r.status).toBe(200);
+        expect(r.headers.get("content-type")).toBe("image/svg+xml");
+        expect(r.headers.get("cache-control")).toBe("public, max-age=86400");
+        expect(r.headers.get("content-security-policy")).toBe("default-src 'none'");
+        expect(r.headers.get("x-content-type-options")).toBe("nosniff");
+        expect(await r.text()).toBe(FAVICON_SVG);
+        const head = await fetch(`${app.publicOrigin}/favicon.svg`, { method: "HEAD" });
+        expect(head.status).toBe(200);
+        expect(await head.text()).toBe("");
+        const post = await fetch(`${app.publicOrigin}/favicon.svg`, { method: "POST" });
         expect(post.status).toBe(405);
     });
 
