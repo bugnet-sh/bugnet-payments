@@ -431,11 +431,29 @@ describe("address-first page", () => {
         expect(html).toContain('<p id="or" class="or" hidden>or</p>');
     });
 
-    it("the address, amount and network are shown with copy buttons", async () => {
+    it("the amount and the Solana address are click-to-copy fields with copy icons", async () => {
         const html = await renderCheckout(offered);
-        expect(html).toContain(`data-copy="${ADDRESS}"`);
-        expect(html).toContain('data-copy="0.05"');
-        expect(html).toContain("<h2>Send USDC on Solana</h2>");
+        const dep = section(html, "deposit");
+        expect(dep).toContain(`data-copy="${ADDRESS}" aria-label="Copy address"`);
+        expect(dep).toContain('data-copy="0.05" aria-label="Copy amount"');
+        expect(dep).toContain('<span class="label">Solana address</span>');
+        // Shown by its two ends, the whole of it in the page for screen readers and selection
+        expect(dep).toContain(
+            `<span class="value" aria-hidden="true">${ADDRESS.slice(0, 8)}\u2026${ADDRESS.slice(-8)}</span><span class="full">${ADDRESS}</span>`,
+        );
+        // Icons, never a Copy word, and no mono text
+        expect(html).not.toMatch(/>Copy</);
+        expect(html).not.toContain("<code");
+        expect(html).toContain('<svg class="idle"');
+    });
+
+    it("USDC is said once on the page, in the amount field", async () => {
+        const html = await renderCheckout(offered);
+        const body = html.slice(html.indexOf("<main"));
+        expect(body.match(/>USDC</g)).toHaveLength(1);
+        expect(body.match(/class="usdc"/g)).toHaveLength(1);
+        expect(html).toContain('<p class="amount"><span class="amount-value">$0.05</span></p>');
+        expect(html).not.toContain("<h2");
     });
 
     it("one code shows: the address's, while the Phantom code waits hidden for a review", async () => {
@@ -484,7 +502,7 @@ describe("address-first page", () => {
         );
     });
 
-    it("once money has arrived, the Amount row, Copy, QR and exchange note ask for the rest", async () => {
+    it("once money has arrived, the Amount field, its copy value and the QR ask for the rest", async () => {
         const partial = {
             ...offered,
             deposit: {
@@ -496,12 +514,11 @@ describe("address-first page", () => {
         };
         const html = await renderCheckout(partial);
         const dep = section(html, "deposit");
-        expect(dep).toContain('<span id="deposit-amount">0.02 USDC</span>');
+        expect(dep).toContain('<span id="deposit-amount" class="value">0.02</span>');
         expect(dep).toContain(
-            '<button id="deposit-amount-copy" class="copy" type="button" data-copy="0.02">',
+            '<button id="deposit-amount-copy" class="copy" type="button" data-copy="0.02" aria-label="Copy amount">',
         );
         expect(dep).toContain('alt="Solana Pay code for 0.02 USDC"');
-        expect(dep).toContain("From an exchange, send exactly 0.02 USDC.");
         expect(dep).not.toContain("0.05");
         // The price stays whole
         expect(html).toContain('<span class="amount-value">$0.05</span>');
@@ -513,10 +530,8 @@ describe("address-first page", () => {
             html.indexOf('<div id="deposit-ask">'),
             html.indexOf('<section id="wallet"'),
         );
-        expect(ask).toContain("<h2>Send USDC on Solana</h2>");
-        expect(ask).toContain('<dl class="pairs">');
+        expect(ask).toContain('<div class="fields">');
         expect(ask).toContain('<figure class="qr">');
-        expect(ask).toContain('id="exchange-note"');
         expect(ask).toContain('id="or"');
         // The order's line sits under its status, apart from any way to pay
         expect(ask).not.toContain('id="deposit-message"');
@@ -525,10 +540,28 @@ describe("address-first page", () => {
         ).toBeLessThan(html.indexOf('id="deposit-ask"'));
     });
 
-    it("the exchange warning says where a refund goes", async () => {
-        expect(section(await renderCheckout(offered), "deposit")).toContain(
-            "From an exchange, send exactly 0.05 USDC. Any refund goes to the exchange, which may not credit you.",
-        );
+    it("with the whole price in and confirming, nothing asks for money", async () => {
+        const html = await renderCheckout({
+            ...offered,
+            deposit: {
+                ...offered.deposit!,
+                status: "confirming" as const,
+                receivedMicros: 50_000,
+                remainingMicros: 0,
+            },
+        });
+        expect(html).toContain('<div id="deposit-ask" hidden>');
+        expect(html).toContain('<section id="phone" hidden>');
+        expect(html).toContain('<span class="time" hidden>');
+        expect(html).not.toContain("<noscript>");
+    });
+
+    it("nothing on the page talks about exchanges", async () => {
+        for (const state of ["unpaid", "settling", "paid", "expired", "refunded"] as const) {
+            expect((await renderCheckout({ ...offered, state })).toLowerCase()).not.toContain(
+                "exchange",
+            );
+        }
     });
 
     it("a failed copy has its own line, apart from the order's", async () => {
@@ -536,9 +569,16 @@ describe("address-first page", () => {
         expect(html).toContain('<p id="copy-message" role="status" aria-live="polite"></p>');
         // Empty live regions stay in the page, so their first line is announced
         expect(html).toContain(
-            "#deposit-message:empty, #message:empty, #copy-message:empty, #wallet-note:empty { margin: 0; }",
+            "#deposit-message:empty, #message:empty, #copy-message:empty { margin: 0; }",
         );
         expect(html).not.toMatch(/:empty \{ display: none/);
+        expect(html).toContain('aria-label="Copy order ID"');
+    });
+
+    it("the code and the two fields beside it share one height", async () => {
+        expect(await renderCheckout(offered)).toContain(
+            "--qr: calc(2 * (var(--fine-line) + var(--space-1) + var(--field)) + var(--space-3));",
+        );
     });
 
     it("phone links stay", async () => {
@@ -584,10 +624,13 @@ describe("address-first page", () => {
         );
     });
 
-    it("the wallet note is an empty live region in the page, before the wallet's line", async () => {
+    it("the wallet part is the Pay button, any other wallet's button and the wallet's line", async () => {
         const wallet = section(await renderCheckout(offered), "wallet");
-        expect(wallet).toContain('<p id="wallet-note" role="status" aria-live="polite"></p>');
-        expect(wallet.indexOf('id="wallet-note"')).toBeLessThan(wallet.indexOf('id="message"'));
+        expect(wallet).toBe(`<section id="wallet" hidden>
+<button id="pay-button" class="button" type="button" disabled>Pay</button>
+<div id="wallets"></div>
+<p id="message" role="status" aria-live="polite"></p>
+`);
     });
 
     it("a disabled Pay button looks disabled, outline or not", async () => {
@@ -619,7 +662,7 @@ describe("address-first page", () => {
         const phone = section(html, "phone");
         expect(html).toContain('<section id="phone">');
         expect(phone).toContain('<figure class="qr">');
-        expect(phone).toContain("Scan to pay in Phantom on your phone");
+        expect(phone).toContain("<figcaption>Scan with Phantom on your phone</figcaption>");
         expect(html).toContain('<section id="wallet" hidden>');
     });
 
@@ -675,7 +718,7 @@ describe("address-first page", () => {
             for (const bad of [
                 "\u00b7",
                 "Waiting for your transfer",
-                "Scan with",
+                "No browser wallet",
                 "Unexpected error",
                 "payment refused:",
                 "did not go through",

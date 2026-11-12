@@ -78,23 +78,23 @@ describe("deposit lines", () => {
             message: "Received $0.03 of $0.05.",
             extra: [],
         });
-        expect(line({ status: "confirming", receivedMicros: 50_000 }).message).toBe(
-            "Received $0.05.",
-        );
+        // The whole price in reads as Confirming alone, under the price it would repeat
+        expect(
+            line({ status: "confirming", receivedMicros: 50_000, remainingMicros: 0 }).message,
+        ).toBe("");
+        expect(
+            line({ status: "confirming", receivedMicros: 30_000, remainingMicros: 20_000 }).message,
+        ).toBe("Received $0.03 of $0.05.");
     });
 
     it("once money has arrived, the section asks for the rest and the line says what arrived", () => {
         expect(depositAsk(50_000, { remainingMicros: 50_000 })).toEqual({
             plain: "0.05",
             alt: "Solana Pay code for 0.05 USDC",
-            exchange:
-                "From an exchange, send exactly 0.05 USDC. Any refund goes to the exchange, which may not credit you.",
         });
         expect(depositAsk(50_000, { remainingMicros: 20_000 })).toEqual({
             plain: "0.02",
             alt: "Solana Pay code for 0.02 USDC",
-            exchange:
-                "From an exchange, send exactly 0.02 USDC. Any refund goes to the exchange, which may not credit you.",
         });
         // Covered only with a held wallet's money: another wallet still pays the price (M24)
         expect(depositAsk(50_000, { remainingMicros: 0 }).plain).toBe("0.05");
@@ -383,7 +383,6 @@ describe("wallet messages", () => {
     });
 
     it("page-made messages", () => {
-        expect(PAGE_TEXT.noWallet).toBe("No browser wallet found.");
         expect(PAGE_TEXT.addressOff).toBe("Paying by address is off right now.");
         expect(PAGE_TEXT.connecting("Phantom")).toBe("Approve the connection in Phantom.");
         expect(PAGE_TEXT.signing("Phantom")).toBe("Approve the payment in Phantom.");

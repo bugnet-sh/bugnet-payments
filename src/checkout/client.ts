@@ -20,8 +20,8 @@ import {
 import {
     arrangement,
     keepPolling,
-    walletNoteShown,
     needsReload,
+    payLabel,
     parseStatus,
     pollDelay,
     showDepositAsk,
@@ -30,9 +30,7 @@ import {
     statusKey,
     type StatusView,
     timeLeft,
-    walletChoice,
     type WalletWatch,
-    walletNote,
     watchWallet,
 } from "./live.ts";
 import {
@@ -59,13 +57,10 @@ interface Page {
     root: HTMLElement;
     message: HTMLElement | null;
     depositMessage: HTMLElement | null;
-    walletNote: HTMLElement | null;
     stateLabel: HTMLElement;
     status: StatusDeps;
     ctx: MessageContext;
     copyMessage: HTMLElement | null;
-    // W35 as the last status answer had it, shown only beside a Pay button
-    noteText: string;
     // While the order takes money, and how many usable browser wallets the page found
     takesMoney: boolean;
     walletsFound: number;
@@ -95,12 +90,6 @@ function arrange(p: Page): void {
     show("#phone .mobile-links", a.phoneLinks);
     show("#phone figure", a.phoneQr);
     show("#or", a.or);
-    // A live region, so it stays in the page and only its text comes and goes
-    if (p.walletNote !== null) {
-        const shown = walletNoteShown(a, p.walletsFound, p.noteText);
-        const text = shown ? p.noteText : "";
-        if (p.walletNote.textContent !== text) p.walletNote.textContent = text;
-    }
 }
 
 function usable(w: Wallet): boolean {
@@ -161,17 +150,19 @@ interface WalletSection {
 }
 
 function startPayment(p: Page): WalletSection {
-    const list = element<HTMLUListElement>(p.root, "#wallets");
+    const others = element<HTMLElement>(p.root, "#wallets");
     const button = element<HTMLButtonElement>(p.root, "#pay-button");
     const wallets = getWallets();
-    let chosen: Wallet | undefined;
+    let found: Wallet[] = [];
     let busy = false;
     let payable = true;
     // Set after W16 or W17, until the order shows whether the payment landed
     let watch: WalletWatch | null = null;
 
+    const buttons = () => [button, ...others.querySelectorAll<HTMLButtonElement>("button")];
+
     const refresh = () => {
-        button.disabled = busy || !payable || chosen === undefined;
+        for (const b of buttons()) b.disabled = busy || !payable || found.length === 0;
     };
 
     const offerPayAfter = (ms: number | undefined) => {
@@ -183,55 +174,34 @@ function startPayment(p: Page): WalletSection {
         }, ms);
     };
 
-    const label = () => {
-        const text = walletChoice([], chosen?.name).label;
-        if (chosen === undefined) {
-            button.textContent = text;
+    const label = (b: HTMLButtonElement, w: Wallet | undefined) => {
+        if (w === undefined) {
+            b.textContent = payLabel(undefined);
             return;
         }
         const icon = document.createElement("img");
-        icon.src = chosen.icon;
+        icon.src = w.icon;
         icon.alt = "";
-        button.replaceChildren(icon, text);
+        b.replaceChildren(icon, payLabel(w.name));
     };
 
+    // The first wallet found pays from the green button, every other from one of its own
     const render = () => {
-        const found = wallets.get().filter(usable);
-        if (chosen === undefined || !found.includes(chosen)) chosen = found[0];
-        list.replaceChildren(
-            ...(found.length > 1 ? found : []).map((w) => {
-                const input = document.createElement("input");
-                input.type = "radio";
-                input.name = "wallet";
-                input.checked = w === chosen;
-                input.addEventListener("change", () => {
-                    chosen = w;
-                    label();
-                    refresh();
+        found = wallets.get().filter(usable);
+        label(button, found[0]);
+        button.hidden = found.length === 0;
+        others.replaceChildren(
+            ...found.slice(1).map((w) => {
+                const b = document.createElement("button");
+                b.type = "button";
+                b.className = "button outline";
+                label(b, w);
+                b.addEventListener("click", () => {
+                    if (!busy && payable) void pay(w);
                 });
-                const icon = document.createElement("img");
-                icon.src = w.icon;
-                icon.alt = "";
-                const choice = document.createElement("label");
-                choice.append(input, icon, w.name);
-                const item = document.createElement("li");
-                item.append(choice);
-                return item;
+                return b;
             }),
         );
-        if (found.length === 0) {
-            const item = document.createElement("li");
-            item.className = "none";
-            item.textContent = PAGE_TEXT.noWallet;
-            list.append(item);
-        }
-        const choice = walletChoice(
-            found.map((w) => w.name),
-            chosen?.name,
-        );
-        list.hidden = !choice.list;
-        button.hidden = !choice.button;
-        label();
         p.walletsFound = found.length;
         arrange(p);
         refresh();
@@ -291,7 +261,8 @@ function startPayment(p: Page): WalletSection {
     };
 
     button.addEventListener("click", () => {
-        if (chosen !== undefined && !busy && payable) void pay(chosen);
+        const first = found[0];
+        if (first !== undefined && !busy && payable) void pay(first);
     });
     wallets.on("register", render);
     wallets.on("unregister", render);
@@ -339,7 +310,6 @@ function follow(p: Page, wallet: WalletSection | null): void {
     const askEls = {
         amount: p.root.querySelector<HTMLElement>("#deposit-amount"),
         copy: p.root.querySelector<HTMLButtonElement>("#deposit-amount-copy"),
-        exchange: p.root.querySelector<HTMLElement>("#exchange-note"),
     };
     // M20 on a page without a deposit, put back once a status error line is no longer true
     const firstLine = p.depositMessage?.textContent ?? "";
@@ -380,9 +350,8 @@ function follow(p: Page, wallet: WalletSection | null): void {
         const d = v.deposit;
         if (d !== null && v.state === "unpaid") {
             const ask = depositAsk(p.ctx.amountMicros, d);
-            if (askEls.amount !== null) askEls.amount.textContent = `${ask.plain} USDC`;
+            if (askEls.amount !== null) askEls.amount.textContent = ask.plain;
             if (askEls.copy !== null) askEls.copy.dataset.copy = ask.plain;
-            if (askEls.exchange !== null) askEls.exchange.textContent = ask.exchange;
             if (qr !== null) qr.alt = ask.alt;
         }
         const askEl = p.root.querySelector<HTMLElement>("#deposit-ask");
@@ -399,7 +368,6 @@ function follow(p: Page, wallet: WalletSection | null): void {
             remaining = d.remainingMicros;
             qr.src = `/o/${p.ctx.orderId}/qr.svg?r=${remaining}`;
         }
-        p.noteText = walletNote(v, p.ctx) ?? "";
         p.takesMoney = showWalletOptions(v);
         arrange(p);
         // After arrange, so a line W18 writes lands in a shown wallet part
@@ -446,20 +414,57 @@ const COPIED_FOR_MS = 1_500;
 
 function offerCopy(button: HTMLButtonElement, failed: () => void, copied: () => void): void {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const label = button.getAttribute("aria-label") ?? "";
     button.addEventListener("click", () => {
         // Without the Clipboard API writeText throws before any promise, so it goes inside one
         Promise.resolve()
             .then(() => navigator.clipboard.writeText(button.dataset.copy ?? ""))
+            // Wallet in-app browsers often lack the Clipboard API but still copy a selection
+            .catch(() => {
+                if (!copySelected(button.dataset.copy ?? "")) throw new Error("copy refused");
+            })
             .then(
                 () => {
                     copied();
                     button.dataset.copied = "";
+                    button.setAttribute("aria-label", "Copied");
                     clearTimeout(timer);
-                    timer = setTimeout(() => delete button.dataset.copied, COPIED_FOR_MS);
+                    timer = setTimeout(() => {
+                        delete button.dataset.copied;
+                        button.setAttribute("aria-label", label);
+                    }, COPIED_FOR_MS);
                 },
                 () => failed(),
             );
     });
+}
+
+function copySelected(text: string): boolean {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.append(area);
+    area.select();
+    let done: boolean;
+    try {
+        // The old command, the only copy some WebViews have
+        done = document.execCommand("copy");
+    } catch {
+        done = false;
+    }
+    area.remove();
+    return done;
+}
+
+// Selects a value so it can be copied by hand when the clipboard refuses
+function selectText(el: HTMLElement): void {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
 }
 
 function localTime(ms: number): string {
@@ -477,7 +482,6 @@ if (root !== null) {
         root,
         message: root.querySelector<HTMLElement>("#message"),
         depositMessage: root.querySelector<HTMLElement>("#deposit-message"),
-        walletNote: root.querySelector<HTMLElement>("#wallet-note"),
         copyMessage: root.querySelector<HTMLElement>("#copy-message"),
         stateLabel: element<HTMLElement>(root, "#state"),
         status: {
@@ -491,21 +495,33 @@ if (root !== null) {
             orderId: root.dataset.orderId ?? "",
             hasAddress: root.querySelector("#deposit-ask:not([hidden])") !== null,
         },
-        noteText: "",
         takesMoney: root.dataset.state === "unpaid",
         walletsFound: 0,
     };
     for (const button of root.querySelectorAll<HTMLButtonElement>("button[data-copy]")) {
+        const field = button.closest<HTMLElement>(".field");
+        const value =
+            button.parentElement?.querySelector<HTMLElement>(".full") ??
+            button.parentElement?.querySelector<HTMLElement>(".value") ??
+            null;
         // W34 has its own line, so it never replaces what happened to the order
         offerCopy(
             button,
             () => {
+                if (value !== null) selectText(value);
                 if (p.copyMessage !== null) p.copyMessage.textContent = PAGE_TEXT.copyFailed;
             },
             () => {
                 if (p.copyMessage !== null) p.copyMessage.textContent = "";
             },
         );
+        // A click anywhere on a field copies it, unless the click made a selection of its own;
+        // the icon button stays the keyboard's way in
+        field?.addEventListener("click", (e) => {
+            if (button.contains(e.target as Node)) return;
+            if ((window.getSelection()?.toString() ?? "") !== "") return;
+            button.click();
+        });
     }
     const wallet =
         root.dataset.state === "unpaid" && root.querySelector("#pay-button") !== null

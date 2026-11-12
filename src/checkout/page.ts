@@ -10,6 +10,7 @@ import {
     STATE_LABELS,
     stateStep,
 } from "./messages.ts";
+import { confirmingInFull } from "./live.ts";
 import { USDC_ICON } from "./usdc.ts";
 
 export { amountLabel, decimalAmount };
@@ -115,10 +116,12 @@ const STYLE = `
     --amount-size: 40px;
     --amount-line: 48px;
     --control: 44px;
-    --chip: 40px;
-    --copy-button: 24px;
+    --field: 40px;
+    --copy-button: 32px;
+    --copy-icon: 16px;
     --wallet-icon: 20px;
-    --qr: 136px;
+    /* Exactly the height of the two labelled fields beside it */
+    --qr: calc(2 * (var(--fine-line) + var(--space-1) + var(--field)) + var(--space-3));
     --usdc: #2775ca;
     --usdc-icon: 20px;
     /* Phones scan the code only on a light square */
@@ -218,13 +221,7 @@ p { margin: 0; }
     font-weight: 400;
     overflow-wrap: anywhere;
 }
-.amount {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: 0 var(--space-3);
-    margin-top: var(--space-1);
-}
+.amount { margin-top: var(--space-1); }
 .amount-value {
     font-family: var(--font-head);
     font-weight: 200;
@@ -232,7 +229,6 @@ p { margin: 0; }
     line-height: var(--amount-line);
     color: var(--accent-2);
 }
-.amount-unit { color: var(--text-muted); }
 .status {
     display: flex;
     flex-wrap: wrap;
@@ -247,33 +243,76 @@ p { margin: 0; }
 .time time { color: var(--text); }
 #deposit-message { margin-top: var(--space-4); }
 /* An empty live region stays in the page, so its first line is announced */
-#deposit-message:empty, #message:empty, #copy-message:empty, #wallet-note:empty { margin: 0; }
+#deposit-message:empty, #message:empty, #copy-message:empty { margin: 0; }
 
-#wallet, #phone { margin-top: var(--space-5); }
-#wallets {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-    list-style: none;
-    margin: 0 0 var(--space-3);
-    padding: 0;
+#deposit, #wallet, #phone { margin-top: var(--space-5); }
+/* The code and the two fields beside it share one height and one top and bottom edge */
+.send { display: flex; gap: var(--space-5); }
+.qr { flex: none; margin: 0; }
+.qr img, .qr svg { display: block; width: var(--qr); height: var(--qr); background: var(--qr-paper); }
+.fields { flex: 1; min-width: 0; }
+.pair + .pair { margin-top: var(--space-3); }
+.pair .label {
+    display: block;
+    color: var(--text-muted);
+    font-size: var(--fine-size);
+    line-height: var(--fine-line);
 }
-#wallets li.none { color: var(--text-muted); }
-#wallets label {
-    display: inline-flex;
+/* A whole field copies its value on click; its icon button is the keyboard's way in */
+.field {
+    display: flex;
     align-items: center;
     gap: var(--space-2);
-    height: var(--chip);
-    padding: 0 var(--space-3);
+    height: var(--field);
+    margin-top: var(--space-1);
+    padding: 0 var(--space-1) 0 var(--space-3);
     border: var(--hairline) solid var(--line);
+    background: var(--surface);
     cursor: pointer;
 }
-#wallets label:hover { background: var(--surface-hover); }
-#wallets label:has(input:checked) { border-color: var(--accent); }
-#wallets label:has(input:focus-visible) { outline: var(--ring) solid var(--accent); outline-offset: var(--ring); }
-/* The radio stays in the page for keyboards and screen readers; the chip's border shows the choice */
-#wallets input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
-#wallets img, .button img { display: block; width: var(--wallet-icon); height: var(--wallet-icon); }
+.field:hover { background: var(--surface-hover); }
+.value { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* In the page, out of sight */
+.full {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+}
+.unit { color: var(--text-muted); }
+.usdc { display: block; flex: none; width: var(--usdc-icon); height: var(--usdc-icon); }
+.copy {
+    display: grid;
+    flex: none;
+    place-items: center;
+    width: var(--copy-button);
+    height: var(--copy-button);
+    margin-left: auto;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--text-muted);
+    cursor: pointer;
+}
+.copy svg { grid-area: 1 / 1; width: var(--copy-icon); height: var(--copy-icon); }
+.copy .done, .copy[data-copied] .idle { visibility: hidden; }
+.copy[data-copied] .done { visibility: visible; }
+.copy[data-copied] { color: var(--accent); }
+.copy:hover { color: var(--text); }
+
+.or {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    margin-top: var(--space-5);
+    color: var(--text-muted);
+    font-size: var(--fine-size);
+    line-height: var(--fine-line);
+}
+.or::before, .or::after { content: ""; flex: 1; border-top: var(--hairline) solid var(--line); }
+
 .button {
     display: flex;
     align-items: center;
@@ -288,6 +327,7 @@ p { margin: 0; }
     font-weight: 600;
     cursor: pointer;
 }
+.button img { display: block; flex: none; width: var(--wallet-icon); height: var(--wallet-icon); }
 .button.outline {
     border: var(--hairline) solid var(--line);
     background: var(--bg);
@@ -296,96 +336,26 @@ p { margin: 0; }
 .button.outline:not(:disabled):hover { background: var(--surface-hover); }
 /* After .button.outline, whose specificity it shares, so a disabled outline button looks it */
 .button:disabled { background: var(--surface); color: var(--text-muted); cursor: default; }
+#wallets { display: grid; gap: var(--space-2); margin-top: var(--space-2); }
+#wallets:empty { margin: 0; }
 #message { margin-top: var(--space-3); }
 #copy-message { margin-top: var(--space-3); color: var(--text-muted); }
 /* The app links open this page in a wallet app on the same device, so only touch screens get them */
 .mobile-links { display: none; grid-template-columns: 1fr 1fr; gap: var(--space-2); }
-#phone .qr { margin: 0; }
-#phone figcaption { margin-top: var(--space-3); color: var(--text-muted); }
+#phone .qr { display: flex; align-items: center; gap: var(--space-5); }
+#phone figcaption { color: var(--text-muted); }
 
-.or {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    margin-top: var(--space-5);
-    color: var(--text-muted);
-    font-size: var(--fine-size);
-    line-height: var(--fine-line);
-}
-.or::before, .or::after { content: ""; flex: 1; border-top: var(--hairline) solid var(--line); }
-
-#deposit { margin-top: var(--space-5); }
-h2 {
-    margin: 0 0 var(--space-4);
-    font-size: var(--ui-size);
-    line-height: var(--ui-line);
-    font-weight: 600;
-}
-.send { display: flex; gap: var(--space-5); align-items: flex-start; }
-.qr { flex-shrink: 0; margin: 0; }
-.qr img, .qr svg { display: block; width: var(--qr); height: var(--qr); background: var(--qr-paper); }
-.pairs { flex: 1; min-width: 0; margin: 0; }
-.pairs div + div { margin-top: var(--space-4); }
-.pairs dt { color: var(--text-muted); font-size: var(--fine-size); line-height: var(--fine-line); }
-.pairs dd {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: var(--space-3);
-    margin: var(--space-1) 0 0;
-}
-/* A payment address is read and compared by eye, so it wraps instead of hiding its end */
-code {
-    min-width: 0;
-    font-family: var(--font-mono);
-    font-size: var(--fine-size);
-    line-height: var(--ui-line);
-    overflow-wrap: anywhere;
-}
-/* Centred on the capitals of the text beside it, measured from the baseline, so every engine agrees */
-.usdc {
-    width: var(--usdc-icon);
-    height: var(--usdc-icon);
-    flex-shrink: 0;
-    vertical-align: -0.3em;
-    vertical-align: calc((1cap - var(--usdc-icon)) / 2);
-}
-.with-usdc .usdc { margin-right: var(--space-2); }
-.note { margin-top: var(--space-4); color: var(--text-muted); }
-#wallet-note { margin-top: var(--space-3); color: var(--text-muted); }
-.copy {
-    display: grid;
-    flex-shrink: 0;
-    place-items: center;
-    height: var(--copy-button);
-    padding: 0 var(--space-2);
-    border: var(--hairline) solid var(--line);
-    background: var(--bg);
-    color: var(--text-muted);
-    font-size: var(--fine-size);
-    line-height: var(--fine-line);
-    cursor: pointer;
-}
-/* Both labels share one cell, so the button keeps its width when it says Copied */
-.copy span { grid-area: 1 / 1; }
-.copy span + span, .copy[data-copied] span:first-child { visibility: hidden; }
-.copy[data-copied] span + span { visibility: visible; }
-.copy[data-copied] { color: var(--accent); }
-.copy:hover { color: var(--text); }
-
+/* The order's copy icon sits on the same vertical line as the fields' icons above it */
 .order {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: var(--space-3);
+    gap: var(--space-2);
     margin-top: var(--space-5);
-    padding-top: var(--space-4);
+    padding: var(--space-3) calc(var(--space-1) + var(--hairline)) 0 0;
     border-top: var(--hairline) solid var(--line);
     color: var(--text-muted);
-    font-size: var(--fine-size);
-    line-height: var(--fine-line);
 }
-.order span { display: flex; align-items: baseline; gap: var(--space-2); min-width: 0; }
+.order .value { color: var(--text); }
 
 .foot {
     display: flex;
@@ -466,11 +436,15 @@ const MESSAGE = '<p id="message" role="status" aria-live="polite"></p>';
 const SCRIPT = '<script type="module" src="/checkout.js"></script>';
 const NOSCRIPT =
     '<noscript><p class="note">This page needs JavaScript to show live status. You can still send to the address above.</p></noscript>';
-const COPY_LABELS = "<span>Copy</span><span>Copied</span>";
 
-function copyButton(value: string, id?: string): string {
+// Square corners, as everywhere on the page: two sheets for copy, a tick once copied
+const COPY_ICONS =
+    '<svg class="idle" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" focusable="false"><path d="M5.75 5.75h7.5v7.5h-7.5z"/><path d="M10.25 5.75v-3h-7.5v7.5h3"/></svg>' +
+    '<svg class="done" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" focusable="false"><path d="M2.75 8.25l3.5 3.5 7-7.5"/></svg>';
+
+function copyButton(value: string, label: string, id?: string): string {
     const idAttr = id === undefined ? "" : ` id="${id}"`;
-    return `<button${idAttr} class="copy" type="button" data-copy="${escapeHtml(value)}">${COPY_LABELS}</button>`;
+    return `<button${idAttr} class="copy" type="button" data-copy="${escapeHtml(value)}" aria-label="${label}">${COPY_ICONS}</button>`;
 }
 
 // m:ss until the deadline, which the script keeps counting down
@@ -479,16 +453,16 @@ function timeLeft(expiresAt: Date, now: Date): string {
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
-// The script shows the wallet once it knows which wallets the browser has. Without an address
-// the phone part shows from the start, so a page whose script never runs still offers a way to
-// pay; its code opens this page in Phantom and is the page's one QR, shown only then.
-async function walletSections(v: CheckoutView, address: boolean): Promise<string> {
+// The script shows the wallet once it knows which wallets the browser has: the first on the
+// green button, any other on a button of its own. The phone part is drawn shown only on a page
+// with no address, so a page whose script never runs still offers a way to pay; its code opens
+// this page in Phantom and is the page's one QR.
+async function walletSections(v: CheckoutView, phoneShown: boolean): Promise<string> {
     const links = walletLinks(v.pageUrl, v.origin);
-    const hidden = address ? " hidden" : "";
+    const hidden = phoneShown ? "" : " hidden";
     return `<section id="wallet" hidden>
-<ul id="wallets" hidden></ul>
 <button id="pay-button" class="button" type="button" disabled>Pay</button>
-<p id="wallet-note" role="status" aria-live="polite"></p>
+<div id="wallets"></div>
 ${MESSAGE}
 </section>
 <section id="phone"${hidden}>
@@ -498,29 +472,38 @@ ${MESSAGE}
 </div>
 <figure class="qr"${hidden}>
 ${await qrSvg(links.phantom)}
-<figcaption>Scan to pay in Phantom on your phone</figcaption>
+<figcaption>Scan with Phantom on your phone</figcaption>
 </figure>
 </section>`;
 }
 
+const ADDRESS_ENDS = 8;
+
 function depositSection(v: CheckoutView, deposit: DepositView): string {
     const ask = depositAsk(v.amountMicros, deposit);
     const id = escapeHtml(v.orderId);
+    // Shown as its start and end, the parts people compare, as wallets show addresses; the whole
+    // address stays in the page for screen readers and to select by hand
+    const short = `${deposit.address.slice(0, ADDRESS_ENDS)}\u2026${deposit.address.slice(-ADDRESS_ENDS)}`;
     // With the price covered the QR route answers 404, so the code waits hidden, unloaded
     const qrHidden = deposit.remainingMicros > 0 ? "" : " hidden";
     const qrLoading = deposit.remainingMicros > 0 ? "" : ' loading="lazy"';
     return `<section id="deposit">
-<h2>Send USDC on Solana</h2>
 <div class="send">
 <figure class="qr"${qrHidden}>
 <img src="/o/${id}/qr.svg?r=${deposit.remainingMicros}" data-remaining="${deposit.remainingMicros}"${qrLoading} alt="${ask.alt}">
 </figure>
-<dl class="pairs">
-<div><dt>Amount</dt><dd><span class="with-usdc">${USDC_ICON}<span id="deposit-amount">${ask.plain} USDC</span></span> ${copyButton(ask.plain, "deposit-amount-copy")}</dd></div>
-<div><dt>Address</dt><dd><code>${escapeHtml(deposit.address)}</code> ${copyButton(deposit.address)}</dd></div>
-</dl>
+<div class="fields">
+<div class="pair">
+<span class="label">Amount</span>
+<div class="field">${USDC_ICON}<span id="deposit-amount" class="value">${ask.plain}</span><span class="unit">USDC</span>${copyButton(ask.plain, "Copy amount", "deposit-amount-copy")}</div>
 </div>
-<p id="exchange-note" class="note">${ask.exchange}</p>
+<div class="pair">
+<span class="label">Solana address</span>
+<div class="field"><span class="value" aria-hidden="true">${escapeHtml(short)}</span><span class="full">${escapeHtml(deposit.address)}</span>${copyButton(deposit.address, "Copy address")}</div>
+</div>
+</div>
+</div>
 </section>`;
 }
 
@@ -552,36 +535,35 @@ export async function renderCheckout(v: CheckoutView): Promise<string> {
     const expires = v.expiresAt.toISOString();
     const unpaid = v.state === "unpaid";
     const dep = unpaid && v.depositsOffered ? v.deposit : null;
+    // With the whole price in and confirming, the page asks for nothing while it lands
+    const confirming = dep !== null && confirmingInFull(dep);
     let methods = "";
     if (dep !== null) {
         // Money sent while the deposit is in review cannot pay the order until an operator looks
-        const askHidden = dep.status === "review" ? " hidden" : "";
+        const askHidden = inReview(dep) || confirming ? " hidden" : "";
         // The address comes first, as the main way to pay (founder, 2026-11-10); P4 points at it
         methods = `<div id="deposit-ask"${askHidden}>
 ${depositSection(v, dep)}
 <p id="or" class="or" hidden>or</p>
 </div>
-${await walletSections(v, askHidden === "")}${askHidden === "" ? `\n${NOSCRIPT}` : ""}`;
+${await walletSections(v, inReview(dep))}${askHidden === "" ? `\n${NOSCRIPT}` : ""}`;
     } else if (unpaid) {
-        methods = await walletSections(v, false);
+        methods = await walletSections(v, true);
     } else if (v.state === "settling") {
         methods = MESSAGE;
     }
     const time = unpaid
-        ? `<span class="time"><time id="time-left" datetime="${expires}">${timeLeft(v.expiresAt, v.now)}</time> left</span>`
+        ? `<span class="time"${confirming ? " hidden" : ""}><time id="time-left" datetime="${expires}">${timeLeft(v.expiresAt, v.now)}</time> left</span>`
         : "";
     return page(
         `Pay ${amount} to Bugnet`,
         `<main id="checkout" class="box" data-order-id="${id}" data-state="${v.state}" data-amount="${amount}" data-amount-micros="${v.amountMicros}" data-expires-at="${expires}" data-now="${v.now.toISOString()}" data-kind="${v.kind}" data-refund-min-micros="${v.refundMinMicros}" data-settle-grace-ms="${v.settleGraceMs}">
 <h1 class="description">${escapeHtml(v.description)}</h1>
-<p class="amount">
-<span class="amount-value">${amount}</span>
-<span class="amount-unit with-usdc">${USDC_ICON}USDC</span>
-</p>
+<p class="amount"><span class="amount-value">${amount}</span></p>
 <p class="status"><span id="state" class="state" data-state="${v.state}" role="status" aria-live="polite">${inReview(dep) ? STATE_LABELS.review : STATE_LABELS[v.state]}</span>${time}</p>
 <p id="deposit-message" role="status" aria-live="polite">${firstLine(v, dep)}</p>
 ${methods}
-<p class="order"><span>Order <code>${id}</code></span>${copyButton(v.orderId)}</p>
+<div class="order"><span>Order</span><span class="value">${id}</span>${copyButton(v.orderId, "Copy order ID")}</div>
 <p id="copy-message" role="status" aria-live="polite"></p>
 </main>
 ${SCRIPT}`,

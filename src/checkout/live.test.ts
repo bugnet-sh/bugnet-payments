@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import type { DepositView } from "../deposits/types.ts";
 import {
     arrangement,
+    confirmingInFull,
     fetchStatus,
     keepPolling,
     needsReload,
     parseStatus,
+    payLabel,
     pollDelay,
     showDepositAsk,
     showDepositQr,
@@ -13,14 +15,10 @@ import {
     statusKey,
     type StatusView,
     timeLeft,
-    walletChoice,
-    walletNote,
-    walletNoteShown,
     watchWallet,
 } from "./live.ts";
 
 const T = (hms: string) => Date.parse(`2030-01-01T${hms}.000Z`);
-const C = { amountMicros: 50_000, deadline: "14:05", refundMinMicros: 1_000, orderId: "ord_a" };
 
 function view(state: StatusView["state"], d: Partial<DepositView> | null = null): StatusView {
     return {
@@ -137,23 +135,29 @@ describe("live status", () => {
         expect(needsReload("settling", view("paid"))).toBe(false);
     });
 
-    it("showWalletOptions and walletNote", () => {
+    it("every way to pay shows while the order takes money", () => {
         expect(showWalletOptions(view("unpaid", { receivedMicros: 30_000 }))).toBe(true);
         expect(showWalletOptions(view("paid"))).toBe(false);
-        expect(walletNote(view("unpaid", {}), C)).toBeNull();
-        const w35 =
-            "Paying by wallet charges the full $0.05 and returns the money already sent to the address.";
-        expect(walletNote(view("unpaid", { receivedMicros: 1 }), C)).toBe(w35);
-        expect(walletNote(view("unpaid", { otherMicros: 1 }), C)).toBe(w35);
     });
 
-    it("in review the wallet note points at no address and promises no return", () => {
-        const note = walletNote(view("unpaid", { status: "review", receivedMicros: 1 }), C);
-        expect(note).toBe(
-            "Paying by wallet charges the full $0.05. The money in review is not returned on its own.",
-        );
-        expect(note).not.toContain("address");
-        expect(walletNote(view("unpaid", { status: "review" }), C)).toBeNull();
+    it("with the whole price in and confirming, the page asks for nothing more", () => {
+        const full = view("unpaid", {
+            status: "confirming",
+            receivedMicros: 50_000,
+            remainingMicros: 0,
+        });
+        expect(confirmingInFull(full.deposit!)).toBe(true);
+        expect(showWalletOptions(full)).toBe(false);
+        expect(showDepositAsk(full)).toBe(false);
+        expect(showDepositQr(full)).toBe(false);
+        // Part of it confirming still asks for the rest
+        const part = view("unpaid", {
+            status: "confirming",
+            receivedMicros: 20_000,
+            remainingMicros: 30_000,
+        });
+        expect(confirmingInFull(part.deposit!)).toBe(false);
+        expect(showDepositAsk(part)).toBe(true);
     });
 });
 
@@ -189,17 +193,15 @@ describe("which ways to pay show", () => {
         expect(at({ phone: true })).toEqual({ ...none, phone: true, phoneLinks: true, or: true });
     });
 
-    it("with no wallet and no address, the page says so and offers the phone, its code off a phone", () => {
+    it("with no wallet and no address, the page offers the phone, its code off a phone", () => {
         expect(at({ address: false })).toEqual({
             ...none,
-            wallet: true,
             phone: true,
             phoneLinks: true,
             phoneQr: true,
         });
         expect(at({ address: false, phone: true })).toEqual({
             ...none,
-            wallet: true,
             phone: true,
             phoneLinks: true,
         });
@@ -224,27 +226,9 @@ describe("which ways to pay show", () => {
         }
     });
 
-    it("the wallet note shows only beside a Pay button", () => {
-        const shown = at({ walletsFound: 1 });
-        expect(walletNoteShown(shown, 1, "W35")).toBe(true);
-        expect(walletNoteShown(shown, 1, "")).toBe(false);
-        // In review with no wallet the wallet part shows only to say none was found
-        expect(walletNoteShown(at({ address: false }), 0, "W35")).toBe(false);
-        expect(walletNoteShown(at({ takesMoney: false, walletsFound: 1 }), 1, "W35")).toBe(false);
-    });
-
-    it("the Pay button names its wallet; the list shows only for none or several", () => {
-        expect(walletChoice([], undefined)).toEqual({ list: true, button: false, label: "Pay" });
-        expect(walletChoice(["Phantom"], "Phantom")).toEqual({
-            list: false,
-            button: true,
-            label: "Pay with Phantom",
-        });
-        expect(walletChoice(["Phantom", "Solflare"], "Solflare")).toEqual({
-            list: true,
-            button: true,
-            label: "Pay with Solflare",
-        });
+    it("each wallet's button names it", () => {
+        expect(payLabel(undefined)).toBe("Pay");
+        expect(payLabel("Phantom")).toBe("Pay with Phantom");
     });
 });
 

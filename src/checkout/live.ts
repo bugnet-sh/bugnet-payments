@@ -1,7 +1,6 @@
 import type { DepositView } from "../deposits/types.ts";
 import type { PublicState } from "../http/public.ts";
 import type { OrderKind } from "../orders/types.ts";
-import { type MessageContext, walletNoteReviewText, walletNoteText } from "./messages.ts";
 
 export { fetchStatus } from "./flow.ts";
 
@@ -131,16 +130,22 @@ export function needsReload(renderedState: string | undefined, v: StatusView): b
     return v.state === "unpaid" && renderedState !== undefined && renderedState !== "unpaid";
 }
 
-// The wallet and phone sections go only once the order no longer takes money
+// The whole price arrived and is confirming: the page asks for nothing more while it lands,
+// since a way to pay left in view invites a second payment (owner ruling, 2026-11-12)
+export function confirmingInFull(d: Pick<DepositView, "status" | "remainingMicros">): boolean {
+    return d.status === "confirming" && d.remainingMicros <= 0;
+}
+
+// Every way to pay goes once the order no longer takes money
 export function showWalletOptions(v: StatusView): boolean {
-    return v.state === "unpaid";
+    return v.state === "unpaid" && (v.deposit === null || !confirmingInFull(v.deposit));
 }
 
 // The address and its notes ask for money, so they show only while money sent there can still
 // pay the order: a closed order says only what happened (spec 15.1), and a deposit in review
 // signs nothing until an operator looks
 export function showDepositAsk(v: StatusView): boolean {
-    return v.state === "unpaid" && v.deposit?.status !== "review";
+    return showWalletOptions(v) && v.deposit?.status !== "review";
 }
 
 // The deposit QR asks for money, so it shows only while the order still lacks some
@@ -148,19 +153,10 @@ export function showDepositQr(v: StatusView): boolean {
     return showDepositAsk(v) && v.deposit !== null && v.deposit.remainingMicros > 0;
 }
 
-// W35 while the order still takes a wallet payment and money already reached the address; while
-// the deposit is in review the address is hidden and that money waits for a person
-export function walletNote(v: StatusView, c: MessageContext): string | null {
-    if (!showWalletOptions(v) || v.deposit === null) return null;
-    if (v.deposit.receivedMicros + v.deposit.otherMicros <= 0) return null;
-    return showDepositAsk(v) ? walletNoteText(c) : walletNoteReviewText(c);
-}
-
-// Which ways to pay the page shows. A found browser wallet always shows; without one, the wallet
-// part says so only on a page with no address. The wallet app links show when this browser has
-// no wallet, on a phone or on a page with no address. The code that opens the page in Phantom
-// shows whenever no address shows, off a phone, even beside a found wallet, which may hold no
-// USDC; so a page never draws two codes.
+// Which ways to pay the page shows. A found browser wallet shows its Pay button. Without one, the
+// wallet app links show on a phone or on a page with no address. The code that opens the page in
+// Phantom shows whenever no address shows, off a phone, even beside a found wallet, which may
+// hold no USDC; so a page never draws two codes.
 export interface Arrangement {
     wallet: boolean;
     phone: boolean;
@@ -175,23 +171,13 @@ export function arrangement(o: {
     address: boolean;
     phone: boolean;
 }): Arrangement {
-    const wallet = o.takesMoney && (o.walletsFound > 0 || !o.address);
+    const wallet = o.takesMoney && o.walletsFound > 0;
     const phoneLinks = o.takesMoney && o.walletsFound === 0 && (o.phone || !o.address);
     const phoneQr = o.takesMoney && !o.address && !o.phone;
     const phone = phoneLinks || phoneQr;
     return { wallet, phone, phoneLinks, phoneQr, or: o.address && (wallet || phone) };
 }
 
-export function walletNoteShown(a: Arrangement, walletsFound: number, note: string): boolean {
-    return a.wallet && walletsFound > 0 && note !== "";
-}
-
-// The Pay button names the wallet it pays with, so one wallet needs no list: the list shows the
-// choices for two or more, and the no-wallet line for none
-export function walletChoice(found: readonly string[], chosen: string | undefined) {
-    return {
-        list: found.length !== 1,
-        button: found.length > 0,
-        label: chosen === undefined ? "Pay" : `Pay with ${chosen}`,
-    };
-}
+// Each found wallet gets a button that names it
+export const payLabel = (wallet: string | undefined): string =>
+    wallet === undefined ? "Pay" : `Pay with ${wallet}`;

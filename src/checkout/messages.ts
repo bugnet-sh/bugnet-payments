@@ -174,19 +174,18 @@ function keptLine(v: NonNullable<StatusView["deposit"]>, c: MessageContext): str
 const P2 = "This page updates when the payment lands.";
 const P3 = "This order's payment was returned to the wallet that paid.";
 
-// The deposit section's Amount row, its Copy value, the QR's alt and the exchange note. Once part of the price has arrived they name what is left, as the QR does (spec 14.2):
+// The deposit section's Amount field, its copy value and the QR's alt. Once part of the price
+// has arrived they name what is left, as the QR does (spec 14.2):
 // a payer copying the price would overpay and pay for the return. With nothing left, the price,
 // which a payment from another wallet still needs while the money waits (M24).
 export function depositAsk(
     amountMicros: number,
     d: Pick<DepositView, "remainingMicros">,
-): { plain: string; alt: string; exchange: string } {
+): { plain: string; alt: string } {
     const plain = decimalAmount(d.remainingMicros > 0 ? d.remainingMicros : amountMicros);
     return {
         plain,
         alt: `Solana Pay code for ${plain} USDC`,
-        // Money returned goes to the sending address, which an exchange may not credit (22.6)
-        exchange: `From an exchange, send exactly ${plain} USDC. Any refund goes to the exchange, which may not credit you.`,
     };
 }
 
@@ -211,7 +210,11 @@ export function depositLine(
             message = `Received ${amountLabel(d.receivedMicros)} of ${amountLabel(c.amountMicros)}.`;
             break;
         case "confirming":
-            message = `Received ${amountLabel(d.receivedMicros)}.`;
+            // The whole price in reads as Confirming alone; part of it says how much of it
+            message =
+                d.remainingMicros > 0
+                    ? `Received ${amountLabel(d.receivedMicros)} of ${amountLabel(c.amountMicros)}.`
+                    : "";
             break;
         case "held":
             message = heldLine(d, c, v.serverNow >= v.expiresAt);
@@ -295,18 +298,7 @@ export function depositLine(
     return { label, message, extra };
 }
 
-// W35, while money already sits at the address and the order still takes a wallet payment
-export function walletNoteText(c: MessageContext): string {
-    return `Paying by wallet charges the full ${amountLabel(c.amountMicros)} and returns the money already sent to the address.`;
-}
-
-// W35 while the deposit is in review: the address is hidden and that money waits for a person
-export function walletNoteReviewText(c: MessageContext): string {
-    return `Paying by wallet charges the full ${amountLabel(c.amountMicros)}. The money in review is not returned on its own.`;
-}
-
 export const PAGE_TEXT = {
-    noWallet: "No browser wallet found.",
     // M20: a page without a deposit address
     addressOff: "Paying by address is off right now.",
     connecting: (wallet: string) => `Approve the connection in ${wallet}.`,
