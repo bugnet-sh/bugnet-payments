@@ -428,6 +428,44 @@ pending_migrations() {
         <(pg_sql "$DB" -At -c 'select version from schema_migrations' 2>/dev/null | LC_ALL=C sort)
 }
 
+# A restore brings back an older point of a money ledger: a refund signed after the dump reads as
+# pending again, and an x402 account as not having spent what it spent. Nothing pays from it until
+# a person has compared it with the database it replaced.
+hold_money() {
+    pg_sql "$1" -1 \
+        -c "update refund_controls set paused = true, reason = 'restore', paused_at = now() where id = 1 and not paused" \
+        -c "update x402_controls set paused = true, refunds_held = true, reason = coalesce(reason, 'restore'), changed_at = now() where id = 1"
+}
+
+money_rows() {
+    pg_sql "$1" -At -F ' ' -c "select id, state, coalesce(tx_signature, '-') from $2 order by id" 2>/dev/null
+}
+
+# Every row of the tables that move money whose state or signature differs between the restored
+# database ($1) and the one it replaces ($2, named $3 once kept)
+money_differences() {
+    local new=$1 old=$2 kept=$3 table here before
+    for table in refunds deposit_moves x402_payments x402_cold_transfers; do
+        if ! here=$(money_rows "$new" "$table") || ! before=$(money_rows "$old" "$table"); then
+            echo "$table: not compared, missing from one of the two databases"
+            continue
+        fi
+        # shellcheck disable=SC2016
+        awk -v t="$table" -v kept="$kept" '
+            FILENAME == ARGV[1] { if (NF) { here[$1] = $2 " " $3; ids[++n] = $1 } next }
+            NF {
+                seen[$1] = 1
+                if (!($1 in here)) print t " " $1 ": none here, " $2 " " $3 " in " kept
+                else if (here[$1] != $2 " " $3) print t " " $1 ": " here[$1] " here, " $2 " " $3 " in " kept
+            }
+            END {
+                for (i = 1; i <= n; i++)
+                    if (!(ids[i] in seen)) print t " " ids[i] ": " here[ids[i]] " here, none in " kept
+            }
+        ' <(printf '%s\n' "$here") <(printf '%s\n' "$before")
+    done
+}
+
 restore_abort() {
     pg_drop_database "$1" >/dev/null 2>&1 || true
     die "$2"
@@ -437,7 +475,7 @@ restore_abort() {
 # one fails as soon as a later migration's table has a foreign key into a table in the dump, and
 # the database it replaces stays whole beside it with everything after the dump.
 do_restore() {
-    local dump=$1 v new kept pending
+    local dump=$1 v new kept pending differences=""
     [ -f "$dump" ] || die "no such file: $dump"
     pg_restore --list "$dump" >/dev/null 2>&1 || die "pg_restore --list cannot read $dump; nothing was changed"
     v=$(installed_version)
@@ -448,16 +486,27 @@ do_restore() {
     if ! as_postgres pg_restore --clean --if-exists --single-transaction -d "$new" <"$dump"; then
         restore_abort "$new" "the restore failed, so nothing was stopped and $DB was not changed"
     fi
+    hold_money "$new" ||
+        restore_abort "$new" "cannot pause refunds and x402 in the restored database, so nothing was stopped and $DB was not changed"
     stop_every_version "$v" ||
         restore_abort "$new" "a version did not stop; $DB was not changed, run --restore again"
     if pg_has_database "$DB"; then
+        differences=$(money_differences "$new" "$DB" "$kept")
         pg_sql postgres -1 -c "alter database $DB rename to $kept" -c "alter database $new rename to $DB" ||
             restore_abort "$new" "cannot rename the databases (pg_stat_activity shows who holds $DB); $DB was not changed and every version is stopped: run --restore again, or --start"
         say "$DB is now the dump; the database it replaced is $kept, which only postgres opens"
+        say "refunds and x402 payments are paused and x402 refunds held in $DB"
+        if [ -n "$differences" ]; then
+            say "rows that differ from $kept:"
+            printf '%s\n' "$differences"
+        else
+            say "no refund, deposit move or x402 payment differs from $kept"
+        fi
     else
         pg_sql postgres -c "alter database $new rename to $DB" ||
             restore_abort "$new" "cannot rename $new to $DB; every version is stopped: run --restore again"
         say "$DB is now the dump; there was no $DB to keep"
+        say "refunds and x402 payments are paused and x402 refunds held in $DB"
     fi
     pending=$(pending_migrations "$v" | tr '\n' ' ')
     pending=${pending% }

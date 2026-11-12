@@ -1204,15 +1204,16 @@ describe("vps-install.sh restore", () => {
     // A database at 00004, its dump, then a release whose migrations add tables with foreign keys
     // into the dumped ones, on a server where v10 still runs while v9 is installed. Postgres runs
     // for real; runuser logs and runs the tool as this user.
-    function scene(o: { before?: () => void; after?: () => void } = {}) {
+    function scene(o: { dumpedAt?: number; before?: () => void; after?: () => void } = {}) {
         expect(PRE.at(-1)).toBe("00004_paid_via.sql");
+        const at = o.dumpedAt ?? PRE.length;
         sql("postgres", `create database ${db}`);
-        migrateTo(db, PRE);
+        migrateTo(db, MIGRATION_FILES.slice(0, at));
         o.before?.();
         const dump = join(dir, "pre.dump");
         pg("pg_dump", ["--format=custom", "-d", db, "-f", dump]);
         o.after?.();
-        migrateTo(db, LATER);
+        migrateTo(db, MIGRATION_FILES.slice(at));
         const server = fakeServer({ active: true });
         const bin = join(server.root, "bin");
         rmSync(join(bin, "pg_dump"));
@@ -1306,6 +1307,58 @@ describe("vps-install.sh restore", () => {
         expect(r.out).toContain(
             "== bugnet-payments@v9 runs no migration the restored database lacks\n",
         );
+    });
+
+    it("--restore pauses refunds and x402 and lists the rows that moved money after the dump", () => {
+        const ORDER = "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const { restore } = scene({
+            before: () => {
+                sql(
+                    db,
+                    `insert into orders (id, kind, package_id, amount_micros, description, claim_sha256, state, expires_at)
+                     values ('${ORDER}', 'start', 'p', 1000000, 'd', '\\x00', 'refunding', now())`,
+                );
+                sql(
+                    db,
+                    `insert into refunds (order_id, kind, reason, amount_micros, destination, payer, state)
+                     values ('${ORDER}', 'full', 'operator', 1000000, 'Dest', 'Payer', 'pending')`,
+                );
+            },
+            // The executor signed and landed the refund after the dump
+            after: () => {
+                sql(
+                    db,
+                    "update refunds set state = 'confirmed', tx_signature = 'SigAfterDump', signed_at = now()",
+                );
+            },
+        });
+        const r = restore();
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        const kept = databasesLike(`${db}_before_`)[0]!;
+        expect(sql(db, "select paused, reason from refund_controls")).toBe("t|restore");
+        expect(sql(db, "select paused, refunds_held, reason from x402_controls")).toBe(
+            "t|t|restore",
+        );
+        expect(sql(kept, "select paused from refund_controls")).toBe("f");
+        expect(sql(kept, "select paused, refunds_held from x402_controls")).toBe("f|f");
+        expect(r.out).toContain(
+            `== refunds and x402 payments are paused and x402 refunds held in ${db}\n` +
+                `== rows that differ from ${kept}:\n` +
+                `refunds 1: pending - here, confirmed SigAfterDump in ${kept}\n` +
+                "deposit_moves: not compared, missing from one of the two databases\n",
+        );
+    });
+
+    it("--restore says so when no row that moves money differs", () => {
+        const { restore } = scene({ dumpedAt: 5 });
+        const r = restore();
+        expect(r.code).toBe(0);
+        const kept = databasesLike(`${db}_before_`)[0]!;
+        expect(r.out).toContain(
+            `== no refund, deposit move or x402 payment differs from ${kept}\n`,
+        );
+        expect(r.out).not.toContain("not compared");
     });
 
     it("a failed restore stops nothing and leaves the database as it was", () => {
