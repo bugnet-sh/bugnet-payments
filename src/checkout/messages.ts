@@ -224,18 +224,20 @@ export function depositLine(
                 message = P3;
                 break;
             }
-            if (d.extraMicros > 0) {
-                message =
-                    d.returningMicros > 0
-                        ? `Paid. The extra ${amountLabel(d.extraMicros)} is being returned to the address that sent it.`
-                        : `Paid. The extra ${amountLabel(d.extraMicros)} was returned to the address that sent it.`;
-            } else {
-                // Money that came after the payment, or another way, is worded by its own reason
+            {
+                // Money that came after the payment, or another way, is worded by its own
+                // reason, which names the newest money, ahead of the payment's own extra
                 const other =
                     d.reason !== null && d.reason !== "extra"
                         ? returnLine(d, c, d.returningMicros === 0)
                         : null;
-                message = other ?? "Paid. Go back to your agent; it continues on its own.";
+                if (other !== null) message = other;
+                else if (d.extraMicros > 0) {
+                    message =
+                        d.returningMicros > 0
+                            ? `Paid. The extra ${amountLabel(d.extraMicros)} is being returned to the address that sent it.`
+                            : `Paid. The extra ${amountLabel(d.extraMicros)} was returned to the address that sent it.`;
+                } else message = "Paid. Go back to your agent; it continues on its own.";
             }
             break;
         case "refunding":

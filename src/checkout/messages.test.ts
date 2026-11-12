@@ -191,6 +191,22 @@ describe("deposit lines", () => {
         );
     });
 
+    it("late money on an order paid with extra names the late money, the newest", () => {
+        const late = { reason: "late", reasonMicros: 2_000, extraMicros: 2_000 } as const;
+        expect(line({ status: "paid", ...late, returningMicros: 2_000 }, "paid").message).toBe(
+            "$0.002 arrived after this order closed and is being returned to the address that sent it.",
+        );
+        expect(line({ status: "paid", ...late, returnedMicros: 4_000 }, "paid").message).toBe(
+            "$0.002 arrived after this order closed and was returned to the address that sent it.",
+        );
+        expect(
+            line(
+                { status: "paid", reason: "extra", extraMicros: 2_000, returningMicros: 2_000 },
+                "paid",
+            ).message,
+        ).toBe("Paid. The extra $0.002 is being returned to the address that sent it.");
+    });
+
     it("a wallet-paid order reads Paid while stray deposit money goes back (M6)", () => {
         const stray = { reason: "paid_otherwise", reasonMicros: 2_000 } as const;
         expect(line({ status: "refunding", ...stray }, "paid").label).toBe("Paid");
