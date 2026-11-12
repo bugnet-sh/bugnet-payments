@@ -750,7 +750,9 @@ allowance wallet, money already swept, or review money already carried to the re
   debit's slot, unapplied money first and newest transfer first, a settling payment's applied
   money last. Each part whose sender is known gets a `deposit` refund row from the refund float to
   that sender's source account; the command prints a part with no known sender as
-  `pay by hand`, and support pays it on a signed claim. When the debit took a settling payment's
+  `pay by hand`, and support pays it on a signed claim. A part of Bugnet's own money (kept dust, or
+  a transfer from one of Bugnet's wallets) or below `refund_min_micros` gets no row: it is printed
+  as `kept` and stays written off. When the debit took a settling payment's
   applied money, its sweep can never land: the payment is archived as failed, the order expires
   and every sender's money goes back. It clears the `unknown_debit` review once the ledger matches
   the chain; the job then returns, closes and finishes the deposit. When a sweep is still manual

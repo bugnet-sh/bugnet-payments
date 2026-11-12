@@ -3218,6 +3218,85 @@ describe("deposits commands", () => {
             expect(await writeOffRefunds()).toEqual([]);
         });
 
+        it("keeps a part of Bugnet's own money or below refund_min_micros and pays it nothing", async () => {
+            await seedDeposit(ORDER_A, { deposit: { review_reason: "unknown_debit" } });
+            const a1 = await credit(a, srcA, 20_000);
+            const f1 = await credit(b, srcB, 5_000);
+            const k1 = await credit(b, srcB, 600);
+            for (const [sig, outcome, reason] of [
+                [f1, "review", "from_bugnet"],
+                [k1, "keep", "below_minimum"],
+            ]) {
+                await db.pool.query(
+                    "update deposit_transfers set outcome = $2, reason = $3 where signature = $1",
+                    [sig, outcome, reason],
+                );
+            }
+            const first = await writeOff(theft(15_600));
+            expect(first.io.errText()).not.toContain("error:");
+            expect(first.code).toBe(0);
+            const [ra] = await writeOffRefunds();
+            expect(first.io.outText().split("\n").slice(1)).toEqual([
+                `part ${a1} 10000 refund=${ra!.id} to=${srcA}`,
+                `part ${f1} 5000 refund=- kept: Bugnet's own money`,
+                `part ${k1} 600 refund=- kept: Bugnet's own money`,
+                "review cleared",
+            ]);
+
+            const u1 = await credit(b, srcB, 700, { unattributed: true });
+            const second = await writeOff(theft(900));
+            expect(second.io.errText()).not.toContain("error:");
+            expect(second.code).toBe(0);
+            expect(second.io.outText().split("\n").slice(1)).toEqual([
+                `part ${a1} 200 refund=- kept: below refund_min_micros`,
+                `part ${u1} 700 refund=- kept: below refund_min_micros`,
+            ]);
+            expect(await writeOffRefunds()).toMatchObject([{ id: ra!.id, amountMicros: 10_000 }]);
+            const ledger = (await depositLedger(db.pool, ORDER_A))!;
+            expect(
+                ledger.writeOffParts.map((p) => [p.transferSignature, p.micros, p.refundId]),
+            ).toEqual(
+                expect.arrayContaining([
+                    [a1, 10_000, ra!.id],
+                    [f1, 5_000, null],
+                    [k1, 600, null],
+                    [a1, 200, null],
+                    [u1, 700, null],
+                ]),
+            );
+            expect(ledger.writeOffParts).toHaveLength(5);
+        });
+
+        it("pays a part of kept dust once the write-off expires the payment", async () => {
+            await seedDeposit(ORDER_A, {
+                order: { state: "settling", amountMicros: 30_000 },
+                deposit: { state: "settling", settled_at: CREATED },
+            });
+            await seedPayment(db.pool, ORDER_A);
+            const a1 = await credit(a, srcA, 30_500);
+            await db.pool.query(
+                `update deposit_transfers set outcome = 'paid', reason = 'below_minimum',
+                    applied_micros = 30000
+                 where signature = $1`,
+                [a1],
+            );
+            const dust = await writeOff(theft(500));
+            expect(dust.io.errText()).not.toContain("error:");
+            expect(dust.io.outText().split("\n").slice(1)).toEqual([
+                `part ${a1} 500 refund=- kept: Bugnet's own money`,
+            ]);
+
+            const applied = await writeOff(theft(2_000));
+            expect(applied.io.errText()).not.toContain("error:");
+            expect(applied.code).toBe(0);
+            const [ra] = await writeOffRefunds();
+            expect(applied.io.outText().split("\n").slice(1)).toEqual([
+                `part ${a1} 2000 refund=${ra!.id} to=${srcA}`,
+                `order ${ORDER_A} expired: its payment was written off`,
+            ]);
+            expect(ra).toMatchObject({ amountMicros: 2_000, depositSignature: a1 });
+        });
+
         it("a later part of one transfer joins its pending payout, or is left for support", async () => {
             await seedDeposit(ORDER_A);
             await credit(a, srcA, 20_000);

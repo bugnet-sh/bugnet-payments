@@ -1,7 +1,7 @@
 /**
  * Writing off a debit Bugnet did not sign (spec 23.1). The debit is recorded at its slot, split
- * onto the senders' transfers, and each known sender's part is paid from the refund float; the
- * job then finishes the deposit as usual.
+ * onto the senders' transfers, and each known sender's part is paid from the refund float unless
+ * Bugnet keeps it; the job then finishes the deposit as usual.
  *
  * The split takes the money that was in the account at the debit's slot: unapplied money first,
  * newest transfer first, and a settling payment's applied money last. Taking applied money means
@@ -84,12 +84,29 @@ export function splitDebit(i: SplitInput): { parts: SplitPart[]; shortMicros: nu
     return { parts: inChainOrder, shortMicros: left };
 }
 
+/**
+ * Why a part gets no payout although its sender may be known (owner's ruling, spec 23.1): Bugnet
+ * pays nothing back to itself, and dust is never returned (D1).
+ */
+export function keptReason(
+    t: Pick<TransferRow, "outcome" | "reason">,
+    micros: number,
+    refundMinMicros: number,
+): string | null {
+    const keep = t.outcome === "keep" || (t.outcome === "paid" && t.reason === "below_minimum");
+    if (keep || t.reason === "from_bugnet") return "Bugnet's own money";
+    if (micros < refundMinMicros) return "below refund_min_micros";
+    return null;
+}
+
 export interface WriteOffRequest {
     orderId: string;
     signature: string;
     slot: bigint;
     micros: number;
     olderInSlot: ReadonlySet<string>;
+    // [deposits] refund_min_micros
+    refundMinMicros: number;
     // A read of the account after the debit; review clears only when it matches the ledger
     read: { micros: bigint; contextSlot: bigint } | null;
     at: Date;
@@ -105,6 +122,8 @@ export interface WrittenPart {
     destination: string | null;
     // the payout went into this write-off row of the transfer, which was still pending
     joined: boolean;
+    // why Bugnet keeps the part (keptReason)
+    kept: string | null;
     // why a part of a known sender got no payout: its earlier write-off row is past pending
     unpaid: string | null;
 }
@@ -171,7 +190,6 @@ export async function writeOff(c: pg.PoolClient, w: WriteOffRequest): Promise<Wr
             refused: `the ledger of ${w.orderId} holds ${split.shortMicros} less than the debit`,
         };
     }
-    const bySignature = new Map(ledger.transfers.map((t) => [t.signature, t]));
     const expires = split.parts.some((p) => p.appliedMicros > 0);
     if (expires) {
         // A settling payment's extra is never returned before its sweep lands (rule 1), so no
@@ -207,14 +225,13 @@ export async function writeOff(c: pg.PoolClient, w: WriteOffRequest): Promise<Wr
             refundId: null,
         })),
     );
-    const parts: WrittenPart[] = [];
-    for (const p of split.parts) {
-        parts.push(await payPart(c, w, bySignature.get(p.signature)!, p));
-    }
-
     if (expires) await expireSettling(c, w, order, ledger.transfers, sweeps);
 
     const after = (await depositLedger(c, w.orderId))!;
+    // Paid after the settling path, which gives a payment's kept dust back to its sender
+    const current = new Map(after.transfers.map((t) => [t.signature, t]));
+    const parts: WrittenPart[] = [];
+    for (const p of split.parts) parts.push(await payPart(c, w, current.get(p.signature)!, p));
     const expectedMicros =
         w.read === null
             ? null
@@ -239,9 +256,9 @@ export async function writeOff(c: pg.PoolClient, w: WriteOffRequest): Promise<Wr
 }
 
 /**
- * One float payout per part of a known sender. A transfer has one write-off row: a later part
- * joins it while it is still pending, and is otherwise left for support like money of no known
- * sender (ruling, spec 23.1).
+ * One float payout per part of a known sender that Bugnet does not keep. A transfer has one
+ * write-off row: a later part joins it while it is still pending, and is otherwise left for
+ * support like money of no known sender (ruling, spec 23.1).
  */
 async function payPart(
     c: pg.PoolClient,
@@ -255,7 +272,9 @@ async function payPart(
         appliedMicros: p.appliedMicros,
         destination: t.sourceTokenAccount,
     };
-    const none = { ...base, refundId: null, joined: false, unpaid: null };
+    const none = { ...base, refundId: null, joined: false, kept: null, unpaid: null };
+    const kept = keptReason(t, p.micros, w.refundMinMicros);
+    if (kept !== null) return { ...none, kept };
     if (t.sourceOwner === null || t.sourceTokenAccount === null) return none;
     const group = await lockRefundGroup(c, w.orderId, "deposit");
     const existing = group.find(
@@ -288,7 +307,7 @@ async function payPart(
          where order_id = $1 and signature = $2 and transfer_signature = $3`,
         [w.orderId, w.signature, t.signature, refundId],
     );
-    return { ...base, refundId, joined: existing !== undefined, unpaid: null };
+    return { ...base, refundId, joined: existing !== undefined, kept: null, unpaid: null };
 }
 
 /**

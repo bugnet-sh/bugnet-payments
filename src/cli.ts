@@ -2133,6 +2133,7 @@ function ledgerBefore(ledger: Ledger, slot: bigint, older: ReadonlySet<string>):
 const partLine = (p: WrittenPart): string => {
     const head = `part ${p.transferSignature} ${p.micros}`;
     if (p.refundId !== null) return `${head} refund=${p.refundId} to=${p.destination}`;
+    if (p.kept !== null) return `${head} refund=- kept: ${p.kept}`;
     const why = p.unpaid ?? "no known sender";
     return `${head} refund=- pay by hand: ${why}`;
 };
@@ -2216,6 +2217,7 @@ async function depositsWriteOff(
                 slot,
                 micros,
                 olderInSlot: older,
+                refundMinMicros: ctx.settings.deposits.refund_min_micros,
                 read: { micros: read.micros, contextSlot: read.contextSlot },
                 at: ctx.now(),
                 x402: ctx.settings.x402,
@@ -2234,6 +2236,7 @@ async function depositsWriteOff(
             micros: p.micros,
             refundId: p.refundId,
             joined: p.joined,
+            kept: p.kept,
         })),
         expired: result.expired,
         droppedMoves: result.dropped,

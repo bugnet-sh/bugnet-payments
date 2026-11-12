@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { MoveRow, TransferRow } from "./types.ts";
-import { type SplitInput, splitDebit } from "./writeoff.ts";
+import { keptReason, type SplitInput, splitDebit } from "./writeoff.ts";
 
 const ORDER_ID = "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa";
 const AT = new Date("2030-01-01T00:04:00Z");
@@ -197,5 +197,40 @@ describe("splitDebit", () => {
             ["D1", 5_000, 0],
         ]);
         expect(split({ transfers, micros: 75_000 }).shortMicros).toBe(5_000);
+    });
+});
+
+describe("keptReason", () => {
+    it.each([
+        ["kept dust", { outcome: "keep", reason: "below_minimum" }, 5_000, "Bugnet's own money"],
+        [
+            "a paid transfer's kept dust",
+            { outcome: "paid", reason: "below_minimum" },
+            5_000,
+            "Bugnet's own money",
+        ],
+        [
+            "Bugnet's own wallet",
+            { outcome: "review", reason: "from_bugnet" },
+            5_000,
+            "Bugnet's own money",
+        ],
+        [
+            "a part below the minimum",
+            { outcome: "open", reason: null },
+            999,
+            "below refund_min_micros",
+        ],
+        [
+            "dust of no known sender",
+            { outcome: "review", reason: "unattributed" },
+            999,
+            "below refund_min_micros",
+        ],
+        ["a part at the minimum", { outcome: "open", reason: null }, 1_000, null],
+        ["a paid transfer's extra", { outcome: "paid", reason: "extra" }, 5_000, null],
+        ["a return", { outcome: "return", reason: "unpaid" }, 5_000, null],
+    ] as const)("%s", (_, over, micros, reason) => {
+        expect(keptReason(t("A1", 30_000, 100, over), micros, 1_000)).toBe(reason);
     });
 });
