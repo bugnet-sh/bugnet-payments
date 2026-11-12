@@ -1184,6 +1184,8 @@ function databasesLike(prefix: string): string[] {
     return out === "" ? [] : out.split("\n").toSorted();
 }
 
+const orderId = (c: string) => `ord_${c.repeat(26)}`;
+
 describe("vps-install.sh restore", () => {
     const PRE = MIGRATION_FILES.slice(0, 4);
     const LATER = MIGRATION_FILES.slice(4);
@@ -1383,9 +1385,12 @@ describe("vps-install.sh restore", () => {
     });
 
     it("--restore lists every order whose state or refund times moved on after the dump", () => {
-        const [PAID, SEEN, SAME, LATER_ORDER] = ["a", "b", "c", "d"].map(
-            (c) => `ord_${c.repeat(26)}`,
-        );
+        const [PAID, SEEN, SAME, LATER_ORDER] = [
+            orderId("a"),
+            orderId("b"),
+            orderId("c"),
+            orderId("d"),
+        ];
         const insert = `insert into orders (id, kind, package_id, amount_micros, description,
             claim_sha256, state, expires_at, paid_at, redeemed_at, token_expires_at) values`;
         const { restore } = scene({
@@ -1429,9 +1434,12 @@ describe("vps-install.sh restore", () => {
     });
 
     it("--restore lists each deposit with moves or transfers after the dump", () => {
-        const [MOVED, CREDITED, SAME, LATER_DEPOSIT] = ["e", "f", "g", "h"].map(
-            (c) => `ord_${c.repeat(26)}`,
-        );
+        const [MOVED, CREDITED, SAME, LATER_DEPOSIT] = [
+            orderId("e"),
+            orderId("f"),
+            orderId("g"),
+            orderId("h"),
+        ];
         const orders = (ids: string[]) =>
             sql(
                 db,
