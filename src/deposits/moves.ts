@@ -62,7 +62,7 @@ import {
     setTransferOutcomes,
     updateDeposit,
 } from "./store.ts";
-import type { DepositRow, MoveRow, MoveState, TransferRow } from "./types.ts";
+import type { DepositRow, MoveRow, MoveState, TransferRow, WriteOffRow } from "./types.ts";
 
 export interface MoveDeps {
     // The money lane: every executor call, the re-sign proof's read and scan included
@@ -111,7 +111,11 @@ export interface MoveTick {
     waitingProof: number;
 }
 
-type Ledger = { transfers: readonly TransferRow[]; moves: readonly MoveRow[] };
+type Ledger = {
+    transfers: readonly TransferRow[];
+    moves: readonly MoveRow[];
+    writeOffs: readonly WriteOffRow[];
+};
 type Landed = { signature: string; slot: bigint };
 type Proof = { kind: "absent" } | { kind: "wait" } | ({ kind: "landed" } & Landed);
 // onchain: the chain failed it; refused: refused at preflight and proven never landed; expired:
@@ -260,6 +264,7 @@ export async function guardRead(
         deposit.checkedSlot ?? 0n,
         ...ledger.transfers.map((t) => t.slot),
         ...ledger.moves.flatMap((m) => (m.landedSlot === null ? [] : [m.landedSlot])),
+        ...ledger.writeOffs.map((w) => w.slot),
     ]);
     const read = (
         await viaRpc(() =>
@@ -274,7 +279,13 @@ export async function guardRead(
         slot: read.contextSlot,
         micros: read.micros,
     });
-    if (read.micros < expectedBalanceAt(ledger.transfers, ledger.moves, read.contextSlot)) {
+    const expected = expectedBalanceAt(
+        ledger.transfers,
+        ledger.moves,
+        ledger.writeOffs,
+        read.contextSlot,
+    );
+    if (read.micros < expected) {
         return out("below_ledger");
     }
     if (move.closes && read.micros !== takesOut(move)) {
@@ -776,7 +787,12 @@ async function proveAbsent(
     }
     if (!result.complete) return { kind: "wait" };
     const { read } = result;
-    const expected = expectedBalanceAt(ledger.transfers, ledger.moves, read.contextSlot);
+    const expected = expectedBalanceAt(
+        ledger.transfers,
+        ledger.moves,
+        ledger.writeOffs,
+        read.contextSlot,
+    );
     return read.micros === expected ? { kind: "absent" } : { kind: "wait" };
 }
 

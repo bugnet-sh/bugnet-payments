@@ -308,7 +308,12 @@ async function planFor(id: string, r: ScanResult): Promise<Plan> {
         order,
         deposit: ledger.deposit,
         read: { ...r.read, invariant: r.invariant },
-        expectedMicros: expectedBalanceAt(ledger.transfers, ledger.moves, r.read.contextSlot),
+        expectedMicros: expectedBalanceAt(
+            ledger.transfers,
+            ledger.moves,
+            ledger.writeOffs,
+            r.read.contextSlot,
+        ),
         transfers: ledger.transfers,
         moves: ledger.moves,
         holds: ledger.holds,

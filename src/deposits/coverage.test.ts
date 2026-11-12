@@ -33,6 +33,7 @@ function t(
         blockedUntil: null,
         moveId: null,
         refundId: null,
+        lostMicros: 0,
         ...over,
     };
 }

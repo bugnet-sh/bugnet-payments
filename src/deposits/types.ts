@@ -83,6 +83,26 @@ export interface TransferRow {
     blockedUntil: Date | null;
     moveId: number | null;
     refundId: number | null;
+    // The sum of its write-off parts: money a debit Bugnet did not sign took from it (spec 23.1)
+    lostMicros: number;
+}
+
+// A debit Bugnet did not sign, written off by an operator (spec 23.1)
+export interface WriteOffRow {
+    orderId: string;
+    signature: string;
+    slot: bigint;
+    micros: number;
+    writtenAt: Date;
+}
+
+// refundId: the float payout of a part whose sender is known
+export interface WriteOffPartRow {
+    orderId: string;
+    signature: string;
+    transferSignature: string;
+    micros: number;
+    refundId: number | null;
 }
 
 export interface MoveRow {
@@ -146,7 +166,7 @@ export type NewMove = Pick<
 >;
 export type NewTransfer = Omit<
     TransferRow,
-    "outcome" | "appliedMicros" | "reason" | "blockedUntil" | "moveId" | "refundId"
+    "outcome" | "appliedMicros" | "reason" | "blockedUntil" | "moveId" | "refundId" | "lostMicros"
 >;
 
 export type DepositStatus =

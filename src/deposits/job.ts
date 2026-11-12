@@ -510,7 +510,15 @@ export async function runDepositTick(d: DepositJobDeps): Promise<DepositTick> {
                 const ledger = await depositLedger(d.pool, deposit.orderId);
                 if (ledger === null) continue;
                 noteProgress(m, ledger, c.nowMs);
-                if (needsScan(ledger.deposit, read, ledger.transfers, ledger.moves)) {
+                if (
+                    needsScan(
+                        ledger.deposit,
+                        read,
+                        ledger.transfers,
+                        ledger.moves,
+                        ledger.writeOffs,
+                    )
+                ) {
                     m.scanDue = true;
                     continue;
                 }
@@ -815,7 +823,12 @@ async function planInput(
         order,
         deposit,
         read,
-        expectedMicros: expectedBalanceAt(ledger.transfers, ledger.moves, read.contextSlot),
+        expectedMicros: expectedBalanceAt(
+            ledger.transfers,
+            ledger.moves,
+            ledger.writeOffs,
+            read.contextSlot,
+        ),
         transfers: ledger.transfers,
         moves: ledger.moves,
         holds: ledger.holds,
@@ -1155,7 +1168,8 @@ async function pushHardStops(c: TickContext, watched: readonly DepositRow[]): Pr
         const pushed = c.nowMs + cfg.expire_hard_after;
         if (pushed > expiryDueAt.getTime() + cfg.expire_hard_max) continue;
         const unrecorded =
-            latest.micros - expectedBalanceAt(ledger.transfers, ledger.moves, latest.contextSlot);
+            latest.micros -
+            expectedBalanceAt(ledger.transfers, ledger.moves, ledger.writeOffs, latest.contextSlot);
         const cov = coverage(
             order.amountMicros,
             ledger.transfers,

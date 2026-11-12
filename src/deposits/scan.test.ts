@@ -24,7 +24,7 @@ import {
     TxCache,
     unexplainedIn,
 } from "./scan.ts";
-import { depositLedger, ensureDeposit, findDeposit, insertMove } from "./store.ts";
+import { depositLedger, ensureDeposit, findDeposit, insertMove, insertWriteOff } from "./store.ts";
 import type { DepositRow, MoveRow, MoveState, NewMove, TransferRow } from "./types.ts";
 
 const ORDER_A = "ord_aaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -72,7 +72,8 @@ beforeEach(async () => {
     log = memoryLog();
     cache = new TxCache(10_000);
     await db.pool.query(
-        `delete from deposit_transfers; delete from deposit_moves; delete from deposit_holds;
+        `delete from deposit_write_off_parts; delete from deposit_write_offs;
+         delete from deposit_transfers; delete from deposit_moves; delete from deposit_holds;
          delete from deposits; delete from orders`,
     );
 });
@@ -298,7 +299,7 @@ describe("scanDeposit", () => {
         const mark = chain.calls().length;
         const r = await readNow();
         const l = await ledger();
-        expect(needsScan(l.deposit, r, l.transfers, l.moves)).toBe(false);
+        expect(needsScan(l.deposit, r, l.transfers, l.moves, l.writeOffs)).toBe(false);
         expect(callsSince(mark, "getSignaturesForAddress")).toHaveLength(0);
     });
 
@@ -343,7 +344,7 @@ describe("scanDeposit", () => {
         // The job records a read that needs no scan, so the cursor stays behind the padding
         const held = await readNow();
         let l = await ledger();
-        expect(needsScan(l.deposit, held, l.transfers, l.moves)).toBe(false);
+        expect(needsScan(l.deposit, held, l.transfers, l.moves, l.writeOffs)).toBe(false);
         await recordRead(db.pool, l.deposit, held, "held", clock);
         trail.reanchor(held.contextSlot, held.micros);
 
@@ -454,7 +455,9 @@ describe("scanDeposit", () => {
         });
         expect(callsSince(mark, "getTransaction").map((c) => c.params[0])).toEqual([pad]);
         let l = await ledger();
-        expect(unexplainedIn(trail.intervals()[0]!, l.transfers, l.moves)).toBe(7_000n);
+        expect(unexplainedIn(trail.intervals()[0]!, l.transfers, l.moves, l.writeOffs)).toBe(
+            7_000n,
+        );
         expect(l.transfers).toEqual([]);
         expect(l.deposit.lastSignature).toBe(cursor);
 
@@ -500,7 +503,9 @@ describe("scanDeposit", () => {
             [move.id, retSlot.toString()],
         );
         l = await ledger();
-        expect(unexplainedIn(trail.intervals()[0]!, l.transfers, l.moves)).toBe(2_000n);
+        expect(unexplainedIn(trail.intervals()[0]!, l.transfers, l.moves, l.writeOffs)).toBe(
+            2_000n,
+        );
         expect((await scanDeposit(deps(), dep, trail)).invariant).toBe("held");
         l = await ledger();
         expect(l.transfers.map((t) => t.signature)).toEqual([first, credit]);
@@ -658,7 +663,7 @@ describe("scanDeposit", () => {
         expect((await scanDeposit(deps(), dep, trail)).invariant).toBe("held");
         const l = await ledger();
         expect(l.moves.find((m) => m.id === move.id)?.landedSlot).toBeNull();
-        expect(expectedBalanceAt(l.transfers, l.moves, r.contextSlot)).toBe(7_001n);
+        expect(expectedBalanceAt(l.transfers, l.moves, l.writeOffs, r.contextSlot)).toBe(7_001n);
     });
 
     it("an equal return and deposit in one interval start a scan", async () => {
@@ -680,8 +685,8 @@ describe("scanDeposit", () => {
         const r = await readNow();
         const l = await ledger();
         expect(r.micros).toBe(l.deposit.balanceMicros);
-        expect(expectedBalanceAt(l.transfers, l.moves, r.contextSlot)).toBe(0n);
-        expect(needsScan(l.deposit, r, l.transfers, l.moves)).toBe(true);
+        expect(expectedBalanceAt(l.transfers, l.moves, l.writeOffs, r.contextSlot)).toBe(0n);
+        expect(needsScan(l.deposit, r, l.transfers, l.moves, l.writeOffs)).toBe(true);
         trail.push(r);
         expect((await scanDeposit(deps(), dep, trail)).invariant).toBe("held");
     });
@@ -770,6 +775,90 @@ describe("scanDeposit", () => {
         await scanDeposit(deps(), dep, trail);
         expect(alarms("deposit_unknown_debit")).toHaveLength(1);
         expect(alarms("deposit_review")).toHaveLength(1);
+    });
+
+    it("a written-off debit is explained, and a restart never flags it again", async () => {
+        const { dep, trail } = await deposit();
+        const sent = await send(5_000n);
+        expect((await scanNow(dep, trail)).invariant).toBe("held");
+        const anchor = (await ledger()).deposit;
+        const debit = chain.debit(TOKEN_A, 1_000n);
+        expect((await scanNow(dep, trail)).invariant).toBe("below");
+        expect(alarms("deposit_unknown_debit")).toHaveLength(1);
+        const { value } = await chain.rpc
+            .getSignatureStatuses([debit as never], { searchTransactionHistory: true })
+            .send();
+        await withTx(db.pool, async (c) => {
+            await insertWriteOff(
+                c,
+                {
+                    orderId: ORDER_A,
+                    signature: debit,
+                    slot: BigInt(value[0]!.slot),
+                    micros: 1_000,
+                    writtenAt: clock,
+                },
+                [{ transferSignature: sent, micros: 1_000, refundId: null }],
+            );
+            await c.query("update deposits set review_reason = null where order_id = $1", [
+                ORDER_A,
+            ]);
+        });
+
+        // A new process: a trail from the stored anchor, from before the debit, and no cache
+        const restarted = new ReadTrail({
+            slot: anchor.checkedSlot!,
+            micros: anchor.balanceMicros,
+        });
+        cache = new TxCache(10_000);
+        const mark = chain.calls().length;
+        expect((await scanNow(dep, restarted)).invariant).toBe("held");
+        expect(callsSince(mark, "getTransaction")).toEqual([]);
+        expect(alarms("deposit_unknown_debit")).toHaveLength(1);
+        expect(alarms("deposit_review")).toHaveLength(1);
+        expect((await ledger()).deposit).toMatchObject({
+            reviewReason: null,
+            balanceMicros: 4_000n,
+        });
+        // The cursor passed the debit, and the old trail agrees
+        expect((await scanNow(dep, trail)).invariant).toBe("held");
+    });
+
+    it("a written-off debit is never fetched again while money beside it is not listed yet", async () => {
+        const { dep, trail } = await deposit();
+        const sent = await send(5_000n);
+        expect((await scanNow(dep, trail)).invariant).toBe("held");
+        const anchor = (await ledger()).deposit;
+        const debit = chain.debit(TOKEN_A, 1_000n);
+        const [newest] = await chain.rpc
+            .getSignaturesForAddress(TOKEN_A as Address, { limit: 1 })
+            .send();
+        await withTx(db.pool, (c) =>
+            insertWriteOff(
+                c,
+                {
+                    orderId: ORDER_A,
+                    signature: debit,
+                    slot: BigInt(newest!.slot),
+                    micros: 1_000,
+                    writtenAt: clock,
+                },
+                [{ transferSignature: sent, micros: 1_000, refundId: null }],
+            ),
+        );
+        chain.advance(1);
+        const hidden = await send(2_000n);
+        chain.hideFromIndex(hidden, 60_000);
+        const restarted = new ReadTrail({
+            slot: anchor.checkedSlot!,
+            micros: anchor.balanceMicros,
+        });
+        cache = new TxCache(10_000);
+        const mark = chain.calls().length;
+        expect((await scanNow(dep, restarted)).invariant).toBe("above");
+        expect(callsSince(mark, "getTransaction")).toEqual([]);
+        expect(alarms("deposit_unknown_debit")).toHaveLength(0);
+        expect((await ledger()).deposit.reviewReason).toBeNull();
     });
 
     it("a lagging index leaves the read above the ledger", async () => {
@@ -1014,6 +1103,7 @@ describe("pure parts", () => {
         blockedUntil: null,
         moveId: null,
         refundId: null,
+        lostMicros: 0,
     });
     const move = (over: Partial<MoveRow>): MoveRow => ({
         id: 1,
@@ -1048,9 +1138,9 @@ describe("pure parts", () => {
     it("expectedBalanceAt", () => {
         const transfers = [transfer(10n, 30_000), transfer(11n, 30_000)];
         const sweep = move({ kind: "sweep", amountMicros: 50_000, landedSlot: 12n });
-        expect(expectedBalanceAt(transfers, [sweep], 12n)).toBe(10_000n);
+        expect(expectedBalanceAt(transfers, [sweep], [], 12n)).toBe(10_000n);
         const failed = move({ amountMicros: 7_000, state: "failed" });
-        expect(expectedBalanceAt(transfers, [sweep, failed], 12n)).toBe(10_000n);
+        expect(expectedBalanceAt(transfers, [sweep, failed], [], 12n)).toBe(10_000n);
         const close = move({
             kind: "close",
             keepMicros: 500,
@@ -1058,32 +1148,59 @@ describe("pure parts", () => {
             closes: true,
             landedSlot: 13n,
         });
-        expect(expectedBalanceAt(transfers, [close], 13n)).toBe(52_500n);
-        expect(expectedBalanceAt(transfers, [close], 12n)).toBe(60_000n);
+        expect(expectedBalanceAt(transfers, [close], [], 13n)).toBe(52_500n);
+        expect(expectedBalanceAt(transfers, [close], [], 12n)).toBe(60_000n);
+    });
+
+    it("expectedBalanceAt subtracts each write-off at its slot", () => {
+        const transfers = [transfer(10n, 30_000), transfer(11n, 30_000)];
+        const theft = [{ slot: 12n, micros: 25_000 }];
+        expect(expectedBalanceAt(transfers, [], theft, 11n)).toBe(60_000n);
+        expect(expectedBalanceAt(transfers, [], theft, 12n)).toBe(35_000n);
+        const twice = [...theft, { slot: 14n, micros: 5_000 }];
+        expect(expectedBalanceAt(transfers, [], twice, 13n)).toBe(35_000n);
+        expect(expectedBalanceAt(transfers, [], twice, 14n)).toBe(30_000n);
     });
 
     it("unexplainedIn", () => {
         const interval = { from: { slot: 10n, micros: 0n }, to: read(20n, 7_000n) };
-        expect(unexplainedIn(interval, [], [])).toBe(7_000n);
-        expect(unexplainedIn(interval, [transfer(15n, 7_000)], [])).toBe(0n);
-        expect(unexplainedIn(interval, [transfer(10n, 7_000)], [])).toBe(7_000n);
+        expect(unexplainedIn(interval, [], [], [])).toBe(7_000n);
+        expect(unexplainedIn(interval, [transfer(15n, 7_000)], [], [])).toBe(0n);
+        expect(unexplainedIn(interval, [transfer(10n, 7_000)], [], [])).toBe(7_000n);
         const unchanged = { from: { slot: 10n, micros: 7_000n }, to: read(20n, 7_000n) };
         const landed = move({ amountMicros: 2_000, landedSlot: 15n });
-        expect(unexplainedIn(unchanged, [], [landed])).toBe(2_000n);
+        expect(unexplainedIn(unchanged, [], [landed], [])).toBe(2_000n);
+    });
+
+    it("unexplainedIn explains a write-off inside the interval", () => {
+        const fell = { from: { slot: 10n, micros: 7_000n }, to: read(20n, 3_000n) };
+        expect(unexplainedIn(fell, [], [], [])).toBe(-4_000n);
+        expect(unexplainedIn(fell, [], [], [{ slot: 15n, micros: 4_000 }])).toBe(0n);
+        expect(unexplainedIn(fell, [], [], [{ slot: 10n, micros: 4_000 }])).toBe(-4_000n);
+        expect(unexplainedIn(fell, [], [], [{ slot: 21n, micros: 4_000 }])).toBe(-4_000n);
     });
 
     it("needsScan names every reason to scan", async () => {
         const { dep } = await deposit(ORDER_A, { create: false });
         const quiet: DepositRow = { ...dep, rentPayer: "Fee", scanSlot: 20n };
         const r = read(30n, 0n);
-        expect(needsScan(quiet, r, [], [])).toBe(false);
-        expect(needsScan(quiet, read(30n, 5n), [], [])).toBe(true);
-        expect(needsScan({ ...quiet, balanceMicros: 5n }, r, [], [])).toBe(true);
-        expect(needsScan({ ...quiet, scanTop: "x" }, r, [], [])).toBe(true);
-        expect(needsScan({ ...quiet, rentPayer: null }, r, [], [])).toBe(true);
-        expect(needsScan(quiet, r, [], [move({ state: "sent" })])).toBe(true);
-        expect(needsScan(quiet, r, [], [move({ kind: "create", landedSlot: 25n })])).toBe(true);
-        expect(needsScan(quiet, r, [], [move({ kind: "create", landedSlot: 15n })])).toBe(false);
+        expect(needsScan(quiet, r, [], [], [])).toBe(false);
+        expect(needsScan(quiet, read(30n, 5n), [], [], [])).toBe(true);
+        expect(needsScan({ ...quiet, balanceMicros: 5n }, r, [], [], [])).toBe(true);
+        expect(needsScan({ ...quiet, scanTop: "x" }, r, [], [], [])).toBe(true);
+        expect(needsScan({ ...quiet, rentPayer: null }, r, [], [], [])).toBe(true);
+        expect(needsScan(quiet, r, [], [move({ state: "sent" })], [])).toBe(true);
+        expect(needsScan(quiet, r, [], [move({ kind: "create", landedSlot: 25n })], [])).toBe(true);
+        expect(needsScan(quiet, r, [], [move({ kind: "create", landedSlot: 15n })], [])).toBe(
+            false,
+        );
+        // A written-off debit is part of the ledger the read is compared with
+        const robbed = { ...quiet, balanceMicros: 3_000n };
+        const after = read(30n, 3_000n);
+        expect(needsScan(robbed, after, [transfer(10n, 7_000)], [], [])).toBe(true);
+        expect(
+            needsScan(robbed, after, [transfer(10n, 7_000)], [], [{ slot: 25n, micros: 4_000 }]),
+        ).toBe(false);
     });
 
     it("stable_since follows the balance", async () => {

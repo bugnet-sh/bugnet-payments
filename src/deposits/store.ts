@@ -23,6 +23,8 @@ import type {
     TransferOutcome,
     TransferReason,
     TransferRow,
+    WriteOffPartRow,
+    WriteOffRow,
 } from "./types.ts";
 
 type Int8 = string | number | bigint;
@@ -79,6 +81,23 @@ interface TransferDbRow extends pg.QueryResultRow {
     reason: TransferReason | null;
     blocked_until: Date | null;
     move_id: Int8 | null;
+    refund_id: Int8 | null;
+    lost_micros: Int8;
+}
+
+interface WriteOffDbRow extends pg.QueryResultRow {
+    order_id: string;
+    signature: string;
+    slot: Int8;
+    micros: Int8;
+    written_at: Date;
+}
+
+interface WriteOffPartDbRow extends pg.QueryResultRow {
+    order_id: string;
+    signature: string;
+    transfer_signature: string;
+    micros: Int8;
     refund_id: Int8 | null;
 }
 
@@ -187,8 +206,34 @@ function toTransfer(r: TransferDbRow): TransferRow {
         blockedUntil: r.blocked_until,
         moveId: num(r.move_id),
         refundId: num(r.refund_id),
+        lostMicros: Number(r.lost_micros),
     };
 }
+
+function toWriteOff(r: WriteOffDbRow): WriteOffRow {
+    return {
+        orderId: r.order_id,
+        signature: r.signature,
+        slot: BigInt(r.slot),
+        micros: Number(r.micros),
+        writtenAt: r.written_at,
+    };
+}
+
+function toWriteOffPart(r: WriteOffPartDbRow): WriteOffPartRow {
+    return {
+        orderId: r.order_id,
+        signature: r.signature,
+        transferSignature: r.transfer_signature,
+        micros: Number(r.micros),
+        refundId: num(r.refund_id),
+    };
+}
+
+// Every transfer read carries lost_micros, the sum of its write-off parts
+const TRANSFERS_SQL = `select t.*, coalesce((select sum(p.micros) from deposit_write_off_parts p
+        where p.order_id = t.order_id and p.transfer_signature = t.signature), 0) as lost_micros
+    from deposit_transfers t where t.order_id = $1`;
 
 function toMove(r: MoveDbRow): MoveRow {
     return {
@@ -302,11 +347,13 @@ export async function depositLedger(
     moves: MoveRow[];
     holds: HoldRow[];
     depositRefunds: RefundRow[];
+    writeOffs: WriteOffRow[];
+    writeOffParts: WriteOffPartRow[];
 } | null> {
     const deposit = await findDeposit(db, orderId);
     if (deposit === null) return null;
     const transfers = await db.query<TransferDbRow>(
-        "select * from deposit_transfers where order_id = $1 order by slot, seq, signature",
+        `${TRANSFERS_SQL} order by t.slot, t.seq, t.signature`,
         [orderId],
     );
     const moves = await db.query<MoveDbRow>(
@@ -323,7 +370,47 @@ export async function depositLedger(
         moves: moves.rows.map(toMove),
         holds: await holdsOf(db, orderId),
         depositRefunds: refunds.rows.map(toRefund),
+        ...(await writeOffsOf(db, orderId)),
     };
+}
+
+export async function writeOffsOf(
+    db: Queryable,
+    orderId: string,
+): Promise<{ writeOffs: WriteOffRow[]; writeOffParts: WriteOffPartRow[] }> {
+    const writeOffs = await db.query<WriteOffDbRow>(
+        "select * from deposit_write_offs where order_id = $1 order by slot, signature",
+        [orderId],
+    );
+    const parts = await db.query<WriteOffPartDbRow>(
+        `select * from deposit_write_off_parts where order_id = $1
+         order by signature, transfer_signature`,
+        [orderId],
+    );
+    return {
+        writeOffs: writeOffs.rows.map(toWriteOff),
+        writeOffParts: parts.rows.map(toWriteOffPart),
+    };
+}
+
+export async function insertWriteOff(
+    c: pg.PoolClient,
+    w: WriteOffRow,
+    parts: readonly Omit<WriteOffPartRow, "orderId" | "signature">[],
+): Promise<void> {
+    await c.query(
+        `insert into deposit_write_offs (order_id, signature, slot, micros, written_at)
+         values ($1, $2, $3, $4, $5)`,
+        [w.orderId, w.signature, w.slot.toString(), w.micros, w.writtenAt],
+    );
+    for (const p of parts) {
+        await c.query(
+            `insert into deposit_write_off_parts (order_id, signature, transfer_signature, micros,
+                refund_id)
+             values ($1, $2, $3, $4, $5)`,
+            [w.orderId, w.signature, p.transferSignature, p.micros, p.refundId],
+        );
+    }
 }
 
 export async function insertTransfers(
@@ -423,18 +510,16 @@ export async function insertMove(
 
 /**
  * The planner reads the ledger without a lock. A step it plans checks under the deposit lock that
- * no transfer changed since that read, so an operator's return-to that committed in between is
- * never carried by a stale move or overwritten by a stale outcome (spec 17); the tick plans again.
+ * no transfer changed since that read, so an operator's return-to or write-off that committed in
+ * between is never carried by a stale move or overwritten by a stale outcome (spec 17, 23.1); the
+ * tick plans again.
  */
 export async function transfersChanged(
     c: pg.PoolClient,
     orderId: string,
     read: readonly TransferRow[],
 ): Promise<boolean> {
-    const { rows } = await c.query<TransferDbRow>(
-        "select * from deposit_transfers where order_id = $1",
-        [orderId],
-    );
+    const { rows } = await c.query<TransferDbRow>(TRANSFERS_SQL, [orderId]);
     if (rows.length !== read.length) return true;
     const before = new Map(read.map((t) => [t.signature, t]));
     return rows.map(toTransfer).some((t) => {
@@ -446,6 +531,7 @@ export async function transfersChanged(
             b.appliedMicros !== t.appliedMicros ||
             b.moveId !== t.moveId ||
             b.refundId !== t.refundId ||
+            b.lostMicros !== t.lostMicros ||
             b.sourceTokenAccount !== t.sourceTokenAccount ||
             b.sourceOwner !== t.sourceOwner
         );
