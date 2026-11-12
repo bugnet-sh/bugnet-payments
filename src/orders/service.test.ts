@@ -363,6 +363,32 @@ describe("redeem", () => {
         }
     });
 
+    it("puts fee_micros in a start token only when fee_claim is on, off by default", async () => {
+        const flag = app.settings.router;
+        const was = flag.fee_claim;
+        expect(was).toBe(false);
+        try {
+            for (const on of [true, false]) {
+                flag.fee_claim = on;
+                const { order, claim } = await seedPaid({
+                    allowanceMicros: 500_000,
+                    feeMicros: 3_000,
+                    amountMicros: 553_000,
+                    payInto: "allowance",
+                });
+                await seedAccount(app.pool, { id: order.id, handleSha256: null });
+                const r = await post(app, "/v1/orders", { orderId: order.id, claim });
+                expect(r.body.status).toBe("paid");
+                const claims = tokenClaims(r.body.orderToken) as Record<string, unknown>;
+                if (on)
+                    expect(claims).toMatchObject({ allowance_micros: 500_000, fee_micros: 3_000 });
+                else expect(claims).not.toHaveProperty("fee_micros");
+            }
+        } finally {
+            flag.fee_claim = was;
+        }
+    });
+
     describe("issued_at claim", () => {
         async function redeem(on: boolean, order: Partial<OrderRow>) {
             const flag = app.settings.router;
