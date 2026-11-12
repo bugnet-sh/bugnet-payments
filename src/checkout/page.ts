@@ -342,7 +342,15 @@ h2 {
 .qr { margin: 0; }
 .qr svg { display: block; width: var(--qr); height: var(--qr); background: var(--qr-paper); }
 .qr img { display: block; width: var(--qr); height: var(--qr); background: var(--qr-paper); }
-.usdc { width: var(--usdc-icon); height: var(--usdc-icon); flex-shrink: 0; vertical-align: middle; }
+/* Centred on the capitals of the text beside it, measured from the baseline, so every engine agrees */
+.usdc {
+    width: var(--usdc-icon);
+    height: var(--usdc-icon);
+    flex-shrink: 0;
+    vertical-align: -0.3em;
+    vertical-align: calc((1cap - var(--usdc-icon)) / 2);
+}
+.with-usdc .usdc { margin-right: var(--space-2); }
 .note { margin: var(--space-3) 0 0; color: var(--text-muted); }
 #deposit-message, #wallet-note { min-height: var(--ui-line); margin: var(--space-3) 0 0; }
 .qr figcaption { margin-top: var(--space-3); color: var(--text-muted); }
@@ -437,7 +445,7 @@ function depositSection(v: CheckoutView, deposit: DepositView): string {
 <div id="deposit-ask"${askHidden}>
 <h2>Send USDC to this address</h2>
 <dl class="facts">
-<div><dt>Amount</dt><dd>${USDC_ICON} <span id="deposit-amount">${ask.plain} USDC</span> ${copyButton(ask.plain, "deposit-amount-copy")}</dd></div>
+<div><dt>Amount</dt><dd><span class="with-usdc">${USDC_ICON}<span id="deposit-amount">${ask.plain} USDC</span></span> ${copyButton(ask.plain, "deposit-amount-copy")}</dd></div>
 <div><dt>Network</dt><dd>Solana</dd></div>
 <div><dt>Address</dt><dd><code>${escapeHtml(deposit.address)}</code> ${copyButton(deposit.address)}</dd></div>
 </dl>
