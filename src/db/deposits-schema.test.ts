@@ -417,6 +417,23 @@ describe("migration 00007", () => {
         await part(id, sigs[3]!, { refundId });
     });
 
+    it("a transfer of a payment a write-off failed goes back with its own reason", async () => {
+        const id = await freshDeposit();
+        const sig = "e".repeat(88);
+        await transfer(id, sig);
+        const set = (reason: string) =>
+            db.pool.query(
+                `update deposit_transfers set outcome = 'return', reason = $3
+                 where order_id = $1 and signature = $2`,
+                [id, sig, reason],
+            );
+        await set("written_off");
+        expect(await failure(set("stolen"))).toEqual({
+            code: "23514",
+            constraint: "deposit_transfers_reason_check",
+        });
+    });
+
     it("one theft transaction gives one row per deposit", async () => {
         const a = await freshDeposit();
         const b = await freshDeposit();

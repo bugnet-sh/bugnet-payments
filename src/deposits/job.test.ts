@@ -2186,8 +2186,8 @@ describe("flows on FakeChain", () => {
             expect(
                 (await ledgerOf()).transfers.map((t) => [t.outcome, t.reason, t.appliedMicros]),
             ).toEqual([
-                ["return", "unpaid", 0],
-                ["return", "unpaid", 0],
+                ["return", "written_off", 0],
+                ["return", "written_off", 0],
             ]);
             expect(await writeOffRows()).toEqual([[sources.B, 20_000, "pending"]]);
 

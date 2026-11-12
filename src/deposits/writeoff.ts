@@ -365,7 +365,8 @@ async function payPart(
 /**
  * Spec 23.1, settling payment: the sweep can no longer land. It fails for good, the payments row
  * is archived as a failed x402 payment is, the order expires, and every applied transfer goes
- * back with nothing applied and the shares gone. No token was issued for a settling order.
+ * back as written_off with nothing applied and the shares gone. No token was issued for a
+ * settling order.
  */
 async function expireSettling(
     c: pg.PoolClient,
@@ -408,7 +409,7 @@ async function expireSettling(
                     : {
                           signature: t.signature,
                           outcome: "return",
-                          reason: "unpaid",
+                          reason: "written_off",
                           appliedMicros: 0,
                           moveId: null,
                       },

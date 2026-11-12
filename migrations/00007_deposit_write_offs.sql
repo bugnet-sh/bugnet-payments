@@ -45,3 +45,11 @@ create unique index refunds_deposit_once on refunds (order_id, deposit_signature
 alter table failed_payments drop constraint failed_payments_reason_check;
 alter table failed_payments add constraint failed_payments_reason_check
     check (reason in ('onchain_failed', 'blockhash_expired', 'written_off'));
+
+-- A settling payment a write-off failed goes back to its senders as written_off
+alter table deposit_transfers drop constraint deposit_transfers_reason_check;
+alter table deposit_transfers add constraint deposit_transfers_reason_check check (reason in
+    ('extra', 'unpaid', 'late', 'after_paid', 'paid_otherwise', 'payer_blocked', 'payer_busy',
+     'payer_rate_limited', 'pool_busy', 'router_unavailable', 'allowance_unavailable',
+     'below_minimum', 'operator', 'unattributed', 'unreadable', 'from_bugnet', 'late_limit',
+     'return_destination_invalid', 'return_failed', 'written_off'));
