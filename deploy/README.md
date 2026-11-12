@@ -849,17 +849,44 @@ sudo ls -l /var/backups/bugnet-payments
 
 ```sh
 v=$(cat /etc/bugnet/payments.release)
-dump=/var/backups/bugnet-payments/bugnet_payments-<UTC stamp>.dump
-sudo systemctl stop "bugnet-payments@$v"
-# postgres cannot read the root-only folder, so root opens the dump
-sudo sh -c 'runuser -u postgres -- pg_restore --clean --if-exists --single-transaction \
-    -d bugnet_payments <"$0"' "$dump"
-sudo "/opt/bugnet/payments/$v/deploy/vps-install.sh" --start
+sudo "/opt/bugnet/payments/$v/deploy/vps-install.sh" \
+    --restore /var/backups/bugnet-payments/bugnet_payments-<UTC stamp>.dump
 ```
 
-`--clean --if-exists` drops each object in the dump before it restores it, and
-`--single-transaction` leaves the database as it was when any step fails. Tables a later migration
-added are not in the dump and stay: before a release that would add them again starts, drop the
-database, create it again (section 4) and restore into the empty one. If boot then refuses with a
-seed check (section 12), the dump is older than a rotation or a retirement; the founder picks the
-fix, as there.
+It never restores over the live database. Once a later migration's table has a foreign key into a
+table in the dump (most new tables point at `orders`), `pg_restore --clean` cannot drop the dumped
+tables and the whole restore fails. In order, it:
+
+1. checks the dump with `pg_restore --list`;
+2. restores it as `postgres` with `pg_restore --clean --if-exists --single-transaction` into a new,
+   empty database, `bugnet_payments_restoring`, owned by `bugnet_payments`. When that fails it
+   drops the new database and stops: nothing was stopped and `bugnet_payments` is as it was;
+3. pauses refunds (`pcli refunds status` shows `restore`), pauses x402 payments and holds x402
+   refunds in the new database;
+4. disables and stops every `bugnet-payments@` version: the installed one and any other still
+   running, such as the newer release after an install step for an older one;
+5. renames both in one transaction: `bugnet_payments` becomes
+   `bugnet_payments_before_<UTC time>`, and the new database `bugnet_payments`. The kept one has no
+   `pg_hba.conf` line, so only `postgres` opens it, and no nightly dump includes it;
+6. lists each row of `refunds`, `deposit_moves`, `x402_payments` and `x402_cold_transfers` whose
+   state or signature differs between the two, and the installed release's migrations that the
+   restored database has not run.
+
+It starts nothing. Then:
+
+1. **Migrations.** When it names migrations and the restore is meant to undo them (a bad
+   migration), first run the install step with the tarball of the release that ran before
+   (section 8): every `--start` takes its dump just before the release it starts migrates. Else
+   that release's start runs them again.
+2. `vps-install.sh --start`. If boot refuses with a seed check (section 12), the dump is older than
+   a rotation or a retirement; the founder picks the fix, as there.
+3. **Money after the dump.** Each listed row moved money, or owed it, after the dump. A refund the
+   kept database shows signed or confirmed was paid already, and resuming refunds would pay it
+   again. An x402 payment there is money its account spent, which the restored account does not
+   show. A deposit move there that is missing here can be a deposit made after the dump, whose
+   salt, and so its key, is only in the kept database. With no row listed, run
+   `pcli refunds resume`, `pcli x402 refunds release` and `pcli x402 resume`. Otherwise all three
+   wait until the founder has settled every listed row. Read the kept database with
+   `sudo runuser -u postgres -- psql -d bugnet_payments_before_<UTC time>`.
+4. Once every row is settled, drop the kept database:
+   `sudo runuser -u postgres -- dropdb bugnet_payments_before_<UTC time>`.
