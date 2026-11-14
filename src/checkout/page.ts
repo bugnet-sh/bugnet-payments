@@ -388,6 +388,21 @@ const MARK = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="320 264 608 693" 
 <path d="M 818 501 L 915 547 Q 928 553 928 566 L 928 641 Q 928 653 914 659 L 873 675 L 873 822 Q 873 840 855 849 L 657 946 Q 637 957 637 935 L 637 691 Q 637 677 649 671 L 885 562 L 820 533 Q 822 518 818 501 Z"/>
 </g></svg>`;
 
+// The tab icon, byte for byte bugnet-website/packages/brand/icon.svg, served at /favicon.svg
+export const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1254 1254" role="img" aria-label="Bugnet">
+  <rect width="1254" height="1254" fill="#0A0A0A"/>
+  <g fill="#EDEDED">
+    <path d="M 556 415 C 546 364 514 330 460 309" fill="none" stroke="#EDEDED" stroke-width="31" stroke-linecap="round"/>
+    <path d="M 694 415 C 704 364 736 330 790 309" fill="none" stroke="#EDEDED" stroke-width="31" stroke-linecap="round"/>
+    <circle cx="440" cy="307" r="43"/>
+    <circle cx="810" cy="307" r="43"/>
+    <path fill-rule="evenodd" d="M 446 563 L 446 534 C 446 455 524 393 624 393 C 724 393 802 455 802 534 L 802 563 L 624 640 Z M 573 499 A 31 31 0 1 0 511 499 A 31 31 0 1 0 573 499 Z M 737 499 A 31 31 0 1 0 675 499 A 31 31 0 1 0 737 499 Z"/>
+    <path d="M 430 501 L 333 547 Q 320 553 320 566 L 320 641 Q 320 653 334 659 L 375 675 L 375 822 Q 375 840 393 849 L 591 946 Q 611 957 611 935 L 611 691 Q 611 677 599 671 L 363 562 L 428 533 Q 426 518 430 501 Z"/>
+    <path d="M 818 501 L 915 547 Q 928 553 928 566 L 928 641 Q 928 653 914 659 L 873 675 L 873 822 Q 873 840 855 849 L 657 946 Q 637 957 637 935 L 637 691 Q 637 677 649 671 L 885 562 L 820 533 Q 822 518 818 501 Z"/>
+  </g>
+</svg>
+`;
+
 const HEADER = `<header class="top"><div class="frame">
 <a class="brand" href="https://bugnet.sh/">${MARK}<span>Bugnet</span></a>
 <nav class="legal" aria-label="Legal">
@@ -403,6 +418,7 @@ function page(title: string, main: string): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(title)}</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 ${PRELOAD}
 <style>${STYLE}</style>
 </head>
