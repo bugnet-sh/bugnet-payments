@@ -64,7 +64,9 @@ export async function auditX402(d: X402AuditDeps): Promise<X402AuditReport> {
 
     if (tail.tokenAccount !== null && tail.verifiedAt !== null) {
         const chain = await chainBalanceAt(d.pool, v, tail.openingBalanceMicros, tail.openingSlot);
+        // Money in the account before the tail opened belongs to no order: it is Bugnet's own
         const ledger =
+            tail.openingBalanceMicros +
             (await liabilitiesAt(d.pool, v, tail)) +
             (await bugnetMoneyAt(d.pool, v, tail)) +
             (await unsettledColdTransfersAt(d.pool, v)) +

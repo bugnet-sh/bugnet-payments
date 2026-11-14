@@ -316,8 +316,17 @@ describe("auditX402 refund and cold rows", () => {
 });
 
 describe("auditX402 balance and committed", () => {
+    it("counts money already in the account when the tail opened as Bugnet's own", async () => {
+        // Production's tail opened on 2026-11-09 with the $0.01 sent while funding the wallets
+        await openTail(db.pool, HOT, 10_000n, 100n, new Date(t0.getTime() - 86_400_000));
+        await advanceVerified(db.pool, 1_000n, t0);
+        const log = memoryLog();
+        expect((await auditX402(deps(createFakeRpc(), log))).mismatches).toEqual([]);
+        expect(alarms(log, "x402_audit_mismatch")).toEqual([]);
+    });
+
     it("the balance equation holds to the micro on a fixture", async () => {
-        await openTail(db.pool, HOT, 2_016_000n, 100n, new Date(t0.getTime() - 86_400_000));
+        await openTail(db.pool, HOT, 0n, 100n, new Date(t0.getTime() - 86_400_000));
         await advanceVerified(db.pool, 1_000n, t0);
         const { order: o1 } = await seedOrder(db.pool, {
             kind: "start",
@@ -327,7 +336,7 @@ describe("auditX402 balance and committed", () => {
             feeMicros: 3_000,
             state: "redeemed",
         });
-        await seedPayment(db.pool, o1.id, { status: "confirmed" });
+        const p1 = await seedPayment(db.pool, o1.id, { status: "confirmed" });
         await setPaymentLandedSlot(db.pool, o1.id, 200n);
         await seedAccount(db.pool, { id: o1.id, fundedMicros: 1_000_000 });
         await seedFunding(db.pool, {
@@ -341,7 +350,7 @@ describe("auditX402 balance and committed", () => {
             [t0, o1.id, { order_id: o1.id, deadline: "2030-01-01T13:00:00Z" }],
         );
         const { order: o2 } = await seedOrder(db.pool, { state: "redeemed" });
-        await seedPayment(db.pool, o2.id, { status: "confirmed" });
+        const p2 = await seedPayment(db.pool, o2.id, { status: "confirmed" });
         await setPaymentLandedSlot(db.pool, o2.id, 150n);
         await seedAccount(db.pool, {
             id: o2.id,
@@ -356,6 +365,12 @@ describe("auditX402 balance and committed", () => {
             "insert into x402_cold_transfers (amount_micros, state, tx_signature) values (1000000, 'sent', $1)",
             [SIG()],
         );
+        // The two payments' money, net of o2's spending and with the cold transfer not yet landed
+        await db.pool.query(
+            `insert into x402_chain_txs (signature, slot, delta_micros, failed, matched, matched_id)
+             values ($1, 200, 1013000, false, 'order', $3), ($2, 150, 1003000, false, 'order', $4)`,
+            [p1.txSignature, p2.txSignature, o1.id, o2.id],
+        );
         await db.pool.query(
             `insert into x402_chain_txs (signature, slot, delta_micros, failed, matched, matched_id)
              values ($1, 300, 10000, false, 'order', $3), ($2, 400, 3000, false, 'inflow', null)`,
@@ -364,7 +379,10 @@ describe("auditX402 balance and committed", () => {
         await db.pool.query("update x402_pool set committed_micros = 1000000");
         const log = memoryLog();
         expect((await auditX402(deps(createFakeRpc(), log))).mismatches).toEqual([]);
-        await db.pool.query("update x402_tail set opening_balance_micros = 2016001");
+        await db.pool.query(
+            "update x402_chain_txs set delta_micros = delta_micros + 1 where signature = $1",
+            [p1.txSignature],
+        );
         const off = await auditX402(deps(createFakeRpc(), log));
         expect(off.mismatches).toEqual(["balance 2029001 != 2029000"]);
         expect(alarms(log, "x402_audit_mismatch")).toHaveLength(1);
