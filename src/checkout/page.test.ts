@@ -127,7 +127,7 @@ describe("checkout page", () => {
     });
 
     it("uses the brand icon as the favicon", async () => {
-        const brand = await readFile("../bugnet-website/packages/brand/icon.svg", "utf8").catch(
+        const brand = await readFile("../website/packages/brand/icon.svg", "utf8").catch(
             () => null,
         );
         if (brand !== null) expect(FAVICON_SVG).toBe(brand);

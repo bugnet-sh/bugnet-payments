@@ -213,7 +213,7 @@ describe("paymentProof", () => {
     });
 });
 
-const router = process.env.BUGNET_ROUTER_DIR ?? resolve("../bugnet-router");
+const router = process.env.BUGNET_ROUTER_DIR ?? resolve("../router");
 // Prod router d7cc8df decodes strictly and has no fee_micros; feat/pricing-groundwork adds it
 const routerHasFee = ((): boolean => {
     try {

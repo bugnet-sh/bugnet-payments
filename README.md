@@ -5,11 +5,11 @@ fee payer, issues router order tokens only to claim holders and refunds automati
 
 ## Setup
 
-Needs Node 26, pnpm 12.6, `buf`, Postgres 18 and a `../bugnet-proto` checkout next to this one.
+Needs Node 26, pnpm 12.6, `buf`, Postgres 18 and a `../proto` checkout next to this one.
 
 ```sh
 pnpm install   # @solana/pay-kit comes from vendor/, check it with: shasum -a 256 -c vendor/SHA256SUMS
-pnpm proto     # generates src/gen from ../bugnet-proto
+pnpm proto     # generates src/gen from ../proto
 ```
 
 `@x402/svm` is pinned at 2.30.0 with `patches/@x402__svm@2.30.0.patch` (`pnpm-workspace.yaml`

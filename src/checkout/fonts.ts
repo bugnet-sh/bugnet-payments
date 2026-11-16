@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname, join } from "node:path";
 import { sendJson } from "../http/server.ts";
 
-// The brand's fonts, cut and licensed as in bugnet-website/packages/brand/fonts
+// The brand's fonts, cut and licensed as in website/packages/brand/fonts
 export const CHECKOUT_FONTS: readonly string[] = [
     "manrope-400.woff2",
     "manrope-600.woff2",

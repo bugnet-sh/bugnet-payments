@@ -1,7 +1,7 @@
-# Generates the router client from the bugnet-proto checkout next to this repository
+# Generates the router client from the proto checkout next to this repository
 version: v2
 inputs:
-    - directory: ../bugnet-proto
+    - directory: ../proto
 plugins:
     - local: node_modules/.bin/protoc-gen-es
       out: src/gen

@@ -1,7 +1,7 @@
 /**
  * Per-IP keys (spec 5): an IPv4 address is its own key, an IPv6 address is keyed by its /64, and
  * the /48 holding that /64 is its block, the way the gateway groups IPv6 (`addressKey` in
- * bugnet-gateway's ratelimit.ts). One host with a /64 is one key.
+ * the gateway's ratelimit.ts). One host with a /64 is one key.
  */
 import { createHmac } from "node:crypto";
 import { isIPv6 } from "node:net";

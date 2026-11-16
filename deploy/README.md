@@ -24,7 +24,7 @@ VPS next to the router (data-plane 15.1).
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin bugnet-payments
 ```
 
-Build in a checkout at the release commit, with `../bugnet-proto` next to it (`pnpm build` runs
+Build in a checkout at the release commit, with `../proto` next to it (`pnpm build` runs
 `pnpm proto`):
 
 ```sh

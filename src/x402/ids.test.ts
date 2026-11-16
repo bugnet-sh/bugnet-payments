@@ -15,11 +15,8 @@ describe("x402 ids", () => {
         expect(serviceIdFor("GET", "seller.example", "/ok/")).toBe("xs_beynw7muaoanyeri");
         expect(serviceIdFor("GET", "seller.example", "/ok/")).toMatch(SERVICE_ID);
     });
-    it("serviceIdFor matches the bugnet-proto vector file", () => {
-        const file = new URL(
-            "../../../bugnet-proto/vectors/x402/service-ids.json",
-            import.meta.url,
-        );
+    it("serviceIdFor matches the proto vector file", () => {
+        const file = new URL("../../../proto/vectors/x402/service-ids.json", import.meta.url);
         const { v, cases } = JSON.parse(readFileSync(file, "utf8")) as {
             v: number;
             cases: { method: "GET" | "POST"; host: string; prefix: string; id: string }[];

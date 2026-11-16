@@ -2,7 +2,7 @@ import { createPrivateKey, createPublicKey, sign, type KeyObject } from "node:cr
 import { isCanonicalAddress, isCanonicalSignature } from "../solana/base58.ts";
 import type { OrderRow } from "./types.ts";
 
-// Matches bugnet-router/internal/ordertoken, which decodes these claims strictly
+// Matches router/internal/ordertoken, which decodes these claims strictly
 export interface OrderClaims {
     order_id: string;
     kind: "start" | "extend";

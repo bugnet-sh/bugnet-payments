@@ -69,7 +69,7 @@ const PRELOAD = ["manrope-400.woff2", "lexend-deca-200.woff2"]
     .map((f) => `<link rel="preload" href="/fonts/${f}" as="font" type="font/woff2" crossorigin>`)
     .join("\n");
 
-// Values copied from bugnet-website/packages/brand/tokens.css; the second group is this page's own
+// Values copied from website/packages/brand/tokens.css; the second group is this page's own
 const STYLE = `
 :root {
     color-scheme: dark;
@@ -388,7 +388,7 @@ const MARK = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="320 264 608 693" 
 <path d="M 818 501 L 915 547 Q 928 553 928 566 L 928 641 Q 928 653 914 659 L 873 675 L 873 822 Q 873 840 855 849 L 657 946 Q 637 957 637 935 L 637 691 Q 637 677 649 671 L 885 562 L 820 533 Q 822 518 818 501 Z"/>
 </g></svg>`;
 
-// The tab icon, byte for byte bugnet-website/packages/brand/icon.svg, served at /favicon.svg
+// The tab icon, byte for byte website/packages/brand/icon.svg, served at /favicon.svg
 export const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1254 1254" role="img" aria-label="Bugnet">
   <rect width="1254" height="1254" fill="#0A0A0A"/>
   <g fill="#EDEDED">

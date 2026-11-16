@@ -54,7 +54,7 @@ import {
 const AMOUNT = 10_000;
 const ATA_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const REPO = resolve(import.meta.dirname, "../..");
-const routerDir = resolve(REPO, "../bugnet-router");
+const routerDir = resolve(REPO, "../router");
 
 interface ParsedIx {
     programId: string;
