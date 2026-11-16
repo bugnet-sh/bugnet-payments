@@ -110,6 +110,9 @@ Boot logs a warn line while `orders.max_amount_micros` (100 USDC by default) is 
 queue as `refund_exceeds_cap`. Set the cap at or above the largest package price to refund every
 order automatically.
 
+`refunds.min_micros` (1,000 by default, pricing D4): a refund the router prices below it is kept
+and logged as `router refund below the minimum kept`. Refunds started with `pcli` ignore it.
+
 ## 3. Secrets: `/etc/bugnet/payments.env`
 
 `root:root 0600`, holding only the production secrets of `.env.example`, never the test ones
