@@ -61,6 +61,7 @@ export interface EventDeps {
     now: () => Date;
     funding: AllowanceFunding | null;
     x402: Settings["x402"];
+    refundMinMicros: number;
 }
 
 interface RouterEvent {
@@ -263,6 +264,15 @@ async function refundTerminated(
     const live: RefundEntry[] = [];
     for (const e of entries) {
         if (e.amountMicros === 0) continue;
+        if (e.amountMicros < d.refundMinMicros) {
+            d.log.info("router refund below the minimum kept", {
+                eventId: event.id,
+                orderId: e.orderId,
+                refundMicros: e.amountMicros,
+                minMicros: d.refundMinMicros,
+            });
+            continue;
+        }
         if ((await findOrder(d.pool, e.orderId)) === null) {
             d.log.warn("refund entry for an unknown order", {
                 eventId: event.id,

@@ -327,6 +327,8 @@ const settingsSchema = z
                 compute_unit_limit: count.default(20_000),
                 compute_unit_price_micro_lamports: amount.default(10_000),
                 max_attempts: count.default(3),
+                // Pricing D4: a router-priced refund below this is kept, not paid
+                min_micros: amount.default(1_000),
             })
             .strict()
             .prefault({}),

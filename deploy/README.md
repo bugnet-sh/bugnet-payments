@@ -65,8 +65,12 @@ recipient = "<cold recipient address>"
 
 [router]
 url = "http://127.0.0.1:8080"
-get_order = true                     # router Task 8 serves GetOrder
-check_payer = false                  # true once router Task 28 serves CheckPayer
+get_order = true                     # the router serves GetOrder
+check_payer = true                   # the router serves CheckPayer (Task 28)
+token_payer_claims = true            # payer, fee_payer and tx on paid tokens
+allowance_claim = true               # allowance_micros on start tokens
+token_issued_at = true               # issued_at on start tokens
+fee_claim = true                     # fee_micros on start tokens, router e0ce937 or later
 event_public_key = "<see section 5>"
 ```
 
@@ -109,6 +113,9 @@ Boot logs a warn line while `orders.max_amount_micros` (100 USDC by default) is 
 `refunds.daily_cap_micros` (20 USDC by default): a refund above the cap always goes to the manual
 queue as `refund_exceeds_cap`. Set the cap at or above the largest package price to refund every
 order automatically.
+
+`refunds.min_micros` (1,000 by default, pricing D4): a refund the router prices below it is kept
+and logged as `router refund below the minimum kept`. Refunds started with `pcli` ignore it.
 
 ## 3. Secrets: `/etc/bugnet/payments.env`
 
@@ -231,18 +238,16 @@ Run the `pnpm cli` commands in a checkout whose `.env` holds the production keys
 
 - Router `order_token_public_key` = the output of `pnpm cli keys pubkey`.
 - Router `events_url = "http://127.0.0.1:8447/v1/events"`.
-- Payments `router.event_public_key` = the output of
-  `go run ./cmd/bugnet-dev pubkey --priv "$BUGNET_EVENT_SIGNING_KEY"` in bugnet-router, with the
-  router's environment loaded. Dev only: the key appears in argv and shell history; use
-  `pubkey --event` once router Task 39 ships.
+- Payments `router.event_public_key` = the output of `sudo bugnet-ops pubkey --event` on the
+  VPS, set with `vps-install.sh --event-key` (router RUNBOOK, key table).
 - `BUGNET_PAYMENTS_ROUTER_TOKEN` is shared with the router session's new variable: the same name
   and value in both environments (`bugnet-dev keys` prints one).
-- Once the router ships it, router
-  `wallets.facilitator_addresses = ["<fee_payer address from pnpm cli keys show>"]`, so the router
-  never counts our fee payer as a user. Not before: the router refuses unknown TOML keys and would
-  not start.
-- `router.get_order` is true, since the router serves GetOrder. Flip `router.check_payer` to true
-  only after the router ships CheckPayer (router Task 28).
+- Router `wallets.facilitator_addresses = ["<fee_payer address>"]` (the `fee_payer=` line of
+  `--pubkeys`), so the router never counts our fee payer as a user. Production's `router.toml`
+  lists it.
+- Every `[router]` switch of section 2 is on in production. Each new claim switch goes on only
+  after the router that decodes the claim is live, because the router decodes tokens strictly and
+  refuses a claim it does not know (section 10, **The router**).
 
 ## 6. RPC
 
@@ -431,18 +436,12 @@ To turn deposits on:
 that exist are watched and finish. When the installed version is not the one running, both leave
 the restart to the next `--start`.
 
-## 9. Open decision 11 (founder, question 14): TLS for `pay.bugnet.sh`
+## 9. TLS for `pay.bugnet.sh`
 
-Both listeners serve plain HTTP on loopback today.
-
-- **A:** a local TLS terminator (Caddy, or HAProxy `mode http`) behind a `names.toml` split, which
-  proxies to `127.0.0.1:8450` and sets `X-Forwarded-For`.
-- **B:** in-process TLS with ACME and PROXY v2, as the gateway front does.
-
-Either also needs a DNS record. **Recommendation: A**, because it keeps ACME and TLS parsing out
-of the process that holds the fee-payer key. Task 26 has a pre-TLS variant. The founder approved A
-on 2026-11-06; what remains is the `pay.bugnet.sh` line in `names.toml` (data-plane 15.2), the
-terminator itself and the DNS record.
+Live since 2026-11-09 (decision 11, A, founder 2026-11-06). Both listeners serve plain HTTP on
+loopback. The router's `names.toml` sends `pay.bugnet.sh` to the website backend, whose Caddy
+ends TLS and proxies to `127.0.0.1:8450` (`internal/deploy/website/README.md`). A local
+terminator keeps ACME and TLS parsing out of the process that holds the fee-payer key.
 
 What the terminator must do, because Payments limits requests per client address:
 
@@ -484,13 +483,12 @@ database locks, so a second process never runs the same job twice.
 
 **The allowance wallet and the TLS files**, once:
 
-1. In the checkout, `pnpm cli keys generate` writes a new `BUGNET_ALLOWANCE_KEY` into the
-   checkout's `.env` and prints only addresses, among them `allowance=<address>`. Copy the value
-   of the `BUGNET_ALLOWANCE_KEY=` line from that `.env` into `/etc/bugnet/payments.env`
-   (`sudoedit`), as the line `BUGNET_ALLOWANCE_KEY=<value>`.
-2. In `/etc/bugnet/payments.toml`, set `[x402] allowance_wallet` to the printed `allowance`
-   address and `[x402] enabled = true`. Without `enabled`, terms answer `enabled: false` and
-   allowance orders are refused `x402_disabled`.
+1. The install step does this on the server: it generates any missing key into
+   `/etc/bugnet/payments.env`, `BUGNET_ALLOWANCE_KEY` among them, prints only addresses
+   (`allowance=<address>`), and sets `[x402] allowance_wallet` to that address. The key never
+   leaves the server.
+2. A `payments.toml` the install step writes has `[x402] enabled = true`. Without `enabled`,
+   terms answer `enabled: false` and allowance orders are refused `x402_disabled`.
 3. `pnpm cli keys fund --create-allowance-ata` creates its USDC account.
 4. The TLS files. The router owner, who keeps the internal CA key on their Mac, runs
    `bugnet-dev mtls init --out <staging>` there. It writes, laid out as on the VPS,
@@ -945,8 +943,8 @@ It starts nothing. Then:
       `<orderId> <signature>`, each side its micros, and the line ends with `parts:` and the kept
       database's parts, each `<transfer> <micros>` with `refund=<id> state=<state>` (that
       refund's state there), `kept=<reason>` or `pay by hand`.
-4. **Pauses and holds.** Refunds and x402 stay paused until the founder has settled every listed
-   row by hand. Then lift only what printed `set by the restore`: refunds paused with
+4. **Pauses and holds.** Refunds and x402 stay paused until the Payments owner has settled every
+   listed row by hand (D10 restore A, founder 2026-11-13). Then lift only what printed `set by the restore`: refunds paused with
    `pcli refunds resume`, x402 payments paused with `pcli x402 resume`, x402 refunds held with
    `pcli x402 refunds release`. Leave what printed `in the dump already` as it was. With nothing
    listed, lift them at once. Read the kept database with

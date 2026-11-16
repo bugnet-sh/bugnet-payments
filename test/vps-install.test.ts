@@ -1140,6 +1140,23 @@ describe("vps-install.sh backups", () => {
     });
 });
 
+describe("a fresh payments.toml", () => {
+    it("turns on every router switch production runs", () => {
+        const text = readFileSync(SCRIPT, "utf8");
+        const router = text.slice(text.indexOf("\n[router]\n"), text.indexOf("\n[x402]\n"));
+        for (const key of [
+            "get_order",
+            "check_payer",
+            "token_payer_claims",
+            "allowance_claim",
+            "token_issued_at",
+            "fee_claim",
+        ]) {
+            expect(router.split("\n")).toContain(`${key} = true`);
+        }
+    });
+});
+
 const MIGRATIONS = join(import.meta.dirname, "../migrations");
 const MIGRATION_FILES = readdirSync(MIGRATIONS)
     .filter((f) => /^\d{5}_[a-z0-9_]+\.sql$/.test(f))

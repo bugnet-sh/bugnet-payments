@@ -89,6 +89,7 @@ float_low_micros = 10000000
 compute_unit_limit = 20000
 compute_unit_price_micro_lamports = 10000
 max_attempts = 3
+min_micros = 1000                       # pricing D4: a router-priced refund below this is kept
 
 [alarms]
 fee_payer_min_lamports = 100000000

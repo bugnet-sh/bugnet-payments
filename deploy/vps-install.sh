@@ -316,6 +316,8 @@ get_order = true
 check_payer = true
 token_payer_claims = true
 allowance_claim = true
+token_issued_at = true
+fee_claim = true
 # Standard base64 of the router's event public key
 event_public_key = "<router event public key>"
 

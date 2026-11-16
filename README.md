@@ -12,6 +12,12 @@ pnpm install   # @solana/pay-kit comes from vendor/, check it with: shasum -a 25
 pnpm proto     # generates src/gen from ../bugnet-proto
 ```
 
+`@x402/svm` is pinned at 2.30.0 with `patches/@x402__svm@2.30.0.patch` (`pnpm-workspace.yaml`
+`patchedDependencies`). The patch lets a payment carry the Lighthouse instructions Phantom adds
+around the USDC transfer. Without it, settlement refuses every Phantom payment. An upgrade of
+`@x402/svm` drops the patch: port it to the new version and run the Phantom tests in
+`src/orders/pay.test.ts` ("Phantom's real layout") before merging.
+
 ## Secrets
 
 `.env` (mode 0600, never committed) holds secrets only; `.env.example` lists every variable.
