@@ -146,7 +146,19 @@ export function createHttpApp(d: HttpAppDeps, o: HttpAppOptions = {}): HttpApp {
         token: secrets.paymentsToken,
         routerToken: secrets.routerToken,
         events: (raw, headers) =>
-            handleEvent({ pool, key: eventKey, log, now, funding, x402: s.x402 }, raw, headers),
+            handleEvent(
+                {
+                    pool,
+                    key: eventKey,
+                    log,
+                    now,
+                    funding,
+                    x402: s.x402,
+                    refundMinMicros: s.refunds.min_micros,
+                },
+                raw,
+                headers,
+            ),
         maxBodyBytes: s.http.max_body_bytes,
         log,
     });

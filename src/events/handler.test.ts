@@ -319,6 +319,7 @@ describe("events", () => {
                 now: app.now.get,
                 funding: null,
                 x402: app.settings.x402,
+                refundMinMicros: app.settings.refunds.min_micros,
             },
             Buffer.from("{}"),
             {},
@@ -349,6 +350,7 @@ describe("events", () => {
                     now: app.now.get,
                     funding: null,
                     x402: app.settings.x402,
+                    refundMinMicros: app.settings.refunds.min_micros,
                 },
                 body,
                 headers,
@@ -424,7 +426,7 @@ describe("placement.terminated refunds", () => {
             refundable: true,
             refunds: [
                 { order_id: start.id, refund_micros: 0 },
-                { order_id: "ord_bbbbbbbbbbbbbbbbbbbbbbbbbb", refund_micros: 500 },
+                { order_id: "ord_bbbbbbbbbbbbbbbbbbbbbbbbbb", refund_micros: 5_000 },
             ],
         });
         expect((await send(body)).status).toBe(200);
@@ -434,6 +436,42 @@ describe("placement.terminated refunds", () => {
             app.log.lines
                 .slice(log)
                 .some((l) => l.level === "warn" && /unknown order/.test(String(l.msg))),
+        ).toBe(true);
+    });
+
+    it("keeps a router refund below refunds.min_micros and pays one at the minimum", async () => {
+        expect(app.settings.refunds.min_micros).toBe(1_000);
+        const start = await seeded("redeemed");
+        const extend = await seeded("redeemed", {
+            kind: "extend",
+            handleSha256: "c".repeat(64),
+            amountMicros: 5_000,
+        });
+        const log = app.log.lines.length;
+        const body = terminated(start.id, eid(), {
+            refundable: true,
+            refunds: [
+                { order_id: start.id, refund_micros: 999 },
+                { order_id: extend.id, refund_micros: 1_000 },
+            ],
+        });
+        expect((await send(body)).status).toBe(200);
+        expect(await refundRows(start.id)).toBe(0);
+        expect((await findOrder(app.pool, start.id))!.state).toBe("redeemed");
+        expect(await findOrderRefund(app.pool, extend.id)).toMatchObject({
+            kind: "partial",
+            amountMicros: 1_000,
+        });
+        expect(
+            app.log.lines
+                .slice(log)
+                .some(
+                    (l) =>
+                        l.level === "info" &&
+                        l.msg === "router refund below the minimum kept" &&
+                        l.orderId === start.id &&
+                        l.refundMicros === 999,
+                ),
         ).toBe(true);
     });
 
@@ -460,9 +498,9 @@ describe("placement.terminated refunds", () => {
         const body = terminated(start.id, eid(), {
             refundable: true,
             refunds: [
-                { order_id: start.id, refund_micros: 100 },
-                { order_id: start.id, refund_micros: 200 },
-                { order_id: other.id, refund_micros: 300 },
+                { order_id: start.id, refund_micros: 1_000 },
+                { order_id: start.id, refund_micros: 2_000 },
+                { order_id: other.id, refund_micros: 3_000 },
             ],
         });
         await send(body);
@@ -524,7 +562,7 @@ describe("placement.terminated refunds", () => {
             handleSha256: "c".repeat(64),
         });
         const entries = [
-            { order_id: "ord_bbbbbbbbbbbbbbbbbbbbbbbbbb", refund_micros: 100 },
+            { order_id: "ord_bbbbbbbbbbbbbbbbbbbbbbbbbb", refund_micros: 1_000 },
             { order_id: extend.id, refund_micros: 2_000 },
         ];
         const log = app.log.lines.length;
@@ -549,11 +587,11 @@ describe("placement.terminated refunds", () => {
                 created_at: "2026-11-06T12:00:00Z",
                 payload: {
                     refundable: true,
-                    refunds: [{ order_id: other.id, refund_micros: 500 }],
+                    refunds: [{ order_id: other.id, refund_micros: 5_000 }],
                 },
             }),
         );
-        expect(await findOrderRefund(app.pool, other.id)).toMatchObject({ amountMicros: 500 });
+        expect(await findOrderRefund(app.pool, other.id)).toMatchObject({ amountMicros: 5_000 });
         expect(
             app.log.lines
                 .slice(mark)
